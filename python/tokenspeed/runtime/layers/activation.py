@@ -126,6 +126,44 @@ class SiluAndMul(torch.nn.Module):
         )
 
 
+
+class GeluTanhAndMul(torch.nn.Module):
+    """GeGLU gated activation over a fused ``[..., gate | up]`` input.
+
+    Computes ``gelu(gate, approximate="tanh") * up``, the activation Gemma 3
+    uses (``hidden_activation="gelu_pytorch_tanh"``).
+
+    On NVIDIA CUDA this prefers the fused ``gelu_tanh_and_mul`` kernel when the
+    installed tokenspeed_kernel exports a callable; otherwise falls back to
+    chunk/gelu/multiply (correct, one extra intermediate).
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] % 2 != 0:
+            raise ValueError(
+                f"GeGLU expects an even [gate, up] width, got {x.shape[-1]}"
+            )
+        d = x.shape[-1] // 2
+        if x.is_cuda and not _is_amd:
+            try:
+                from tokenspeed_kernel.ops.activation.flashinfer import (
+                    gelu_tanh_and_mul as _gelu_tanh_and_mul,
+                )
+            except Exception:
+                _gelu_tanh_and_mul = None
+            if callable(_gelu_tanh_and_mul):
+                out = torch.empty(
+                    x.shape[:-1] + (d,), dtype=x.dtype, device=x.device
+                )
+                try:
+                    _gelu_tanh_and_mul(x, out)
+                    return out
+                except Exception:
+                    pass
+        gate, up = x[..., :d], x[..., d:]
+        return torch.nn.functional.gelu(gate, approximate="tanh") * up
+
+
 class SituAndMul(torch.nn.Module):
     """SiTU / SituGLU gated activation used by Kimi models (e.g. Kimi-K3).
 

@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import os
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -155,6 +157,47 @@ LINEAR_ATTENTION = "linear_attention"
 # Labels whose group is state-family (recurrent-state checkpoints, not rows
 # of KV history).
 STATE_LAYER_TYPES = frozenset({LINEAR_ATTENTION})
+
+
+def split_groups_to_equal_depth(layer_types: Sequence[str]) -> tuple[str, ...]:
+    """Relabel so every cache group holds the same number of layers.
+
+    The hybrid slab layout binds the i-th layer of EVERY group to slab i, so
+    groups of unequal depth leave dead rows (and ordinary packing can exceed
+    ``max_padding_fraction``). Gemma 3's 5:1 sliding:full is the usual case:
+    split the deeper label round-robin into ``ceil(deep/shallow)`` sub-groups
+    (``sliding_attention_0..4``) so every slab is fully bound. Matches vLLM
+    and Inkling. Set ``TOKENSPEED_NO_GROUP_SPLIT=1`` to disable.
+
+    Must run BEFORE the KV memory profile: the profile sizes the pool from the
+    slab count, so relabelling afterwards mismatches budget and layout.
+    """
+    if not layer_types:
+        return tuple(layer_types)
+    if os.environ.get("TOKENSPEED_NO_GROUP_SPLIT") == "1":
+        return tuple(layer_types)
+    counts = Counter(layer_types)
+    if len(counts) < 2:
+        return tuple(layer_types)
+    shallow = min(counts.values())
+    deep_label, deep = max(counts.items(), key=lambda kv: kv[1])
+    if deep_label in STATE_LAYER_TYPES:
+        # State groups have no slab rows to waste; splitting also breaks
+        # exact-label consumers (spec/registry route by STATE_LAYER_TYPES).
+        return tuple(layer_types)
+    num_groups = -(-deep // shallow)  # ceil
+    if num_groups <= 1:
+        return tuple(layer_types)
+    out_labels: list[str] = []
+    rank = 0
+    for label in layer_types:
+        if label != deep_label:
+            out_labels.append(label)
+        else:
+            out_labels.append(f"{label}_{rank % num_groups}")
+            rank += 1
+    return tuple(out_labels)
+
 
 
 def validate_scheduler_config(
@@ -720,6 +763,7 @@ __all__ = [
     "Retention",
     "SlidingWindowTokens",
     "STATE_LAYER_TYPES",
+    "split_groups_to_equal_depth",
     "apply_pd_transfer_policies",
     "group",
     "compute_max_logical_pages_for_capture",

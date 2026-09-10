@@ -31,6 +31,7 @@ from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
+from tokenspeed.runtime.layers.quantization.torchao import TorchAOConfig
 from tokenspeed.runtime.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 
 BASE_QUANTIZATION_METHODS: dict[str, type[QuantizationConfig]] = {
@@ -41,6 +42,7 @@ BASE_QUANTIZATION_METHODS: dict[str, type[QuantizationConfig]] = {
     "nvfp4": Nvfp4Config,
     "mxfp4": Mxfp4Config,
     "modelopt_mixed": ModelOptMixedConfig,
+    "torchao": TorchAOConfig,
 }
 
 

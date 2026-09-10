@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.dense.torchao import TorchAOLinearMethod
 from tokenspeed.runtime.layers.dense.mxfp4 import Mxfp4LinearMethod
 from tokenspeed.runtime.layers.dense.nvfp4 import (
     Nvfp4LinearMethod,
@@ -28,6 +29,7 @@ from tokenspeed.runtime.layers.dense.w8a8_fp8 import W8A8Fp8LinearMethod
 
 __all__ = [
     "Fp8LinearMethod",
+    "TorchAOLinearMethod",
     "Mxfp4LinearMethod",
     "Nvfp4LinearMethod",
     "Nvfp4W4A16LinearMethod",

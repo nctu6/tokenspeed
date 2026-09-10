@@ -42,6 +42,9 @@ import torch
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    split_groups_to_equal_depth,
+)
 
 ComponentT = TypeVar("ComponentT", bound="AttnComponentSpec")
 
@@ -85,16 +88,27 @@ def resolve_cache_layer_types(
     full-history group whatever compute mask its layers apply: the label
     vector says so explicitly instead of losing the labels.
     """
+    # Gemma3ForConditionalGeneration keeps layer_types / cache_layer_types on
+    # ``text_config``, not the multimodal wrapper. Prefer top-level, then text.
+    text_config = getattr(hf_config, "text_config", None)
+
+    def _layer_types_from(cfg):
+        if cfg is None:
+            return None
+        return getattr(cfg, "cache_layer_types", None) or getattr(
+            cfg, "layer_types", None
+        )
+
     layer_types = tuple(
-        getattr(hf_config, "cache_layer_types", None)
-        or getattr(hf_config, "layer_types", None)
-        or ()
+        _layer_types_from(hf_config) or _layer_types_from(text_config) or ()
     )
     if draft_block_decode:
         return (FULL_ATTENTION,) * num_layers
     if is_draft and layer_types and len(layer_types) != num_layers:
         return ()
-    return layer_types
+    # Gemma 3 / Inkling unequal sliding:full depths -> sliding_attention_<k>
+    # sub-groups so hybrid packing stays within max_padding_fraction.
+    return split_groups_to_equal_depth(layer_types)
 
 
 def resolve_dtype(kv_cache_dtype_str: str) -> torch.dtype:

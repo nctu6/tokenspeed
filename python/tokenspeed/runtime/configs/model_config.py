@@ -319,6 +319,63 @@ def _is_dflash2_mla(
     )
 
 
+
+_GEMMA3_ARCHITECTURES = frozenset(
+    {"Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"}
+)
+_GEMMA3_DEFAULT_SLIDING_WINDOW_PATTERN = 6
+
+
+def _maybe_synthesize_gemma3_layer_types(
+    hf_text_config: PretrainedConfig,
+    architectures: list[str],
+) -> None:
+    """Give a Gemma 3 text config an explicit ``layer_types`` list.
+
+    Gemma 3 alternates 5 local sliding-window layers to every 1 global
+    full-attention layer, but the 27B ``config.json`` declares only
+    ``sliding_window`` (+ an implicit ``sliding_window_pattern`` of 6) and no
+    per-layer ``layer_types``. The model (``models/gemma3.py``) and the KV pool
+    (``MHAConfig``) both key their sliding-group placement off ``layer_types``;
+    without it the pool collapses to a single full-history group and ignores
+    the window. Materialise the labels HF's ``Gemma3TextConfig.__post_init__``
+    would compute, so both sides agree.
+
+    No-op when the config already carries ``layer_types`` (newer checkpoints),
+    when the model is not Gemma 3, or when the layer count is unknown.
+    """
+    # Detect Gemma 3 by architecture string OR by model_type. The model_type
+    # ("gemma3" / "gemma3_text") is always present on the config, whereas
+    # ``architectures`` can be lost to None on a multimodal wrapper -- keying on
+    # both means a config that lost its arch list still gets its window.
+    is_gemma3 = any(arch in _GEMMA3_ARCHITECTURES for arch in architectures) or str(
+        getattr(hf_text_config, "model_type", "")
+    ).startswith("gemma3")
+    if not is_gemma3:
+        return
+    if getattr(hf_text_config, "layer_types", None):
+        return
+    num_layers = getattr(hf_text_config, "num_hidden_layers", None)
+    if not num_layers:
+        return
+    pattern = int(
+        getattr(
+            hf_text_config,
+            "sliding_window_pattern",
+            _GEMMA3_DEFAULT_SLIDING_WINDOW_PATTERN,
+        )
+        or _GEMMA3_DEFAULT_SLIDING_WINDOW_PATTERN
+    )
+    layer_types = [
+        "full_attention" if (i + 1) % pattern == 0 else "sliding_attention"
+        for i in range(int(num_layers))
+    ]
+    # Bypass __setattr__: gemma3's wrapper config forwards attribute access to
+    # text_config, and we want this pinned on the object the rest of the
+    # pipeline reads.
+    hf_text_config.__dict__["layer_types"] = layer_types
+
+
 def _apply_block_spec_widths(
     server_args: ServerArgs,
     hf_config: PretrainedConfig,
@@ -609,18 +666,27 @@ class ModelConfig:
             self.hf_config,
             self.hf_text_config,
         )
+        model_architectures = _model_architectures(
+            self.hf_config,
+            self.hf_text_config,
+        )
         if attention_family is not None:
             _apply_attention_family_defaults(server_args, attention_family)
             attention_family.configure(self)
         elif _is_dflash2_mla(self.hf_config, self.hf_text_config):
             configure_mla_attention(self)
-        elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
+        elif "MiniCPM3ForCausalLM" in model_architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
         else:
             self.attention_arch = AttentionArch.MHA
+
+        # Gemma 3 ships as *ForConditionalGeneration and its 27B config.json
+        # omits an explicit ``layer_types`` list. Synthesise onto the text
+        # config so the model and KV pool read the same 5:1 local:global labels.
+        _maybe_synthesize_gemma3_layer_types(self.hf_text_config, model_architectures)
 
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(

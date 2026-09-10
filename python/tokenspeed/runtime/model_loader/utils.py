@@ -42,10 +42,62 @@ def set_default_torch_dtype(dtype: torch.dtype) -> Generator[None]:
     torch.set_default_dtype(old_dtype)
 
 
+# Fallback map from a config's ``model_type`` to the registered architecture,
+# for checkpoints whose config arrives with ``architectures = None`` (e.g. a
+# Gemma 3 text sub-config). Keyed by ``model_type`` PREFIX so both the
+# multimodal wrapper ("gemma3") and its text sub-config ("gemma3_text") resolve
+# to the same entry class; the text-only decoder is handled by that class.
+_MODEL_TYPE_ARCH_ALIASES: tuple[tuple[str, str], ...] = (
+    ("gemma3", "Gemma3ForConditionalGeneration"),
+)
+
+
+def _architectures_from_model_type(hf_config) -> list[str]:
+    model_type = str(getattr(hf_config, "model_type", "") or "")
+    for prefix, arch in _MODEL_TYPE_ARCH_ALIASES:
+        if model_type.startswith(prefix):
+            return [arch]
+    return []
+
+
+def _architectures_from_config_class(hf_config) -> list[str]:
+    """Last-resort architecture name from the HF config class.
+
+    Used when ``resolve_architecture`` is unavailable in this tokenspeed tree.
+    """
+    name = type(hf_config).__name__
+    # Strip a trailing "Config" so e.g. Gemma3TextConfig -> Gemma3Text, which is
+    # still not a registered arch but is better than raising AttributeError on
+    # a None architectures list.
+    if name.endswith("Config"):
+        name = name[: -len("Config")]
+    return [name] if name else []
+
+
 def get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], str]:
     from tokenspeed.runtime.models.registry import ModelRegistry
 
-    architectures = getattr(model_config.hf_config, "architectures", [])
+    # ``hf_config.architectures`` can be present-but-None on wrapper / text
+    # configs (e.g. Gemma 3). ``getattr(..., [])`` does NOT help -- the
+    # attribute exists and is None, so the default never fires. Resolve in
+    # order: outer -> nested text_config -> model_type alias ->
+    # resolve_architecture (if available) -> config class name.
+    architectures = getattr(model_config.hf_config, "architectures", None)
+    if not architectures:
+        text_config = getattr(model_config.hf_config, "text_config", None)
+        if text_config is not None:
+            architectures = getattr(text_config, "architectures", None)
+    if not architectures:
+        architectures = _architectures_from_model_type(model_config.hf_config)
+    if not architectures:
+        try:
+            from tokenspeed.runtime.utils.hf_transformers_utils import (
+                resolve_architecture,
+            )
+
+            architectures = [resolve_architecture(model_config.hf_config)]
+        except Exception:
+            architectures = _architectures_from_config_class(model_config.hf_config)
     # Mixtral only supports the quantization backends listed here in the
     # current model registry and loader stack.
     mixtral_supported = ["fp8", "compressed-tensors"]

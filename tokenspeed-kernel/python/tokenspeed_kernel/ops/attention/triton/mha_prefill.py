@@ -24,7 +24,23 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
+
+# High-precision query over fp8 paged KV (in-kernel upcast). Must stay in
+# lockstep with mha_decode.py so extend+decode both accept the mixed pair.
+_Q_OVER_FP8_KV_SIGNATURES = frozenset(
+    format_signature(
+        q=dense_tensor_format(q_dtype),
+        k_cache=dense_tensor_format(kv_dtype),
+        v_cache=dense_tensor_format(kv_dtype),
+    )
+    for q_dtype in (torch.float16, torch.bfloat16)
+    for kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+)
 
 
 @triton.jit
@@ -531,7 +547,8 @@ def triton_mha_prefill(
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=format_signatures(
         ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
-    ),
+    )
+    | _Q_OVER_FP8_KV_SIGNATURES,
     priority=Priority.PORTABLE,
     traits={
         "is_causal": frozenset({False, True}),

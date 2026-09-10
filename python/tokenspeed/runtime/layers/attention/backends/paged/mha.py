@@ -135,12 +135,21 @@ class MHAAttnBackend(PagedAttentionBackend):
             self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
             and not self.is_mxfp8
         )
+        # Triton (and flashinfer paged) read fp8 KV and upcast to the query
+        # dtype in-kernel. Casting Q to fp8 loses accuracy, forces an
+        # all-fp8 signature Triton does not declare, and with empty_like(q)
+        # would return e4m3 activations. Only fa3/fa4 need an fp8 query.
+        self.cast_query_to_fp8 = self.kernel_solution in ("fa3", "fa4")
         self.plan = partial(
             mha_plan,
             dtype=(
                 torch.float8_e4m3fn
                 if self.is_mxfp8
-                else (self.kv_cache_dtype if self.is_fp8 else self.qkv_dtype)
+                else (
+                    self.kv_cache_dtype
+                    if self.is_fp8 and self.cast_query_to_fp8
+                    else self.qkv_dtype
+                )
             ),
             head_dim=self.head_dim,
             return_lse=False,
@@ -291,7 +300,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             q, q_sf = self._quantize_mxfp8_tokens(q)
             k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
-        elif self.is_fp8:
+        elif self.is_fp8 and self.cast_query_to_fp8:
             q = q.to(self.kv_cache_dtype)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
@@ -378,7 +387,7 @@ class MHAAttnBackend(PagedAttentionBackend):
     ) -> torch.Tensor:
         q, k, v = _slice_extend_inputs(metadata, q, k, v)
         # TODO: use a custom kernel to do downcast
-        if self.is_fp8:
+        if self.is_fp8 and self.cast_query_to_fp8:
             q = q.to(self.kv_cache_dtype)
             k = k.to(self.kv_cache_dtype)
             v = v.to(self.kv_cache_dtype)
@@ -423,7 +432,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             q, q_sf = self._quantize_mxfp8_tokens(q)
             k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
-        elif self.is_fp8:
+        elif self.is_fp8 and self.cast_query_to_fp8:
             q = q.to(self.kv_cache_dtype)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)

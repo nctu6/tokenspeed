@@ -62,9 +62,17 @@ class MHAConfig(SoftmaxAttnConfig):
         )
         # The retention window belongs to the storage labels: a block drafter
         # has none of its own (its window is a compute mask on its layers).
-        sliding_window_tokens = (
-            None if draft_block_decode else getattr(hf_config, "sliding_window", None)
-        )
+        # Gemma3ForConditionalGeneration keeps ``sliding_window`` on text_config.
+        if draft_block_decode:
+            sliding_window_tokens = None
+        else:
+            sliding_window_tokens = getattr(hf_config, "sliding_window", None)
+            if sliding_window_tokens is None:
+                text_config = getattr(hf_config, "text_config", None)
+                if text_config is not None:
+                    sliding_window_tokens = getattr(
+                        text_config, "sliding_window", None
+                    )
         spec = cls(
             backend_name=(
                 server_args.attention_backend

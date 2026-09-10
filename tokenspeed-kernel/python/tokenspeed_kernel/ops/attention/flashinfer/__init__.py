@@ -337,7 +337,7 @@ def _flashinfer_trtllm_dsa_impl(
     return result.reshape(num_tokens, q_kernel.shape[2], int(kv_lora_rank))
 
 
-if platform.is_nvidia and platform.is_hopper_plus:
+if platform.is_nvidia and platform.is_blackwell:
 
     @register_kernel(
         "attention",
@@ -346,6 +346,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
@@ -427,6 +428,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
