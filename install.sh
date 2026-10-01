@@ -339,6 +339,31 @@ build_and_install_vllm_flash_attn() {
     if ! "$PY" -c "import flash_attn.cute" >/dev/null 2>&1; then
         err "vllm_flash_attn shadowed the FA4 'flash_attn.cute' namespace the kernel needs; uninstalling it to keep the engine importable (prefill falls back to Triton). The fork's package must import as 'vllm_flash_attn', not 'flash_attn'."
         "$PY" -m pip uninstall -y vllm-flash-attn vllm_flash_attn >/dev/null 2>&1 || true
+        # DESTRUCTIVE-UNINSTALL REPAIR. The fork installs its package under the
+        # import name `flash_attn`, the SAME top-level directory `tokenspeed-fa4`
+        # owns (it ships `flash_attn/cute/`). pip merges the two on install, so
+        # the uninstall above deletes the shared `flash_attn/` directory -- and
+        # with it tokenspeed-fa4's `flash_attn/cute/` files -- while pip still
+        # records tokenspeed-fa4 as installed. Left as-is the engine dies at
+        # import with "No module named 'flash_attn'" (tokenspeed_kernel imports
+        # flash_attn.cute). Force-reinstall tokenspeed-fa4 to lay its files back
+        # down. Pin to the version pip currently records so this restores the
+        # exact build the kernel resolved; fall back to unpinned if unknown.
+        local fa4_ver
+        fa4_ver="$("$PY" -m pip show tokenspeed-fa4 2>/dev/null \
+            | awk -F': ' '/^Version:/{print $2}')"
+        if [[ -n "$fa4_ver" ]]; then
+            "$PY" -m pip install --no-deps --force-reinstall \
+                "tokenspeed-fa4==$fa4_ver" >/dev/null 2>&1 || true
+        else
+            "$PY" -m pip install --no-deps --force-reinstall \
+                tokenspeed-fa4 >/dev/null 2>&1 || true
+        fi
+        if "$PY" -c "import flash_attn.cute" >/dev/null 2>&1; then
+            log "Restored the FA4 'flash_attn.cute' provider (tokenspeed-fa4) after backing out the FA2 fork; engine import path is intact."
+        else
+            err "FA4 'flash_attn.cute' is STILL missing after reinstalling tokenspeed-fa4; the engine will not import. Recover with: '$PY' -m pip install --no-deps --force-reinstall tokenspeed-fa4"
+        fi
         return 1
     fi
     if ! "$PY" -c "import vllm_flash_attn" >/dev/null 2>&1; then
