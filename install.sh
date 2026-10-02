@@ -63,11 +63,19 @@
 # Building the gateway needs a Rust toolchain, protoc, and maturin -- install.sh
 # installs them if missing.
 #
+# VENV SELECTION. If a venv is ALREADY active, this script installs INTO it
+# instead of creating a second one. "Active" is detected from the interpreter
+# (sys.prefix != sys.base_prefix), so it works both when the venv was entered
+# via `source .venv_docker/bin/activate` AND when a Docker image merely puts the
+# venv on PATH (ENV PATH=/opt/venv/bin:$PATH) without exporting $VIRTUAL_ENV.
+# Otherwise it falls back to ./.venv. An explicit VENV_DIR=... overrides both.
+#
 # Usage:
-#   ./install.sh                 # create/use ./.venv; install only what's missing
+#   ./install.sh                 # adopt active $VIRTUAL_ENV, else create/use ./.venv
+#   source .venv_docker/bin/activate && ./install.sh   # install into .venv_docker
 #   REINSTALL=1 ./install.sh     # force full from-source rebuild of all packages
 #   REINSTALL_KERNEL=1 ./install.sh  # force only the kernel to recompile
-#   VENV_DIR=/path/to/venv ./install.sh
+#   VENV_DIR=/path/to/venv ./install.sh   # force a specific venv (overrides active)
 #   MAX_JOBS=8 ./install.sh
 #   CUDA_ARCH_LIST="12.0a" ./install.sh   # build only for sm_120 (faster)
 #
@@ -82,7 +90,13 @@ cd "$SCRIPT_DIR"
 # --- Tunables (mirror the Dockerfile ARG/ENV values) -------------------------
 MAX_JOBS="${MAX_JOBS:-16}"
 CUDA_ARCH_LIST="${CUDA_ARCH_LIST:-9.0a 10.0a 12.0a}"
-VENV_DIR="${VENV_DIR:-$SCRIPT_DIR/.venv}"
+# VENV_DIR intentionally has NO default here. We resolve it below with this
+# precedence: an explicit VENV_DIR wins; otherwise an already-active venv
+# ($VIRTUAL_ENV, e.g. a .venv_docker the user sourced inside a container) is
+# adopted as-is; otherwise we fall back to $SCRIPT_DIR/.venv. Defaulting it here
+# would erase the distinction between "user asked for this path" and "we picked
+# the fallback", which is exactly what lets us honor an active venv.
+VENV_DIR="${VENV_DIR:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # Force flags. REINSTALL forces every package to rebuild/reinstall from source;
@@ -157,20 +171,83 @@ if [[ -d smg/bindings/python && -d smg/grpc_servicer && -d smg/crates/grpc_clien
     HAVE_SMG_SRC=1
 fi
 
-# --- Virtualenv: create if missing, then ACTIVATE (do this first) ------------
+# --- Virtualenv: adopt an active one, else create/reuse, then ACTIVATE -------
 # Done before anything else so the user never has to remember to activate it --
 # every pip/python call below runs inside the venv, and the activated shell is
 # what they inherit after the script finishes.
-if [[ ! -d "$VENV_DIR" ]]; then
-    log "Creating virtualenv at $VENV_DIR"
-    "$PYTHON_BIN" -m venv "$VENV_DIR"
-else
-    log "Reusing existing virtualenv at $VENV_DIR"
+#
+# Resolution precedence (first match wins):
+#   1. Explicit VENV_DIR=... from the caller -- always honored, created if
+#      missing. The caller asked for a specific path; respect it verbatim.
+#   2. An ALREADY-ACTIVE venv -- adopt it in place and do NOT create or switch
+#      to .venv. This is the Docker case: a container whose venv is already live
+#      should install INTO that venv, not have install.sh silently build a
+#      second .venv beside it and leave the active one empty.
+#   3. Neither -- fall back to $SCRIPT_DIR/.venv (the original default),
+#      creating it on first run.
+#
+# DETECTING AN ACTIVE VENV. $VIRTUAL_ENV alone is NOT reliable: it is only
+# exported when the venv was entered via `source bin/activate`. A Docker image
+# that just puts the venv on PATH (`ENV PATH=/opt/venv/bin:$PATH`) runs entirely
+# inside that venv yet leaves $VIRTUAL_ENV empty. The authoritative signal is
+# the interpreter itself: inside a venv, Python's sys.prefix differs from
+# sys.base_prefix. So we ask the active python3 directly, and treat $VIRTUAL_ENV
+# only as the preferred source for the venv's PATH when it is set.
+#
+# detect_active_venv: echo the path of the venv the active `python3` belongs to,
+# or nothing if python3 is not running inside a venv. Prefer $VIRTUAL_ENV (the
+# activate-script case) and fall back to sys.prefix (the PATH-only case).
+detect_active_venv() {
+    "$PYTHON_BIN" - <<'PY' 2>/dev/null
+import os, sys
+if sys.prefix != sys.base_prefix:        # running inside a venv/virtualenv
+    print(os.environ.get("VIRTUAL_ENV") or sys.prefix)
+PY
+}
+
+ACTIVE_VENV=""
+if [[ -z "$VENV_DIR" ]]; then
+    ACTIVE_VENV="$(detect_active_venv)"
 fi
-# shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
+
+if [[ -n "$VENV_DIR" ]]; then
+    if [[ ! -d "$VENV_DIR" ]]; then
+        log "Creating virtualenv at $VENV_DIR (VENV_DIR override)"
+        "$PYTHON_BIN" -m venv "$VENV_DIR"
+    else
+        log "Reusing virtualenv at $VENV_DIR (VENV_DIR override)"
+    fi
+    # shellcheck disable=SC1091
+    source "$VENV_DIR/bin/activate"
+elif [[ -n "$ACTIVE_VENV" ]]; then
+    # A venv is already active (via `source bin/activate` OR just on PATH, e.g.
+    # a .venv_docker inside a container). Adopt it as-is. If it was activated
+    # the standard way its bin/ is already on PATH; if it was only PATH-injected
+    # we still source its activate script so VIRTUAL_ENV and PATH are set
+    # consistently for the pip/python calls below.
+    VENV_DIR="$ACTIVE_VENV"
+    log "Adopting the already-active virtualenv at $VENV_DIR"
+    if [[ -z "${VIRTUAL_ENV:-}" && -f "$VENV_DIR/bin/activate" ]]; then
+        # shellcheck disable=SC1091
+        source "$VENV_DIR/bin/activate"
+    fi
+else
+    VENV_DIR="$SCRIPT_DIR/.venv"
+    if [[ ! -d "$VENV_DIR" ]]; then
+        log "Creating virtualenv at $VENV_DIR"
+        "$PYTHON_BIN" -m venv "$VENV_DIR"
+    else
+        log "Reusing existing virtualenv at $VENV_DIR"
+    fi
+    # shellcheck disable=SC1091
+    source "$VENV_DIR/bin/activate"
+fi
 
 PY="$VENV_DIR/bin/python"
+if [[ ! -x "$PY" ]]; then
+    err "no python interpreter at $PY; the resolved venv ($VENV_DIR) looks incomplete."
+    exit 1
+fi
 log "Activated venv; using interpreter: $("$PY" -c 'import sys; print(sys.executable)')"
 
 # Export the build-time environment once; every source build below inherits it.

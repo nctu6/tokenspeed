@@ -9,3 +9,12 @@
 *.nsys-rep
 *.sqlite
 *.egg-info
+
+# Local Python virtualenvs -- never part of the build; a stray .venv at the
+# repo root would otherwise be copied wholesale into the build context.
+.venv
+**/.venv
+
+# Build output trees (Rust gateway, scheduler/kernel build dirs)
+**/target
+**/build

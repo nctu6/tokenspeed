@@ -1,0 +1,179 @@
+# Build (run from the repo root):  docker build -f docker/Dockerfile.nvidia.unieai -t tokenspeed:nvidia-unieai .
+#
+# UnieAI variant of Dockerfile.nvidia --------------------------------------
+#
+# Same build as Dockerfile.nvidia -- same base image and install order --
+# widened to cover the sm_120 workstation tier. It is kept as a separate file,
+# never an edit to Dockerfile.nvidia, for the reason UNIEINFRA.md gives: adding
+# a file never conflicts on rebase, editing an upstream one conflicts on every
+# rebase.
+#
+# What differs from Dockerfile.nvidia, and why:
+#   1. CUDA_ARCH_LIST adds 12.0a (sm_120) to the datacenter 9.0a/10.0a, so one
+#      image serves both tiers. Datacenter-only tcgen05 groups still build for
+#      sm_90/sm_100 and are auto-skipped for sm_120 by setup.py's arch gate --
+#      no ptxas "tcgen05 not supported on sm_120a" failure.
+#
+# This file is SELF-CONTAINED: everything it installs lives in this repo's own
+# build context (`COPY . /workspace`), so the image builds from a plain checkout
+# with no out-of-tree sources.
+#
+# Build with buildx for linux/amd64 and linux/arm64. The base image is a
+# multi-architecture manifest; prefer a native arm64 builder because QEMU
+# emulation can make native extension builds substantially slower.
+FROM lightseekorg/tokenspeed-runner:cu130-torch-2.13.0-flashinfer-0.6.18
+
+USER root
+
+ARG MAX_JOBS=16
+# Fat binary spanning the datacenter tier (sm_90 Hopper, sm_100 Blackwell) and
+# the workstation tier (sm_120, RTX PRO 6000 / 5090). The tcgen05 groups
+# (attn_res) build for sm_90/sm_100 and are auto-skipped for sm_120 by
+# tokenspeed-kernel/python/setup.py, so this list compiles cleanly.
+ARG CUDA_ARCH_LIST="9.0a 10.0a 12.0a"
+# FlashAttention-2 for sm_120, built from vLLM's fork. The engine's sm_120
+# prefill/extend path uses the fast FA2 kernels only if `import vllm_flash_attn`
+# succeeds; the base runner does not ship it, so without this the engine
+# silently falls back to the Triton prefill kernel (~1.39x TTFT loss). No usable
+# PyPI wheel exists for this torch/cu combo, so it is compiled from source
+# against the runner's own torch -- guaranteeing the ABI matches. Pin a ref
+# rather than tracking main so the build is reproducible.
+ARG VLLM_FLASH_ATTN_REPO="https://github.com/vllm-project/flash-attention"
+ARG VLLM_FLASH_ATTN_REF="main"
+
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
+WORKDIR /workspace
+
+# libnuma1 is required at runtime by torch_memory_saver, a TokenSpeed
+# dependency. Install system dependencies before copying sources to preserve
+# this cache layer across source-only changes.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        libssl-dev \
+        libopenmpi-dev \
+        libnuma1 \
+        pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY . /workspace
+
+# Install every TokenSpeed package from this checkout so the image always
+# contains the source being built, rather than published package wheels.
+#
+# THE KERNEL MUST BE (RE)INSTALLED FROM SOURCE LAST. The engine (python/)
+# declares `tokenspeed-kernel>=0.1.3.dev0` as a dependency, so
+# `pip install ./python` re-resolves it and OVERWRITES the source kernel we
+# built in step 1 with an older published wheel (0.1.3). That wheel is missing
+# symbols the engine imports, so the server dies at startup with e.g.
+#   ImportError: cannot import name 'allgather_dual_rmsnorm'
+#              from 'tokenspeed_kernel.ops.communication'
+# Installing the engine first (letting it satisfy its many third-party deps --
+# fastapi, grpcio, transformers, the tokenspeed-smg* stack, torch_memory_saver,
+# ...), THEN reinstalling the local kernel and scheduler with
+# --no-deps --force-reinstall, guarantees the source builds are the ones present
+# in the final image. --force-reinstall overwrites the wheel pip pulled;
+# --no-deps stops these two from dragging anything else back in.
+RUN python3 -m pip install cmake ninja && \
+    MAX_JOBS=${MAX_JOBS} \
+    FLASHINFER_CUDA_ARCH_LIST="${CUDA_ARCH_LIST}" \
+    TOKENSPEED_KERNEL_BACKEND=cuda \
+    python3 -m pip install tokenspeed-kernel/python/ --no-build-isolation && \
+    python3 -m pip install tokenspeed-scheduler/ && \
+    python3 -m pip install ./python --no-build-isolation && \
+    MAX_JOBS=${MAX_JOBS} \
+    FLASHINFER_CUDA_ARCH_LIST="${CUDA_ARCH_LIST}" \
+    TOKENSPEED_KERNEL_BACKEND=cuda \
+    python3 -m pip install tokenspeed-kernel/python/ \
+        --no-build-isolation --no-deps --force-reinstall && \
+    python3 -m pip install tokenspeed-scheduler/ --no-deps --force-reinstall && \
+    python3 -m pip install "torchao>=0.10.0"
+
+# Build vLLM's FlashAttention fork from source, against this image's torch so
+# the extension ABI matches. Clone with submodules (CUTLASS lives there) and
+# install --no-build-isolation so it links the torch already in the image
+# rather than pulling its own. The gencode comes from the same CUDA_ARCH_LIST
+# the rest of this image uses (9.0a 10.0a 12.0a), passed as the CMake arch list,
+# so FA2 covers every tier this image serves -- not just sm_120.
+RUN git clone --depth 1 --branch "${VLLM_FLASH_ATTN_REF}" --recursive \
+        "${VLLM_FLASH_ATTN_REPO}" /tmp/vllm-flash-attention && \
+    MAX_JOBS=${MAX_JOBS} \
+    CUDA_ARCH_LIST="${CUDA_ARCH_LIST}" \
+    TORCH_CUDA_ARCH_LIST="${CUDA_ARCH_LIST}" \
+    python3 -m pip install /tmp/vllm-flash-attention --no-build-isolation --no-deps ; \
+    rm -rf /tmp/vllm-flash-attention ; \
+    # COLLISION GUARD. The fork installs a top-level `flash_attn` package that
+    # can shadow the base image's FA4 `flash_attn.cute` -- which
+    # tokenspeed_kernel imports -- breaking the engine at startup ("No module
+    # named 'flash_attn_2_cuda'"). FA2 is an optional prefill speedup; the
+    # kernel is not. If flash_attn.cute no longer imports, back FA2 out and keep
+    # the working kernel (prefill falls back to Triton). Never fail the build on
+    # FA2 -- it is best-effort.
+    if ! python3 -c "import flash_attn.cute" >/dev/null 2>&1; then \
+        echo "WARN: vllm_flash_attn shadowed flash_attn.cute; removing it (prefill falls back to Triton)"; \
+        python3 -m pip uninstall -y vllm-flash-attn vllm_flash_attn >/dev/null 2>&1 || true; \
+    elif python3 -c "import vllm_flash_attn" >/dev/null 2>&1; then \
+        echo "vllm_flash_attn OK and flash_attn.cute intact"; \
+    else \
+        echo "WARN: vllm_flash_attn not importable under that name; sm_120 FA2 will fall back to Triton"; \
+    fi
+
+# Build the smg OpenAI gateway (+ proto + servicer) from the vendored smg/
+# source so the image carries local patches -- notably the best_of+stream
+# validator fix in smg/crates/protocols. The base image ships the published
+# tokenspeed-smg* wheels, which claim the same `smg` / `smg_grpc_proto` /
+# `smg_grpc_servicer` import paths and would shadow the source build, so they
+# are removed first. Recipe mirrors smg/scripts/installation/install-smg.sh: the
+# OFFICIAL protoc release zip (NOT apt's protobuf-compiler -- that omits the
+# well-known-type includes google/protobuf/{timestamp,struct}.proto the smg
+# protos import, so codegen fails with "File not found"), a Rust toolchain, and
+# maturin, then a release wheel built with vendored OpenSSL. Rust/protoc are
+# build-only; no runtime footprint beyond the installed wheel.
+RUN if [ -d smg/bindings/python ]; then \
+        apt-get update && apt-get install -y --no-install-recommends \
+            curl build-essential pkg-config unzip && \
+        rm -rf /var/lib/apt/lists/* && \
+        curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/protoc.zip \
+            https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip && \
+        unzip -o /tmp/protoc.zip -d /usr/local && rm /tmp/protoc.zip && \
+        protoc --version && \
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+        . "$HOME/.cargo/env" && \
+        python3 -m pip install "maturin>=1.0,<2.0" && \
+        python3 -m pip uninstall -y \
+            tokenspeed-smg tokenspeed-smg-grpc-proto tokenspeed-smg-grpc-servicer \
+            smg smg-grpc-proto smg-grpc-servicer || true && \
+        rm -rf smg/bindings/python/dist && \
+        ( cd smg/bindings/python && \
+          PROTOC=/usr/local/bin/protoc \
+          maturin build --release --features vendored-openssl --out dist ) && \
+        python3 -m pip install --force-reinstall smg/bindings/python/dist/*.whl && \
+        python3 -m pip install smg/crates/grpc_client/python && \
+        python3 -m pip install smg/grpc_servicer ; \
+    else \
+        echo "smg/ source not present in build context; keeping published tokenspeed-smg* wheels" ; \
+    fi
+
+# Sanity check WITHOUT importing the kernel: importing tokenspeed_kernel runs
+# GPU detection (platform.py) and raises "requires an NVIDIA CUDA or AMD ROCm
+# GPU" during `docker build`, which has no GPU. So check the installed
+# distribution's version (must be the dev/source build, not the 0.1.3 wheel)
+# and that the installed source exports the symbol the wheel lacked -- both via
+# metadata/file inspection, no import. Fails the build here rather than at
+# container startup if a wheel ever shadows the source again.
+RUN python3 - <<'PY'
+import importlib.metadata as md, pathlib, sys
+ver = md.version("tokenspeed-kernel")
+print("installed tokenspeed-kernel:", ver)
+if ".dev" not in ver and "+git" not in ver:
+    sys.exit(f"ERROR: installed a release wheel ({ver}), not the source build; "
+             "a dependency reinstall shadowed the local kernel.")
+files = md.files("tokenspeed-kernel")
+init = next(f for f in files if f.as_posix().endswith("ops/communication/__init__.py"))
+text = pathlib.Path(init.locate()).read_text()
+if "allgather_dual_rmsnorm" not in text:
+    sys.exit("ERROR: installed kernel lacks allgather_dual_rmsnorm.")
+print("kernel source + symbol OK")
+PY
+
+CMD ["/bin/bash"]
