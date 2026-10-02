@@ -925,6 +925,14 @@ class EventLoop:
           different pipeline stages; committing the queue head (join the
           forward thread, then its copy event) is the backpressure.
 
+        One refinement regardless of depth: a prefill/extend head commits as
+        soon as its forward has run, rather than waiting the depth-1 extra
+        round. That head carries a request's FIRST token, so deferring it adds
+        a full step to TTFT for no benefit (the head already ran on the GPU, so
+        the commit never blocks). Decode->decode keeps the one-step overlap.
+        This only orders a commit earlier, never later, so the depth stays a
+        pure performance knob.
+
         Correctness never depends on the depth: any dispatch whose inputs
         depend on a pending commit's side effects drains the queue first
         (``_dispatch_depends_on_pending_commit`` is the single registry of
@@ -1052,7 +1060,19 @@ class EventLoop:
                     # pipeline behind under PP). A round with no new work drains
                     # fully so results never wait on future traffic.
                     effective_depth = depth if forward_op is not None else 0
-                    while len(in_flight) > effective_depth:
+                    # TTFT: a prefill/extend forward carries a request's FIRST
+                    # token. The overlap schedule otherwise holds the head one
+                    # extra round, so that first token waits a full step before
+                    # it streams. The head always already ran on the GPU last
+                    # round, so committing it now never blocks (its result() is
+                    # ready) — commit a prefill head immediately and keep the
+                    # one-step overlap only for decode->decode. This is a commit
+                    # ordered earlier, never later, so the depth stays a perf
+                    # knob (event-loop.md Principle 4): correctness is unchanged.
+                    while in_flight and (
+                        len(in_flight) > effective_depth
+                        or in_flight[0][0].num_extends() > 0
+                    ):
                         fo, res = in_flight.popleft()
                         request_changes.extend(self._commit_forward_results(fo, res))
 
