@@ -76,8 +76,8 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.activation import GeluTanhAndMul
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
+    QKVParallelLinear,
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -329,35 +329,23 @@ class Gemma3Attention(nn.Module):
         self.scaling = query_pre_attn_scalar**-0.5
 
         attention_bias = bool(getattr(config, "attention_bias", False))
-        self.q_proj = ColumnParallelLinear(
+        # Fused QKV: one GEMM over the shared input instead of three separate
+        # q/k/v projections. The three cuBLAS calls read the same activation
+        # and under-use the weight-read pipeline on the narrow k/v shapes
+        # (N = num_kv_heads * head_dim); one [q|k|v] GEMM amortizes that. The
+        # per-head q/k norms still apply after the split (a view), so this is
+        # transparent to the norm + RoPE path.
+        self.qkv_proj = QKVParallelLinear(
             hidden_size,
-            total_num_heads * self.head_dim,
+            self.head_dim,
+            total_num_heads,
+            total_num_kv_heads,
             bias=attention_bias,
             quant_config=quant_config,
             tp_rank=tp_rank,
             tp_size=tp_size,
             tp_group=tp_group,
-            prefix=add_prefix("q_proj", prefix),
-        )
-        self.k_proj = ColumnParallelLinear(
-            hidden_size,
-            total_num_kv_heads * self.head_dim,
-            bias=attention_bias,
-            quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            prefix=add_prefix("k_proj", prefix),
-        )
-        self.v_proj = ColumnParallelLinear(
-            hidden_size,
-            total_num_kv_heads * self.head_dim,
-            bias=attention_bias,
-            quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            prefix=add_prefix("v_proj", prefix),
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
             total_num_heads * self.head_dim,
@@ -408,9 +396,8 @@ class Gemma3Attention(nn.Module):
                 (0, self.num_heads * self.head_dim), dtype=hidden_states.dtype
             )
         num_tokens = hidden_states.shape[0]
-        q, _ = self.q_proj(hidden_states)
-        k, _ = self.k_proj(hidden_states)
-        v, _ = self.v_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # qk-norm (per head) then RoPE. The norms reduce over head_dim, so the
         # head axis is folded into the row axis rather than materialised.
@@ -650,7 +637,14 @@ class Gemma3ForConditionalGeneration(BaseCausalLM):
         # Gemma stores gate/up separately; fuse into gate_up_proj. q/k/v are
         # NOT fused in the checkpoint (separate q_norm/k_norm live between the
         # projections and RoPE), so they load directly.
+        # (fused param, checkpoint shard name, shard id). q/k/v fuse into the
+        # single qkv_proj GEMM; the checkpoint stores them separately (the
+        # per-head q_norm/k_norm live between the projections and RoPE, so the
+        # projection weights themselves are plain). gate/up fuse into gate_up.
         stacked_params_mapping = [
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
@@ -681,7 +675,12 @@ class Gemma3ForConditionalGeneration(BaseCausalLM):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name or "mlp" not in name:
+                if weight_name not in name:
+                    continue
+                # gate/up live in mlp; q/k/v in self_attn. Keep the two fused
+                # groups from matching each other's shard names.
+                is_mlp_shard = param_name == "gate_up_proj"
+                if is_mlp_shard != ("mlp" in name):
                     continue
                 mapped = name.replace(weight_name, param_name)
                 if mapped not in params_dict:
