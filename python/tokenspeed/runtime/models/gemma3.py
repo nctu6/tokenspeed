@@ -478,29 +478,49 @@ class Gemma3DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
         ctx: ForwardContext,
-    ) -> torch.Tensor:
-        # Attention block (sandwich norms; explicit residual -- Gemma adds the
-        # residual AFTER the post-attention norm).
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Sandwich norms with the residual stream carried out of band.
+        #
+        # Gemma's sandwich adds the residual AFTER the post-sublayer norm:
+        #   h = r + post_norm(sublayer(pre_norm(r)))
+        # and the next block immediately pre-norms that sum. Folding the add
+        # into the following norm is exact (add-then-norm) and removes one
+        # standalone residual-add kernel per sandwich -- i.e. one redundant
+        # read+write of the hidden state over HBM at every block boundary.
+        #
+        # ``GemmaRMSNorm.forward(x, residual)`` runs ``gemma_fused_add_rmsnorm``:
+        # it updates ``residual <- residual + x`` in place and returns
+        # ``gemma_rmsnorm(residual)``. The first layer has no incoming residual,
+        # so the block entry is a plain norm and the residual starts as the
+        # (scaled) embedding.
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
         hidden_states = self.self_attn(positions, hidden_states, ctx)
         # o_proj / down_proj are built with reduce_results=False, so the shard
         # sums are still partial here.
         if self.mapping.attn.tp_size > 1:
             hidden_states = all_reduce(hidden_states, self.mapping.attn.tp_group)
+        # post_attn_norm(attn_out) folded with the (residual + .) add into the
+        # pre_feedforward norm: residual becomes r + post_attn_norm(attn_out),
+        # the real hidden going forward; hidden becomes pre_ff_norm(residual).
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states, residual = self.pre_feedforward_layernorm(
+            hidden_states, residual
+        )
 
-        # Feed-forward block.
-        residual = hidden_states
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         if self.mapping.dense.tp_size > 1:
             hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
+        # post_ff_norm(mlp_out); the (residual + .) add folds into the NEXT
+        # layer's input_layernorm (or the final norm), so return both streams.
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return hidden_states, residual
 
 
 class Gemma3Model(nn.Module):
@@ -579,9 +599,14 @@ class Gemma3Model(nn.Module):
             hidden_states = self.get_input_embeddings(input_ids)
         else:
             hidden_states = input_embeds
+        # Residual stream carried out of band so each block boundary's
+        # ``residual + .`` folds into the next norm (see Gemma3DecoderLayer).
+        residual: torch.Tensor | None = None
         for layer in self.layers:
-            hidden_states = layer(positions, hidden_states, ctx)
-        hidden_states = self.norm(hidden_states)
+            hidden_states, residual = layer(positions, hidden_states, residual, ctx)
+        # Final block's post_feedforward_layernorm output still owes its
+        # residual add; fold it into the final norm.
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states, None
 
 
