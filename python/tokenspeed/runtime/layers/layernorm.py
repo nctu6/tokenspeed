@@ -225,6 +225,64 @@ class RMSNorm(torch.nn.Module):
         return result, None, None
 
 
+class RMSNormNoWeight(torch.nn.Module):
+    """Weightless RMS normalization: ``x / rms(x)`` with no learnable scale.
+
+    This is the standard ``x_normed * weight`` RMSNorm (same kernel path as
+    :class:`RMSNorm`) specialized to the case where ``weight`` is a constant
+    one vector that is NOT a learnable parameter and is NOT loaded from a
+    checkpoint. Gemma 4's per-head value norm (``v_norm``) uses this form:
+    vllm-unieai builds it as ``RMSNorm(head_dim, eps, has_weight=False)``, i.e.
+    pure normalization with no scale. Because the ones vector is held in a
+    non-persistent buffer rather than an ``nn.Parameter``, the module claims no
+    checkpoint tensor and the strict weight-load coverage check does not expect
+    one.
+
+    The fused ``rmsnorm`` kernel still requires a ``weight`` argument, so a
+    ones buffer is materialized lazily to match the input's dtype and device on
+    first use (and whenever the input dtype/device changes).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.variance_epsilon = eps
+        # Non-persistent, non-Parameter ones vector: the kernel needs a weight
+        # tensor but this norm has no learnable scale and loads nothing.
+        self.register_buffer("weight", torch.ones(hidden_size), persistent=False)
+
+    def _weight_for(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.weight
+        if weight.dtype != x.dtype or weight.device != x.device:
+            weight = weight.to(dtype=x.dtype, device=x.device)
+            self.weight = weight
+        return weight
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # There might be no tokens here (e.g. idle/padded graph rows).
+        if x.shape[0] == 0:
+            if residual is not None:
+                return x, residual
+            return x
+
+        return rmsnorm(
+            x,
+            self._weight_for(x),
+            self.variance_epsilon,
+            residual=residual,
+            out=out,
+        )
+
+
 class GemmaRMSNorm(torch.nn.Module):
     def __init__(
         self,

@@ -319,11 +319,34 @@ def _is_dflash2_mla(
     )
 
 
-
 _GEMMA3_ARCHITECTURES = frozenset(
     {"Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"}
 )
 _GEMMA3_DEFAULT_SLIDING_WINDOW_PATTERN = 6
+
+_GEMMA4_ARCHITECTURES = frozenset(
+    {"Gemma4ForConditionalGeneration", "Gemma4ForCausalLM"}
+)
+
+
+def is_gemma4(config: PretrainedConfig) -> bool:
+    """True for a gemma-4 checkpoint (multimodal wrapper or bare text).
+
+    Detected by architecture string OR by ``model_type``, the same way
+    ``_maybe_synthesize_gemma3_layer_types`` keys gemma-3: the ``model_type``
+    (``gemma4`` / ``gemma4_text``) is always on the config, whereas the
+    ``architectures`` list can be lost to None on a multimodal wrapper. gemma-4
+    is the one MHA model that splits its KV geometry by layer type, so the
+    cache path reads this to decide whether to resolve head_dim / kv-heads per
+    layer rather than once model-wide.
+    """
+    architectures = _model_architectures(config, get_hf_text_config(config))
+    if any(arch in _GEMMA4_ARCHITECTURES for arch in architectures):
+        return True
+    for cfg in (config, getattr(config, "text_config", None)):
+        if cfg is not None and str(getattr(cfg, "model_type", "")).startswith("gemma4"):
+            return True
+    return False
 
 
 def _maybe_synthesize_gemma3_layer_types(

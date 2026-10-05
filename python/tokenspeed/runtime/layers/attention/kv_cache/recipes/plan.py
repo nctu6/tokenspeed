@@ -712,7 +712,12 @@ def pack(
             byte ratios plus the exact-page-stride constraints their fields
             impose.
         alignment: Byte alignment for plane sizes.
-        max_padding_fraction: Padding budget per group.
+        max_padding_fraction: Padding budget per group, measured over the
+            planes a group actually occupies (not the whole parent, which may
+            hold other groups' disjoint planes). For every group that shares
+            one aliased set of byte-equal planes -- the uniform and hybrid
+            slab models -- a group's planes are the whole parent, so this is
+            the whole-parent fraction unchanged.
 
     Returns:
         The packed :class:`CacheLayout`.
@@ -912,7 +917,21 @@ def pack(
                 f"cache group {group_id!r}: packing {count} does not partition "
                 f"LCM block size {lcm_block_bytes}"
             )
-        stride = lcm_block_bytes // count
+        # A group wastes bytes only inside the planes it actually occupies: a
+        # group's CacheBlock never touches a plane no field of its places a
+        # payload on. Measure the padding over those planes, not the whole
+        # parent. For the common case where every group shares one aliased set
+        # of planes (byte-equal slabs: all uniform and hybrid models today),
+        # a group's planes ARE the whole parent, so this equals the old
+        # whole-parent metric byte for byte. Only groups on disjoint planes
+        # (a per-layer-geometry model whose full and sliding layers differ in
+        # head_dim) differ: the other groups' planes are not this group's
+        # waste, and charging them would reject a layout that in fact packs
+        # with no padding at all.
+        occupied_bytes = sum(
+            plane_bytes[plane_id] for plane_id in group_plane_bytes[group_id]
+        )
+        stride = occupied_bytes // count
         padding_fraction = (stride - raw_by_group[group_id]) / raw_by_group[group_id]
         if padding_fraction > max_padding_fraction:
             raise ValueError(

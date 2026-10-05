@@ -113,6 +113,32 @@ def _force_deterministic_rsag() -> bool:
     return bool(global_server_args_dict.get("force_deterministic_rsag", False))
 
 
+# Intra-node interconnect topologies that back a symmetric-memory multicast
+# pointer (``multimem.*`` PTX). A PCIe or single-GPU topology has none, so the
+# multimem gather must not be selected there.
+_MULTICAST_TOPOLOGIES = frozenset({"nvlink_pairs", "nvlink_full", "nvswitch"})
+
+
+def _intra_node_multicast_capable() -> bool:
+    """Whether this host's GPU interconnect provides NVLink/NVSwitch multicast.
+
+    The symmetric-memory gather's ``multimem.st``/``multimem.ld`` instructions
+    require an NVLink domain. ``current_platform().interconnect.topology`` is
+    detected once at startup (NVML P2P/NVLink probe); only the NVLink and
+    NVSwitch topologies expose a multicast object. A ``pcie`` or ``single_gpu``
+    topology -- e.g. the RTX PRO 6000 (sm_120) workstation pair, which carries
+    no NVLink -- returns False so the caller falls back to the NCCL all-gather.
+    An unknown/undetected interconnect (``None``) is treated as no multicast:
+    guessing wrong here is an illegal memory access, not a slow path.
+    """
+    interconnect = current_platform().interconnect
+    if interconnect is None:
+        return False
+    if interconnect.nvswitch_present:
+        return True
+    return interconnect.topology in _MULTICAST_TOPOLOGIES
+
+
 @dataclasses.dataclass
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/tokenspeed/runtime/layers/logits_processor.py::LogitsProcessor
@@ -343,11 +369,23 @@ class LogitsProcessor(nn.Module):
     def _tp_group_multicast_reachable(self) -> bool:
         """Whether the gather's symmetric buffer can map multicast here.
 
-        Topology now only admits: an NVLink domain can span hosts, so a
-        host-spread group is asked of the fabric rather than refused outright,
-        and without fabric the rendezvous hangs rather than failing over. The
-        rank count cannot stand in for the topology test -- a strided group can
-        be smaller than one host's device count while living on two.
+        The gather kernel issues ``multimem.st`` / ``multimem.ld`` PTX against
+        a symmetric-memory multicast pointer, which only exists inside an
+        NVLink domain (NVLink pairs/full or an NVSwitch fabric). On a
+        PCIe-only interconnect there is no multicast object, and the
+        instruction faults with an illegal memory access rather than failing
+        the rendezvous -- so the intra-node interconnect must be checked, not
+        assumed. ``comms:symmetric_memory`` being importable is NOT sufficient:
+        PyTorch exposes the symmetric-memory API on any CUDA host, including
+        the PCIe-only RTX PRO 6000 (sm_120) pair this gates, where the
+        multicast handle is unbacked.
+
+        Topology also admits a cross-host case: an NVLink domain can span
+        hosts, so a host-spread group is asked of the fabric (the IMEX/MNNVL
+        probe) rather than refused outright, and without fabric the rendezvous
+        would hang rather than failing over. The rank count cannot stand in
+        for either test -- a strided group can be smaller than one host's
+        device count while living on two hosts.
 
         The world fabric map is gathered during distributed initialization, so
         the group verdict is a local lookup with no dispatch-time collective.
@@ -366,9 +404,13 @@ class LogitsProcessor(nn.Module):
         spans_hosts = bool(nprocs_per_node) and (
             len({rank // nprocs_per_node for rank in self.tp_group}) > 1
         )
-        if not spans_hosts:
-            return True
-        return group_has_fabric(self.tp_group)
+        if spans_hosts:
+            return group_has_fabric(self.tp_group)
+        # Single-node group: multicast is available only when the intra-node
+        # interconnect is an NVLink domain. A PCIe or single-GPU topology has
+        # no multicast pointer, so the multimem gather would issue an illegal
+        # access; fall back (return False) to the NCCL all-gather instead.
+        return _intra_node_multicast_capable()
 
     def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
         if not current_platform().is_nvidia or _force_deterministic_rsag():

@@ -313,6 +313,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             cache_seqlens=metadata.seq_lens,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
+            softmax_scale=layer.scaling,
             sinks=kwargs.get("sinks"),
             max_seqlen_k=self.max_context_len,
             max_seqlen_q=max_seqlen_q,
@@ -401,6 +402,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             max_seqlen=metadata.max_extend_seq_len,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
+            softmax_scale=layer.scaling,
             sinks=sinks,
             solution=self.kernel_solution,
         )
@@ -449,6 +451,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             is_causal=True,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
+            softmax_scale=layer.scaling,
             sinks=sinks,
             solution=self.kernel_solution,
             **scale_kwargs,

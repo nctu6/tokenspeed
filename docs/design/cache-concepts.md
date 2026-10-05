@@ -471,7 +471,21 @@ layers ──group──▶ groups ──pack──▶ CacheLayout ──bind─
   plane sizes, per-field offsets and page strides, and how many of each
   group's CacheBlocks share a parent (`cache_blocks_per_lcm_block`). The
   result, `CacheLayout`, is **capacity-independent** — it describes one
-  parent, not an allocation.
+  parent, not an allocation. A group left unpinned is packed from its byte
+  ratio to the widest group plus the exact-page-stride constraints its
+  planes impose, and `max_padding_fraction` is checked over the planes a
+  group actually occupies, not the whole parent. For every model whose
+  groups share one aliased set of byte-equal planes — the uniform and hybrid
+  slab layouts, where the i-th layer of each group lands on one shared
+  plane — a group's planes are the whole parent, so that padding fraction is
+  the whole-parent fraction and nothing changes. A per-layer-geometry model
+  (gemma-4, whose full `4 × 512` and sliding `16 × 256` layers are not
+  byte-equal and therefore cannot share a plane) is the one case where the
+  groups own disjoint planes: there the byte-ratio packing fills each
+  group's own planes exactly (the full page is half the sliding page, so
+  the full group packs two CacheBlocks per parent to the sliding group's
+  one), and a whole-parent padding metric would wrongly charge each group
+  for the other's planes and reject a layout that in fact wastes nothing.
 * **`bind`** (`CacheLayout.bind(num_lcm_blocks)`) multiplies that parent out
   by a count and yields the `CacheMemoryPlan` the arena allocates from and
   the PD wire carries.

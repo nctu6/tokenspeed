@@ -47,8 +47,16 @@ def set_default_torch_dtype(dtype: torch.dtype) -> Generator[None]:
 # Gemma 3 text sub-config). Keyed by ``model_type`` PREFIX so both the
 # multimodal wrapper ("gemma3") and its text sub-config ("gemma3_text") resolve
 # to the same entry class; the text-only decoder is handled by that class.
+# The gemma-4-31B-it checkpoint ships a top-level ``Gemma4ForConditionalGeneration``
+# architecture (resolved directly), but a bare text release arrives with
+# ``architectures = None`` and ``model_type = "gemma4_text"`` -- without this
+# alias ``resolve_architecture`` falls back to the config class name
+# ("Gemma4TextConfig"), which is not registered and raises "not supported".
+# Keying on the "gemma4" prefix makes both the wrapper ("gemma4") and the text
+# sub-config ("gemma4_text") resolve to the registered entry class.
 _MODEL_TYPE_ARCH_ALIASES: tuple[tuple[str, str], ...] = (
     ("gemma3", "Gemma3ForConditionalGeneration"),
+    ("gemma4", "Gemma4ForConditionalGeneration"),
 )
 
 

@@ -110,19 +110,36 @@ class MHATokenToKVPool(CachePool):
         return k_size_bytes, v_size_bytes
 
     def _layer_row_view(self, buf: torch.Tensor, layer_id: int) -> torch.Tensor:
-        """Per-layer token-row view over one byte-uniform cache field.
+        """Per-layer token-row view over this layer's cache field.
 
         A layer serving fewer heads than the field's planned head count
         reinterprets the same bytes as proportionally more rows of
         ``heads_l`` heads; a field planned at the layer's own head count is
         served as is.
+
+        The row width is the field's OWN head_dim (``buf.shape[-1]``), never
+        the pool's model-wide ``self.head_dim``. The two agree for every
+        per-layer-head-count-only model (Inkling: one head_dim, planes
+        allocated at the alloc width, so this reshape splits the alloc-wide
+        plane into served-width rows at the shared head_dim). They DIFFER for
+        a per-layer-GEOMETRY model (gemma-4): its full-attention layers are
+        planned at head_dim 512 while the pool's ``head_dim`` is the sliding
+        256, and the recipe already materialized each plane at the layer's own
+        ``(kv_heads, head_dim)``. Reinterpreting a 512-wide plane with the
+        model-wide 256 produced a half-width row stride, so ``store_kv_cache``
+        wrote 1024-element K rows at a 512-element stride -- overlapping,
+        out-of-bounds KV writes that surfaced as an illegal memory access once
+        a full TP forward crossed a page boundary. Reading the width from the
+        plane keeps the view at the layer's true geometry: identity for a
+        plane already shaped at ``heads_l`` heads, a head-count split
+        otherwise.
         """
         if self._layer_kv_head_counts is None:
             return buf
         heads_l = self._layer_heads_per_rank(layer_id)
-        if heads_l == self.head_num:
+        if heads_l == self.head_num and buf.shape[-1] == self.head_dim:
             return buf
-        return buf.reshape(-1, heads_l, self.head_dim)
+        return buf.reshape(-1, heads_l, buf.shape[-1])
 
     def _layer_heads_per_rank(self, layer_id: int) -> int:
         counts = self._layer_kv_head_counts

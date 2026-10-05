@@ -201,6 +201,79 @@ class RotaryEmbedding(torch.nn.Module):
         return s
 
 
+class Gemma4RotaryEmbedding(RotaryEmbedding):
+    """Gemma 4 proportional RoPE (full-attention layers).
+
+    Gemma 4's full-attention layers declare ``rope_type="proportional"`` with a
+    ``partial_rotary_factor`` of 0.25. ``get_rope`` cannot express this with a
+    plain partial-rotary ``RotaryEmbedding`` because the two disagree on the
+    frequency denominator:
+
+    * The base ``RotaryEmbedding._compute_inv_freq`` divides the exponent by
+      ``rotary_dim`` (128 for the 0.25 factor over a 512 head), so only the
+      rotated sub-space sets the frequency spacing.
+    * HF's ``_compute_proportional_rope_parameters`` divides by ``head_size``
+      (512) instead, then leaves the remaining dimensions unrotated.
+
+    This subclass overrides ``_compute_inv_freq`` to match HF (and the
+    vllm-unieai ``Gemma4RotaryEmbedding`` oracle): the exponents use
+    ``head_size`` as the denominator, and the non-rotated dimensions are
+    zero-padded so their cos/sin collapse to the identity (cos=1, sin=0). The
+    base class's ``rotary_dim`` is set to ``head_size`` so the standard
+    neox-style rotation and the ``apply_rope`` kernel span all dimensions; the
+    zero-padding makes the trailing span a no-op.
+
+    The caller passes the already-reduced ``rotary_dim`` (``head_size *
+    partial_rotary_factor``), identical to how the oracle is constructed; the
+    rotated-pair count is ``rotary_dim // 2`` and the identity-padded count is
+    ``head_size // 2 - rotary_dim // 2``.
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int | float,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+    ) -> None:
+        # Rotated angle pairs (from partial_rotary_factor) and the identity
+        # pairs that fill the rest of the head so the cache spans head_size.
+        self.rope_angles = rotary_dim // 2
+        self.nope_angles = (head_size // 2) - self.rope_angles
+        # rotary_dim = head_size so the base cache/kernel apply rotation to the
+        # full head; the zero-padded inv_freq makes the nope span an identity.
+        super().__init__(
+            head_size,
+            head_size,
+            max_position_embeddings,
+            base,
+            is_neox_style,
+            dtype,
+        )
+
+    def _compute_inv_freq(self, base: int | float) -> torch.Tensor:
+        # HF proportional formula: exponents divided by head_size (not
+        # rotary_dim), then zero-pad the non-rotated dimensions.
+        freq_exponents = (
+            torch.arange(0, 2 * self.rope_angles, 2, dtype=torch.float) / self.head_size
+        )
+        inv_freq = 1.0 / (base**freq_exponents)
+        if self.nope_angles > 0:
+            inv_freq = torch.cat(
+                [inv_freq, torch.zeros(self.nope_angles, dtype=torch.float)]
+            )
+        return inv_freq
+
+    def extra_repr(self) -> str:
+        s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
+        s += f", rope_angles={self.rope_angles}, nope_angles={self.nope_angles}"
+        s += f", max_position_embeddings={self.max_position_embeddings}"
+        s += f", base={self.base}, is_neox_style={self.is_neox_style}"
+        return s
+
+
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
     """RotaryEmbedding extended with linear scaling.
 
