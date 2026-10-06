@@ -1044,6 +1044,19 @@ def create_attn_components(
         cache_family,
         draft_cache_family,
     )
+    # F3: FA2 paged-extend float workspace + JIT must land before KV budgeting
+    # so the ~256 MiB scratch is not stolen from the cache pool at first request.
+    try:
+        from tokenspeed_kernel.ops.attention.flashinfer.paged_extend import (
+            fa2_extend_mode,
+            warmup_fa2_extend,
+        )
+
+        if fa2_extend_mode() != "off":
+            warmup_fa2_extend(config.device)
+    except Exception as exc:  # noqa: BLE001 — never block server start
+        logger.warning("FlashInfer FA2 extend warmup skipped: %s", exc)
+
     cache_memory = profile_available_cache_memory_bytes(
         attn_config=config,
         gpu_id=gpu_id,

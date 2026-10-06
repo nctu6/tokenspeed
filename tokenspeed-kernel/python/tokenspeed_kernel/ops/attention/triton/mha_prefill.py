@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import math
+import os
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -41,6 +42,37 @@ _Q_OVER_FP8_KV_SIGNATURES = frozenset(
     for q_dtype in (torch.float16, torch.bfloat16)
     for kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
 )
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Parse a boolean env flag (``1/true/yes/on`` vs ``0/false/no/off``).
+
+    Unset or empty falls back to ``default``; an unrecognized value raises so a
+    typo never silently picks a kernel variant.
+    """
+    raw = os.environ.get(name, "").strip().lower()
+    if raw == "":
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name}={raw!r}: expected one of 1/0/true/false/yes/no/on/off")
+
+
+# Read once at import; forwarded to ``_fwd_kernel`` as constexprs, so each
+# setting compiles its own specialization and the "off" kernel is the legacy one.
+#
+# SKIP_OOR: query blocks whose first row is past this sequence's extend length
+# return immediately instead of streaming the whole KV range just to store
+# nothing (ragged batches, e.g. one long chunk next to short prefix-cached
+# turns). Output is bitwise identical; ``0`` is a kill switch.
+_TRITON_PREFILL_SKIP_OOR = _env_flag("TOKENSPEED_TRITON_PREFILL_SKIP_OOR", True)
+# CLAMP_KV: bound the KV loop to tiles that can be visible to this query block
+# (causal upper bound, sliding-window lower bound; custom masks untouched).
+# Skipped tiles contribute p=0 / were already SKIP_TILE'd, so output is bitwise
+# identical; off by default until benchmarked on sm120 and sm90.
+_TRITON_PREFILL_CLAMP_KV = _env_flag("TOKENSPEED_TRITON_PREFILL_CLAMP_KV", False)
 
 
 @triton.jit
@@ -97,6 +129,8 @@ def _fwd_kernel(
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
     HAS_LSE: tl.constexpr,
+    SKIP_OOR_BLOCKS: tl.constexpr = False,
+    CLAMP_KV_RANGE: tl.constexpr = False,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -105,6 +139,11 @@ def _fwd_kernel(
 
     cur_seq_extend_start_idx = tl.load(cu_seqlens_q + cur_seq)
     cur_seq_len_extend = tl.load(cu_seqlens_q + cur_seq + 1) - cur_seq_extend_start_idx
+    if SKIP_OOR_BLOCKS:
+        # Every row of this block is past the sequence's extend length: the
+        # epilogue stores are fully masked, so the KV loop is pure waste.
+        if cur_block_m * BLOCK_M >= cur_seq_len_extend:
+            return
     if HAS_KV_CACHE:
         cur_seq_len = tl.load(cache_seqlens + cur_seq)
     else:
@@ -150,7 +189,39 @@ def _fwd_kernel(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    for start_n in range(0, cur_seq_len, BLOCK_N):
+    # Visible KV bounds for CLAMP_KV_RANGE. Triton has no break/continue, so
+    # the loop is still ``range(kv_lo, kv_hi, BLOCK_N)``. Two sm120 footguns
+    # that showed up under CLAMP + DECODE_KV_SPLITS=auto (larger mid buffers,
+    # tighter allocator, overlap with decode):
+    #   1) ``q_blk - WINDOW`` unsigned-wrapping before max(0) -> huge kv_lo
+    #      (empty attn / bad tokens, or runaway gathers);
+    #   2) last-tile masked lanes computing page_indices past page_table
+    #      stride — predicated loads still faulted under memory pressure.
+    kv_lo = 0
+    kv_hi = cur_seq_len
+    if CLAMP_KV_RANGE:
+        if not USE_CUSTOM_MASK:
+            # Bounds use the same cur_q_start as the masks below, so every tile
+            # outside [kv_lo, kv_hi) is fully masked for all BLOCK_M rows.
+            if IS_CAUSAL:
+                # Last key visible to the block's last row (exclusive bound).
+                kv_hi = tl.minimum(
+                    cur_seq_len, cur_q_start + (cur_block_m + 1) * BLOCK_M
+                )
+            if SLIDING_WINDOW_SIZE > 0:
+                # First key visible to the block's first row, rounded down to a
+                # BLOCK_N boundary. Gate the subtract with tl.where so
+                # q_blk < window cannot unsigned-wrap.
+                q_blk = cur_q_start + cur_block_m * BLOCK_M
+                kv_lo = tl.where(
+                    q_blk > SLIDING_WINDOW_SIZE,
+                    (q_blk - SLIDING_WINDOW_SIZE) // BLOCK_N * BLOCK_N,
+                    0,
+                )
+            # Empty range if the window starts past the causal hi (OOR / short).
+            kv_lo = tl.minimum(kv_lo, kv_hi)
+
+    for start_n in range(kv_lo, kv_hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len
 
@@ -186,9 +257,14 @@ def _fwd_kernel(
                 cache_token_indices = start_n + offs_n
                 page_indices = cache_token_indices // PAGE_SIZE
                 page_offsets = cache_token_indices - page_indices * PAGE_SIZE
+                # Bound page-table gathers: masked lanes of the last tile can
+                # compute page_indices past stride even when mask_n is false;
+                # on sm120 a predicated load with a wildly OOB address has
+                # still faulted under memory pressure.
+                page_in_range = mask_n & (page_indices < page_table_stride_b)
                 physical_pages = tl.load(
                     page_table + cur_seq * page_table_stride_b + page_indices,
-                    mask=mask_n,
+                    mask=page_in_range,
                     other=0,
                 )
                 # int64 to avoid address overflow for large (>int32 range) KV caches
@@ -200,7 +276,7 @@ def _fwd_kernel(
                 )
                 k = tl.load(
                     K_Buffer + offs_k,
-                    mask=(mask_n[None, :]) & (mask_d[:, None]),
+                    mask=(page_in_range[None, :]) & (mask_d[:, None]),
                     other=0.0,
                 )
             else:
@@ -225,7 +301,7 @@ def _fwd_kernel(
                     )
                     kpe = tl.load(
                         K_Buffer + offs_kpe,
-                        mask=mask_n[None, :],
+                        mask=page_in_range[None, :],
                         other=0.0,
                     )
                 else:
@@ -264,7 +340,7 @@ def _fwd_kernel(
                 )
                 v = tl.load(
                     V_Buffer + offs_v,
-                    mask=mask_n[:, None] & mask_dv[None, :],
+                    mask=page_in_range[:, None] & mask_dv[None, :],
                     other=0.0,
                 )
             else:
@@ -501,6 +577,8 @@ def prefill_attention_fwd(
         HAS_SINK=HAS_SINK,
         HAS_LSE=HAS_LSE,
         STORE_TRANSPOSE=platform.is_amd,
+        SKIP_OOR_BLOCKS=_TRITON_PREFILL_SKIP_OOR,
+        CLAMP_KV_RANGE=_TRITON_PREFILL_CLAMP_KV,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,

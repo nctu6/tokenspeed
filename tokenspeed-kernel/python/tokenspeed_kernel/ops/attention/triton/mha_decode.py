@@ -18,7 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import functools
 import math
+import os
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -44,6 +46,173 @@ _Q_OVER_FP8_KV_SIGNATURES = frozenset(
 )
 
 _MIN_BLOCK_KV = 32
+# Grouped stage-1 packs up to this many q heads (of one kv head) per CTA.
+_GROUPED_BLOCK_H = 16
+
+# --------------------------------------------------------------------------
+# KV-split sizing (flash-decoding).
+#
+# Two levels, both CUDA-graph safe:
+#   * host:   MAX_KV_SPLITS sizes the stage-1 grid and the partial buffers. It
+#             depends only on static shapes (total_q, head counts) and the SM
+#             count, so it is a constant for every captured batch size.
+#   * device: per-request num_kv_splits from the actual KV length, computed
+#             with torch elementwise ops (no host sync, nothing frozen into a
+#             graph from cache_seqlens).
+# --------------------------------------------------------------------------
+
+# Legacy behaviour: grid/buffers sized for 4 splits but every request uses 1.
+_LEGACY_MAX_KV_SPLITS = 4
+
+
+def _env_pos_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name}={raw!r}: expected a positive integer") from None
+    if value < 1:
+        raise ValueError(f"{name}={raw!r}: expected a positive integer")
+    return value
+
+
+def _parse_kv_splits_mode(name: str) -> str | int:
+    """``legacy`` (default) / ``auto`` / positive integer N (fixed N splits)."""
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in ("", "legacy"):
+        return "legacy"
+    if raw == "auto":
+        return "auto"
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise ValueError(
+            f"{name}={raw!r}: expected 'legacy', 'auto' or a positive integer"
+        )
+    return value
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Read once at import (like the prefill flags); tests patch the attributes.
+_TRITON_DECODE_KV_SPLITS = _parse_kv_splits_mode("TOKENSPEED_TRITON_DECODE_KV_SPLITS")
+_TRITON_DECODE_MAX_KV_SPLITS = _env_pos_int(
+    "TOKENSPEED_TRITON_DECODE_MAX_KV_SPLITS", 16
+)
+_TRITON_DECODE_SPLIT_MIN_TOKENS = _env_pos_int(
+    "TOKENSPEED_TRITON_DECODE_SPLIT_MIN_TOKENS", 256
+)
+# Diagnostic/sweep knob: stage-1 CTAs to aim for, in multiples of the SM count.
+_TRITON_DECODE_TARGET_WAVES = _env_pos_int("TOKENSPEED_TRITON_DECODE_TARGET_WAVES", 2)
+# Batch invariance: MAX no longer depends on batch size, so a request's split
+# count (hence its reduction order) depends only on its own length.
+_BATCH_INVARIANT = _env_truthy("VLLM_BATCH_INVARIANT")
+
+
+def _pow2_floor(x: int) -> int:
+    return 1 << (max(int(x), 1).bit_length() - 1)
+
+
+def decode_max_kv_splits(
+    total_q: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    sm_count: int,
+    *,
+    max_cap: int,
+    target_waves: int,
+    batch_invariant: bool = False,
+) -> int:
+    """Host-side upper bound on KV splits (grid dim 2 and buffer size).
+
+    Picks the largest power of two that brings the stage-1 grid to about
+    ``target_waves * sm_count`` CTAs, clamped to ``[1, max_cap]``. Only static
+    shapes enter, so it is constant per captured batch size; the partial
+    buffers (``base_ctas * MAX``) stay bounded and big batches fall to 1.
+    """
+    if batch_invariant:
+        return max_cap
+    kv_group = max(num_q_heads // max(num_kv_heads, 1), 1)
+    if kv_group == 1:
+        head_blocks = num_q_heads  # MHA kernel: one CTA per q head
+    else:
+        head_blocks = triton.cdiv(num_q_heads, min(_GROUPED_BLOCK_H, kv_group))
+    base_ctas = max(total_q * head_blocks, 1)
+    want = triton.cdiv(target_waves * sm_count, base_ctas)
+    return max(1, min(_pow2_floor(want), max_cap))
+
+
+def decode_num_kv_splits(
+    cache_seqlens: torch.Tensor,
+    window_left: int,
+    max_kv_splits: int,
+    split_min_tokens: int,
+) -> torch.Tensor:
+    """Device-side per-request split count from the actual attended length.
+
+    ``clamp(cdiv(eff_len, split_min_tokens), 1, max_kv_splits)`` where
+    ``eff_len`` is clipped to the sliding window. Pure elementwise torch ops:
+    no host sync, safe inside CUDA graph capture.
+    """
+    eff_len = cache_seqlens
+    if window_left >= 0:
+        eff_len = torch.clamp(eff_len, max=window_left + 1)
+    splits = torch.div(
+        eff_len + (split_min_tokens - 1), split_min_tokens, rounding_mode="floor"
+    )
+    return torch.clamp(splits, 1, max_kv_splits).to(torch.int32)
+
+
+@functools.lru_cache(maxsize=None)
+def _device_sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _sm_count(device: torch.device) -> int:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _device_sm_count(index)
+
+
+def _resolve_kv_splits(
+    q: torch.Tensor,
+    num_kv_heads: int,
+    cache_seqlens: torch.Tensor,
+    window_left: int,
+) -> tuple[int, torch.Tensor]:
+    """Return ``(max_kv_splits, num_kv_splits)`` for the current mode."""
+    batch = cache_seqlens.shape[0]
+    mode = _TRITON_DECODE_KV_SPLITS
+    # AMD stays on the legacy split policy until it is validated there.
+    if mode == "auto" and current_platform().is_amd:
+        mode = "legacy"
+    if mode == "legacy":
+        num_kv_splits = torch.ones((batch,), dtype=torch.int32, device=q.device)
+        return _LEGACY_MAX_KV_SPLITS, num_kv_splits
+    if isinstance(mode, int):
+        num_kv_splits = torch.full((batch,), mode, dtype=torch.int32, device=q.device)
+        return mode, num_kv_splits
+    max_kv_splits = decode_max_kv_splits(
+        q.shape[0],
+        q.shape[1],
+        num_kv_heads,
+        _sm_count(q.device),
+        max_cap=_TRITON_DECODE_MAX_KV_SPLITS,
+        target_waves=_TRITON_DECODE_TARGET_WAVES,
+        batch_invariant=_BATCH_INVARIANT,
+    )
+    if max_kv_splits == 1:
+        num_kv_splits = torch.ones((batch,), dtype=torch.int32, device=q.device)
+    else:
+        num_kv_splits = decode_num_kv_splits(
+            cache_seqlens, window_left, max_kv_splits, _TRITON_DECODE_SPLIT_MIN_TOKENS
+        )
+    return max_kv_splits, num_kv_splits
 
 
 @triton.jit
@@ -497,7 +666,7 @@ def _decode_grouped_att_m_fwd(
     total_q, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
-    BLOCK_H = 16
+    BLOCK_H = _GROUPED_BLOCK_H
     MAX_KV_SPLITS = max_kv_splits
     grid = (
         total_q,
@@ -892,7 +1061,9 @@ def triton_mha_decode_with_kvcache(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     out = torch.empty_like(q)
-    max_kv_splits = 4
+    max_kv_splits, num_kv_splits = _resolve_kv_splits(
+        q, k_cache.shape[2], cache_seqlens, window_left
+    )
     attn_logits = torch.empty(
         q.shape[0],
         q.shape[1],
@@ -907,9 +1078,6 @@ def triton_mha_decode_with_kvcache(
         max_kv_splits,
         dtype=torch.float32,
         device=q.device,
-    )
-    num_kv_splits = torch.ones(
-        (cache_seqlens.shape[0],), dtype=torch.int32, device=q.device
     )
     decode_attention_fwd(
         q,

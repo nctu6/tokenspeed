@@ -49,11 +49,11 @@
 # restart, and you only re-run this script when a package is genuinely missing.
 #
 # Force a full from-source rebuild/reinstall of everything:
-#   REINSTALL=1 ./install.sh      (or: ./install.sh --force)
+#   REINSTALL=1 ./scripts/install.sh      (or: ./scripts/install.sh --force)
 # Force just the kernel to recompile (after a C++/CUDA change):
-#   REINSTALL_KERNEL=1 ./install.sh
+#   REINSTALL_KERNEL=1 ./scripts/install.sh
 # Force just the smg gateway to rebuild (after editing smg/, Rust):
-#   REINSTALL_SMG=1 ./install.sh  (or: ./install.sh --force-smg)
+#   REINSTALL_SMG=1 ./scripts/install.sh  (or: ./scripts/install.sh --force-smg)
 #
 # The smg gateway is a git submodule. On a git checkout this script runs
 # `git submodule update --init smg` when smg/ is empty, so a fresh clone builds
@@ -71,13 +71,13 @@
 # Otherwise it falls back to ./.venv. An explicit VENV_DIR=... overrides both.
 #
 # Usage:
-#   ./install.sh                 # adopt active $VIRTUAL_ENV, else create/use ./.venv
-#   source .venv_docker/bin/activate && ./install.sh   # install into .venv_docker
-#   REINSTALL=1 ./install.sh     # force full from-source rebuild of all packages
-#   REINSTALL_KERNEL=1 ./install.sh  # force only the kernel to recompile
-#   VENV_DIR=/path/to/venv ./install.sh   # force a specific venv (overrides active)
-#   MAX_JOBS=8 ./install.sh
-#   CUDA_ARCH_LIST="12.0a" ./install.sh   # build only for sm_120 (faster)
+#   ./scripts/install.sh                 # adopt active $VIRTUAL_ENV, else create/use ./.venv
+#   source .venv_docker/bin/activate && ./scripts/install.sh   # install into .venv_docker
+#   REINSTALL=1 ./scripts/install.sh     # force full from-source rebuild of all packages
+#   REINSTALL_KERNEL=1 ./scripts/install.sh  # force only the kernel to recompile
+#   VENV_DIR=/path/to/venv ./scripts/install.sh   # force a specific venv (overrides active)
+#   MAX_JOBS=8 ./scripts/install.sh
+#   CUDA_ARCH_LIST="12.0a" ./scripts/install.sh   # build only for sm_120 (faster)
 #
 # Run this from the repository root (the directory that contains python/,
 # tokenspeed-kernel/, tokenspeed-scheduler/).
@@ -85,7 +85,9 @@ set -euo pipefail
 
 # --- Resolve repo root (this script lives at the repo root) ------------------
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-cd "$SCRIPT_DIR"
+# scripts/ lives one level below the repo root; keep .venv and package paths at REPO_ROOT.
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
+cd "$REPO_ROOT"
 
 # --- Tunables (mirror the Dockerfile ARG/ENV values) -------------------------
 MAX_JOBS="${MAX_JOBS:-16}"
@@ -93,7 +95,7 @@ CUDA_ARCH_LIST="${CUDA_ARCH_LIST:-9.0a 10.0a 12.0a}"
 # VENV_DIR intentionally has NO default here. We resolve it below with this
 # precedence: an explicit VENV_DIR wins; otherwise an already-active venv
 # ($VIRTUAL_ENV, e.g. a .venv_docker the user sourced inside a container) is
-# adopted as-is; otherwise we fall back to $SCRIPT_DIR/.venv. Defaulting it here
+# adopted as-is; otherwise we fall back to $REPO_ROOT/.venv. Defaulting it here
 # would erase the distinction between "user asked for this path" and "we picked
 # the fallback", which is exactly what lets us honor an active venv.
 VENV_DIR="${VENV_DIR:-}"
@@ -183,7 +185,7 @@ fi
 #      to .venv. This is the Docker case: a container whose venv is already live
 #      should install INTO that venv, not have install.sh silently build a
 #      second .venv beside it and leave the active one empty.
-#   3. Neither -- fall back to $SCRIPT_DIR/.venv (the original default),
+#   3. Neither -- fall back to $REPO_ROOT/.venv (the original default),
 #      creating it on first run.
 #
 # DETECTING AN ACTIVE VENV. $VIRTUAL_ENV alone is NOT reliable: it is only
@@ -232,7 +234,7 @@ elif [[ -n "$ACTIVE_VENV" ]]; then
         source "$VENV_DIR/bin/activate"
     fi
 else
-    VENV_DIR="$SCRIPT_DIR/.venv"
+    VENV_DIR="$REPO_ROOT/.venv"
     if [[ ! -d "$VENV_DIR" ]]; then
         log "Creating virtualenv at $VENV_DIR"
         "$PYTHON_BIN" -m venv "$VENV_DIR"
@@ -427,7 +429,7 @@ install_cuda_toolkit_apt() {
         if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
             SUDO="sudo"
         else
-            err "CUDA toolkit install needs root (sudo -n unavailable). Install manually, then re-run ./install.sh:"
+            err "CUDA toolkit install needs root (sudo -n unavailable). Install manually, then re-run ./scripts/install.sh:"
             err "  sudo apt-get update"
             err "  sudo apt-get install -y --no-install-recommends cuda-compiler-${ver_dash} cuda-libraries-dev-${ver_dash} cuda-nvml-dev-${ver_dash}"
             err "  # or: sudo apt-get install -y --no-install-recommends cuda-toolkit-${ver_dash}"
@@ -533,7 +535,7 @@ resolve_cuda_home() {
     unset CUDA_HOME
     err "No CUDA toolkit (nvcc) found. Checked: \$CUDA_HOME, \$FLASHINFER_NVCC, /usr/local/cuda, PATH, /usr/local/cuda-*, /opt/cuda, venv nvidia/cu*/bin."
     err "torch in this venv was built for CUDA ${torch_cuda:-unknown}. The kernel build needs a matching toolkit."
-    err "  or point at an existing toolkit: CUDA_HOME=/path/to/cuda ./install.sh"
+    err "  or point at an existing toolkit: CUDA_HOME=/path/to/cuda ./scripts/install.sh"
     return 1
 }
 
@@ -746,7 +748,7 @@ elif ! have_dist tokenspeed || ! have_dist tokenspeed-kernel \
 else
     skip "All packages already installed. Nothing to build."
     skip "Editable engine/scheduler pick up synced Python edits with no reinstall."
-    skip "Force a rebuild with:  REINSTALL=1 ./install.sh   (kernel only: REINSTALL_KERNEL=1)"
+    skip "Force a rebuild with:  REINSTALL=1 ./scripts/install.sh   (kernel only: REINSTALL_KERNEL=1)"
 fi
 
 # The kernel compile is the expensive step. Build it only on a fresh/forced
@@ -847,7 +849,7 @@ if [[ "$SMG_WORK" == "1" ]]; then
     log "Building + installing smg gateway/proto/servicer from local source (smg/)"
     build_and_install_smg
 elif [[ "$HAVE_SMG_SRC" == "1" ]]; then
-    skip "smg gateway already installed. Rebuild after editing smg/ with: REINSTALL_SMG=1 ./install.sh"
+    skip "smg gateway already installed. Rebuild after editing smg/ with: REINSTALL_SMG=1 ./scripts/install.sh"
 fi
 
 # --- vllm_flash_attn (sm_120 FA2), OPT-IN, independent of kernel/smg branches -
@@ -859,7 +861,7 @@ if [[ "$FA2_WORK" == "1" ]]; then
     build_and_install_vllm_flash_attn || \
         err "continuing without vllm_flash_attn; FA2 prefill falls back to Triton (engine unaffected)."
 else
-    skip "Skipping FA2 (vllm_flash_attn). It is optional; prefill uses the Triton fallback. Build it with: ./install.sh --with-fa2"
+    skip "Skipping FA2 (vllm_flash_attn). It is optional; prefill uses the Triton fallback. Build it with: ./scripts/install.sh --with-fa2"
 fi
 
 # --- Verify WITHOUT importing the kernel (mirrors the Dockerfile check) -------
