@@ -472,11 +472,19 @@ class LogitsProcessor(nn.Module):
         if self.tp_group is None:
             return False
 
+        from tokenspeed.runtime.distributed.nvls_multicast import (
+            nvls_multicast_mapping_usable,
+        )
         from tokenspeed_kernel.ops.communication.fabric import (
             group_has_fabric,
         )
 
         from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        # Hosts that advertise multicast but fail cuMulticastBindMem leave a
+        # null multicast_ptr; multimem.st/ld then illegal-memory-access.
+        if nvls_multicast_mapping_usable() is False:
+            return False
 
         mapping = global_server_args_dict.get("mapping")
         nprocs_per_node = getattr(mapping, "nprocs_per_node", None)
