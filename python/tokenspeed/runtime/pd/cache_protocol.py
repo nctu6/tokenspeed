@@ -32,13 +32,16 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
+from functools import cached_property
 
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    virtual_block_count as sharded_virtual_block_count,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldLayout,
     CacheGroupLayout,
     CacheMemoryPlan,
     CachePlaneLayout,
-    cache_field_layer_id,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
@@ -85,7 +88,9 @@ def _load_wire_json(raw: bytes, *, name: str, maximum: int) -> dict:
     return value
 
 
-@dataclass(frozen=True, slots=True)
+# No ``slots``: like ``CacheMemoryPlan``, the frozen contract caches its
+# lookup index in ``__dict__``; dataclass fields alone define the wire form.
+@dataclass(frozen=True)
 class CacheTransferContract:
     """Thin PD wire envelope around the cache-owned plan and group specs."""
 
@@ -102,6 +107,27 @@ class CacheTransferContract:
                 (field for field in self.plan.fields if field.group_id == group_id),
                 key=lambda field: field.field_id,
             )
+        )
+
+    # Resolved per manifest group on the transfer paths; index the immutable
+    # spec tuple once instead of scanning it per call.
+    @cached_property
+    def _specs_by_id(self) -> dict[str, CacheGroupSpec]:
+        return {spec.group_id: spec for spec in self.group_specs}
+
+    def group_spec(self, group_id: str) -> CacheGroupSpec:
+        return self._specs_by_id[group_id]
+
+    def virtual_block_count(self, group_id: str) -> int:
+        """Exclusive bound of the scheduler block IDs a manifest may carry.
+
+        Block manifests are read from the scheduler's tables, so a sharded
+        group's IDs run over ``shard_count`` times its physical page count;
+        the physical count bounds local arena addressing only.
+        """
+        return sharded_virtual_block_count(
+            self.plan.group(group_id).page_count,
+            self.group_spec(group_id).shard_count,
         )
 
     def field_dtype(self, field_id: str) -> str:
@@ -254,63 +280,23 @@ class CacheProducerSchedule:
 def build_cache_fields_by_producer_step(
     plan: CacheMemoryPlan,
     *,
-    num_target_layers: int,
-    pp_layer_window: tuple[int, int] | None = None,
+    producer_fields_by_step: tuple[tuple[str, ...], ...],
 ) -> CacheProducerSchedule:
-    """Group cache fields by the Prefill barrier that makes them transferable.
+    """Validate construction-provided readiness against the resident field plan.
 
-    With prefill chunk-pipeline parallelism, ``pp_layer_window`` narrows the
-    schedule to this stage's [start, end) global layers: the attention backend
-    records one producer step per layer IT executes, so the step axis must be
-    stage-local while the field IDs keep their global layer numbering.
+    Args:
+        plan: This rank's physical cache plan.
+        producer_fields_by_step: Field IDs becoming ready at each local barrier.
+
+    Returns:
+        A model-independent producer schedule covering every resident field once.
     """
-
-    fields_by_layer: dict[int, list[str]] = {}
-    for field in plan.fields:
-        layer_id = cache_field_layer_id(field.field_id)
-        fields_by_layer.setdefault(layer_id, []).append(field.field_id)
-
-    if not fields_by_layer:
-        raise ValueError("layerwise PD requires at least one cache field")
-    merged_layers = max(fields_by_layer) + 1
-    if (
-        isinstance(num_target_layers, bool)
-        or not isinstance(num_target_layers, int)
-        or num_target_layers < 1
-        or (pp_layer_window is None and num_target_layers > merged_layers)
+    schedule = CacheProducerSchedule(fields_by_step=producer_fields_by_step)
+    if schedule.fields_in_range(0, schedule.step_count) != frozenset(
+        field.field_id for field in plan.fields
     ):
-        raise ValueError("PD target layer count is outside the cache plan")
-
-    if pp_layer_window is not None:
-        start, end = pp_layer_window
-        if not 0 <= start < end <= num_target_layers:
-            raise ValueError("PP layer window is outside the target layer range")
-        # The plan may already be narrowed to the stage window (v2 physical
-        # narrowing), in which case merged_layers reflects the window's last
-        # layer + 1 rather than the full model — that's expected here.
-        return CacheProducerSchedule(
-            fields_by_step=tuple(
-                tuple(fields_by_layer.get(layer_id, ()))
-                for layer_id in range(start, end)
-            )
-        )
-
-    fields_by_step = [
-        tuple(fields_by_layer.get(layer_id, ()))
-        for layer_id in range(num_target_layers)
-    ]
-    if merged_layers > num_target_layers:
-        # A speculative drafter may execute its physical layers repeatedly;
-        # all draft cache fields become transferable at one final barrier.
-        fields_by_step.append(
-            tuple(
-                field_id
-                for layer_id in range(num_target_layers, merged_layers)
-                for field_id in fields_by_layer.get(layer_id, ())
-            )
-        )
-
-    return CacheProducerSchedule(tuple(fields_by_step))
+        raise ValueError("cache producer schedule must cover every resident field")
+    return schedule
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +307,14 @@ class CachePDGroupBlocks:
 
 @dataclass(frozen=True, slots=True)
 class CachePDBlockManifest:
+    """One request's transferable blocks per group, in logical slot order.
+
+    Block IDs are the publishing side's scheduler IDs -- virtual IDs for a
+    DCP-sharded group. The sender translates its own IDs to local pages when
+    it copies; the destination's IDs are addressed as the destination's
+    contract says.
+    """
+
     groups: tuple[CachePDGroupBlocks, ...]
     prefix_len: int
     prompt_len: int
@@ -400,6 +394,9 @@ def validate_cache_peer_layout(
     for local_spec, peer_spec in zip(
         layout.group_specs, peer_layout.group_specs, strict=True
     ):
+        # shard_count is deliberately not compared: a DCP-sharded Prefill
+        # transfers into an unsharded Decode. Which rank sets exchange which
+        # pages is the transfer planner's decision, not a contract mismatch.
         if (
             local_spec.family != peer_spec.family
             or local_spec.rows_per_page != peer_spec.rows_per_page
@@ -407,6 +404,7 @@ def validate_cache_peer_layout(
             or local_spec.checkpoint_granularity != peer_spec.checkpoint_granularity
             or local_spec.retention != peer_spec.retention
             or local_spec.sliding_window_tokens != peer_spec.sliding_window_tokens
+            or local_spec.replayable != peer_spec.replayable
             or local_spec.transfer_policy != peer_spec.transfer_policy
         ):
             raise CacheContractError(
@@ -475,7 +473,7 @@ def validate_cache_manifest(
                 f"{peer} manifest group {group.group_id!r} block count disagrees "
                 "with its transfer policy"
             )
-        group_capacity = layout.plan.group(spec.group_id).page_count
+        group_capacity = layout.virtual_block_count(spec.group_id)
         if any(block <= 0 or block >= group_capacity for block in group.block_ids):
             raise CacheContractError(
                 f"{peer} manifest group {group.group_id!r} has an out-of-bounds block"
@@ -524,8 +522,8 @@ def build_cache_block_manifest(
         block_ids = tuple(
             int(table[request_row, logical_slot]) for logical_slot in logical_slots
         )
+        group_capacity = layout.virtual_block_count(spec.group_id)
         for logical_slot, block_id in zip(logical_slots, block_ids, strict=True):
-            group_capacity = layout.plan.group(spec.group_id).page_count
             if block_id <= 0 or block_id >= group_capacity:
                 raise CacheContractError(
                     f"table {spec.group_id!r} logical slot {logical_slot} "
@@ -628,7 +626,7 @@ def build_cache_layerwise_block_selection(
         source_block_ids = tuple(
             int(table[request_row, logical_slot]) for logical_slot in logical_slots
         )
-        group_capacity = layout.plan.group(spec.group_id).page_count
+        group_capacity = layout.virtual_block_count(spec.group_id)
         for logical_slot, block_id in zip(logical_slots, source_block_ids, strict=True):
             if block_id <= 0 or block_id >= group_capacity:
                 raise CacheContractError(

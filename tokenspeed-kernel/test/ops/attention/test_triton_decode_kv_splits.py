@@ -43,7 +43,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-_MOD_NAME = "tokenspeed_kernel.ops.attention.triton.mha_decode"
+_MOD_NAME = "tokenspeed_kernel.ops.attention.mha._triton.decode"
 dec = importlib.import_module(_MOD_NAME)
 
 requires_cuda = pytest.mark.skipif(
@@ -386,7 +386,7 @@ def test_decode_splits_match_reference_and_legacy(
     logit_cap = 30.0 if feature != "plain" else 0.0
 
     def fn():
-        return dec.triton_mha_decode_with_kvcache(
+        return dec._triton_mha_decode_with_kvcache_impl(
             q,
             k_cache,
             v_cache,
@@ -471,7 +471,7 @@ def test_cuda_graph_replay_matches_eager(monkeypatch, bs) -> None:
         _patch(m, "auto")
 
         def fn():
-            return dec.triton_mha_decode_with_kvcache(
+            return dec._triton_mha_decode_with_kvcache_impl(
                 q,
                 k_cache,
                 v_cache,

@@ -36,8 +36,6 @@ Routing precedence is top-down. The first matching rule wins:
    the engine (defers JSON grammars past the reasoning channel).
 3. ``--host`` / ``--port`` — gateway only (user-facing)
 4. ``--chat-template`` / ``--tool-call-parser`` — gateway only
-   **(override)**: ``prepare_server_args`` accepts these too, but in smg
-   mode the gateway owns OpenAI-compat HTTP and parsing.
 5. ``--tp`` / ``--tensor-parallel-size`` — engine only (alias normalized)
 6. Anything else ``prepare_server_args`` accepts — engine only
 7. Anything else — gateway (fall-through to ``smg launch`` clap)
@@ -80,6 +78,8 @@ _HEADLESS_FLAG = "--headless"
 _ENGINE_MULTI_VALUE_FLAGS = {
     "--cudagraph-capture-sizes",
     "--prefill-graph-capture-sizes",
+    "--prefill-graph-capture-token-sizes",
+    "--prefill-graph-capture-batch-sizes",
 }
 
 
@@ -95,7 +95,7 @@ def _has_model_flag(tokens: Iterable[str]) -> bool:
 
 @dataclass
 class OrchestratorOpts:
-    engine_startup_timeout: int = 1800
+    engine_startup_timeout: int = 3600
     gateway_startup_timeout: int = 60
     drain_timeout: int = 30
     control_port: int | None = None

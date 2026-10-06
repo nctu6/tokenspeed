@@ -23,7 +23,6 @@
 #include <cstdint>
 #include <optional>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -49,7 +48,7 @@ public:
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
 
     void CompleteWriteBack(std::uint32_t op_id);
-    void CompleteLoadBack(std::uint32_t op_id);
+    void CompleteLoadBack(std::uint32_t op_id, bool success);
 
     bool HasLoadBacksInFlight() const { return !load_backs_.empty(); }
     // Pinned stores hold Device capacity that returns by itself at the ACK;
@@ -81,7 +80,6 @@ private:
 
     CacheCoordinator& coordinator_;
     std::unordered_map<std::uint32_t, InFlightWriteBack> write_backs_;
-    std::unordered_set<CacheKey, CacheKeyHash> store_keys_;
     // Each transfer pins both tiers until the runtime acknowledges the copy.
     std::unordered_map<std::uint32_t, std::vector<BlockTransfer>> load_backs_;
     std::uint32_t next_op_id_{0};

@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 
 
 CUDA_GRAPH_VARIANT_TRITON_FULL_MIN_P = "triton_full_min_p"
@@ -78,6 +79,9 @@ CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P = "triton_full_top_k_top_p_min_
 
 class TritonFullSamplingBackend(TritonSamplingBackend):
     """Full sampling backend with TokenSpeed-owned state and Triton kernels."""
+
+    # verify() here adds penalties and logit processors with no tree path yet.
+    supports_tree_verify = False
 
     def __init__(self, config: SamplingBackendConfig) -> None:
         super().__init__(config)
@@ -208,16 +212,12 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
                 f"vocab_size={vocab}, offending="
                 f"{[t for t in raw_ids if not 0 <= t < vocab]}"
             )
-            token_ids = torch.tensor(
-                raw_ids,
-                device=self._logit_bias.device,
-                dtype=torch.long,
+            token_ids = torch.tensor(raw_ids, dtype=torch.long, pin_memory=True).to(
+                self._logit_bias.device, non_blocking=True
             )
             bias_values = torch.tensor(
-                list(bias_map.values()),
-                device=self._logit_bias.device,
-                dtype=torch.bfloat16,
-            )
+                list(bias_map.values()), dtype=torch.bfloat16, pin_memory=True
+            ).to(self._logit_bias.device, non_blocking=True)
             self._logit_bias[pool_idx, token_ids] = bias_values
 
     def reset_capture_state(self) -> None:
@@ -449,11 +449,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             sampling_info.req_pool_indices, logits.shape[0]
         )
         logits = self._apply_penalties_and_bias(logits, req_pool_indices)
-        offsets_pool = (
-            sampling_info.valid_cache_lengths
-            if sampling_info.valid_cache_lengths is not None
-            else self._zero_offsets_pool
-        )
+        offsets_pool = self._offsets_pool_for_kernels(sampling_info)
         sampled = self._gumbel_sample_full_logits(
             logits,
             req_pool_indices,
@@ -484,7 +480,13 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
+        *,
+        tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if tree is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot verify draft trees"
+            )
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
 
@@ -519,11 +521,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             num_tokens_per_req=num_tokens_per_req,
         )
 
-        offsets_pool = (
-            sampling_info.valid_cache_lengths
-            if sampling_info.valid_cache_lengths is not None
-            else self._zero_offsets_pool
-        )
+        offsets_pool = self._offsets_pool_for_kernels(sampling_info)
         target_sampled = self._gumbel_sample_full_logits(
             logits,
             req_pool_indices,
@@ -541,7 +539,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
 
         accept_length += 1
 
-        self.maybe_broadcast(predict, accept_index, accept_length)
+        self.broadcast_verify_outputs()
 
         valid = accept_index >= 0
         safe_positions = accept_index.clamp(min=0).long()

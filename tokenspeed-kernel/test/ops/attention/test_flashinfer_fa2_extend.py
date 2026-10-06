@@ -54,15 +54,14 @@ def _fa2_arch_ok() -> bool:
 
 def _subprocess_select(env_mode: str, head_dim: int) -> str:
     """Return selected kernel name for mha_extend at ``head_dim`` under env."""
-    code = textwrap.dedent(
-        f"""
+    code = textwrap.dedent(f"""
         import os
         os.environ["TOKENSPEED_FLASHINFER_FA2_EXTEND"] = {env_mode!r}
         # Fresh process: registry import reads the env once.
         import torch
         from tokenspeed_kernel.signature import dense_tensor_format, format_signature
         from tokenspeed_kernel.selection import select_kernel
-        import tokenspeed_kernel.ops.attention  # noqa: F401 — register kernels
+        import tokenspeed_kernel.ops.attention.mha  # noqa: F401 — register kernels
 
         sig = format_signature(
             q=dense_tensor_format(torch.bfloat16),
@@ -74,8 +73,8 @@ def _subprocess_select(env_mode: str, head_dim: int) -> str:
             "page_size": 64,
             "is_causal": True,
             "sliding_window": False,
-            "support_logit_cap": False,
-            "support_sinks": False,
+            "logit_cap": False,
+            "sinks": False,
             "return_lse": False,
         }}
         kernel = select_kernel(
@@ -85,8 +84,7 @@ def _subprocess_select(env_mode: str, head_dim: int) -> str:
             traits=traits,
         )
         print(kernel.name)
-        """
-    )
+        """)
     env = os.environ.copy()
     env["TOKENSPEED_FLASHINFER_FA2_EXTEND"] = env_mode
     # Avoid inheriting an override that would pin the solution.
@@ -102,12 +100,10 @@ def _subprocess_select(env_mode: str, head_dim: int) -> str:
 
 
 def _subprocess_fa3_head_dims() -> str:
-    code = textwrap.dedent(
-        """
-        import tokenspeed_kernel.ops.attention.flash_attn as fa
+    code = textwrap.dedent("""
+        import tokenspeed_kernel.ops.attention.mha.cuda as fa
         print(sorted(fa._FA3_HOPPER_HEAD_DIMS)[:3], max(fa._FA3_HOPPER_HEAD_DIMS))
-        """
-    )
+        """)
     proc = subprocess.run(
         [sys.executable, "-c", code],
         check=True,
@@ -167,8 +163,8 @@ def test_fa3_hopper_head_dim_gate_locked():
             "tokenspeed_kernel",
             "ops",
             "attention",
-            "flash_attn",
-            "__init__.py",
+            "mha",
+            "cuda.py",
         )
         path = os.path.abspath(path)
         src = open(path, encoding="utf-8").read()
@@ -306,8 +302,8 @@ def test_fa2_extend_matches_triton_and_fp32(
     # Re-import is not enough for registry; call kernel by override name after
     # ensuring the module registered under this env via subprocess-less path:
     # the parent process may have imported with off. Force override.
-    from tokenspeed_kernel.ops.attention import mha_extend_with_kvcache
-    from tokenspeed_kernel.ops.attention.flashinfer import paged_extend as pe
+    from tokenspeed_kernel.ops.attention.mha import mha_extend_with_kvcache
+    from tokenspeed_kernel.ops.attention.mha._flashinfer import paged_extend as pe
 
     if pe.fa2_extend_mode() == "off":
         pytest.skip(
@@ -358,7 +354,7 @@ def test_mha_plan_per_layer_head_dim_prewrite_on_sm90():
     """F3c: head_dim 512 has no FA3 prefill → prewrite; 256 → postwrite on Hopper."""
     if _arch_major() != 9:
         pytest.skip("prewrite/postwrite split is Hopper-specific")
-    from tokenspeed_kernel.ops.attention import mha_plan
+    from tokenspeed_kernel.ops.attention.mha import mha_plan
 
     plan_256 = mha_plan(dtype=torch.bfloat16, head_dim=256)
     plan_512 = mha_plan(dtype=torch.bfloat16, head_dim=512)

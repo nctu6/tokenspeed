@@ -23,12 +23,22 @@ import cutlass
 import cutlass.cute as cute
 
 
+def get_mla_decode_arch(compute_capability: tuple[int, int]) -> str:
+    """Return the CuTe architecture name for a supported MLA decode device."""
+    if compute_capability not in ((10, 0), (10, 3), (10, 7)):
+        raise ValueError(
+            f"MLA decode requires SM100, SM103 or SM107, got {compute_capability}"
+        )
+    major, minor = compute_capability
+    return f"sm_{major}{minor}"
+
+
 def select_mla_decode_tilers(
     num_heads: int,
     seq_len_q: int,
     *,
     is_fp8: bool,
-    compute_capability: tuple[int, int] | None = None,
+    compute_capability: tuple[int, int],
 ) -> tuple[tuple[int, int], tuple[int, int]]:
     """Select decode MMA tile shapes from runtime head/q_len configuration.
 
@@ -36,6 +46,7 @@ def select_mla_decode_tilers(
     FP8 path supports an additional M=64 kernel family on SM100 for the tuned
     H=16, S_q=4 decode shape.
     """
+    get_mla_decode_arch(compute_capability)
     default_qk = (128, 128)
     default_pv = (128, 256)
     if not is_fp8:
@@ -46,6 +57,24 @@ def select_mla_decode_tilers(
     if num_heads * seq_len_q <= 64 and is_sm100:
         return (64, 128), (64, 256)
     return default_qk, default_pv
+
+
+def compute_q_tile_layout(
+    num_heads: int, seq_len_q: int, m_tile: int
+) -> tuple[int, int, int]:
+    """Return total rows, tile count and valid rows in the final query tile.
+
+    ``num_heads`` is the positive head count per query, ``seq_len_q`` is the
+    positive query length, and ``m_tile`` is the positive MMA row capacity.
+    Heads must fit within one MMA tile. Following FlashInfer PR #4178,
+    consecutive rows represent ``query_token * num_heads + head`` and may
+    cross query boundaries. The returned tail is in ``[1, m_tile]``.
+    """
+    if min(num_heads, seq_len_q, m_tile) <= 0 or num_heads > m_tile:
+        raise ValueError("Require positive H, Sq and M, with H <= M")
+    total_rows = num_heads * seq_len_q
+    num_tiles = (total_rows + m_tile - 1) // m_tile
+    return total_rows, num_tiles, total_rows - (num_tiles - 1) * m_tile
 
 
 def get_mla_decode_fold_sq_factor(

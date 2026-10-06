@@ -606,6 +606,11 @@ class Gemma4Attention(nn.Module):
             layer_id=layer_id,
             logit_cap=logit_cap,
             sliding_window_size=sliding_window_size,
+            # Norms and RoPE stay in this module for now (weightless v_norm,
+            # proportional RoPE at head_dim 512 and k_eq_v are not validated
+            # in the attention prologue yet); the prologue only writes KV.
+            rotary_emb=None,
+            qk_norm=None,
         )
 
     def forward(
@@ -666,7 +671,7 @@ class Gemma4Attention(nn.Module):
 
         # Stock TokenSpeed: PagedAttention reads write locations from ctx
         # (cf. gemma3), not an explicit out_cache_loc argument.
-        attn_output = self.attn(q, k, v, ctx=ctx)
+        attn_output = self.attn(q, k, v, positions, ctx=ctx)
         if attn_output.dim() == 3:
             attn_output = attn_output.reshape(attn_output.shape[0], -1)
         output, _ = self.o_proj(attn_output)

@@ -17,7 +17,7 @@ it does not capture or replay a CUDA graph.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention import kda_paged_prefill
+from tokenspeed_kernel.ops.attention.kda import kda_paged_prefill
 
 from tokenspeed.runtime.layers.attention.backends.state.kda import (
     _slice_kda_prefill_inputs,
@@ -120,6 +120,8 @@ def _run_case(
 ) -> None:
     operator_inputs = _slice_kda_prefill_inputs(call_tokens, *packed_inputs)
     result = kda_paged_prefill(
+        capacity=None,
+        inputs_packed=False,
         *operator_inputs,
         *parameters,
         initial_state=recurrent_state,

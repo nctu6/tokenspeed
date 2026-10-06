@@ -36,6 +36,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch  # noqa: E402
+from torch.profiler import ProfilerActivity, profile  # noqa: E402
 
 import tokenspeed.runtime.sampling.backends.triton as triton_backend_module  # noqa: E402
 from tokenspeed.runtime.execution.forward_step import (  # noqa: E402
@@ -86,6 +87,9 @@ POOL = 8  # max_req_pool_size → pool_rows == POOL + 1
 
 def _make_config() -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        enable_speculative_sampling=False,
+        sampling_stream="batch",
+        logprob_order="torch",
         max_bs=4,
         max_draft_tokens_per_req=4,
         max_req_pool_size=POOL,
@@ -113,6 +117,35 @@ def _sp(rid_suffix: str, **overrides) -> SamplingParams:
     sp.resolve_seed(f"rid_{rid_suffix}")
     sp.normalize(None)
     return sp
+
+
+def _assert_logit_bias_h2d_is_async(test: unittest.TestCase, backend) -> None:
+    """The bias scatter on flip must not stall the host: no pageable H2D
+    memcpy and no cudaStreamSynchronize while the stream is busy, and the
+    row still holds the requested values once the stream drains."""
+    sp = _sp("bias")
+    sp.logit_bias = {"100": 2.0, "200": -1.5, "300": 0.25}
+    busy = torch.randn((4096, 4096), device="cuda")
+    for _ in range(8):
+        busy = busy @ busy
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        backend.prepare_step(
+            request_ids=["bias"],
+            request_pool_indices=[5],
+            sampling_params_list=[sp],
+        )
+    torch.cuda.synchronize()
+    names = [e.name for e in prof.events()]
+    if not any("Memcpy HtoD" in n for n in names):
+        test.skipTest("profiler collected no CUDA memcpy activity")
+    test.assertNotIn("cudaStreamSynchronize", names)
+    test.assertFalse(any("Pageable -> Device" in n for n in names), names)
+    test.assertTrue(any("Pinned -> Device" in n for n in names), names)
+    row = backend._logit_bias[5]
+    test.assertAlmostEqual(row[100].item(), 2.0, places=2)
+    test.assertAlmostEqual(row[200].item(), -1.5, places=2)
+    test.assertAlmostEqual(row[300].item(), 0.25, places=2)
+    test.assertAlmostEqual(row[150].item(), 0.0, places=3)
 
 
 class TestGreedyNoPoolState(unittest.TestCase):
@@ -412,6 +445,7 @@ class TestTritonRouteSelection(unittest.TestCase):
                 LogitsProcessorOutput(next_token_logits=logits),
                 sampling_info,
                 candidates,
+                tree=None,
             )
 
         direct_sampler.assert_called_once()
@@ -473,6 +507,7 @@ class TestTritonRouteSelection(unittest.TestCase):
                 LogitsProcessorOutput(next_token_logits=logits),
                 sampling_info,
                 candidates,
+                tree=None,
             )
 
         top_p_sampler.assert_called_once()
@@ -485,6 +520,9 @@ class TestTritonRouteSelection(unittest.TestCase):
         bs, n, vocab = 32, 4, 32768
         backend = TritonSamplingBackend(
             SamplingBackendConfig(
+                enable_speculative_sampling=False,
+                sampling_stream="batch",
+                logprob_order="torch",
                 max_bs=bs,
                 max_draft_tokens_per_req=n,
                 max_req_pool_size=POOL + bs,
@@ -551,6 +589,7 @@ class TestTritonRouteSelection(unittest.TestCase):
                 LogitsProcessorOutput(next_token_logits=logits),
                 sampling_info,
                 candidates,
+                tree=None,
             )
 
         qrita_sampler.assert_called_once()
@@ -566,6 +605,9 @@ class TestTritonRouteSelection(unittest.TestCase):
         bs, n, vocab = 32, 4, 200064
         backend = TritonSamplingBackend(
             SamplingBackendConfig(
+                enable_speculative_sampling=False,
+                sampling_stream="batch",
+                logprob_order="torch",
                 max_bs=bs,
                 max_draft_tokens_per_req=n,
                 max_req_pool_size=POOL + bs,
@@ -632,6 +674,7 @@ class TestTritonRouteSelection(unittest.TestCase):
                 LogitsProcessorOutput(next_token_logits=logits),
                 sampling_info,
                 candidates,
+                tree=None,
             )
 
         qrita_sampler.assert_called_once()
@@ -864,6 +907,9 @@ class TestFlashInferFullFlipExtended(unittest.TestCase):
         # Other positions untouched.
         self.assertAlmostEqual(self.backend._logit_bias[4, 150].item(), 0.0, places=3)
 
+    def test_logit_bias_h2d_is_pinned_and_non_blocking(self):
+        _assert_logit_bias_h2d_is_async(self, self.backend)
+
     def test_logit_bias_out_of_vocab_asserts(self):
         """OOV token ids would write past the bias row; must be caught."""
         sp = _sp("a")
@@ -922,6 +968,9 @@ class TestTritonFullIndependentState(unittest.TestCase):
         self.assertAlmostEqual(self.backend._logit_bias[4, 100].item(), 2.0, places=2)
         self.assertAlmostEqual(self.backend._logit_bias[4, 200].item(), -1.5, places=2)
         self.assertAlmostEqual(self.backend._logit_bias[4, 150].item(), 0.0, places=3)
+
+    def test_logit_bias_h2d_is_pinned_and_non_blocking(self):
+        _assert_logit_bias_h2d_is_async(self, self.backend)
 
     def test_reset_capture_state_clears_capture_counts(self):
         self.backend._counts[0, 10] = 3

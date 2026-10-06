@@ -20,6 +20,7 @@
 
 #include "scheduler/scheduler.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -46,7 +47,6 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
     if (request == nullptr || request->Is<fsm::Finished>()) {
         return;
     }
-    pd_transfer_pins_.erase(event.request_id);
     request->Apply(fsm::AbortEvent{&coordinator_});
 }
 
@@ -58,7 +58,6 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
         throw std::logic_error("PD SucceededEvent received in state " + request->StateName());
     }
-    pd_transfer_pins_.erase(event.request_id);
     request->Apply(fsm::FinishEvent{&coordinator_});
 }
 
@@ -71,7 +70,6 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
         if (event.bootstrap_token < 0) {
             throw std::invalid_argument("PD RemotePrefillDoneEvent requires a non-negative bootstrap token");
         }
-        pd_transfer_pins_.erase(event.request_id);
         request->Apply(fsm::RemotePrefillDoneEvent{event.bootstrap_token});
         return;
     }
@@ -83,10 +81,10 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
 }
 
 void Scheduler::handleEvent(const forward::Finish& event) {
-    if (pd_transfer_pins_.contains(event.request_id)) {
-        throw std::logic_error("PD Finish received while transfer pages are pinned");
-    }
     if (Request* request = findRequest(event.request_id)) {
+        if (pdTransferInFlight(*request)) {
+            throw std::logic_error("PD Finish received while transfer pages are pinned");
+        }
         if (request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>()) {
             if (auto store = publishCompletedPages(*request)) {
                 pending_write_back_operations_.push_back(std::move(*store));
@@ -110,17 +108,30 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         progress.prefix_hashes.insert(progress.prefix_hashes.end(), std::make_move_iterator(new_hashes.begin()),
                                       std::make_move_iterator(new_hashes.end()));
 
-        std::vector<CacheKey> event_keys =
-            registerKvEventPrefixPages(request, progress.prefix_hashes, first_new_prefix_page);
-        coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), progress.prefix_hashes, progress.access_epoch,
-                                          first_new_prefix_page, request.TokenSize() - 1, CacheBoundaryKind::kEndpoint);
-        discardUncachedKvEventPages(event_keys);
+        registerKvEventPrefixPages(request, progress.prefix_hashes, first_new_prefix_page);
+        coordinator_.CacheCompletedBlocks(
+            request.BlockTablesRef(),
+            RequestProgress{
+                .completed_pages =
+                    CompletedPages{
+                        .prefix_hashes = progress.prefix_hashes,
+                        .first_new_prefix_page = first_new_prefix_page,
+                        .boundary_kind = CacheBoundaryKind::kEndpoint,
+                        .stream_completed_to_host = false,
+                        .materialized_state_boundaries = progress.materialized_state_boundaries,
+                    },
+                .num_computed_tokens = request.TokenSize() - 1,
+            },
+            progress.access_epoch);
     }
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
     }
     coordinator_.QueueCachedBlocksForStore(progress.prefix_hashes);
-    coordinator_.QueueLatestSnapshotBlocksForStore(progress.prefix_hashes);
+    const auto prefill_hashes = std::span<const std::string>{progress.prefix_hashes}.first(
+        std::min(progress.prefix_hashes.size(),
+                 static_cast<std::size_t>(request.PrefillSize() / coordinator_.PrefixGranularity())));
+    coordinator_.QueueLatestSnapshotBlocksForStore(prefill_hashes);
     // The request's pages are released right after this (FinishEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
     return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
@@ -143,10 +154,20 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
 }
 
 void Scheduler::handleEvent(const forward::Abort& event) {
-    pd_transfer_pins_.erase(event.request_id);
     if (Request* request = findRequest(event.request_id)) {
         request->Apply(fsm::AbortEvent{&coordinator_});
     }
+}
+
+void Scheduler::handleEvent(const forward::Retract& event) {
+    Request* request = findRequest(event.request_id);
+    if (request == nullptr || request->Is<fsm::Finished>() || request->Is<fsm::Retracted>()) {
+        return;
+    }
+    // Snapshot-less: dest pages were not filled. Publishing would cache empty
+    // KV. The request re-prefills through ordinary admission.
+    request->Apply(fsm::RetractEvent{&coordinator_, next_retraction_epoch_++, /*has_recoverable_snapshot=*/false,
+                                     request->HasGeneratedOutput()});
 }
 
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
@@ -154,7 +175,7 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
 }
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
-    tier_transfers_.CompleteLoadBack(event.op_id);
+    tier_transfers_.CompleteLoadBack(event.op_id, event.success);
 }
 
 }  // namespace tokenspeed

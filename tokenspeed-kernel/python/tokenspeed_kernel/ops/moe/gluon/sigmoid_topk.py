@@ -36,7 +36,6 @@ if current_platform().is_amd:
             "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
         ),
         priority=Priority.SPECIALIZED,
-        tags={"prefill", "routing"},
     )
     def gluon_sigmoid_bias_topk_gfx950(
         *,
@@ -80,8 +79,8 @@ if current_platform().is_amd:
         ),
         signatures=format_signatures("router_logits", "dense", {torch.float32}),
         priority=Priority.SPECIALIZED,
-        tags={"prefill", "routing", "gfx1250"},
         traits={
+            # Keep the Gluon path available for explicit selection below 513.
             "tokens": range(2, 1 << 31),
             "experts": frozenset({896}),
             "topk": frozenset({16}),

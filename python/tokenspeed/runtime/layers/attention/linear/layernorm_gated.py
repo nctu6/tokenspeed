@@ -28,8 +28,9 @@
 the gate. Inference only (no backward)."""
 
 import torch
-import triton
-import triton.language as tl
+from tokenspeed_kernel.platform import pdl_enabled
+
+from tokenspeed.runtime.utils.triton import tl, triton
 
 
 @triton.heuristics({"HAS_Z": lambda args: args["Z"] is not None})
@@ -39,6 +40,7 @@ def _rms_norm_fwd_kernel(
     Y,  # pointer to the output
     W,  # pointer to the weights
     Z,  # pointer to the other branch
+    FP8_SCALE,  # static FP8 dequant scale of the consumer
     stride_x_row,  # how much to increase the pointer when moving by 1 row
     stride_y_row,
     stride_z_row,
@@ -48,6 +50,9 @@ def _rms_norm_fwd_kernel(
     HAS_Z: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
     SIGMOID_GATE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+    WEIGHTS_INDEPENDENT: tl.constexpr,
+    OUT_FP8: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
     row = tl.program_id(0)
@@ -59,6 +64,13 @@ def _rms_norm_fwd_kernel(
     W += group * N
     cols = tl.arange(0, BLOCK_N)
     mask = cols < N
+    if WEIGHTS_INDEPENDENT:
+        w = tl.load(W + cols, mask=mask).to(tl.float32)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    if not WEIGHTS_INDEPENDENT:
+        w = tl.load(W + cols, mask=mask).to(tl.float32)
     x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
     if HAS_Z and not NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=mask).to(tl.float32)
@@ -66,12 +78,15 @@ def _rms_norm_fwd_kernel(
     xbar = tl.where(mask, x, 0.0)
     var = tl.sum(xbar * xbar, axis=0) / N
     rstd = 1 / tl.sqrt(var + eps)
-    w = tl.load(W + cols, mask=mask).to(tl.float32)
     y = x * rstd * w
     if HAS_Z and NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=mask).to(tl.float32)
         y *= tl.sigmoid(z) if SIGMOID_GATE else z * tl.sigmoid(z)
-    tl.store(Y + cols, y, mask=mask)
+    if OUT_FP8:
+        # Quantize the activation-dtype output, as the consumer would.
+        y = y.to(X.dtype.element_ty).to(tl.float32)
+        y = tl.clamp(y * (1.0 / tl.load(FP8_SCALE).to(tl.float32)), -448.0, 448.0)
+    tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
 
 
 def rmsnorm_fn(
@@ -82,11 +97,21 @@ def rmsnorm_fn(
     group_size=None,
     norm_before_gate=True,
     sigmoid_gate=False,
+    *,
+    weights_independent: bool,
+    fp8_scale: torch.Tensor | None = None,
 ):
     """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else
     norm(x * silu(z)); ``sigmoid_gate`` swaps silu(z) for sigmoid(z). With
     ``group_size`` set, each group of that many features is normalized on its
-    own (``None`` means one group over the whole last dim)."""
+    own (``None`` means one group over the whole last dim).
+
+    ``weights_independent`` promises the weight is already visible before the
+    preceding PDL producer starts, permitting its load before the input wait.
+    Pass False for producer-written weights. Returns a tensor shaped like x,
+    quantized to static FP8 with ``fp8_scale`` when one is given.
+    """
+    enable_pdl = pdl_enabled()
     x_shape_og = x.shape
     x = x.reshape(-1, x.shape[-1])
     if x.stride(-1) != 1:
@@ -96,6 +121,7 @@ def rmsnorm_fn(
         z = z.reshape(-1, z.shape[-1])
         if z.stride(-1) != 1:
             z = z.contiguous()
+    weights_independent = weights_independent and weight.is_contiguous()
     weight = weight.contiguous()
 
     M, N = x.shape
@@ -104,7 +130,9 @@ def rmsnorm_fn(
     assert N % group_size == 0
     ngroups = N // group_size
     assert weight.shape == (N,)
-    out = torch.empty_like(x)
+    out = torch.empty_like(
+        x, dtype=x.dtype if fp8_scale is None else torch.float8_e4m3fn
+    )
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
@@ -119,6 +147,7 @@ def rmsnorm_fn(
             out,
             weight,
             z,
+            fp8_scale,
             x.stride(0),
             out.stride(0),
             z.stride(0) if z is not None else 0,
@@ -128,6 +157,10 @@ def rmsnorm_fn(
             NORM_BEFORE_GATE=norm_before_gate,
             SIGMOID_GATE=sigmoid_gate,
             num_warps=num_warps,
+            ENABLE_PDL=enable_pdl,
+            WEIGHTS_INDEPENDENT=weights_independent,
+            OUT_FP8=fp8_scale is not None,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return out.reshape(x_shape_og)
 
@@ -159,9 +192,15 @@ class RMSNorm(torch.nn.Module):
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)
 
-    def forward(self, x, z=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        z: torch.Tensor | None = None,
+        fp8_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else
-        norm(x * silu(z)); ``sigmoid_gate`` swaps silu(z) for sigmoid(z)."""
+        norm(x * silu(z)); ``sigmoid_gate`` swaps silu(z) for sigmoid(z).
+        ``fp8_scale`` quantizes the output for a static-FP8 consumer."""
         return rmsnorm_fn(
             x,
             self.weight,
@@ -170,4 +209,6 @@ class RMSNorm(torch.nn.Module):
             group_size=self.group_size,
             norm_before_gate=self.norm_before_gate,
             sigmoid_gate=self.sigmoid_gate,
+            weights_independent=True,
+            fp8_scale=fp8_scale,
         )

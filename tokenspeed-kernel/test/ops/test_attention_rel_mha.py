@@ -36,10 +36,24 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import (
+from rel_mha_reference import (
+    DTYPE,
+    HEAD_DIM,
+    NUM_KV_HEADS,
+    NUM_Q_HEADS,
+    PAGE,
+    build_paged,
+    cu_seqlens,
+    ref_rel_attn,
+    ref_rel_logits,
+    require_fa4,
+)
+from tokenspeed_kernel.ops.attention.mha import (
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_prefill,
+)
+from tokenspeed_kernel.ops.attention.rmha import (
     rel_mha_decode_with_kvcache,
     rel_mha_extend_with_kvcache,
     rel_mha_prefill,
@@ -47,84 +61,7 @@ from tokenspeed_kernel import (
 
 torch.manual_seed(7)
 
-DTYPE = torch.bfloat16
-NUM_Q_HEADS = 8
-NUM_KV_HEADS = 2
-HEAD_DIM = 128
-PAGE = 128
 TOL = 2e-2
-
-
-def _ref_rel_attn(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    rel_logits: torch.Tensor | None,
-    rel_extent: int,
-    window_left: int,
-    scale: float,
-) -> torch.Tensor:
-    """Per-sequence torch reference. q [Sq,H,D], k/v [Sk,KV,D], rel_logits [Sq,H,E]."""
-    Sq, H, _ = q.shape
-    Sk, KV, _ = k.shape
-    rep = H // KV
-    k = k.repeat_interleave(rep, dim=1)
-    v = v.repeat_interleave(rep, dim=1)
-    logits = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * scale
-    q_pos = torch.arange(Sq, device=q.device) + (Sk - Sq)
-    kv_pos = torch.arange(Sk, device=q.device)
-    dist = q_pos[:, None] - kv_pos[None, :]  # [Sq, Sk]
-    if rel_logits is not None:
-        in_range = (dist >= 0) & (dist < rel_extent)
-        idx = dist.clamp(0, rel_extent - 1)
-        bias = rel_logits.float().gather(-1, idx.unsqueeze(1).expand(Sq, H, Sk))
-        bias = torch.where(in_range.unsqueeze(1), bias, 0.0)
-        logits = logits + bias.permute(1, 0, 2)
-    mask = dist < 0  # causal
-    if window_left >= 0:
-        mask |= dist > window_left
-    logits.masked_fill_(mask.unsqueeze(0), float("-inf"))
-    return torch.einsum("hqk,khd->qhd", logits.softmax(-1), v.float()).to(q.dtype)
-
-
-def _cu(lens: list[int], device: str) -> torch.Tensor:
-    return torch.tensor(
-        [0] + list(torch.tensor(lens).cumsum(0)), device=device, dtype=torch.int32
-    )
-
-
-def _build_paged(
-    kv_lens: list[int], device: str, page: int = PAGE
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list]:
-    """Scatter per-sequence K/V into a paged cache; return caches and flat k/v."""
-    batch = len(kv_lens)
-    pages_per = [(length + page - 1) // page for length in kv_lens]
-    total_pages = sum(pages_per) + 3  # spare pages
-    k_cache = torch.zeros(
-        total_pages, page, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=DTYPE
-    )
-    v_cache = torch.zeros_like(k_cache)
-    page_table = torch.zeros(batch, max(pages_per), device=device, dtype=torch.int32)
-    ks, vs = [], []
-    next_page = 1  # leave page 0 unused to catch indexing bugs
-    for i, length in enumerate(kv_lens):
-        k = torch.randn(length, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=DTYPE)
-        k *= 0.5
-        v = torch.randn(length, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=DTYPE)
-        v *= 0.5
-        ks.append(k)
-        vs.append(v)
-        for p in range(pages_per[i]):
-            n = min(page, length - p * page)
-            k_cache[next_page, :n] = k[p * page : p * page + n]
-            v_cache[next_page, :n] = v[p * page : p * page + n]
-            page_table[i, p] = next_page
-            next_page += 1
-    return k_cache, v_cache, page_table, ks, vs
-
-
-def _require_fa4(require) -> None:
-    require("attention", "rel_mha_prefill", "fa4", DTYPE, "q")
 
 
 @pytest.mark.parametrize(
@@ -145,7 +82,7 @@ def test_rel_mha_prefill(
     window_left: int,
 ) -> None:
     if solution is None:
-        _require_fa4(require)
+        require_fa4(require)
     else:
         require("attention", "rel_mha_prefill", solution, DTYPE, "q")
     q_lens = [128, 200, 65]
@@ -177,7 +114,7 @@ def test_rel_mha_prefill(
 
     for i, length in enumerate(q_lens):
         s = cu_cpu[i]
-        ref = _ref_rel_attn(
+        ref = ref_rel_attn(
             q[s : s + length],
             k[s : s + length],
             v[s : s + length],
@@ -212,7 +149,7 @@ def test_rel_mha_extend_with_kvcache(
     """Paged extend with cached prefix (kv longer than q) exercises the
     seqlen_k - seqlen_q relative-distance offset."""
     if solution is None:
-        _require_fa4(require)
+        require_fa4(require)
     else:
         require("attention", "rel_mha_extend_with_kvcache", solution, DTYPE, "q")
     scale = 1.0 / HEAD_DIM
@@ -221,10 +158,10 @@ def test_rel_mha_extend_with_kvcache(
     rel_logits = (
         torch.randn(total_q, NUM_Q_HEADS, rel_extent, device=device, dtype=DTYPE) * 0.5
     )
-    cu_q = _cu(q_lens, device)
-    cu_kv = _cu(kv_lens, device)
+    cu_q = cu_seqlens(q_lens, device)
+    cu_kv = cu_seqlens(kv_lens, device)
     cache_seqlens = torch.tensor(kv_lens, device=device, dtype=torch.int32)
-    k_cache, v_cache, page_table, ks, vs = _build_paged(kv_lens, device, page=page)
+    k_cache, v_cache, page_table, ks, vs = build_paged(kv_lens, device, page)
 
     out = rel_mha_extend_with_kvcache(
         q=q,
@@ -244,7 +181,7 @@ def test_rel_mha_extend_with_kvcache(
 
     for i, (ql, _) in enumerate(zip(q_lens, kv_lens)):
         s = int(cu_q[i].item())
-        ref = _ref_rel_attn(
+        ref = ref_rel_attn(
             q[s : s + ql],
             ks[i],
             vs[i],
@@ -279,7 +216,7 @@ def test_rel_mha_decode_with_kvcache(
     """Paged decode via the varlen path: cu_seqlens_q maps each request's
     query row into rel_logits at its batch-flattened position."""
     if solution is None:
-        _require_fa4(require)
+        require_fa4(require)
     else:
         require("attention", "rel_mha_decode_with_kvcache", solution, DTYPE, "q")
     batch = len(kv_lens)
@@ -290,7 +227,7 @@ def test_rel_mha_decode_with_kvcache(
     )
     cu_seqlens_q = torch.arange(batch + 1, device=device, dtype=torch.int32)
     cache_seqlens = torch.tensor(kv_lens, device=device, dtype=torch.int32)
-    k_cache, v_cache, page_table, ks, vs = _build_paged(kv_lens, device, page=page)
+    k_cache, v_cache, page_table, ks, vs = build_paged(kv_lens, device, page)
 
     out = rel_mha_decode_with_kvcache(
         q=q,
@@ -309,7 +246,7 @@ def test_rel_mha_decode_with_kvcache(
 
     assert out.shape == q.shape
     for i in range(batch):
-        ref = _ref_rel_attn(
+        ref = ref_rel_attn(
             q[i : i + 1],
             ks[i],
             vs[i],
@@ -327,7 +264,7 @@ def test_mha_ops_interface_has_no_rel_args(device: str, require) -> None:
     the rel_mha family's contract. Use default dispatch so each architecture
     exercises a supported plain-MHA backend. Regression guard for interface
     creep."""
-    _require_fa4(require)
+    require_fa4(require)
     q_lens = [70, 130]
     kv_lens = [198, 130]
     total_q = sum(q_lens)
@@ -354,12 +291,12 @@ def test_mha_ops_interface_has_no_rel_args(device: str, require) -> None:
         with pytest.raises(TypeError):
             mha_prefill(**common, **{bad_kwarg: None})
 
-    k_cache, v_cache, page_table, _, _ = _build_paged(kv_lens, device)
+    k_cache, v_cache, page_table, _, _ = build_paged(kv_lens, device, PAGE)
     cache_seqlens = torch.tensor(kv_lens, device=device, dtype=torch.int32)
     out = mha_extend_with_kvcache(
         q=q,
         cu_seqlens_q=cu,
-        cu_seqlens_kv=_cu(kv_lens, device),
+        cu_seqlens_kv=cu_seqlens(kv_lens, device),
         k_cache=k_cache,
         v_cache=v_cache,
         page_table=page_table,
@@ -383,3 +320,76 @@ def test_mha_ops_interface_has_no_rel_args(device: str, require) -> None:
     )
     assert out.shape == q_decode.shape
     assert not torch.isnan(out).any()
+
+
+@pytest.mark.parametrize("head_dim", [128, 96], ids=["d128", "d96"])
+@pytest.mark.parametrize("window_left", [-1, 31], ids=["full", "swa32"])
+def test_triton_rel_mha_prefill_lse(
+    device: str, require, head_dim: int, window_left: int
+) -> None:
+    """Triton prefill output and LSE, including a non-power-of-two head dim."""
+    require("attention", "rel_mha_prefill", "triton", DTYPE, "q")
+    q_lens, rel_extent, scale = [150, 64, 1], 48, 1.0 / head_dim
+    total = sum(q_lens)
+    q = torch.randn(total, NUM_Q_HEADS, head_dim, device=device, dtype=DTYPE) * 0.5
+    k = torch.randn(total, NUM_KV_HEADS, head_dim, device=device, dtype=DTYPE) * 0.5
+    v = torch.randn(total, NUM_KV_HEADS, head_dim, device=device, dtype=DTYPE) * 0.5
+    rel_logits = torch.randn(total, NUM_Q_HEADS, rel_extent, device=device, dtype=DTYPE)
+    cu = cu_seqlens(q_lens, device)
+    out, lse = rel_mha_prefill(
+        q=q,
+        k=k,
+        v=v,
+        rel_logits=rel_logits,
+        cu_seqlens=cu,
+        cu_seqlens_cpu=cu.tolist(),
+        max_seqlen=max(q_lens),
+        window_left=window_left,
+        return_lse=True,
+        softmax_scale=scale,
+        solution="triton",
+    )
+    for s, e in zip(cu.tolist()[:-1], cu.tolist()[1:]):
+        args = (q[s:e], k[s:e], rel_logits[s:e], rel_extent, window_left, scale)
+        ref_lse = ref_rel_logits(*args).logsumexp(-1).transpose(0, 1)
+        torch.testing.assert_close(lse[s:e], ref_lse, atol=1e-4, rtol=1e-4)
+        ref = ref_rel_attn(q[s:e], k[s:e], v[s:e], *args[2:])
+        torch.testing.assert_close(out[s:e], ref, atol=TOL, rtol=0)
+
+
+def test_triton_rel_mha_extend_lse_ignores_page_padding(device: str, require) -> None:
+    """Multi-block windowed extend; NaN in page padding must not reach the output."""
+    require("attention", "rel_mha_extend_with_kvcache", "triton", DTYPE, "q")
+    q_lens, kv_lens, rel_extent, window_left = [150, 7], [430, 7], 64, 100
+    scale = 1.0 / HEAD_DIM
+    k_cache, v_cache, page_table, ks, vs = build_paged(kv_lens, device, PAGE)
+    for i, length in enumerate(kv_lens):
+        last_page, used = page_table[i, (length - 1) // PAGE], (length - 1) % PAGE + 1
+        k_cache[last_page, used:] = float("nan")
+        v_cache[last_page, used:] = float("nan")
+    total = sum(q_lens)
+    q = torch.randn(total, NUM_Q_HEADS, HEAD_DIM, device=device, dtype=DTYPE) * 0.5
+    rel_logits = torch.randn(total, NUM_Q_HEADS, rel_extent, device=device, dtype=DTYPE)
+    cu = cu_seqlens(q_lens, device)
+    out, lse = rel_mha_extend_with_kvcache(
+        q=q,
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu_seqlens(kv_lens, device),
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=torch.tensor(kv_lens, device=device, dtype=torch.int32),
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(kv_lens),
+        rel_logits=rel_logits,
+        window_left=window_left,
+        return_lse=True,
+        softmax_scale=scale,
+        solution="triton",
+    )
+    for i, (s, e) in enumerate(zip(cu.tolist()[:-1], cu.tolist()[1:])):
+        args = (rel_logits[s:e], rel_extent, window_left, scale)
+        ref_lse = ref_rel_logits(q[s:e], ks[i], *args).logsumexp(-1).transpose(0, 1)
+        torch.testing.assert_close(lse[s:e], ref_lse, atol=1e-4, rtol=1e-4)
+        ref = ref_rel_attn(q[s:e], ks[i], vs[i], *args)
+        torch.testing.assert_close(out[s:e], ref, atol=TOL, rtol=0)

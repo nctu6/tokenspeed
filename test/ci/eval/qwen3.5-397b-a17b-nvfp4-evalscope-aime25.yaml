@@ -7,7 +7,7 @@ triggers:
   - manual
 runner:
   labels:
-    - b200-4gpu
+    - slurm-gb200-4gpu
     - b300-4gpu
 env:
   CI: "true"
@@ -27,9 +27,9 @@ server:
     --quantization nvfp4
     --kv-cache-dtype fp8
     --speculative-algorithm MTP
+    --disable-replay-ssm
     --speculative-num-steps 3
     --drafter-attention-backend trtllm
-    --enable-cache-report
     --host 127.0.0.1
     --port 8000
   ready:

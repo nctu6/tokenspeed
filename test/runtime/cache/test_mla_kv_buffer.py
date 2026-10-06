@@ -27,20 +27,18 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.embedding import (
     FusedMLASetKVBufferArg,
-    apply_rope,
     apply_rope_mla,
-    apply_rope_mla_set_kv,
 )
+from tokenspeed_kernel.ops.embedding.triton import apply_rope_mla_set_kv_buffer_triton
 from tokenspeed_kernel.ops.kvcache.triton import (
     get_mla_kv_buffer_triton,
     mla_latent_norm_rope_scatter,
     set_mla_kv_buffer_triton,
 )
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
-from tokenspeed.runtime.models.utils import (
-    create_fused_mla_set_kv_buffer_arg,
-)
 
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -66,6 +64,13 @@ N_LOC_ALL = N_LOC_SMALL + N_LOC_LARGE
 
 def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+def _assert_fp8_rounding(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    # E4M3FN rounds by at most half its mantissa step (2**-3), or half
+    # its smallest subnormal (2**-9). Compare against FP32, since the
+    # portable split RoPE path rounds through BF16 before converting to FP8.
+    torch.testing.assert_close(actual.float(), expected, rtol=2**-4, atol=2**-10)
 
 
 def _make_inputs(n_loc: int, dtype: torch.dtype, pattern: str, seed: int = 0):
@@ -149,7 +154,7 @@ def test_set_matches_torch_reference(n_loc, dtype, pattern):
     kv = _empty_kv(dtype)
     ref = _torch_set_reference(kv, loc, k_nope, k_rope)
 
-    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope)
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, write_mask=None)
     torch.cuda.synchronize()
 
     assert _bitwise_equal(kv, ref)
@@ -167,7 +172,7 @@ def test_set_casts_bf16_sources_into_fp8_buffer(n_loc, pattern):
         kv, loc, k_nope.to(torch.float8_e4m3fn), k_rope.to(torch.float8_e4m3fn)
     )
 
-    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope)
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, write_mask=None)
     torch.cuda.synchronize()
 
     assert _bitwise_equal(kv, ref)
@@ -193,7 +198,7 @@ def test_set_casts_mixed_sources_into_fp8_buffer(n_loc, nope_dtype, rope_dtype):
         k_rope.to(torch.float8_e4m3fn),
     )
 
-    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope)
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, write_mask=None)
     torch.cuda.synchronize()
 
     assert _bitwise_equal(kv, ref)
@@ -225,7 +230,7 @@ def test_pool_scatter_quantizes_without_materializing_fp8_sources(monkeypatch):
 
     monkeypatch.setattr(mla_pool_module, "set_mla_kv_buffer_triton", capture)
     layer = type("Layer", (), {"layer_id": 0})()
-    pool.set_mla_kv_buffer(layer, loc, k_nope, k_rope)
+    pool.set_mla_kv_buffer(layer, loc, k_nope, k_rope, write_mask=None)
 
     assert captured["kv_buffer"].dtype == torch.float8_e4m3fn
     assert captured["kv_buffer"].untyped_storage().data_ptr() == storage.data_ptr()
@@ -243,7 +248,7 @@ def test_set_supports_zero_width_rope_with_int32_locations(n_loc):
     ref = kv.clone()
     ref[loc.long()] = k_nope[:, 0]
 
-    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope)
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, write_mask=None)
     torch.cuda.synchronize()
 
     assert loc.dtype == torch.int32
@@ -269,7 +274,7 @@ def test_set_squashes_nan_and_inf(n_loc):
         ),
     )
 
-    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, sanitize=True)
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, sanitize=True, write_mask=None)
     torch.cuda.synchronize()
 
     assert _bitwise_equal(kv, ref)
@@ -284,8 +289,12 @@ def test_set_pdl_invariant(n_loc, dtype):
     kv_off = _empty_kv(dtype)
     kv_on = _empty_kv(dtype)
 
-    set_mla_kv_buffer_triton(kv_off, loc, k_nope, k_rope, enable_pdl=False)
-    set_mla_kv_buffer_triton(kv_on, loc, k_nope, k_rope, enable_pdl=True)
+    set_mla_kv_buffer_triton(
+        kv_off, loc, k_nope, k_rope, enable_pdl=False, write_mask=None
+    )
+    set_mla_kv_buffer_triton(
+        kv_on, loc, k_nope, k_rope, enable_pdl=True, write_mask=None
+    )
     torch.cuda.synchronize()
 
     assert _bitwise_equal(kv_off, kv_on)
@@ -358,7 +367,7 @@ def test_set_then_get_round_trip(n_loc, dtype):
     loc, k_nope_in, k_rope_in = _make_inputs(n_loc, dtype, "rand")
     kv = _empty_kv(dtype)
 
-    set_mla_kv_buffer_triton(kv, loc, k_nope_in, k_rope_in)
+    set_mla_kv_buffer_triton(kv, loc, k_nope_in, k_rope_in, write_mask=None)
 
     k_nope_out = torch.empty_like(k_nope_in)
     k_rope_out = torch.empty_like(k_rope_in)
@@ -401,19 +410,21 @@ def test_mla_rope_set_kv_buffer_matches_reference(is_neox, loc_dtype):
     kv_ref[loc.long(), :NOPE_DIM] = k_nope[:, 0, :]
     kv_ref[loc.long(), NOPE_DIM:] = k_rope_ref[:, 0, :]
 
-    apply_rope(
+    apply_rope_mla_set_kv_buffer_triton(
+        positions=positions,
+        q_rope=q_rope,
+        k_rope=k_rope,
         cos_sin_cache=cos_sin,
+        is_neox=is_neox,
         fused_mla_set_kv_buffer_arg=FusedMLASetKVBufferArg(
             k_nope=k_nope,
             kv_buffer=kv,
             cache_loc=loc,
+            q_nope=None,
+            sanitize=False,
+            write_mask=None,
         ),
-        head_size=ROPE_DIM,
-        positions=positions,
-        q=q_rope,
-        k=k_rope,
         q_rope_out=q_out_rope,
-        is_neox=is_neox,
     )
     torch.cuda.synchronize()
 
@@ -421,7 +432,8 @@ def test_mla_rope_set_kv_buffer_matches_reference(is_neox, loc_dtype):
     torch.testing.assert_close(kv[loc.long()], kv_ref[loc.long()], atol=0.01, rtol=0.01)
 
 
-def test_mla_rope_set_kv_buffer_fp8_matches_two_kernel_path() -> None:
+def test_mla_rope_set_kv_buffer_fp8_matches_fp32_reference() -> None:
+    """Fused and split RoPE paths stay within the FP8 rounding bound."""
     torch.manual_seed(0)
     n_loc = 17
     num_heads = 3
@@ -448,24 +460,35 @@ def test_mla_rope_set_kv_buffer_fp8_matches_two_kernel_path() -> None:
     query = torch.empty_like(query_ref)
     kv = _empty_kv(torch.float8_e4m3fn)
 
-    apply_rope(
+    apply_rope_mla_set_kv_buffer_triton(
         positions=positions,
-        q=q_rope,
-        k=k_rope,
-        head_size=ROPE_DIM,
+        q_rope=q_rope,
+        k_rope=k_rope,
         cos_sin_cache=cos_sin,
+        is_neox=True,
         fused_mla_set_kv_buffer_arg=FusedMLASetKVBufferArg(
             k_nope=k_nope,
             kv_buffer=kv,
             cache_loc=loc,
             q_nope=q_nope,
+            sanitize=False,
+            write_mask=None,
         ),
         q_rope_out=query,
     )
     torch.cuda.synchronize()
 
-    assert _bitwise_equal(query, query_ref)
-    assert _bitwise_equal(kv[loc], key_ref[:, 0])
+    assert _bitwise_equal(query[..., :NOPE_DIM], query_ref[..., :NOPE_DIM])
+    assert _bitwise_equal(kv[loc, :NOPE_DIM], key_ref[:, 0, :NOPE_DIM])
+    q_rope_ref = _rotate_rope_reference(q_rope.float(), cos_sin, positions, True)
+    k_rope_ref = _rotate_rope_reference(k_rope.float(), cos_sin, positions, True)
+    for actual, expected in (
+        (query[..., NOPE_DIM:], q_rope_ref),
+        (query_ref[..., NOPE_DIM:], q_rope_ref),
+        (kv[loc, NOPE_DIM:], k_rope_ref[:, 0]),
+        (key_ref[:, 0, NOPE_DIM:], k_rope_ref[:, 0]),
+    ):
+        _assert_fp8_rounding(actual, expected)
 
 
 @pytest.mark.parametrize("n_loc", [1, 17, 600])
@@ -499,16 +522,19 @@ def test_mla_set_kv_nope_matches_two_kernel_path(n_loc: int) -> None:
     query = torch.empty_like(query_ref)
     kv = _empty_kv(torch.float8_e4m3fn)
 
-    apply_rope_mla_set_kv(
+    apply_rope_mla_set_kv_buffer_triton(
         positions=positions,
         q_rope=q_rope,
         k_rope=k_rope,
+        cos_sin_cache=None,
+        is_neox=True,
         fused_mla_set_kv_buffer_arg=FusedMLASetKVBufferArg(
             k_nope=k_nope,
             kv_buffer=kv,
             cache_loc=loc,
             q_nope=q_nope,
-            cos_sin_cache=None,
+            sanitize=False,
+            write_mask=None,
         ),
         q_rope_out=query,
     )
@@ -520,10 +546,8 @@ def test_mla_set_kv_nope_matches_two_kernel_path(n_loc: int) -> None:
 
 @pytest.mark.parametrize("n_loc", [4, 600])
 @pytest.mark.parametrize("has_rope", [False, True])
-def test_fused_sanitize_matches_the_split_path_bytes(
-    n_loc: int, has_rope: bool
-) -> None:
-    """A sanitizing fused write lands the same latent bytes as the split path.
+def test_fused_sanitize_matches_the_composite(n_loc: int, has_rope: bool) -> None:
+    """Fused writes preserve sanitization and FP8 accuracy of the composite.
 
     This is the property that lets Kimi-K3's pool declare
     ``latent_write_sanitizes`` instead of overriding the latent write: the
@@ -573,24 +597,26 @@ def test_fused_sanitize_matches_the_split_path_bytes(
         key_ref[:, :, :NOPE_DIM],
         key_ref[:, :, NOPE_DIM:],
         sanitize=True,
+        write_mask=None,
     )
 
     kv = _empty_kv(torch.float8_e4m3fn)
     query = torch.empty(
         n_loc, num_heads, NOPE_DIM + ROPE_DIM, device="cuda", dtype=dtype
     )
-    apply_rope_mla_set_kv(
+    apply_rope_mla_set_kv_buffer_triton(
         positions=positions,
         q_rope=q_rope,
         k_rope=k_rope,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=False,
         fused_mla_set_kv_buffer_arg=FusedMLASetKVBufferArg(
             k_nope=k_nope,
             kv_buffer=kv,
             cache_loc=loc,
             q_nope=q_nope,
-            cos_sin_cache=cos_sin_cache,
-            is_neox=False,
             sanitize=True,
+            write_mask=None,
         ),
         q_rope_out=query,
     )
@@ -598,7 +624,29 @@ def test_fused_sanitize_matches_the_split_path_bytes(
 
     assert not torch.isnan(kv[loc.cpu()].float()).any()
     assert torch.isfinite(kv[loc.cpu()].float()).all()
-    assert _bitwise_equal(kv, kv_ref)
+    if not has_rope:
+        assert _bitwise_equal(kv, kv_ref)
+        return
+
+    # NoPE values and untouched slots still have an exact byte contract.
+    assert _bitwise_equal(kv[:, :NOPE_DIM], kv_ref[:, :NOPE_DIM])
+    untouched = torch.ones(NUM_PAGES, device="cuda", dtype=torch.bool)
+    untouched[loc] = False
+    assert _bitwise_equal(kv[untouched, NOPE_DIM:], kv_ref[untouched, NOPE_DIM:])
+
+    rope_ref = _rotate_rope_reference(k_rope.float(), cos_sin_cache, positions, False)[
+        :, 0
+    ]
+    finite = torch.isfinite(rope_ref)
+    actual_rope = kv[loc, NOPE_DIM:]
+    split_rope = kv_ref[loc, NOPE_DIM:]
+    # Non-finite inputs must produce exactly the composite's sanitized bytes.
+    assert torch.equal(
+        actual_rope.view(torch.uint8)[~finite],
+        split_rope.view(torch.uint8)[~finite],
+    )
+    for output in (actual_rope, split_rope):
+        _assert_fp8_rounding(output.float()[finite], rope_ref[finite])
 
 
 def _fake_mla_pool(dtype: torch.dtype = torch.float8_e4m3fn) -> MLATokenToKVPool:
@@ -613,6 +661,23 @@ def _fake_mla_pool(dtype: torch.dtype = torch.float8_e4m3fn) -> MLATokenToKVPool
     return pool
 
 
+def _mla_prologue_kernel(num_q_heads: int, num_tokens: int) -> str:
+    """The MLA prologue kernel a full FP8 absorbed write of this shape selects."""
+    return select_kernel(
+        "attention",
+        "mla_prologue",
+        format_signature(query=dense_tensor_format(torch.bfloat16)),
+        traits={
+            "token_heads": num_tokens * num_q_heads,
+            "full_write": True,
+            "kv_format": "fp8",
+            "expanded": False,
+            "rope_style": "none",
+            "sanitize": False,
+        },
+    ).name
+
+
 @pytest.mark.parametrize(
     "num_q_heads,num_tokens,expect_fused",
     [
@@ -624,127 +689,74 @@ def _fake_mla_pool(dtype: torch.dtype = torch.float8_e4m3fn) -> MLATokenToKVPool
         (64, 513, False),
     ],
 )
-def test_fused_gate_token_head_budget(num_q_heads, num_tokens, expect_fused):
-    """The fused write's token cap scales down with head count: the fused
+def test_one_launch_prologue_token_head_budget(num_q_heads, num_tokens, expect_fused):
+    """The one-launch write's token cap scales down with head count: the fused
     kernel's own CTA count is tokens*(heads+1), so a fixed token cap is only
     safe at the head count it was measured at. Regression measured directly:
-    at H=32 the fused path lost to the split path by 18.9% at 2048 tokens
+    at H=32 the fused path lost to the composite by 18.9% at 2048 tokens
     while still winning at 1024; at H=64 it lost by 4.9% at 768 while still
     winning at 512."""
-    pool = _fake_mla_pool()
-    k_nope = torch.zeros(num_tokens, 1, NOPE_DIM, device="cuda", dtype=torch.bfloat16)
-    q_nope = torch.zeros(
-        num_tokens, num_q_heads, NOPE_DIM, device="cuda", dtype=torch.bfloat16
-    )
-    loc = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
-    arg = create_fused_mla_set_kv_buffer_arg(
-        k_nope=k_nope,
-        rope_dim=ROPE_DIM,
-        rotary_emb=None,
-        out_cache_loc=loc,
-        token_to_kv_pool=pool,
-        layer_id=0,
-        num_q_heads=num_q_heads,
-        q_nope=q_nope,
-    )
-    assert (arg is not None) == expect_fused
+    fused = _mla_prologue_kernel(num_q_heads, num_tokens) == "triton_mla_prologue"
+    assert fused == expect_fused
 
 
-def _gate_arg_for_pool(pool, n_loc: int = 8, num_q_heads: int = 16):
-    """Run the fused-write gate against ``pool`` with an otherwise valid shape."""
-    return create_fused_mla_set_kv_buffer_arg(
-        k_nope=torch.zeros(n_loc, 1, NOPE_DIM, device="cuda", dtype=torch.bfloat16),
-        rope_dim=ROPE_DIM,
-        rotary_emb=None,
-        out_cache_loc=torch.arange(n_loc, device="cuda", dtype=torch.int64),
-        token_to_kv_pool=pool,
-        layer_id=0,
-        num_q_heads=num_q_heads,
-        q_nope=torch.zeros(
-            n_loc, num_q_heads, NOPE_DIM, device="cuda", dtype=torch.bfloat16
-        ),
-    )
+def test_latent_write_target_carries_the_pool_sanitize():
+    """Kimi-K3's pool sanitizes its latent write.
 
-
-def test_fused_gate_declines_a_pool_that_overrides_the_latent_write():
-    """A pool that customizes set_mla_kv_buffer must not be fused past.
-
-    An override adds something the fused write does not have, and fusing would
-    bypass it silently. isinstance alone does not exclude such a pool, since it
-    is an MLATokenToKVPool subclass -- the gate compares method identity.
-    """
-
-    class _OverridingPool(MLATokenToKVPool):
-        def set_mla_kv_buffer(self, *args, **kwargs):  # pragma: no cover
-            raise AssertionError("must not be reached")
-
-    pool = _fake_mla_pool()
-    pool.__class__ = _OverridingPool
-
-    assert issubclass(_OverridingPool, MLATokenToKVPool)
-    assert _gate_arg_for_pool(pool) is None
-
-
-def test_fused_gate_admits_the_hybrid_kda_pool_and_carries_its_sanitize():
-    """Kimi-K3's pool reaches the fused write, sanitizing.
-
-    It needs a sanitizing latent write -- a padded row's NaN otherwise reaches
-    a live row's softmax through the shared dummy slot -- but declares that
-    through ``latent_write_sanitizes`` instead of overriding the method, so the
-    identity check above still holds and the flag rides into the kernel.
+    A padded row's NaN otherwise reaches a live row's softmax through the
+    shared dummy slot; the pool declares it through ``latent_write_sanitizes``
+    and the write target carries it into the prologue.
     """
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
         HybridKDATokenToKVPool,
     )
 
-    assert issubclass(HybridKDATokenToKVPool, MLATokenToKVPool)
-    assert (
-        HybridKDATokenToKVPool.set_mla_kv_buffer is MLATokenToKVPool.set_mla_kv_buffer
-    )
-    assert HybridKDATokenToKVPool.latent_write_sanitizes is True
-    assert MLATokenToKVPool.latent_write_sanitizes is False
-
+    slots = torch.arange(4, device="cuda")
     pool = _fake_mla_pool()
     pool.__class__ = HybridKDATokenToKVPool
-    arg = _gate_arg_for_pool(pool)
-    assert arg is not None
-    assert arg.sanitize is True
-
-    plain = _fake_mla_pool()
-    plain_arg = _gate_arg_for_pool(plain)
-    assert plain_arg is not None
-    assert plain_arg.sanitize is False
+    assert pool.kv_write_target(0, slots, None).sanitize is True
+    assert _fake_mla_pool().kv_write_target(0, slots, None).sanitize is False
 
 
-def test_every_fused_call_site_uses_the_probed_entry_point():
-    """The gate answers for ``embedding.rope_mla_set_kv``, so every launch
-    that carries its argument goes through that entry point.
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_latent_prologue_hands_attention_the_cache_dtype(hybrid, dtype):
+    """An FP8 latent cache gets an FP8 query; the pool decides, hybrid or not."""
+    from types import SimpleNamespace
 
-    Overrides are keyed by ``(family, mode)`` and resolve without trait
-    filtering, so a call site that builds the argument here and then launches
-    through ``embedding.rope`` -- as ``rotary_emb`` does -- can be redirected
-    to a solution that rejects the fused argument, and inference raises where
-    the gate promised a working kernel.
-    """
-    import ast
-    import pathlib
+    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
+        HybridKDATokenToKVPool,
+    )
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
-    source = (
-        pathlib.Path(__file__).resolve().parents[3]
-        / "python/tokenspeed/runtime/models/deepseek_v3.py"
-    ).read_text()
-    tree = ast.parse(source)
-
-    carriers = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and any(kw.arg == "fused_mla_set_kv_buffer_arg" for kw in node.keywords)
-    ]
-    assert len(carriers) == 2, "expected the FP8 and BF16 fused branches"
-    for call in carriers:
-        assert isinstance(call.func, ast.Name), ast.dump(call.func)
-        assert call.func.id == "apply_rope_mla_set_kv", call.func.id
+    pool = _fake_mla_pool(dtype)
+    if hybrid:
+        pool.__class__ = HybridKDATokenToKVPool
+    layer = PagedAttention(
+        2,
+        TOTAL_DIM,
+        1.0,
+        num_kv_heads=1,
+        layer_id=0,
+        v_head_dim=NOPE_DIM,
+        rotary_emb=None,
+        qk_norm=None,
+    )
+    query = torch.randn(3, 2, TOTAL_DIM, device="cuda", dtype=torch.bfloat16)
+    out = layer.latent_prologue(
+        query,
+        query[..., NOPE_DIM:],
+        torch.randn(3, TOTAL_DIM, device="cuda", dtype=torch.bfloat16),
+        torch.arange(3, device="cuda"),
+        SimpleNamespace(
+            token_to_kv_pool=pool,
+            attn_backend=SimpleNamespace(cache_placement=lambda layer: None),
+        ),
+        slots=torch.arange(3, device="cuda"),
+        expanded=None,
+        key_rows=None,
+    )
+    assert out.query.dtype == dtype
 
 
 @pytest.mark.parametrize("n_loc", [1, 4, 600])
@@ -779,16 +791,19 @@ def test_fused_write_follows_a_strided_cache_loc(n_loc: int) -> None:
             n_loc, num_heads, NOPE_DIM + ROPE_DIM, device="cuda", dtype=dtype
         )
         kv = _empty_kv(torch.float8_e4m3fn)
-        apply_rope_mla_set_kv(
+        apply_rope_mla_set_kv_buffer_triton(
             positions=positions,
             q_rope=q_rope,
             k_rope=k_rope,
+            cos_sin_cache=None,
+            is_neox=True,
             fused_mla_set_kv_buffer_arg=FusedMLASetKVBufferArg(
                 k_nope=k_nope,
                 kv_buffer=kv,
                 cache_loc=loc,
                 q_nope=q_nope,
-                cos_sin_cache=None,
+                sanitize=False,
+                write_mask=None,
             ),
             q_rope_out=query,
         )
@@ -857,3 +872,7 @@ def test_stacked_latent_write_matches_norm_rope_then_scatter(dtype, is_neox, san
         torch.testing.assert_close(
             buffers[layer].float(), expected, atol=tolerance, rtol=tolerance
         )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

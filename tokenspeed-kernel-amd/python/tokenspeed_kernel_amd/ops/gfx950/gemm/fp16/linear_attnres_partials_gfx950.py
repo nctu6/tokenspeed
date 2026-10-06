@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
-from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import _mfma_lds_mediumm_kernel
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+    gluon_mm_a16w16_medium_gfx950,
+)
 
 _INPUT_SIZE = gl.constexpr(7168)
 _BLOCK_N_SIZE = 16
@@ -37,7 +39,7 @@ _PARTIAL_BLOCK = gl.constexpr(8192)
 
 
 @gluon.jit
-def _linear_attnres_partials_kernel(
+def gluon_linear_attnres_partials_gfx950(
     hidden_ptr,
     weight_ptr,
     output_ptr,
@@ -208,7 +210,7 @@ def _linear_attnres_partials_kernel(
 
 
 @gluon.jit
-def _linear_attnres_partials_m4_mfma_kernel(
+def gluon_linear_attnres_partials_m4_gfx950(
     hidden_ptr,
     weight_ptr,
     output_ptr,
@@ -229,9 +231,11 @@ def _linear_attnres_partials_m4_mfma_kernel(
     """Run an M=4 MFMA projection alongside dual-AttnRes CTAs."""
     pid = gl.program_id(0)
     if pid >= 4:
-        _mfma_lds_mediumm_kernel(
+        gluon_mm_a16w16_medium_gfx950(
             hidden_ptr,
             weight_ptr,
+            output_ptr,
+            output_ptr,
             output_ptr,
             output_ptr,
             output_ptr,
@@ -256,10 +260,12 @@ def _linear_attnres_partials_m4_mfma_kernel(
             NUM_BUFFERS=3,
             GROUP_SIZE_M=1,
             ADD3=False,
+            SPLIT_K=1,
+            NUM_XCDS=1,
             PID_OFFSET=4,
         )
     else:
-        _linear_attnres_partials_kernel(
+        gluon_linear_attnres_partials_gfx950(
             hidden_ptr,
             weight_ptr,
             output_ptr,
@@ -281,7 +287,7 @@ def _linear_attnres_partials_m4_mfma_kernel(
         )
 
 
-def gluon_linear_attnres_partials_gfx950(
+def launch_gluon_linear_attnres_partials_gfx950(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
     blocks: torch.Tensor,
@@ -349,7 +355,7 @@ def gluon_linear_attnres_partials_gfx950(
         raise ValueError("AttnRes epsilon must be positive")
 
     if num_tokens == 4 and output_size == 6288:
-        _linear_attnres_partials_m4_mfma_kernel[(output_size // _BLOCK_N_SIZE + 4,)](
+        gluon_linear_attnres_partials_m4_gfx950[(output_size // _BLOCK_N_SIZE + 4,)](
             hidden_states,
             weight,
             out,
@@ -373,7 +379,7 @@ def gluon_linear_attnres_partials_gfx950(
     attnres_program_offset = (
         192 if num_tokens == 2 and output_size == 6288 else projection_programs
     )
-    _linear_attnres_partials_kernel[(projection_programs + num_tokens,)](
+    gluon_linear_attnres_partials_gfx950[(projection_programs + num_tokens,)](
         hidden_states,
         weight,
         out,
@@ -388,11 +394,11 @@ def gluon_linear_attnres_partials_gfx950(
         num_tokens,
         attnres_program_offset,
         output_size,
-        num_warps=_NUM_WARPS,
+        num_warps=_NUM_WARPS.value,
         num_stages=1,
         waves_per_eu=1,
     )
     return out
 
 
-__all__ = ["gluon_linear_attnres_partials_gfx950"]
+__all__ = ["launch_gluon_linear_attnres_partials_gfx950"]

@@ -1,6 +1,6 @@
-"""End-to-end tests for --no-enable-prefix-caching.
+"""End-to-end tests for --disable-prefix-caching.
 
-Validates that the ``--no-enable-prefix-caching`` flag actually disables
+Validates that the ``--disable-prefix-caching`` flag actually disables
 prefix caching at runtime, by checking the ``cached_tokens`` field in
 ``Engine.generate()`` response ``meta_info``.
 
@@ -150,6 +150,7 @@ def _make_engine(case: ModelCase, enable_prefix_caching: bool) -> Engine:
         "chunked_prefill_size": 1024,
         "gpu_memory_utilization": 0.7,
         "disable_kvstore": True,
+        "disable_autotune": True,
     }
     kwargs.update(case.extra_kwargs)
     return Engine(**kwargs)

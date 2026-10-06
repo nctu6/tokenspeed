@@ -20,12 +20,7 @@
 
 from __future__ import annotations
 
-import logging
-
 import torch
-from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
-    situ_moe_unavailable_reason,
-)
 from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -35,63 +30,68 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-logger = logging.getLogger(__name__)
-
 platform = current_platform()
 TRTLLM_NVFP4_ISPP_ALIGNMENT = 64
+# Non-gated GEMM1 tiles its rows by 128.
+TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT = 128
 
 
 if platform.is_nvidia:
     from flashinfer import (
         fp4_quantize,
         nvfp4_block_scale_interleave,
-        trtllm_fp4_block_scale_moe,
     )
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
     )
     from flashinfer.fused_moe.core import (
         get_w2_permute_indices_with_cache,
     )
-
-    # SiTU availability (flashinfer > 0.6.15, PR #4180) and the per-expert
-    # SiTU constant lookup are shared with the MXFP4 TRT-LLM integration.
+    from flashinfer.tllm_enums import ActivationType
     from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
-        _SITU_ACTIVATION_TYPE,
         _positive_situ_value,
+    )
+    from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
+        trtllm_fp4_block_scale_moe,
+        trtllm_fp4_block_scale_routed_moe,
     )
 
     def _flashinfer_trtllm_nvfp4_moe_weights(
-        plan: dict, w: torch.nn.Module, *, situ: bool
+        plan: dict, w: torch.nn.Module, *, activation: str
     ):
-        if situ and (reason := situ_moe_unavailable_reason()) is not None:
-            raise RuntimeError(reason)
+        if activation not in ("swiglu", "situ", "relu2"):
+            raise ValueError(f"unsupported NVFP4 MoE activation {activation!r}")
+        # relu2 is non-gated: w13 holds only the up projection.
+        gated = activation != "relu2"
         _group_size = 16
         _correction_bias = getattr(w, "_correction_bias", None)
         _routing_logits_dtype = getattr(w, "_routing_logits_dtype", torch.bfloat16)
 
         num_experts = w.w13_weight.shape[0]
-        # intermediate_size_per_partition = half of w13 rows (gate + up)
-        intermediate_size = w.w13_weight.shape[1] // 2
+        w13_rows = w.w13_weight.shape[1]
+        # intermediate_size_per_partition: gated w13 stacks gate + up.
+        intermediate_size = w13_rows // 2 if gated else w13_rows
         hidden_size = w.w13_weight.shape[2] * 2
 
-        # Fix 1: Swap [W1(Gate), W3(Up)] -> [W3(Up), W1(Gate)].
-        # The fused gated-act reorder interleaves [first_half, second_half] as
-        # [row0_first, row0_second, row1_first, row1_second, ...].
-        # It expects [W3(Up), W1(Gate)] so that the interleaved result pairs
-        # each up-proj row with its corresponding gate-proj row correctly.
-        half_w = w.w13_weight.shape[1] // 2
-        w1_weight = w.w13_weight.data[:, :half_w, :].clone()
-        w.w13_weight.data[:, :half_w, :] = w.w13_weight.data[:, half_w:, :]
-        w.w13_weight.data[:, half_w:, :] = w1_weight
-        del w1_weight
+        if gated:
+            # Fix 1: Swap [W1(Gate), W3(Up)] -> [W3(Up), W1(Gate)].
+            # The fused gated-act reorder interleaves [first_half, second_half] as
+            # [row0_first, row0_second, row1_first, row1_second, ...].
+            # It expects [W3(Up), W1(Gate)] so that the interleaved result pairs
+            # each up-proj row with its corresponding gate-proj row correctly.
+            half_w = w13_rows // 2
+            w1_weight = w.w13_weight.data[:, :half_w, :].clone()
+            w.w13_weight.data[:, :half_w, :] = w.w13_weight.data[:, half_w:, :]
+            w.w13_weight.data[:, half_w:, :] = w1_weight
+            del w1_weight
 
-        half_s = w.w13_weight_scale.shape[1] // 2
-        w1_scale = w.w13_weight_scale.data[:, :half_s, :].clone()
-        w.w13_weight_scale.data[:, :half_s, :] = w.w13_weight_scale.data[:, half_s:, :]
-        w.w13_weight_scale.data[:, half_s:, :] = w1_scale
-        del w1_scale
+            half_s = w.w13_weight_scale.shape[1] // 2
+            w1_scale = w.w13_weight_scale.data[:, :half_s, :].clone()
+            w.w13_weight_scale.data[:, :half_s, :] = w.w13_weight_scale.data[
+                :, half_s:, :
+            ]
+            w.w13_weight_scale.data[:, half_s:, :] = w1_scale
+            del w1_scale
 
         # Shuffle weights and scales using fused-kernel permute indices.
         cache: dict = {}
@@ -99,10 +99,10 @@ if platform.is_nvidia:
 
         # View as fp8 for permutation (uint8 and fp8_e4m3fn are both 1 byte)
         w13_fp4 = w.w13_weight.data.view(torch.float8_e4m3fn).reshape(
-            num_experts, 2 * intermediate_size, hidden_size // 2
+            num_experts, w13_rows, hidden_size // 2
         )
         w13_scales = w.w13_weight_scale.data.view(torch.float8_e4m3fn).reshape(
-            num_experts, 2 * intermediate_size, hidden_size // _group_size
+            num_experts, w13_rows, hidden_size // _group_size
         )
         w2_fp4 = w.w2_weight.data.view(torch.float8_e4m3fn).reshape(
             num_experts, hidden_size, intermediate_size // 2
@@ -119,7 +119,10 @@ if platform.is_nvidia:
         for idx in range(num_experts):
             # W1/W3 (gemm1) weight permutation
             perm = maybe_get_cached_w3_w1_permute_indices(
-                cache, w13_fp4[idx].view(torch.uint8), epilogue_tile_m
+                cache,
+                w13_fp4[idx].view(torch.uint8),
+                epilogue_tile_m,
+                is_gated_act_gemm=gated,
             )
             w13_weights_shuffled.append(
                 w13_fp4[idx].view(torch.uint8)[perm.to(w13_fp4.device)].contiguous()
@@ -130,6 +133,7 @@ if platform.is_nvidia:
                 w13_scales[idx].view(torch.uint8),
                 epilogue_tile_m,
                 num_elts_per_sf=16,
+                is_gated_act_gemm=gated,
             )
             w13_scales_shuffled.append(
                 nvfp4_block_scale_interleave(
@@ -167,7 +171,7 @@ if platform.is_nvidia:
         w.gemm1_scales_fp4_shuffled = torch.nn.Parameter(
             torch.stack(w13_scales_shuffled)
             .view(torch.float8_e4m3fn)
-            .reshape(num_experts, 2 * intermediate_size, hidden_size // _group_size),
+            .reshape(num_experts, w13_rows, hidden_size // _group_size),
             requires_grad=False,
         )
         w.gemm2_weights_fp4_shuffled = torch.nn.Parameter(
@@ -195,9 +199,8 @@ if platform.is_nvidia:
         else:
             gate_ws2 = ws2.reshape(ws2.shape[0])
             up_ws2 = gate_ws2
-        # Input scales (max across shards) for alpha computation
-        w13_input_scale = w.w13_input_scale.max().to(torch.float32)
-        w2_input_scale = w.w2_input_scale.max().to(torch.float32)
+        w13_input_scale = w.w13_input_scale.to(torch.float32)
+        w2_input_scale = w.w2_input_scale.to(torch.float32)
 
         # Store input_scale_quant for runtime fp4_quantize
         w13_input_scale_quant = (1.0 / w13_input_scale).to(torch.float32)
@@ -214,7 +217,13 @@ if platform.is_nvidia:
             (w2_input_scale * w.w2_weight_scale_2).to(torch.float32),
             requires_grad=False,
         )
-        if situ:
+        if activation == "relu2":
+            # Dequant is applied before squaring, so scale_c is only the GEMM2-input requant.
+            w.g1_scale_c = torch.nn.Parameter(
+                (w2_input_scale_quant * torch.ones_like(up_ws2)).to(torch.float32),
+                requires_grad=False,
+            )
+        elif activation == "situ":
             # SiTU is nonlinear in BOTH GEMM1 halves: the kernel dequantizes
             # the raw accumulators with output1_scale_gate_scalar inside the
             # activation, so (a) gate and up must share one per-expert global
@@ -295,15 +304,18 @@ if platform.is_nvidia:
             _correction_bias = _correction_bias.to(_routing_logits_dtype)
 
     def flashinfer_trtllm_nvfp4_moe_weights(plan: dict, w: torch.nn.Module):
-        return _flashinfer_trtllm_nvfp4_moe_weights(plan, w, situ=False)
+        return _flashinfer_trtllm_nvfp4_moe_weights(plan, w, activation="swiglu")
 
     def flashinfer_trtllm_nvfp4_situ_moe_weights(plan: dict, w: torch.nn.Module):
         # SiTU shares the standard TRT-LLM [up|gate] shuffled layout with
         # SwiGLU; only the GEMM1 output scales and act constants differ.
-        return _flashinfer_trtllm_nvfp4_moe_weights(plan, w, situ=True)
+        return _flashinfer_trtllm_nvfp4_moe_weights(plan, w, activation="situ")
+
+    def flashinfer_trtllm_nvfp4_relu2_moe_weights(plan: dict, w: torch.nn.Module):
+        return _flashinfer_trtllm_nvfp4_moe_weights(plan, w, activation="relu2")
 
     def _flashinfer_trtllm_nvfp4_moe_apply(
-        x: torch.Tensor,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         w: torch.nn.Module,
         router_logits: torch.Tensor,
         topk_weights: torch.Tensor | None,
@@ -323,25 +335,34 @@ if platform.is_nvidia:
         """
         _spec = getattr(w, "_spec", None)
 
-        num_tokens = x.shape[0]
+        prequantized = isinstance(x, tuple)
+        data = x[0] if prequantized else x
+        num_tokens = data.shape[0]
         # Idle DP ranks pass 0 tokens and the fused kernel divides by token count on host; skip experts.
         if num_tokens == 0:
+            output = (
+                data.new_empty((0, data.shape[1] * 2), dtype=torch.bfloat16)
+                if prequantized
+                else data
+            )
             if do_finalize:
-                return x
+                return output
             return (
-                x,
-                x.new_empty((0, _spec.top_k), dtype=torch.bfloat16),
+                output,
+                data.new_empty((0, _spec.top_k), dtype=torch.bfloat16),
                 # moe_finalize_fuse_shared expects a 1-D [num_tokens * top_k] permute map.
-                x.new_empty((0,), dtype=torch.int32),
+                data.new_empty((0,), dtype=torch.int32),
             )
 
-        # Quantize input to FP4 using the fused-kernel scale layout.
-        hs_fp4, hs_scale = fp4_quantize(
-            x,
-            w.w13_input_scale_quant,
-            is_sf_swizzled_layout=False,
-            enable_pdl=enable_pdl,
-        )
+        if prequantized:
+            hs_fp4, hs_scale = x
+        else:
+            hs_fp4, hs_scale = fp4_quantize(
+                x,
+                w.w13_input_scale_quant,
+                is_sf_swizzled_layout=False,
+                enable_pdl=enable_pdl,
+            )
 
         # GEMM and scale arguments shared by both kernel entry points.
         common_kwargs = dict(
@@ -532,50 +553,184 @@ if platform.is_nvidia:
             routed=True,
         )
 
-    def _register_nvfp4_situ_kernel(function):
-        reason = situ_moe_unavailable_reason()
-        if reason is not None:
-            # Skipping is normal for deployments that don't serve Kimi-K3, so
-            # log at INFO -- but keep the reason (e.g. a flashinfer build
-            # without SiTU), which otherwise vanishes and makes "kernel not
-            # found" failures hard to trace back here.
-            logger.info("Kimi-K3 NVFP4 SiTU MoE kernel not registered: %s", reason)
-            return function
-        return register_kernel(
-            "moe",
-            "apply",
-            name="flashinfer_trtllm_nvfp4_situ_routed_moe_apply",
-            solution="flashinfer_trtllm",
-            weight_preprocessor=flashinfer_trtllm_nvfp4_situ_moe_weights,
-            capability=CapabilityRequirement(
-                vendors=frozenset({"nvidia"}),
-                min_arch_version=ArchVersion(10, 0),
-                max_arch_version=ArchVersion(10, 3),
-            ),
-            signatures=format_signatures(
-                "x",
-                "dense",
-                {torch.bfloat16},
-            ),
-            traits={
-                "weight_dtype": frozenset({"nvfp4"}),
-                "activation": frozenset({"situ"}),
-                "routing_mode": frozenset({"precomputed_topk"}),
-                "supports_deferred_finalize": frozenset({True, False}),
-                "supports_ep": frozenset({True}),
-                "supports_all_to_all_ep": frozenset({False}),
-                "ispp_alignment": frozenset({TRTLLM_NVFP4_ISPP_ALIGNMENT}),
-                # NVFP4 SiTU runs w4a4: the wrapper quantizes the bf16 input
-                # to NVFP4 itself, which the registry models as "input"
-                # (unlike the MXFP4 SiTU cubins, which are w4a8/MXFP8).
-                "internal_activation_dtype": frozenset({"input"}),
-                "supports_bias": frozenset({False}),
-            },
-            priority=Priority.SPECIALIZED,
-        )(function)
-
-    @_register_nvfp4_situ_kernel
+    @register_kernel(
+        "moe",
+        "apply",
+        name="flashinfer_trtllm_nvfp4_situ_routed_moe_apply",
+        solution="flashinfer_trtllm",
+        weight_preprocessor=flashinfer_trtllm_nvfp4_situ_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 7),
+        ),
+        signatures=format_signatures(
+            "x",
+            "dense",
+            {torch.bfloat16, torch.uint8},
+        ),
+        traits={
+            "weight_dtype": frozenset({"nvfp4"}),
+            "activation": frozenset({"situ"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({True, False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({TRTLLM_NVFP4_ISPP_ALIGNMENT}),
+            # NVFP4 SiTU runs w4a4, accepting BF16 or an already-quantized pair.
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({False}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
     def flashinfer_trtllm_nvfp4_situ_routed_moe_apply(
+        plan: dict,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ):
+        if topk_weights is None or topk_ids is None:
+            raise ValueError("precomputed_topk plan requires topk_weights and topk_ids")
+        if isinstance(x, tuple):
+            data, scales = x
+            if data.dtype != torch.uint8 or scales.dtype not in (
+                torch.uint8,
+                torch.float8_e4m3fn,
+            ):
+                raise TypeError(
+                    "Prequantized NVFP4 requires uint8 data and byte-sized block scales"
+                )
+            if (
+                data.ndim != 2
+                or data.shape[1] % 8 != 0
+                or scales.shape != (data.shape[0], data.shape[1] // 8)
+            ):
+                raise ValueError(
+                    "Prequantized NVFP4 requires linear per-token block scales"
+                )
+            output_shape = (data.shape[0], data.shape[1] * 2)
+        else:
+            if x.dtype != torch.bfloat16:
+                raise TypeError(
+                    "FlashInfer NVFP4 SiTU requires bf16 input or an NVFP4 pair"
+                )
+            output_shape = x.shape
+        # Caller-owned destination (e.g. K3's fused all-reduce lane slice):
+        # writing the finalized rows in place keeps the join zero-copy, same
+        # contract as the MXFP4 SiTU kernel. Only meaningful when finalizing;
+        # deferred mode returns the permuted triple (gemm2 rows, the caller's
+        # bf16 expert weights echoed back, expanded_idx) instead of finalized
+        # rows, so no destination exists to write into.
+        out_buf = getattr(w, "_situ_output_buffer", None) if do_finalize else None
+        if not (
+            out_buf is not None
+            and out_buf.shape == output_shape
+            and out_buf.is_contiguous()
+        ):
+            out_buf = None
+        return _flashinfer_trtllm_nvfp4_moe_apply(
+            x,
+            w,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            do_finalize,
+            enable_pdl,
+            routed=True,
+            activation_type=ActivationType.Situ,
+            output=out_buf,
+        )
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="flashinfer_trtllm_nvfp4_relu2_moe_apply",
+        solution="flashinfer_trtllm",
+        weight_preprocessor=flashinfer_trtllm_nvfp4_relu2_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+        ),
+        signatures=format_signatures(
+            "x",
+            "dense",
+            {torch.float16, torch.bfloat16},
+        ),
+        traits={
+            "weight_dtype": frozenset({"nvfp4"}),
+            "activation": frozenset({"relu2"}),
+            "routing_mode": frozenset({"kernel_routing"}),
+            "supports_deferred_finalize": frozenset({True}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({False}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def flashinfer_trtllm_nvfp4_relu2_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ):
+        return _flashinfer_trtllm_nvfp4_moe_apply(
+            x,
+            w,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            do_finalize,
+            enable_pdl,
+            routed=False,
+            activation_type=ActivationType.Relu2,
+        )
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="flashinfer_trtllm_nvfp4_relu2_routed_moe_apply",
+        solution="flashinfer_trtllm",
+        weight_preprocessor=flashinfer_trtllm_nvfp4_relu2_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+        ),
+        signatures=format_signatures(
+            "x",
+            "dense",
+            {torch.float16, torch.bfloat16},
+        ),
+        traits={
+            "weight_dtype": frozenset({"nvfp4"}),
+            "activation": frozenset({"relu2"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({True}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({False}),
+        },
+        # One below in-kernel routing: this wins only for plans with routing_mode="precomputed_topk".
+        priority=Priority.PERFORMANT + 3,
+    )
+    def flashinfer_trtllm_nvfp4_relu2_routed_moe_apply(
         plan: dict,
         x: torch.Tensor,
         w: torch.nn.Module,
@@ -589,21 +744,6 @@ if platform.is_nvidia:
     ):
         if topk_weights is None or topk_ids is None:
             raise ValueError("precomputed_topk plan requires topk_weights and topk_ids")
-        if x.dtype != torch.bfloat16:
-            raise TypeError("FlashInfer NVFP4 SiTU requires bf16 input")
-        # Caller-owned destination (e.g. K3's fused all-reduce lane slice):
-        # writing the finalized rows in place keeps the join zero-copy, same
-        # contract as the MXFP4 SiTU kernel. Only meaningful when finalizing;
-        # deferred mode returns the permuted triple (gemm2 rows, the caller's
-        # bf16 expert weights echoed back, expanded_idx) instead of finalized
-        # rows, so no destination exists to write into.
-        out_buf = getattr(w, "_situ_output_buffer", None) if do_finalize else None
-        if not (
-            out_buf is not None
-            and out_buf.shape == (x.shape[0], x.shape[-1])
-            and out_buf.is_contiguous()
-        ):
-            out_buf = None
         return _flashinfer_trtllm_nvfp4_moe_apply(
             x,
             w,
@@ -613,6 +753,5 @@ if platform.is_nvidia:
             do_finalize,
             enable_pdl,
             routed=True,
-            activation_type=_SITU_ACTIVATION_TYPE,
-            output=out_buf,
+            activation_type=ActivationType.Relu2,
         )

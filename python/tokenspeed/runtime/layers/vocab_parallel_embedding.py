@@ -28,11 +28,16 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.platform import current_platform
 from torch.nn.parameter import Parameter, UninitializedParameter
 
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
+from tokenspeed.runtime.distributed.comm_ops import (
+    all_reduce,
+    token_all_gather_rows,
+    token_reduce_scatter,
+)
 from tokenspeed.runtime.distributed.utils import divide
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.parameter import BaseWeightParameter
 from tokenspeed.runtime.layers.quantization.base_config import (
     QuantizationConfig,
@@ -86,6 +91,14 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
+            # Bitwise envelopes: the logits GEMM must be batch-invariant like
+            # every other row-parallel projection (see layers/dense/unquant).
+            import tokenspeed_kernel
+
+            return tokenspeed_kernel.mm(x, layer.weight, bias=bias, override="aok")
         return F.linear(x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
@@ -173,7 +186,6 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_added_elements <= self.num_added_elements_padded
 
 
-@torch.compile(disable=current_platform().is_npu)
 def get_masked_input_and_mask(
     input_: torch.Tensor,
     org_vocab_start_index: int,
@@ -182,8 +194,6 @@ def get_masked_input_and_mask(
     added_vocab_start_index: int,
     added_vocab_end_index: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # torch.jit.script will fuse all of the pointwise ops below
-    # into a single kernel, making it very fast
     org_vocab_mask = (input_ >= org_vocab_start_index) & (input_ < org_vocab_end_index)
     added_vocab_mask = (input_ >= added_vocab_start_index) & (
         input_ < added_vocab_end_index
@@ -507,62 +517,123 @@ class VocabParallelEmbedding(torch.nn.Module):
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 
+    def _fused_shard_gather(self, input_: torch.Tensor) -> bool:
+        """Whether the plain table lookup can run as one masked gather kernel.
+
+        Quantized embedding methods and the FP8 PLE table keep the two-step
+        mask-then-lookup path; their lookups are not a row gather of
+        ``self.weight``.
+        """
+        return (
+            input_.is_cuda
+            and type(self.quant_method) is UnquantizedEmbeddingMethod
+            and self.weight.dtype not in _FLOAT8_DTYPES
+            and self.weight.is_cuda
+        )
+
     def forward(
-        self, input_: torch.Tensor, reduce_results: bool = True
+        self,
+        input_: torch.Tensor,
+        reduce_results: bool = True,
+        *,
+        query_shard: QueryShardPlan | None = None,
     ) -> torch.Tensor:
         """Forward pass for the vocabulary parallel embedding.
 
         Args:
             input_: The input tensor.
             reduce_results: Whether to reduce the results across all the model parallel GPUs.
+            query_shard: The forward's query shard when ``input_`` holds this
+                rank's rows of a sharded extend (query context parallelism;
+                ``ctx.query_shard``). ``None`` -- the default, every other
+                caller -- means the ids are the same on every rank of the
+                group. Under a shard every vocab shard must see every row's
+                id, so the ids are all-gathered to the span, the partial
+                lookup runs over the span and the sum is reduce-scattered
+                back to the shard's rows: the same bytes as the replicated
+                all-reduce, the rows this rank holds.
 
         Returns:
             The output tensor.
 
         """
-        if self.tp_size > 1:
-            # Build the mask.
-            masked_input, input_mask = get_masked_input_and_mask(
-                input_,
-                self.shard_indices.org_vocab_start_index,
-                self.shard_indices.org_vocab_end_index,
-                self.shard_indices.num_org_vocab_padding,
-                self.shard_indices.added_vocab_start_index,
-                self.shard_indices.added_vocab_end_index,
+        sharded = query_shard is not None and query_shard.size > 1
+        if sharded and self.tp_size > 1:
+            if not reduce_results:
+                raise ValueError("a query-sharded embedding lookup reduces its rows")
+            if input_.dim() != 1 or input_.shape[0] != query_shard.local_rows:
+                raise ValueError(
+                    f"query shard rank {query_shard.rank} embeds "
+                    f"{query_shard.local_rows} rows, got {tuple(input_.shape)}"
+                )
+            if len(self.tp_group) != query_shard.size:
+                raise ValueError(
+                    f"the embedding's TP group of {len(self.tp_group)} ranks is not "
+                    f"the query shard group of {query_shard.size}"
+                )
+            counts = list(query_shard.row_counts)
+            ids = token_all_gather_rows(
+                input_.reshape(-1, 1), self.tp_group, counts
+            ).reshape(-1)
+            return token_reduce_scatter(
+                self._partial_lookup(ids), self.tp_group, counts
             )
-        else:
-            # Single-rank (DP / replicated) path has no shard mask, so an
-            # out-of-range id (e.g. CUDA-graph capture warmup where the drafter
-            # feeds argmax over uninitialized logits) hits F.embedding OOB.
-            # Clamp here for parity with the tp_size>1 mask path; under normal
-            # inference upstream guarantees id < num_embeddings_padded so this
-            # is a no-op.
-            masked_input = input_.clamp(min=0, max=self.num_embeddings_padded - 1)
-
-        # Get the embeddings.
-        output_parallel = self.quant_method.embedding(self, masked_input)
-
-        # Mask the output embedding.
         if self.tp_size > 1:
-            output_mask = input_mask.unsqueeze(-1)
-            if output_parallel.dtype in _FLOAT8_DTYPES:
-                # CUDA does not implement masked_fill_ for FP8. PLE keeps its
-                # n-gram table in FP8 and dequantizes after this sharded
-                # lookup, so preserve the FP8 payload while zeroing rows that
-                # belong to another TP rank with the supported pointwise op.
-                output_parallel = torch.where(output_mask, 0.0, output_parallel)
-            else:
-                output_parallel.masked_fill_(output_mask, 0)
-
+            output_parallel = self._partial_lookup(input_)
             if reduce_results:
-                output = all_reduce(output_parallel, self.tp_group)
-            else:
-                output = output_parallel
+                return all_reduce(output_parallel, self.tp_group)
+            return output_parallel
+        # Single-rank (DP / replicated) path has no shard mask, so an
+        # out-of-range id (e.g. CUDA-graph capture warmup where the drafter
+        # feeds argmax over uninitialized logits) hits F.embedding OOB.
+        # Clamp here for parity with the tp_size>1 mask path; under normal
+        # inference upstream guarantees id < num_embeddings_padded so this
+        # is a no-op.
+        masked_input = input_.clamp(min=0, max=self.num_embeddings_padded - 1)
+        return self.quant_method.embedding(self, masked_input)
 
-        else:
-            output = output_parallel
+    def _partial_lookup(self, input_: torch.Tensor) -> torch.Tensor:
+        """This rank's vocab shard's contribution to every row of ``input_``:
+        the embedding of ids inside the shard, zero rows for the others. The
+        sum over the TP group is the full embedding."""
+        if self._fused_shard_gather(input_):
+            # One gather resolves the shard mask, the local index and the
+            # zeroing of other ranks' rows.
+            from tokenspeed_kernel.ops.embedding import vocab_shard_embedding
 
-        return output
+            return vocab_shard_embedding(
+                self.weight,
+                input_.contiguous(),
+                (
+                    self.shard_indices.org_vocab_start_index,
+                    self.shard_indices.org_vocab_end_index,
+                ),
+                self.shard_indices.num_org_vocab_padding,
+                (
+                    self.shard_indices.added_vocab_start_index,
+                    self.shard_indices.added_vocab_end_index,
+                ),
+            )
+        # Build the mask.
+        masked_input, input_mask = get_masked_input_and_mask(
+            input_,
+            self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+            self.shard_indices.num_org_vocab_padding,
+            self.shard_indices.added_vocab_start_index,
+            self.shard_indices.added_vocab_end_index,
+        )
+        output_parallel = self.quant_method.embedding(self, masked_input)
+        # Mask the output embedding.
+        output_mask = input_mask.unsqueeze(-1)
+        if output_parallel.dtype in _FLOAT8_DTYPES:
+            # CUDA does not implement masked_fill_ for FP8. PLE keeps its
+            # n-gram table in FP8 and dequantizes after this sharded
+            # lookup, so preserve the FP8 payload while zeroing rows that
+            # belong to another TP rank with the supported pointwise op.
+            return torch.where(output_mask, 0.0, output_parallel)
+        output_parallel.masked_fill_(output_mask, 0)
+        return output_parallel
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"

@@ -37,7 +37,6 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4Compressor,
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
-    DeepseekV4MegaMoEExperts,
     _deepseek_v4_expert_scale_parameter_name,
     hc_head,
 )
@@ -53,6 +52,7 @@ from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
     DSparkConfidenceHead,
     DSparkVanillaMarkov,
 )
+from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -142,9 +142,8 @@ def count_dspark_stages(
             )
         except Exception as exc:  # noqa: BLE001 - fail closed below
             logger.debug(
-                "Unable to resolve DSpark safetensors index for %s: %s",
-                model_path,
-                exc,
+                f"Unable to resolve DSpark safetensors index for {model_path!s}: "
+                f"{exc!s}",
             )
             return None
     if not os.path.isfile(index_path):
@@ -310,6 +309,11 @@ class DeepseekV4DSparkModel(nn.Module):
                 "Week-0 DSpark supports only the vanilla Markov head; "
                 f"got {markov_kind!r}."
             )
+        target_vocab_parallel_kwargs = {
+            "tp_rank": mapping.attn.tp_rank,
+            "tp_size": mapping.attn.tp_size,
+            "tp_group": mapping.attn.tp_group,
+        }
 
         self.stages = nn.ModuleList(
             [
@@ -328,29 +332,24 @@ class DeepseekV4DSparkModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             int(config.vocab_size),
             self.hidden_size,
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
             prefix=add_prefix("embed_tokens", prefix),
+            **target_vocab_parallel_kwargs,
         )
+        # The bigram table is replicated so the block sampler gathers rows
+        # locally; the projection shares the LM head's vocabulary shards.
         self.markov_embedding = VocabParallelEmbedding(
             int(config.vocab_size),
             self.markov_rank,
-            params_dtype=torch.float32,
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
+            params_dtype=torch.bfloat16,
             prefix=add_prefix("markov_embedding", prefix),
         )
         self.markov_projection = ParallelLMHead(
             int(config.vocab_size),
             self.markov_rank,
-            params_dtype=torch.float32,
+            params_dtype=torch.bfloat16,
             quant_config=None,
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
             prefix=add_prefix("markov_projection", prefix),
+            **target_vocab_parallel_kwargs,
         )
         self.markov_head = DSparkVanillaMarkov(
             self.markov_embedding,
@@ -420,6 +419,8 @@ class DeepseekV4DSparkModel(nn.Module):
             block.rms_norm_eps,
             block.hc_eps,
             block.hc_sinkhorn_iters,
+            norm_weight=None,
+            norm_eps=None,
         )
         layer_input = block.attn_norm(layer_input)
         attention_output = dspark_attention_forward_batched(
@@ -443,6 +444,8 @@ class DeepseekV4DSparkModel(nn.Module):
             block.rms_norm_eps,
             block.hc_eps,
             block.hc_sinkhorn_iters,
+            norm_weight=None,
+            norm_eps=None,
         )
         layer_input = block.ffn_norm(layer_input)
         flat_input = layer_input.reshape(batch * block_size, hidden_size)
@@ -531,9 +534,27 @@ class DeepseekV4DSparkModel(nn.Module):
     def local_base_logits(
         self,
         hidden_states: torch.Tensor,
-        lm_head: nn.Module,
+        head: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.matmul(hidden_states.float(), lm_head.weight.float().T)
+        """Compute public FP32 base logits from the local vocabulary shard.
+
+        ``head`` is the target's BF16 shard shared with the draft. BF16
+        products are exact in FP32, so accumulating them in FP32 reproduces
+        the reference's FP32 head GEMM up to summation order without keeping
+        an FP32 copy of the head.
+        """
+
+        if head.ndim != 2 or head.dtype != hidden_states.dtype:
+            raise ValueError(
+                "DSpark base logits need a rank-2 head in the hidden dtype; got "
+                f"{tuple(head.shape)} {head.dtype} for {hidden_states.dtype}."
+            )
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        if flat.is_cuda:
+            logits = torch.mm(flat, head.T, out_dtype=torch.float32)
+        else:
+            logits = flat.float() @ head.float().T
+        return logits.view(*hidden_states.shape[:-1], head.shape[0])
 
     def write_context_windows_batched(
         self,
@@ -581,8 +602,13 @@ class DeepseekV4DSparkModel(nn.Module):
             )
 
 
-class DeepseekV4ForCausalLMDSpark(nn.Module):
+class DeepseekV4ForCausalLMDSpark(nn.Module, TargetCaptureConfigurator):
     """Draft-only DSpark model loaded from the target checkpoint."""
+
+    def configure_target(self, target_model, target_config) -> None:
+        """Install the checkpoint's target taps before draft execution exists."""
+        del target_config
+        target_model.set_dspark_layers_to_capture(list(self.model.target_layer_ids))
 
     def __init__(
         self,
@@ -605,10 +631,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             int(config.vocab_size),
             int(config.hidden_size),
             quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
-            prefix=add_prefix("lm_head", prefix),
         )
 
     def get_hot_token_id(self):
@@ -758,7 +784,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     continue
                 param = params.get(name)
                 if param is None:
-                    logger.debug("Skipping unmatched DSpark weight: %s", name)
+                    logger.debug(f"Skipping unmatched DSpark weight: {name!s}")
                     continue
                 loader = getattr(param, "weight_loader", default_weight_loader)
                 loader(param, loaded_weight)
@@ -840,8 +866,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         for module in self.modules():
             if isinstance(module, DeepseekV4Compressor):
                 module.process_weights_after_loading()
-            elif isinstance(module, DeepseekV4MegaMoEExperts):
-                module.finalize_weights()
             elif isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
 

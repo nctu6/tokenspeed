@@ -23,10 +23,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.metadata import PrepTape, Reg
+from tokenspeed_kernel.ops.metadata import PrepTape, Reg, fill_ngram_history
 
 from tokenspeed.runtime.execution.cache_loc_kernel import fused_decode_input_prep
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
+from tokenspeed.runtime.execution.types import NGramInputs
 from tokenspeed.runtime.multimodal.inputs import Modality, substitute_mm_pad_
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -58,6 +59,8 @@ class InputBuffers:
         self.state_write_padding_pool_index = state_write_padding_pool_index
         self.max_bs = max_bs
         self.all_extends_mid_chunk = False
+        self.ngram_previous_tokens_buf: torch.Tensor | None = None
+        self.ngram_token_mask_buf: torch.Tensor | None = None
         # Per-modality in-vocab draft tokens; when set, fill rewrites the
         # drafter-only shift-1 buffer's media pad ids in place so drafters
         # only ever see embeddable input ids.
@@ -76,6 +79,13 @@ class InputBuffers:
             # Used in draft prefill
             self.shifted_prefill_ids_buf = torch.ones_like(self.input_ids_buf)
             self.input_lengths_buf = torch.ones((max_num_tokens,), dtype=torch.int32)
+            # Packed request layout read by request-token history; see
+            # prepare_request_token_history_inputs.
+            self.request_token_history_input_lengths_buf = torch.ones(
+                (max_bs,), dtype=torch.int32
+            )
+            self.input_start_offsets_buf = torch.zeros(max_bs + 1, dtype=torch.int32)
+            self.active_request_mask_buf = torch.zeros(max_bs, dtype=torch.bool)
             # Zero (not arange) so padded positions read a consistent, in-range
             # value; the tail is re-zeroed every iteration by fill_input_buffers.
             self.positions_buf = torch.zeros(max_num_tokens, dtype=torch.int64)
@@ -94,7 +104,159 @@ class InputBuffers:
         # NOT pinned: python readers only; the H2D uses the per-step bulk pinned staging (_bulk_pinned).
         self.extend_prefix_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self.extend_seq_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
+        # Host-only extend facts the attention backend plans from: how many
+        # leading input rows re-feed cached prompt positions (bounded replay)
+        # and each request's whole prompt length (whether this chunk ends it).
+        self.extend_replay_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
+        self.extend_prompt_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self._pad_tape = self._record_pad_tape()
+
+    def prepare_request_token_history_inputs(
+        self,
+        *,
+        batch_size: int,
+        num_extends: int,
+        decode_width: int,
+    ) -> None:
+        """Publish the packed batch layout request-token history reads.
+
+        Args:
+            batch_size: Rows the layout covers, graph padding included.
+            num_extends: Leading rows whose widths are their input lengths.
+            decode_width: Packed width of every remaining (decode) row.
+        """
+        if not 0 <= num_extends <= batch_size <= self.max_bs:
+            raise ValueError(
+                "request-token history batch sizes must satisfy "
+                f"0 <= num_extends <= batch_size <= {self.max_bs}"
+            )
+        if decode_width <= 0:
+            raise ValueError("request-token history decode width must be positive")
+        lengths = self.request_token_history_input_lengths_buf[:batch_size]
+        lengths.copy_(self.input_lengths_buf[:batch_size])
+        lengths[num_extends:].fill_(decode_width)
+        offsets = self.input_start_offsets_buf[: batch_size + 1]
+        offsets[0].zero_()
+        torch.cumsum(lengths, dim=0, out=offsets[1:])
+        self.active_request_mask_buf[:batch_size].fill_(True)
+
+    def prepare_request_token_history_graph_inputs(
+        self, *, active_bs: int, padded_bs: int, decode_width: int
+    ) -> None:
+        """Lay out a fixed-width decode graph batch; padding rows are inactive."""
+        if not 0 <= active_bs <= padded_bs <= self.max_bs:
+            raise ValueError(
+                "request-token history graph batch sizes must satisfy "
+                f"0 <= active_bs <= padded_bs <= {self.max_bs}"
+            )
+        torch.arange(
+            0,
+            padded_bs * decode_width + 1,
+            decode_width,
+            dtype=torch.int32,
+            device=self.device,
+            out=self.input_start_offsets_buf[: padded_bs + 1],
+        )
+        self.active_request_mask_buf[:active_bs].fill_(True)
+        self.active_request_mask_buf[active_bs:padded_bs].fill_(False)
+
+    def init_ngram_buffers(self, context_len: int) -> None:
+        """Allocate forward-sized, pointer-stable Engram inputs; no request cache."""
+        if context_len == 0:
+            return
+        self.ngram_previous_tokens_buf = torch.full(
+            (self.max_num_tokens, context_len),
+            -1,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.ngram_token_mask_buf = torch.zeros(
+            self.max_num_tokens, dtype=torch.bool, device=self.device
+        )
+
+    def ngram_model_kwargs(self, num_tokens: int) -> dict[str, torch.Tensor]:
+        """Borrow the same raw-history/mask views for every model forward."""
+        if self.ngram_previous_tokens_buf is None:
+            return {}
+        assert self.ngram_token_mask_buf is not None
+        return {
+            "engram_previous_tokens": self.ngram_previous_tokens_buf[:num_tokens],
+            "engram_token_mask": self.ngram_token_mask_buf[:num_tokens],
+        }
+
+    def fill_ngram_inputs(
+        self,
+        snapshot: NGramInputs | None,
+        total_tokens: int,
+        runtime_states: RuntimeStates,
+        forward_op,
+    ) -> None:
+        """Assemble branch-local raw history before embedding-ID clamping.
+
+        ``snapshot`` holds one immutable host seed per request in ``forward_op``;
+        ``total_tokens`` is its packed input size. ``runtime_states`` owns the
+        accepted prefix, advanced with valid_cache_lengths. For token j and
+        distance d, use input[j-d] if j >= d, else accepted_prefix[d-j-1]. The
+        same rule covers prefill, N=1 decode and speculative verify. Returns None.
+        """
+        if self.ngram_previous_tokens_buf is None:
+            if snapshot is not None:
+                raise ValueError("N-gram snapshot supplied without input buffers")
+            return
+        assert self.ngram_token_mask_buf is not None
+        tail = runtime_states.ngram_accepted_tokens
+        needs_seed = runtime_states.ngram_needs_seed
+        assert tail is not None and needs_seed is not None
+        bs = len(forward_op.request_ids)
+        if (
+            snapshot is None
+            or len(snapshot.tokens) != bs
+            or len(snapshot.positions) != bs
+        ):
+            raise ValueError("Engram requires one history snapshot per request")
+        context_len = self.ngram_previous_tokens_buf.shape[1]
+        if any(len(row) != context_len + 1 for row in snapshot.tokens):
+            raise ValueError("Engram snapshot has the wrong history width")
+
+        num_extends = forward_op.num_extends()
+        overrides = forward_op.decode_input_ids
+        reset = [
+            i < num_extends
+            or runtime_states.ngram_request_ids[slot] != rid
+            or (overrides is not None and overrides[i - num_extends] != -1)
+            for i, (rid, slot) in enumerate(
+                zip(forward_op.request_ids, forward_op.request_pool_indices)
+            )
+        ]
+        # One pinned upload carries the snapshot rows, their positions and
+        # the reset flags; the kernels read them as views.
+        rows = bs * (context_len + 1)
+        (staging_cpu,) = self._bulk_pinned((rows + 2 * bs, torch.int64))
+        staging_cpu[:rows].copy_(
+            torch.tensor(snapshot.tokens, dtype=torch.int64).view(-1)
+        )
+        staging_cpu[rows : rows + bs].copy_(
+            torch.tensor(snapshot.positions, dtype=torch.int64)
+        )
+        staging_cpu[rows + bs :].copy_(torch.tensor(reset, dtype=torch.int64))
+        staging = staging_cpu.to(self.device, non_blocking=True)
+        fill_ngram_history(
+            staging[:rows].view(bs, context_len + 1),
+            staging[rows : rows + bs],
+            staging[rows + bs :],
+            self.req_pool_indices_buf[:bs],
+            self.input_lengths_buf[:bs],
+            self.input_ids_buf,
+            runtime_states.valid_cache_lengths,
+            tail,
+            needs_seed,
+            self.ngram_previous_tokens_buf,
+            self.ngram_token_mask_buf,
+            total_tokens,
+            runtime_states.vocab_size,
+        )
+        for rid, slot in zip(forward_op.request_ids, forward_op.request_pool_indices):
+            runtime_states.ngram_request_ids[slot] = rid
 
     def _record_pad_tape(self) -> "PrepTape | None":
         """One launch for the whole padding-tail scrub.
@@ -165,6 +327,8 @@ class InputBuffers:
         forward_op,
         runtime_states: RuntimeStates,
         total_tokens: int,
+        *,
+        ngram_inputs: NGramInputs | None,
     ):
         batch_size = len(forward_op.request_ids)
         num_extends = forward_op.num_extends()
@@ -198,6 +362,12 @@ class InputBuffers:
             input_lengths_cpu,
             non_blocking=True,
         )
+        if runtime_states.has_request_token_history:
+            self.prepare_request_token_history_inputs(
+                batch_size=batch_size,
+                num_extends=num_extends,
+                decode_width=runtime_states.future_input_map.shape[1],
+            )
 
         self.all_extends_mid_chunk = (
             num_extends > 0
@@ -216,6 +386,12 @@ class InputBuffers:
             )
             self.extend_seq_lens_cpu[:num_extends] = torch.as_tensor(
                 forward_op.input_lengths[:num_extends], dtype=torch.int32
+            )
+            self.extend_replay_lens_cpu[:num_extends] = torch.as_tensor(
+                forward_op.extend_replay_lens, dtype=torch.int32
+            )
+            self.extend_prompt_lens_cpu[:num_extends] = torch.as_tensor(
+                forward_op.prefill_lengths[:num_extends], dtype=torch.int32
             )
             ext_prefix_cpu, ext_seq_cpu = self._bulk_pinned(
                 (num_extends, torch.int32), (num_extends, torch.int32)
@@ -272,6 +448,13 @@ class InputBuffers:
                 dummy_tail = ids.expand(-1, width - 1)
                 runtime_states.future_input_map[decode_req_pool_indices, 1:] = (
                     torch.where(force_single_token.unsqueeze(1), dummy_tail, tail)
+                )
+            if runtime_states.future_parent_map is not None:
+                parents = runtime_states.future_parent_map[decode_req_pool_indices]
+                runtime_states.future_parent_map[decode_req_pool_indices] = torch.where(
+                    force_single_token.unsqueeze(1),
+                    runtime_states.chain_parents,
+                    parents,
                 )
             self.force_single_token_verify_buf[
                 row_offset : row_offset + expected_count
@@ -394,6 +577,7 @@ class InputBuffers:
         # sampled token), and every id the drafters consume is sampled or
         # substituted in-vocab by construction.
         vocab_size = runtime_states.vocab_size
+        self.fill_ngram_inputs(ngram_inputs, total_tokens, runtime_states, forward_op)
         self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
 
         if valid_cache_lengths is not None:
@@ -430,15 +614,21 @@ class InputBuffers:
                 )
                 self.seq_lens_buf[batch_size:].fill_(1)
 
+        self.input_lengths_buf[batch_size:].zero_()
         return decode_input_ids
 
     def fill_dummy_decode_buffers(self, batch_size: int, total_tokens: int):
         """Prepare padded decode graph inputs for a rank with no real tokens."""
+        if self.ngram_previous_tokens_buf is not None:
+            assert self.ngram_token_mask_buf is not None
+            self.ngram_previous_tokens_buf[:total_tokens].fill_(-1)
+            self.ngram_token_mask_buf[:total_tokens].zero_()
         if total_tokens > 0:
             self.input_ids_buf[:total_tokens].fill_(1)
             self.positions_buf[:total_tokens].fill_(0)
             self.mrope_positions_buf[:, :total_tokens].zero_()
         if batch_size > 0:
+            self.input_lengths_buf[:batch_size].zero_()
             self.req_pool_indices_buf[:batch_size].fill_(0)
             self.state_write_req_pool_indices_buf[:batch_size].fill_(
                 self.state_write_padding_pool_index

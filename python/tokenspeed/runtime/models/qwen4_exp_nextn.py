@@ -24,10 +24,10 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Iterable
-from dataclasses import replace
 from typing import Any
 
 import torch
+from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from torch import nn
 
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -35,7 +35,6 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -90,52 +89,45 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
 
     def _attn(
         self,
+        positions: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         gate: torch.Tensor | None,
         ctx: ForwardContext,
+        *,
+        topk_indices: torch.Tensor | None,
     ) -> torch.Tensor:
         if ctx.draft_narrowing is None:
-            return super()._attn(q, k, v, gate, ctx)
-        from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-
-        # The live rows attend over the accepted prefix, not the verify window.
-        ctx.draft_narrowing.publish_accepted_prefix()
-        q = q.index_select(0, ctx.gather_ids)
+            return super()._attn(
+                positions, q, k, v, gate, ctx, topk_indices=topk_indices
+            )
+        rows = ctx.gather_ids
+        if topk_indices is None:
+            output = self.attn.attend_live_rows(q, k, v, positions, ctx)
+        else:
+            # Sparse QSA attends the live rows in the round's own mode.
+            ctx.draft_narrowing.publish_accepted_prefix()
+            q = self.attn.prologue(q, k, v, positions, ctx).q
+            output = self.attn(
+                q.index_select(0, rows),
+                k=None,
+                v=None,
+                positions=None,
+                ctx=ctx,
+                topk_indices=topk_indices.index_select(0, rows),
+            )
         if gate is not None:
-            gate = gate.index_select(0, ctx.gather_ids)
-        decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
-        output = self.attn(
-            q,
-            k,
-            v,
-            decode_ctx,
-            record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
-        )
-        if gate is not None:
-            sigmoid_mul(output, gate)
+            sigmoid_mul(output, gate.index_select(0, rows))
         return output
-
-    def _qsa_attention(self, **kwargs) -> torch.Tensor:
-        ctx = kwargs["ctx"]
-        if ctx.draft_narrowing is None:
-            return super()._qsa_attention(**kwargs)
-        # The indexer published the accepted prefix once its verify-window
-        # layout was done; the sparse attention reads it for the live rows.
-        kwargs["q"] = kwargs["q"].index_select(0, ctx.gather_ids)
-        kwargs["selected_slots"] = kwargs["selected_slots"].index_select(
-            0, ctx.gather_ids
-        )
-        if kwargs["gate"] is not None:
-            kwargs["gate"] = kwargs["gate"].index_select(0, ctx.gather_ids)
-        return super()._qsa_attention(**kwargs)
 
     def forward(self, *args, **kwargs):
         ctx = kwargs["ctx"]
         hidden_states = kwargs["hidden_states"]
         input_ids = kwargs["input_ids"]
-        mixed, residuals = self._prepare_attention(hidden_states, input_ids, ctx)
+        mixed, residuals = self._prepare_attention(
+            hidden_states, kwargs["residual"], input_ids, ctx
+        )
         attention_output = (
             mixed
             if ctx.forward_mode.is_idle()
@@ -145,8 +137,8 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
             residuals = tuple(
                 value.index_select(0, ctx.gather_ids) for value in residuals
             )
-        hidden_states = self._finish_attention(attention_output, residuals, ctx)
-        return self._run_mlp(hidden_states, ctx), None
+        mixed, residuals = self._finish_attention(attention_output, residuals, ctx)
+        return self._run_mlp(mixed, residuals, ctx)
 
 
 class Qwen4ExpDraftModel(Qwen4ExpModel):
@@ -218,6 +210,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
+            dp_lm_head_tp=False,
         )
 
     def get_hot_token_id(self):

@@ -91,12 +91,20 @@ class _RouterCase(_TorchCase):
         leaf.max_context_len = MAX_NUM_PAGES * 2
         leaf.kernel_page_size = 2
         leaf.device = "cpu"
-        router = CacheGroupRouter(None, is_draft=False, spec_num_tokens=1, device="cpu")
+        router = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
         router.bind(
             CacheGroupGeometry(
                 granularities={FULL: 2},
                 families={FULL: "history"},
                 full_history_group_id=FULL,
+                row_geometry={FULL: (2, 1)},
+                retentions={FULL: ("full_history", None)},
             ),
             {FULL: leaf},
         )
@@ -198,6 +206,11 @@ class FlashMLATileScheduleTest(_TorchCase):
         leaf.max_context_len = MAX_NUM_PAGES * flashmla.PAGE_SIZE
         leaf.kernel_page_size = flashmla.PAGE_SIZE
         leaf.device = "cpu"
+        leaf.dcp_group = (0,)
+        leaf.dcp_rank = 0
+        leaf.dcp_block_granularity = None
+        leaf.dcp_virtual_block_count = None
+        leaf.dcp_metadata = None
         leaf.forward_decode_metadata = None
         leaf._decode_tile_metadata = None
         leaf._decode_tile_metadata_keepalive = []
@@ -437,9 +450,67 @@ class LeafSignatureConformanceTest(_TorchCase):
                         extend_prefix_lens=None,
                         extend_prefix_lens_cpu=None,
                         extend_with_prefix=False,
+                        query_shard=None,
+                        page_table_cpu=None,
                     )
                 except TypeError as exc:
                     self.fail(f"{cls.__name__}.init_forward_metadata: {exc}")
+                for name in ("query_shard", "page_table_cpu"):
+                    param = sig.parameters.get(name)
+                    self.assertIsNotNone(
+                        param, f"{cls.__name__}.init_forward_metadata lacks {name}"
+                    )
+                    self.assertIs(
+                        param.default,
+                        inspect.Parameter.empty,
+                        f"{cls.__name__}.init_forward_metadata gives {name} a default",
+                    )
+
+
+class WrapperForwardsTheExtendBundleTest(_TorchCase):
+    """A wrapper that re-states the extend bundle for an inner runner-facing
+    node must forward every field: a field it accepts but drops would reach
+    the inner node's required-keyword check only on hardware that runs it."""
+
+    def test_inkling_wrapper_forwards_every_extend_field(self):
+        from unittest.mock import Mock
+
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+            InklingAttnBackend,
+        )
+
+        torch = self.torch
+        wrapper = InklingAttnBackend.__new__(InklingAttnBackend)
+        wrapper.inner = Mock()
+        wrapper._pfg_seq_idx = None
+        wrapper.conv_columns = {"group_block_tokens": {"conv": 4}}
+        counts = torch.tensor([3], dtype=torch.int32)
+        prefix = torch.tensor([0], dtype=torch.int32)
+        bundle = dict(
+            extend_seq_lens=counts,
+            extend_seq_lens_cpu=counts,
+            extend_prefix_lens=prefix,
+            extend_prefix_lens_cpu=prefix,
+            extend_replay_lens_cpu=torch.zeros_like(prefix),
+            extend_prompt_lens_cpu=counts.clone(),
+            extend_with_prefix=False,
+            query_shard=None,
+        )
+        wrapper.init_forward_metadata(
+            1,
+            1,
+            torch.tensor([0], dtype=torch.int32),
+            counts,
+            ForwardMode.EXTEND,
+            block_tables={
+                "conv": torch.zeros((1, 2), dtype=torch.int32),
+                "full": torch.zeros((1, 2), dtype=torch.int32),
+            },
+            **bundle,
+        )
+        forwarded = wrapper.inner.init_forward_metadata.call_args.kwargs
+        for name, value in bundle.items():
+            self.assertIs(forwarded[name], value, f"{name} was not forwarded")
 
 
 class RunnerSignatureConformanceTest(_TorchCase):
@@ -459,6 +530,10 @@ class RunnerSignatureConformanceTest(_TorchCase):
             "DeepseekV4AttentionBackend",
         ),
         (
+            "tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41",
+            "DeepseekV41AttentionBackend",
+        ),
+        (
             "tokenspeed.runtime.layers.attention.backends.state.mamba",
             "MambaAttnBackend",
         ),
@@ -473,14 +548,23 @@ class RunnerSignatureConformanceTest(_TorchCase):
         ),
         (
             "tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp",
-            "Qwen4ExpMambaAttnBackend",
+            "Qwen4ExpBackend",
+        ),
+        (
+            "tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple",
+            "Qwen4ExpPLEBackend",
+        ),
+        (
+            "tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer",
+            "QSAIndexerBackend",
         ),
     )
 
     def test_init_forward_metadata_binds_the_runner_call_shape(self):
-        """The runner's extend call: five positionals, then block_tables and
-        the five extend fields as required keywords (no defaults anywhere),
-        plus the model-side extras a node may ignore."""
+        """The runner's extend call: five positionals, then block_tables with
+        its CPU mirror, the seven extend fields and the query shard as required
+        keywords (no defaults anywhere), plus the model-side extras a node may
+        ignore."""
         import importlib
         import inspect
 
@@ -501,11 +585,15 @@ class RunnerSignatureConformanceTest(_TorchCase):
                         None,
                         None,
                         block_tables={},
+                        block_tables_cpu={},
                         extend_seq_lens=None,
                         extend_seq_lens_cpu=None,
                         extend_prefix_lens=None,
                         extend_prefix_lens_cpu=None,
+                        extend_replay_lens_cpu=None,
+                        extend_prompt_lens_cpu=None,
                         extend_with_prefix=False,
+                        query_shard=None,
                         positions=None,
                         global_num_tokens=None,
                         all_decode_or_idle=False,
@@ -519,7 +607,10 @@ class RunnerSignatureConformanceTest(_TorchCase):
                     "extend_seq_lens_cpu",
                     "extend_prefix_lens",
                     "extend_prefix_lens_cpu",
+                    "extend_replay_lens_cpu",
+                    "extend_prompt_lens_cpu",
                     "extend_with_prefix",
+                    "query_shard",
                 ):
                     param = sig.parameters.get(name)
                     if param is None:

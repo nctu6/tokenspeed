@@ -46,6 +46,7 @@ from tokenspeed.runtime.layers.parameter import (
 from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.utils import convert_to_channelwise
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 class Fp8LinearMethod(LinearMethodBase):
@@ -211,6 +212,21 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
                 )
                 return
+            # This opt-in applies across models, but only to the standard
+            # 128x128 block-FP8 contract. Specialized/grouped projections,
+            # MXFP8 and per-tensor FP8 keep their existing implementations.
+            backend = global_server_args_dict["dense_gemm_backend"]
+            if backend == "trtllm_cutedsl" and tuple(
+                self.quant_config.weight_block_size
+            ) == (128, 128):
+                layer._prepared_fp8_linear = (
+                    tokenspeed_kernel.prepare_trtllm_cutedsl_fp8_linear(
+                        layer.weight.data,
+                        layer.weight_scale_inv.data,
+                        self.quant_config.weight_block_size,
+                    )
+                )
+                return
             layer._prepared_fp8_linear = prepare_fp8_linear(
                 layer.weight.data,
                 layer.weight_scale_inv.data,
@@ -268,6 +284,11 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.input_scale = Parameter(
                         layer.input_scale.max(), requires_grad=False
                     )
+                    # Shards sharing one scale stay per-tensor, which cuBLASLt FP8 GEMMs take.
+                    if bool((weight_scale == weight_scale[0]).all()):
+                        layer.weight_scale = Parameter(
+                            weight_scale[0].clone(), requires_grad=False
+                        )
 
     def apply(
         self,
@@ -320,7 +341,11 @@ class Fp8LinearMethod(LinearMethodBase):
                     raise ValueError(
                         f"input_scale must contain exactly one value, got {input_scale.numel()}."
                     )
-                qinput, x_scale = static_quant_fp8(input_2d, input_scale)
+                if input_2d.dtype == torch.float8_e4m3fn:
+                    # Its producer already quantized it with this layer's scale.
+                    qinput, x_scale = input_2d, input_scale
+                else:
+                    qinput, x_scale = static_quant_fp8(input_2d, input_scale)
             else:
                 qinput, x_scale = per_token_quant_fp8(input_2d)
 
@@ -331,7 +356,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight,
                 A_scales=x_scale,
                 B_scales=weight_scale,
-                out_dtype=input.dtype,
+                out_dtype=(
+                    layer.orig_dtype
+                    if input.dtype == torch.float8_e4m3fn
+                    else input.dtype
+                ),
                 quant="fp8",
             )
             if bias is not None:

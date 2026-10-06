@@ -15,7 +15,6 @@
 #   ATTENTION_BACKEND    default: empty (engine auto). Set e.g. triton to force.
 #   VENV_DIR             default: ./.venv
 #   TOKENSPEED_TRITON_PREFILL_SKIP_OOR   default: 1 (F1; kernel default on)
-#   TOKENSPEED_TRITON_PREFILL_CLAMP_KV   default: 0 (F1b; conservative off)
 #   TOKENSPEED_TRITON_DECODE_KV_SPLITS   default: legacy (F2; not auto)
 #   TOKENSPEED_FLASHINFER_FA2_EXTEND    default: off (F3; not 512/all)
 #
@@ -47,9 +46,9 @@ export FLASHINFER_DISABLE_VERSION_CHECK=1
 export HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN:-}"
 
 # F1–F3 attention: conservative defaults (match kernel). Override for
-# CLAMP_KV=1 / DECODE_KV_SPLITS=auto / FA2_EXTEND=512 after A/B.
+# DECODE_KV_SPLITS=auto / FA2_EXTEND=512 after A/B. (The sliding-window
+# KV-range trim is always on in the kernel, upstream #1559.)
 export TOKENSPEED_TRITON_PREFILL_SKIP_OOR="${TOKENSPEED_TRITON_PREFILL_SKIP_OOR:-1}"
-export TOKENSPEED_TRITON_PREFILL_CLAMP_KV="${TOKENSPEED_TRITON_PREFILL_CLAMP_KV:-0}"
 export TOKENSPEED_TRITON_DECODE_KV_SPLITS="${TOKENSPEED_TRITON_DECODE_KV_SPLITS:-legacy}"
 export TOKENSPEED_FLASHINFER_FA2_EXTEND="${TOKENSPEED_FLASHINFER_FA2_EXTEND:-off}"
 

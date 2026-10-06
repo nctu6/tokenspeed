@@ -29,12 +29,13 @@ from math import prod
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.cuda  # noqa: F401
+import tokenspeed_kernel.ops.gemm.cute_dsl  # noqa: F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.ll_bf16  # noqa: F401
-import tokenspeed_kernel.ops.gemm.routed_gemv  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
+import tokenspeed_kernel.ops.gemm.trtllm_cutedsl  # noqa: F401
 import torch
 from tokenspeed_kernel.ops.gemm.deep_gemm import (
     _warmup_deep_gemm_fp8_linears,
@@ -42,6 +43,10 @@ from tokenspeed_kernel.ops.gemm.deep_gemm import (
     transform_sf_into_required_layout,
 )
 from tokenspeed_kernel.ops.gemm.flashinfer import (
+    BF16_GEMM_MAX_M,
+    autotune_bf16_gemm,
+    flashinfer_bf16_gemm,
+    flashinfer_joint_bf16_supported,
     has_flashinfer_cute_dsl_nvfp4_a16,
     has_flashinfer_fp8_blockscale,
     has_flashinfer_mxfp8,
@@ -71,7 +76,12 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import SelectedKernel, select_kernel
+from tokenspeed_kernel.selection import (
+    NoKernelFoundError,
+    SelectedKernel,
+    resolve_kernel_override,
+    select_kernel,
+)
 from tokenspeed_kernel.signature import (
     ScaleFormat,
     dense_tensor_format,
@@ -90,6 +100,7 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
     "fp8_linear",
+    "quantize_fp8_group32_for_linear",
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
@@ -102,12 +113,38 @@ __all__ = [
     "kimi3_shared_situ_projection",
     "mm",
     "prepare_fp8_linear",
+    "prepare_trtllm_cutedsl_fp8_linear",
     "prepare_nvfp4_a16_weights",
     "warmup_prepared_fp8_linears",
 ]
 
 _platform = Platform.get()
 _fp8_dtype = torch.float8_e4m3fn
+
+# ---------------------------------------------------------------------------
+# Selection traits
+# ---------------------------------------------------------------------------
+#
+# The trait dicts this module passes to ``select_kernel`` and the ``traits``
+# that gemm registrations declare share one vocabulary. Problem-shape traits
+# describe the kernel's supported envelope:
+#
+#   batch, m, n, k       exact dimensions; the request carries an int, the
+#                        spec a set of supported values
+#   <dim>_align          spec only: set of accepted alignments for <dim>
+#   <dim>_min            spec only: set of accepted minimums for <dim>
+#   mnk_problem_filter   spec only: ``(m, n, k) -> bool`` predicates for rules
+#                        the above cannot express
+#
+# ``selection.spec_matches_shape_traits`` evaluates these; a spec that
+# constrains a dimension rejects a request that does not supply it. Every
+# other trait (layout flags such as ``a_inner_stride_one``, plus
+# ``block_scale_layout``, ``out_dtype``, ``pdl_enabled``, ...) is matched by
+# set membership in ``selection.spec_matches_traits``.
+#
+# Trait dicts list the shape traits first, in ``batch``, ``m``, ``n``, ``k``
+# order with ``_align``/``_min`` after the exact sets and
+# ``mnk_problem_filter`` last, followed by the remaining traits alphabetically.
 
 
 class _PreparedFp8Linear(torch.nn.Module):
@@ -216,7 +253,11 @@ def prepare_fp8_linear(
             )
         if not enable_pdl:
             return _PreparedFp8Linear(
-                override="triton_mm_fp8_blockscale",
+                override=(
+                    None
+                    if platform.is_cdna4 or platform.is_cdna5
+                    else "triton_mm_fp8_blockscale"
+                ),
                 block_size=(block_n, block_k),
             )
 
@@ -247,6 +288,84 @@ def _require_fp8_linear_plan(plan: object) -> _PreparedFp8Linear:
     if not isinstance(plan, _PreparedFp8Linear):
         raise TypeError("plan must be returned by prepare_fp8_linear")
     return plan
+
+
+def quantize_fp8_group32_for_linear(
+    plan: object,
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize exact group-32 inputs in the prepared GEMM's scale layout.
+
+    Args:
+        plan: Opaque plan returned by prepare_fp8_linear for [1,32] weights.
+        x: CUDA BF16/FP16 [M,K], K divisible by32. The activation rule preserves
+            the1e-4 amax floor and IEEE upward power-of-two scale rounding.
+
+    Returns:
+        FP8 values and UE8M0 scales ready for fp8_linear(input_scales=...).
+        FlashInfer plans receive fully initialized1D F8_128x4 scales directly;
+        portable/other plans retain the2D row-major scale contract. Outputs
+        belong to this call and are never cached across eager or graph calls.
+    """
+    typed_plan = _require_fp8_linear_plan(plan)
+    if typed_plan.block_size != (1, 32):
+        raise ValueError("Exact group-32 plan quantization requires [1,32] weights")
+    from tokenspeed_kernel.ops.quantization import (
+        quantize_fp8_group32_ue8m0_swizzled,
+        quantize_fp8_with_scale,
+    )
+
+    if typed_plan.override == "flashinfer_mm_mxfp8":
+        return quantize_fp8_group32_ue8m0_swizzled(x, override=None, solution="triton")
+    return quantize_fp8_with_scale(
+        x,
+        granularity="token_group",
+        group_size=32,
+        scale_encoding="ue8m0",
+        enable_pdl=False,
+        override="triton_quantize_fp8_group32_ue8m0",
+        solution=None,
+    )
+
+
+def prepare_trtllm_cutedsl_fp8_linear(
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor,
+    block_size: tuple[int, int] | list[int],
+) -> object:
+    """Prepare original-scale block-FP8 GEMM and compile before graph capture.
+
+    Args:
+        weight: Contiguous CUDA E4M3 [N,K], with N and K divisible by 128.
+        weight_scales: Canonical FP32 [N/128,K/128] checkpoint scales.
+        block_size: Must be (128,128).
+    Returns:
+        An opaque fp8_linear plan; weight values and scales are not modified.
+    """
+    platform = current_platform()
+    if not platform.is_nvidia or not platform.is_blackwell:
+        raise RuntimeError("TRT-LLM CuTe-DSL block-FP8 requires Blackwell")
+    if (
+        tuple(block_size) != (128, 128)
+        or weight.ndim != 2
+        or weight.dtype != torch.float8_e4m3fn
+        or not weight.is_cuda
+        or not weight.is_contiguous()
+        or any(d == 0 or d % 128 for d in weight.shape)
+        or weight_scales.dtype != torch.float32
+        or weight_scales.device != weight.device
+        or weight_scales.shape != (weight.shape[0] // 128, weight.shape[1] // 128)
+    ):
+        raise ValueError(
+            "TRT-LLM CuTe-DSL requires aligned E4M3 weights and canonical 128x128 FP32 scales"
+        )
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise import prepare
+
+    prepare(weight.device)
+    return _PreparedFp8Linear(
+        override="trtllm_cutedsl_mm_fp8_blockscale",
+        block_size=(128, 128),
+    )
 
 
 def fp8_linear(
@@ -677,6 +796,69 @@ def dsv4_grouped_output_projection_warmup_model(
         )
 
 
+def grouped_bf16_projection(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None,
+    solution: str | None,
+) -> torch.Tensor:
+    """Compute ``einsum('tgd,grd->tgr', x, weight)`` from canonical BF16 weights.
+
+    Args:
+        x: BF16 ``[tokens, groups, input_dim]`` activations. Strided group and
+            token views, including a slice of padded attention heads, are valid.
+        weight: BF16 ``[groups, output_dim, input_dim]`` live weights. No packing,
+            copying or persistent weight cache is created. Group/row strides are
+            explicit; nonunit inner strides use the original torch fallback.
+        out: Optional contiguous BF16 ``[tokens, groups, output_dim]`` result.
+            Must not overlap either input. None allocates a fresh result.
+        solution: Optional registered solution restriction ("triton" or "torch").
+            None selects an implementation from the input geometry.
+
+    Returns:
+        BF16 ``[tokens, groups, output_dim]``; out when provided. Registered
+        implementations declare their supported geometry; unmatched inputs use
+        torch.einsum. Eager and graph execution use the same selection path.
+    """
+    if x.ndim != 3 or weight.ndim != 3:
+        raise ValueError("Grouped projection requires two rank-3 tensors")
+    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        raise ValueError("Grouped projection requires BF16 operands")
+    if x.device != weight.device or x.shape[1:] != (weight.shape[0], weight.shape[2]):
+        raise ValueError(
+            "Grouped projection operands must share device/groups/input_dim"
+        )
+    expected = (x.shape[0], weight.shape[0], weight.shape[1])
+    if out is not None and (
+        tuple(out.shape) != expected
+        or out.dtype != x.dtype
+        or out.device != x.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "Grouped projection out must be contiguous BF16 with matching shape/device"
+        )
+    kernel = select_kernel(
+        "gemm",
+        "grouped_bf16_projection",
+        format_signature(
+            x=dense_tensor_format(torch.bfloat16),
+            weight=dense_tensor_format(torch.bfloat16),
+        ),
+        traits={
+            "batch": weight.shape[0],
+            "m": x.shape[0],
+            "n": weight.shape[1],
+            "k": weight.shape[2],
+            "a_inner_stride_one": x.stride(-1) == 1,
+            "b_inner_stride_one": weight.stride(-1) == 1,
+            "is_cuda": x.is_cuda,
+        },
+        solution=solution,
+    )
+    return kernel(x, weight, out)
+
+
 def dsv4_linear_fp32(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -708,24 +890,32 @@ def dsv4_linear_fp32(
 
     enable_pdl = pdl_enabled()
     traits = {
-        "hidden_rank": hidden_states.ndim,
-        "weight_rank": weight.ndim,
         "has_tokens": hidden_states.numel() > 0,
-        "k_match": True,
+        "hidden_rank": hidden_states.ndim,
     }
     signature = format_signature(
         hidden_states=dense_tensor_format(hidden_states.dtype),
         weight=dense_tensor_format(weight.dtype),
     )
-    kernel = select_kernel(
-        "gemm",
-        "dsv4_linear_fp32",
-        signature,
-        traits=traits,
-        override=override,
-        solution=solution,
-    )
     k = int(weight.shape[1])
+    try:
+        kernel = select_kernel(
+            "gemm",
+            "dsv4_linear_fp32",
+            signature,
+            traits=traits,
+            override=override,
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        if override is not None or solution is not None:
+            raise
+        flat = hidden_states.reshape(-1, k)
+        if flat.is_cuda and flat.dtype == weight.dtype:
+            output = torch.mm(flat, weight.t(), out_dtype=torch.float32)
+        else:
+            output = torch.mm(flat.float(), weight.float().t())
+        return output.reshape(*hidden_states.shape[:-1], weight.shape[0])
     shape_params = {
         "M": int(prod(hidden_states.shape[:-1])),
         "N": int(weight.shape[0]),
@@ -764,10 +954,18 @@ _KERNELS_WITH_FUSED_BIAS: frozenset[str] = frozenset(
 _KERNELS_WITH_PDL: frozenset[str] = frozenset(
     {
         "deep_gemm_mm_fp8_blockscale",
+        "flashinfer_cute_dsl_mm_nvfp4",
         "flashinfer_cute_dsl_mm_nvfp4_a16",
         "flashinfer_mm_nvfp4",
     }
 )
+
+
+def _as_2d_tensor_scale(scale: torch.Tensor | None) -> torch.Tensor | None:
+    """A single-element scale of rank < 2 as its ``[1, 1]`` view."""
+    if scale is not None and scale.dim() < 2 and scale.numel() == 1:
+        return scale.view(1, 1)
+    return scale
 
 
 def _infer_scale_type(
@@ -804,8 +1002,23 @@ def _gemm_format_signature(
             raise ValueError("mxfp8 format selection requires block_size")
         if B_scales is None:
             raise ValueError("mxfp8 format selection requires B_scales")
+        # Kernel selection precedes online activation quantization, so the
+        # signature must predict the scale storage produced afterward. Most
+        # paths emit FP32 scales; on CDNA5, canonical (1, 32) uint8 weight
+        # scales identify the UE8M0 contract, whose matching activation
+        # quantizer also emits uint8 UE8M0 scales.
+        online_scale_dtype = torch.float32
+        if (
+            A_scales is None
+            and tuple(block_size) == (1, 32)
+            and B_scales.dtype == torch.uint8
+            and _platform.is_cdna5
+        ):
+            online_scale_dtype = torch.uint8
         a_scale = ScaleFormat(
-            storage_dtype=(A_scales.dtype if A_scales is not None else torch.float32),
+            storage_dtype=(
+                A_scales.dtype if A_scales is not None else online_scale_dtype
+            ),
             granularity="block",
             block_shape=tuple(block_size),
         )
@@ -916,6 +1129,19 @@ def _online_quantize_mxfp8(
             solution="triton",
         )
 
+    if kernel_name == "gluon_mm_mxfp8_ue8m0_gfx1250":
+        from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+
+        return quantize_fp8_with_scale(
+            A,
+            granularity="token_group",
+            group_size=block_k,
+            scale_encoding="ue8m0",
+            enable_pdl=False,
+            override="triton_quantize_fp8_group32_ue8m0",
+            solution=None,
+        )
+
     if (
         kernel_name in {"flashinfer_mm_fp8_blockscale", "triton_mm_fp8_blockscale"}
         and _platform.is_nvidia
@@ -970,6 +1196,13 @@ def _online_quantize_mxfp8(
             scale_ue8m0=_platform.is_blackwell_plus,
             enable_pdl=enable_pdl,
         )
+    elif kernel_name == "trtllm_cutedsl_mm_fp8_blockscale":
+        from tokenspeed_kernel.ops.gemm.fp8_utils import (
+            flashinfer_fp8_blockscale_quantize_prepacked,
+        )
+
+        values, scales = flashinfer_fp8_blockscale_quantize_prepacked(A, block_k)
+        return values[: A.shape[0]], scales[:, : A.shape[0]].T
     elif kernel_name == "flashinfer_mm_fp8_blockscale":
         from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 
@@ -977,7 +1210,10 @@ def _online_quantize_mxfp8(
             *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
             group_major_scales=_platform.is_nvidia,
         )
-    elif kernel_name == "triton_mm_fp8_blockscale":
+    elif kernel_name in {
+        "gluon_mm_fp8_blockscale_gfx1250",
+        "triton_mm_fp8_blockscale",
+    }:
         from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 
         return ensure_row_major_scales(
@@ -1063,10 +1299,15 @@ def mm(
             kernel's prepared layout. This is supported only by FlashInfer's
             FP8 ``[128, 128]`` block-scale GEMM.
     """
+    override = resolve_kernel_override("gemm", "mm", override)
     enable_pdl = pdl_enabled()
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
+    # Per-tensor scales may arrive as 0-dim or [1]; kernels take them as [1, 1].
+    A_scales = _as_2d_tensor_scale(A_scales)
+    B_scales = _as_2d_tensor_scale(B_scales)
 
     M = A.shape[0]
+    b_layout = "NK"
     if quant == "mxfp4":
         K = A.shape[-1] * 2
         N = B.shape[0]
@@ -1075,7 +1316,8 @@ def mm(
         N = B.shape[0]
     else:
         K = A.shape[-1]
-        N = B.shape[-1] if B.shape[0] == K else B.shape[0]
+        b_layout = "KN" if B.shape[0] == K else "NK"
+        N = B.shape[-1] if b_layout == "KN" else B.shape[0]
 
     if out is not None:
         _validate_gemm_out(
@@ -1086,6 +1328,41 @@ def mm(
             op="mm",
         )
 
+    # A dense layer's large-M arm reaches mm directly, while small M can
+    # select decode_gemv. Expose those branches at the shared kernel boundary.
+    if (
+        override is None
+        and alpha is None
+        and not prepacked_scales
+        and quant in (None, "none")
+        and A_scales is None
+        and B_scales is None
+        and out_dtype == torch.bfloat16
+        and B.shape[-1] == K
+    ):
+        # Row-parallel layers add bias only on rank 0. All ranks must expose
+        # the same bias-free tuning branch for FI's timing collectives, even
+        # when this rank's actual GEMM retains the generic biased path.
+        autotune_bf16_gemm(A, B)
+        if (
+            bias is None
+            and M <= BF16_GEMM_MAX_M
+            and flashinfer_joint_bf16_supported(A, B, out)
+        ):
+            shape_params = {"M": M, "N": N, "K": K}
+            ShapeCapture.get().record(
+                "gemm", "mm", "flashinfer_bf16_gemm", A.dtype, shape_params
+            )
+            with kernel_scope(
+                "gemm",
+                "mm",
+                A.dtype,
+                kernel_name="flashinfer_bf16_gemm",
+                **shape_params,
+                has_out=out is not None,
+            ):
+                return flashinfer_bf16_gemm(A, B, out)
+
     block_scale_layout = (
         "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"
     )
@@ -1093,17 +1370,18 @@ def mm(
         block_scale_layout = "flashinfer_mn"
 
     traits: dict[str, object] = {
-        "n_align_16": N % 16 == 0,
-        "k_align_16": K % 16 == 0,
-        "k_align_32": K % 32 == 0,
-        "n_align_64": N % 64 == 0,
-        "n_align_128": N % 128 == 0,
-        "k_align_64": K % 64 == 0,
-        "k_align_128": K % 128 == 0,
-        "n_min_128": N >= 128,
-        "k_min_128": K >= 128,
+        "m": M,
+        "n": N,
+        "k": K,
+        "b_layout": b_layout,
+        "a_inner_stride_one": A.stride(-1) == 1,
+        "a_scales_inner_stride_one": (A_scales is None or A_scales.stride(-1) == 1),
+        "b_inner_stride_one": B.stride(-1) == 1,
+        "b_scales_inner_stride_one": (B_scales is None or B_scales.stride(-1) == 1),
         "block_scale_layout": block_scale_layout,
-        "pdl_enabled": pdl_enabled(),
+        "out_dtype": out_dtype,
+        "out_inner_stride_one": out is None or out.stride(-1) == 1,
+        "pdl_enabled": enable_pdl,
     }
 
     signature = _gemm_format_signature(
@@ -1269,17 +1547,8 @@ def bmm(
         "k": K,
         "a_inner_stride_one": A.stride(-1) == 1,
         "b_n_stride_one": B.stride(1) == 1,
-        "out_inner_stride_one": out is None or out.stride(-1) == 1,
         "out_dtype": out_dtype,
-        "n_align_16": N % 16 == 0,
-        "k_align_16": K % 16 == 0,
-        "k_align_32": K % 32 == 0,
-        "n_align_64": N % 64 == 0,
-        "n_align_128": N % 128 == 0,
-        "k_align_64": K % 64 == 0,
-        "k_align_128": K % 128 == 0,
-        "n_min_128": N >= 128,
-        "k_min_128": K >= 128,
+        "out_inner_stride_one": out is None or out.stride(-1) == 1,
     }
 
     signature = _gemm_format_signature(

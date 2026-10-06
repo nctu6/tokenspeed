@@ -50,6 +50,9 @@ class MHAConfig(SoftmaxAttnConfig):
     # field is only populated when ``generate`` sees >1 distinct geometry, so a
     # uniform model never leaves this None.
     layer_kv_geometry: tuple[tuple[int, int], ...] | None = None
+    # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950); see
+    # ServerArgs.skip_softmax_threshold.
+    skip_softmax_threshold: float = 0.0
 
     @classmethod
     def generate(
@@ -99,6 +102,7 @@ class MHAConfig(SoftmaxAttnConfig):
             cache_layer_types=cache_layer_types,
             sliding_window_tokens=sliding_window_tokens,
             layer_kv_geometry=layer_kv_geometry,
+            skip_softmax_threshold=server_args.skip_softmax_threshold,
         )
         return AttnConfig(
             components=(spec,),

@@ -383,6 +383,10 @@ class Gemma3Attention(nn.Module):
             layer_id=layer_id,
             logit_cap=logit_cap,
             sliding_window_size=sliding_window_size,
+            # The attention prologue owns per-head qk-norm (Gemma ``1 + w``
+            # via ``GemmaRMSNorm.weight_offset``) and RoPE, then the KV write.
+            rotary_emb=self.rotary_emb,
+            qk_norm=(self.q_norm, self.k_norm),
         )
 
     def forward(
@@ -395,19 +399,13 @@ class Gemma3Attention(nn.Module):
             return hidden_states.new_zeros(
                 (0, self.num_heads * self.head_dim), dtype=hidden_states.dtype
             )
-        num_tokens = hidden_states.shape[0]
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # qk-norm (per head) then RoPE. The norms reduce over head_dim, so the
-        # head axis is folded into the row axis rather than materialised.
-        q = self.q_norm(q.reshape(-1, self.head_dim)).view(num_tokens, self.q_size)
-        k = self.k_norm(k.reshape(-1, self.head_dim)).view(num_tokens, self.kv_size)
-        q, k = self.rotary_emb(positions, q, k)
-
-        # Stock TokenSpeed: PagedAttention reads write locations from ctx
-        # (cf. llama_ts), not an explicit out_cache_loc argument.
-        attn_output = self.attn(q, k, v, ctx=ctx)
+        # qk-norm (per head) and RoPE run in the attention prologue
+        # (``qk_norm`` / ``rotary_emb`` on ``PagedAttention``), which then
+        # writes K/V at the write locations from ctx.
+        attn_output = self.attn(q, k, v, positions, ctx=ctx)
         if attn_output.dim() == 3:
             attn_output = attn_output.reshape(attn_output.shape[0], -1)
         output, _ = self.o_proj(attn_output)

@@ -39,6 +39,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.state.mamba import MambaAttnBackend
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -61,6 +62,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_layers = set(full_attn_layers)
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend
+        self._init_pool_binding()
 
     # The MLA full-attention sub-backend owns the spec-decode token width and
     # the chunked-prefill machinery. The DeepseekV3-style MLA layer forward
@@ -90,12 +92,23 @@ class HybridLinearAttnBackend(AttentionBackend):
     def override_num_extends(self, num_extends: int):
         return self.full_attn_backend.override_num_extends(num_extends)
 
+    def forward_sparse_prefill(self, *args, **kwargs):
+        return self.full_attn_backend.forward_sparse_prefill(*args, **kwargs)
+
     def forward_extend_chunked(self, *args, **kwargs):
         return self.full_attn_backend.forward_extend_chunked(*args, **kwargs)
 
+    # Composite: the full-attention child owns the per-request decode lengths
+    # the draft reads, so every drafter length-edit hook reaches it (the
+    # linear child's state follows the committed position, not seq_lens).
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
-        # Composite: the full-attention child owns the seq_lens the draft reads.
         self.full_attn_backend.advance_draft_forward_metadata(seq_lens)
+
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        self.full_attn_backend.update_draft_forward_metadata(frontier)
+
+    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
+        self.full_attn_backend.fill_block_decode_seq_lens(bs, block_seq_lens)
 
     def draft_history_view(self):
         return self.full_attn_backend.draft_history_view()
@@ -121,6 +134,19 @@ class HybridLinearAttnBackend(AttentionBackend):
             layer, forward_mode
         )
 
+    def forward_write_locations(self, layer, forward_mode):
+        return self._backend_for_layer(layer.layer_id).forward_write_locations(
+            layer, forward_mode
+        )
+
+    def padded_write_locations(self, layer, forward_mode, rows):
+        return self._backend_for_layer(layer.layer_id).padded_write_locations(
+            layer, forward_mode, rows
+        )
+
+    def cache_placement(self, layer):
+        return self._backend_for_layer(layer.layer_id).cache_placement(layer)
+
     @property
     def cache_consumer_families(self) -> frozenset[str]:
         """Cache families consumed by the two child backends."""
@@ -132,17 +158,16 @@ class HybridLinearAttnBackend(AttentionBackend):
     def child_backends(self):
         return (self.full_attn_backend, self.linear_attn_backend)
 
-    def set_cache_pool(self, cache_pool) -> None:
-        self.cache_pool = cache_pool
-        for backend in self.child_backends():
-            backend.set_cache_pool(cache_pool)
-
     def _backend_for_layer(self, layer_id: int) -> AttentionBackend:
         if layer_id in self.full_attn_layers:
             return self.full_attn_backend
         return self.linear_attn_backend
 
     # ---- Metadata delegation ----
+
+    def configure_runtime(self, **kwargs) -> None:
+        self.full_attn_backend.configure_runtime(**kwargs)
+        self.linear_attn_backend.configure_runtime(**kwargs)
 
     def init_forward_metadata(self, *args, **kwargs):
         self.full_attn_backend.init_forward_metadata(*args, **kwargs)
@@ -153,6 +178,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         # absorbs the runner extras (cache_group_specs, ...) through **kwargs.
         self.full_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
         self.linear_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
+
+    def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
+        self.full_attn_backend.init_prefill_graph_state(max_num_tokens, max_bs)
+        self.linear_attn_backend.init_prefill_graph_state(max_num_tokens, max_bs)
 
     def register_step_counter(self, step_counter):
         # Hybrid layerwise transfer needs one global step per model layer,
@@ -172,14 +201,30 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend.refresh_decode_metadata(*args, **kwargs)
         self.linear_attn_backend.refresh_decode_metadata(*args, **kwargs)
 
-    def support_kv_cache_prewrite(
-        self, forward_mode: ForwardMode | None = None
-    ) -> bool:
-        return self.full_attn_backend.support_kv_cache_prewrite(forward_mode)
+    def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
+        return self.full_attn_backend.supports_narrowed_draft_decode(forward_mode)
 
     # ---- Forward dispatch ----
 
-    @break_point
+    def admits_prefill_graph(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode
+    ) -> bool:
+        return (
+            self.step_counter is None
+            and self.linear_attn_backend.admits_prefill_graph(
+                token_capacity, bs, forward_mode
+            )
+        )
+
+    def prepare_prefill_metadata(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
+    ) -> bool:
+        if not self.admits_prefill_graph(token_capacity, bs, forward_mode):
+            return False
+        return self.linear_attn_backend.prepare_prefill_metadata(
+            token_capacity, bs, forward_mode, capture=capture
+        )
+
     def forward(
         self,
         q: torch.Tensor,
@@ -193,9 +238,48 @@ class HybridLinearAttnBackend(AttentionBackend):
         record_kv_cache: bool | None = None,
         **kwargs,
     ):
-        """Dispatch one layer to its full-attention or GDN backend (the break point).
+        layer_id = layer.layer_id if layer else kwargs["layer_id"]
+        backend = self._backend_for_layer(layer_id)
+        forward = (
+            self._forward
+            if backend.prefill_metadata_is_capture_ready and self.step_counter is None
+            else self._forward_break
+        )
+        return forward(
+            q,
+            k,
+            v,
+            layer,
+            token_to_kv_pool,
+            forward_mode,
+            bs,
+            save_kv_cache,
+            record_kv_cache,
+            **kwargs,
+        )
 
-        Overrides the base forward, so it carries its own ``@break_point``;
+    @break_point
+    def _forward_break(self, *args, **kwargs):
+        # Keep the outer graph boundary and host transfer callbacks here;
+        # _forward is shared by this route and inline attention capture.
+        return self._forward(*args, **kwargs)
+
+    def _forward(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        token_to_kv_pool,
+        forward_mode,
+        bs,
+        save_kv_cache,
+        record_kv_cache,
+        **kwargs,
+    ):
+        """Dispatch shared compute to the layer's full- or state-attention backend.
+
+        The ordinary route carries its own ``@break_point``;
         the frozen capture-time scalars (forward_mode/bs) are re-read from the
         ambient ctx (semantics: see breakable_cuda_graph). The GDN scan's
         batched [1, T, Hv, D] output is collapsed to z-shaped [T, Hv, D].
@@ -250,5 +334,17 @@ class HybridLinearAttnBackend(AttentionBackend):
             ret = ret.flatten(0, 1)
         return ret
 
-    def update_mamba_state_after_mtp_verify(self, accepted_lengths):
-        self.linear_attn_backend.commit_verified_state(accepted_lengths)
+    def tree_support(self) -> TreeSupport:
+        return TreeSupport(verify_blocker=None, draft_blocker=None)
+
+    def commit_speculative_state_after_verify(
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+        accepted_path: torch.Tensor | None,
+    ) -> None:
+        if num_extends == 0:
+            self.linear_attn_backend.commit_verified_state(
+                accepted_lengths, accepted_path=accepted_path
+            )

@@ -18,6 +18,12 @@ Supported task types:
 - `eval`
 - `perf`
 
+Task types that start a server (`server_smoke`, `eval`, `perf`) run with
+`TOKENSPEED_JIT_COMPILE_CHECK=error` unless the task's `env` sets it: a
+compile-time kernel parameter that keeps taking new values after startup
+(a per-batch `tl.constexpr`) fails the run. The server log names the kernel,
+the parameter, and the launching call site.
+
 Currently configured task directories:
 
 - `eval`
@@ -27,28 +33,45 @@ Currently configured task directories:
 Every task declares one `workflow_stage`:
 
 - `unit-test` for kernel and runtime tests
+- `kernel-benchmark` for registration-level kernel performance tests
 - `model-test` for model evaluation and performance tests
 
-The PR workflows run these stages in that order. Matrix entries within a stage
-run in parallel, but a later stage starts only after every required job in the
-previous stage succeeds. A stage with no matching tasks is treated as
+The NVIDIA B200 Tests workflow runs unit tests before model tests. The normal AMD flow
+runs unit tests, then kernel benchmarks and model tests concurrently; the
+workflow still fails if either fails. Matrix entries within
+each stage run in parallel. A stage with no matching tasks is treated as
 successfully satisfied.
+
+`ut-tokenspeed-kernel-part-i` runs tests outside `tokenspeed-kernel/test/ops/`,
+keeping the numerics, TRT-LLM communication and CUDA suites in separate processes.
+`ut-tokenspeed-kernel-part-ii` runs `tokenspeed-kernel/test/ops/`; together the two
+tasks cover the kernel suite once.
 
 PRs labeled `high priority` start `unit-test` and `model-test` concurrently.
 Applying the label starts a new CI run immediately and cancels the older run
 through the workflow's concurrency policy. A unit-test failure does not cancel
-model tests that are already running in this mode.
+model tests that are already running in this mode. AMD kernel benchmarks retain
+their normal unit-test dependency.
 
 The Qwen3.5 FP8 DeepEP correctness task runs GSM8K on four B200 GPUs with
 attention TP2, attention DP2, and MoE EP4. DeepEP `auto` mode exercises its
 normal path during prefill and low-latency path during decode, and the task
 uses the bounded non-thinking chat template for CI stability. The task requires
-a score of at least 0.90.
+a score of at least 0.90. After installation, it imports `tokenspeed_kernel` on
+GPU before launching the model, so incompatible native wheels fail at the
+installation stage. This GPU check is kept outside the general installer,
+which also runs during image builds without GPU access.
 
 The Qwen3.8 Flash Next FP8 correctness task runs GSM8K on two GB200 GPUs with
 tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
 bounded non-thinking chat template for CI stability. The task requires a score
 of at least 0.96.
+
+The long-context performance report accepts both current EvalScope metrics
+(`Avg TPOT (ms)`, `Avg Decoded Tok/Iter`) and their older names. Missing or
+invalid TPOT fails collection instead of producing a zero-throughput report.
+Unavailable acceptance metrics appear as `N/A` (empty CSV cells); an aggregate
+is unavailable if any run for that prompt length lacks the metric.
 
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
@@ -72,13 +95,40 @@ priority:
 
 Typical use: adjust one runner instance without disturbing the same task's
 dispatch order on other GPU families. Priority only affects jobs within the
-same workflow stage; later stages cannot contend with earlier ones.
+same workflow stage; it does not change dependencies between stages.
 
 `retries` (eval/perf only) is a non-negative integer: the pipeline restarts the
 managed server and reruns later stages that many extra times after a crash or
 score miss. Use it for infrastructure flakes (CUDA launch failure, NVLink
 barrier timeout, GPU memory-access fault) where a clean second attempt is
 cheap relative to a red PR.
+
+The AMD Kimi-K2.5 AIME25, NVIDIA Kimi-K2.5 EAGLE3 AIME25, and B200 GLM-5.2
+AIME26 gates write EvalScope results under
+`.ci-artifacts/published/evalscope-results`. Their CI artifact upload runs on
+both success and failure, including timestamped per-question predictions and
+scoring records. Compare the
+responses, stop reasons, and extracted answers when investigating an accuracy
+miss before changing the token limit or sampling configuration.
+
+The NVIDIA Kimi-K2.5 EAGLE3 AIME25 gate allows `max_tokens=131072` within a
+262138-token context. EAGLE3 with one speculative step uses two draft tokens;
+its three overlap spans reserve six positions below the model's 262144-token
+limit. A fixed-version diagnostic reproduced a 65536-token
+truncation; with the larger budget, the identical generated prefix continued
+to a correct answer and stopped naturally at 70332 tokens. This single-question
+result motivates the budget; the full 30-question gate still requires 0.93
+accuracy with batch size 16 and greedy sampling. EvalScope records are saved
+under `.ci-artifacts/published/evalscope-results` on success and failure.
+
+The AMD Kimi-K2.5 AIME25 gate allows `max_tokens=65536`, matching the NVIDIA
+Kimi-K2.5 DFlash task. The same question was truncated in both the
+[8K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34763795877) and
+[16K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34764637152).
+With the larger budget, the [64K run](https://github.com/lightseekorg/tokenspeed/actions/runs/34765831078)
+completed all four answers correctly with natural stops; the longest used 41181
+output tokens. The four questions, batch size four, greedy sampling, EAGLE3
+configuration, score threshold of 0.75, and timeouts remain unchanged.
 
 `optional` marks a task or per-label matrix entry as non-blocking.
 Optional entries are emitted with `matrix.optional: true`, and the PR workflows
@@ -88,10 +138,10 @@ map that to GitHub Actions `continue-on-error`.
 # whole task can fail without blocking the workflow
 optional: true
 
-# only the MI355 bench entry is non-blocking; the MI350 entry of the same
-# task still blocks on failure
+# only the MI35x 1-GPU entry is non-blocking; other entries of the same
+# task still block on failure
 optional:
-  amd-mi355-1gpu-bench: true
+  amd-mi35x-1gpu-test: true
 ```
 
 The NVIDIA PR workflow routes `b200-<Ngpu>` task labels to
@@ -107,6 +157,62 @@ the two directories are created beside that cache instead. This survives
 runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
+
+CI runner images are expected to provide `ninja`. Runner setup checks for the
+executable and only refreshes apt metadata and installs `ninja-build` when it is
+missing. This keeps source checkouts independently installable without making
+every ephemeral GPU runner wait on package mirrors before installation.
+
+For model evaluation and performance jobs, the reusable PR task workflow puts
+uv's cache in `.uv-cache` under the job's work directory, overriding an inherited
+shared uv cache. The existing always-run work-directory cleanup removes this
+general task cache on success or failure. EvalScope downloads use the dedicated
+`HF_HOME/.uv-cache/evalscope` namespace when a runner provides `HF_HOME`, or an
+explicit `EVALSCOPE_UV_CACHE_DIR` override. Only the `eval.install` and
+`perf.install` stages use this cache, so every job still creates a clean virtual
+environment. Runners without either location continue using the disposable job
+cache. Unit-test, kernel benchmark, pip, and release-wheel caches retain their
+existing policy.
+
+Accuracy jobs also keep Triton's compiled kernels in `.triton-cache` under their
+work directory. Lazy compilation during a request can then write its cache even
+when the runner's shared `/cache/triton` volume is full. The directory survives
+the task's server restarts and is removed by the same job cleanup; compiler
+options and test workloads are unchanged. Performance jobs retain the runner's
+Triton cache policy so cold compilation is not newly introduced into measured
+requests.
+
+The AMD Kimi-K3 EAGLE3 performance task publishes its EvalScope outputs and
+tokenizer under
+`.ci-artifacts/published/kimi-k3-eagle3-tp8ep1-50k-500-perf`, including the
+request/response database. These artifacts allow input, output, and speculative
+acceptance differences to be investigated alongside timing changes. The task
+measures 16 concurrent 50K-input/500-output requests with TP8/EP1 and zero
+benchmark warmup requests.
+
+The corresponding AMD Kimi-K3 EAGLE3 AIME26 gate publishes its per-question
+predictions and scoring records under
+`.ci-artifacts/published/kimi-k3-eagle3-aime26`. This retains evidence for accuracy
+misses without changing the full 30-question workload, generation settings, or
+score threshold.
+
+Model jobs load weights from the runner's shared Hugging Face cache
+(`HF_HOME`) and must not pass `--download-dir` into the job's work directory.
+The work directory is deleted after every job, so a per-job download fetches
+the full checkpoint again on every run. On the AMD runners the work directory
+and the shared cache sit on the same node filesystem, so a per-job copy does
+not add capacity either.
+
+EvalScope perf jobs pass a local tokenizer directory to `--tokenizer-path`.
+EvalScope loads a remote tokenizer ID through ModelScope into the job's
+ephemeral home directory, which downloads it again for every job. The jobs
+instead save the tokenizer from the shared Hugging Face cache into their
+output directory before running the benchmark.
+
+The same model jobs isolate MIOpen's writable user database and kernel cache
+under `.miopen-db` and `.miopen-kernels` in their work directory. This avoids
+SQLite I/O failures from a runner's shared cache. MIOpen's system database and
+tuning settings remain unchanged; the job cleanup removes the writable caches.
 
 The MI450 simulator launcher sets `TRITON_LIBHIP_PATH` to the ROCm SDK's
 unversioned `libamdhip64.so` linker name. The gfx1250 PyTorch wheel and
@@ -140,10 +246,107 @@ The CI system derives `SM` from common runner label prefixes by default:
 `sm103`. Use `runner.env.<label>` only for environment variables that should
 override or extend the defaults for a single runner label.
 
-PR workflows split runner labels by vendor and host architecture. `PR Test
-NVIDIA` uses the `nvidia-x86` runner group, while `PR Test NVIDIA ARM` uses
-the `nvidia-arm` runner group. GB300 is classified as NVIDIA ARM, but is not
+PR workflows split runner labels by vendor and host architecture. `NVIDIA
+B200 Tests` uses the `nvidia-x86` runner group, while the disabled `PR Test
+NVIDIA ARM` workflow uses the `nvidia-arm` runner group. GB300 is classified as NVIDIA ARM, but is not
 declared in task YAMLs and therefore does not enter default CI matrices.
+
+### Vendor path filtering
+
+Each vendor PR workflow starts with a `scan` job that classifies the changed
+files with `test/ci_system/ci_path_filter.py --runner-group <group>` and skips
+its GPU matrix jobs when nothing requires that runner group. The first
+matching rule decides (`ci_path_filter.py` holds the full lists):
+
+* Markdown files require no runner group.
+* Vendor-owned paths (`tokenspeed-kernel-amd/`, `tokenspeed-mla/`, the
+  `tokenspeed-kernel/test/<vendor>/` subtrees, and vendor-specific requirements
+  and CI scripts) require only that vendor's runner groups.
+* Kernel sources are classified by solution name: `cuda`, `cute_dsl`,
+  `flashinfer`, `deep_gemm`, `trtllm`, etc. are NVIDIA; `gluon` is AMD. A
+  vendor-named file whose content mentions another vendor stays shared.
+* `test/ci` task YAMLs require only the runner groups matching their
+  `runner.labels`.
+* Other paths under `python/`, `test/`, `tokenspeed-kernel/`, and
+  `tokenspeed-scheduler/` require every runner group.
+* Each workflow's own YAML requires only its runner group; `workflow_dispatch`
+  always runs.
+
+PR and push diffs containing only `test/ci/**/*.yaml` run only the changed tasks,
+with existing validation and runner/trigger rules. Diffs that also, or only,
+touch kernel benchmark suites under `tokenspeed-kernel/benchmarks/` additionally
+run every `kernel-benchmark` task, skipping unit and model tests. Other mixed,
+empty, or potentially truncated diffs (300+ paths) keep the existing scope. Manual and nightly runs
+retain their existing task selection.
+
+`tokenspeed-kernel/test/` is laid out to feed the vendor rules. Tests whose
+module-level gate (`is_cdna4()`, `is_cdna5()`, `is_amd()`, or an import from
+`tokenspeed_kernel_amd`) skips them off AMD hardware live under
+`tokenspeed-kernel/test/amd/`; tests that require CUDA, CuTe DSL, FlashInfer,
+DeepEP, DeepGEMM, TRT-LLM, FlashAttention 3/4, FlashMLA, Marlin, MNNVL, or
+`tokenspeed-mla` live under `tokenspeed-kernel/test/nvidia/`. Everything else
+(portable Triton kernels, registry and selection logic, tests that
+parametrize over both vendors) stays at the top level. The vendor subtrees
+mirror the top-level `ops/` and `thirdparty/` layout, and every subtree shares
+the root `conftest.py`, `utils.py`, and `kimi3_reference.py`, so a test moves
+between them without changing its imports. Put a new test in the narrowest
+directory whose gate matches its module-level skip; a mixed test belongs at
+the top level rather than in either vendor subtree.
+
+## Registration-Level Kernel Benchmarks
+
+The `kernel-benchmark-amd-gfx950` performance task compares exact kernel
+registrations between two revisions. `AMD Tests` discovers it as a dedicated
+`kernel-benchmark` stage. In the normal flow, it runs after unit tests,
+concurrently with model tests; a benchmark failure still fails the workflow. The
+high-priority model path remains eager
+and does not wait for either stage. All stages contribute to the workflow's final
+status.
+
+Pull request runs compare the pull request's merge base with its head commit.
+Main-branch pushes compare the previous and new commits. A manual `AMD Tests`
+run uses its selected commit for both sides as a runner smoke test. For a
+meaningful manual comparison, use `K8s Dispatch`: selecting a pull request uses
+its target and head revisions, while selecting a commit compares it with the
+latest `main`. Both revisions always execute serially in one task allocation.
+
+The task requests the ci-infra-managed `amd-mi350-1gpu-bench` runner pool and
+exposes logical device 0. Each allocation must provide one `gfx950` GPU,
+working ROCm device permissions, Git, Bash, Python virtual-environment support,
+sufficient temporary storage, and access to the configured package indexes. The normal AMD
+task executor provides runner cleanup and setup before invoking the benchmark.
+
+The coordinator creates independent worktrees and Python environments inside
+that allocation. Each revision installs its own ROCm kernel requirements and
+uses isolated compilation caches. The automated task explicitly disables
+profiling so regression measurements match production execution as closely as
+possible; direct manual worker runs on AMD retain Proton as their default.
+A benchmark fails only when it exceeds both its merge-base relative and absolute
+regression limits. Noisy measurements and successful added, changed, or missing
+cases remain informational. Correctness, execution, environment, and
+infrastructure failures fail the task.
+
+The shared task executor uploads the task result and the benchmark's published
+comparison in one Actions artifact. A separate `AMD Kernel Benchmark PR
+Comment` workflow runs trusted code from the default branch after `AMD Tests`
+finishes. It validates the untrusted artifact and exact source revision before
+creating or replacing one bot-owned comment, including for fork runs whose
+completion event omits the pull request association and for runs that finish
+after the pull request merges. Closed, unmerged pull requests remain ignored.
+Runs where the benchmark task was not selected have no report and are ignored.
+
+A merge base that does not contain the suite yields a candidate-only
+bootstrap instead of a comparison. Changes to the comment workflow take effect
+only after they merge, since `workflow_run` workflows execute from the default
+branch. Manual runs produce summaries and artifacts but not pull request
+comments.
+
+`ROCR_VISIBLE_DEVICES=0` does not limit the shared cleanup process scan, so the
+runner must provide scheduler-enforced GPU or process-namespace isolation. The
+runner fleet must prevent two jobs from sharing one physical GPU.
+
+Harness, suite, correctness, timing, and local reproduction details are in the
+[kernel benchmark documentation](../../tokenspeed-kernel/benchmarks/README.md).
 
 ## Slurm with Pyxis/Enroot
 
@@ -312,7 +515,24 @@ hardware. A selected YAML follows the same rule; YAMLs that already declare a
 `slurm-dispatch-gb300` coordinators form one shared pool for manual, nightly,
 and per-commit submissions.
 
-The `GB300 Slurm Per Commit` workflow selects only multi-node model tasks with
+The `NVIDIA GB200 Tests` workflow runs single-node `slurm-gb200-*`
+tasks through the `slurm-dispatch` coordinator. Qwen four-GPU tasks migrated
+from B200 use `slurm-gb200-4gpu`: the 397B NVFP4 AIME25 evaluation, 35B FP8
+DeepEP GSM8K evaluation, and 122B EPD OCRBench evaluation and unit test.
+Their existing commands, triggers, and score thresholds are preserved.
+
+It runs automatically for relevant pushes to `main` and non-draft,
+same-repository pull requests; manual dispatch selects the `manual` trigger.
+The ordinary NVIDIA ARM workflow excludes `slurm-*` tasks. The dedicated
+Slurm scan clears `TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS`, so the Kubernetes
+`gb200` exclusion does not disable these tasks. Closing a PR cancels its run;
+the approved-PR and latest-main retry workflows also cover this workflow.
+
+`Slurm Dispatch` includes `slurm-gb200-4gpu` in its default bulk runners.
+Its default `eval,perf` selection covers the three migrated evaluations;
+select `ut` explicitly to include the EPD unit test.
+
+The `NVIDIA GB300 Tests` workflow selects only multi-node model tasks with
 the `per-commit` trigger and submits them through the same
 `slurm-dispatch-gb300` coordinator pool used by manual dispatch. It runs for
 pushes to `main` and for non-draft pull requests whose head branch belongs to
@@ -330,7 +550,13 @@ cannot filter the multi-node matrix here. During this workflow's
 bootstrap only, leave the switch unset; after dispatcher support reaches
 `main`, set it to `true` and re-run the merge commit's workflow.
 
-The `GB300 Slurm Nightly` workflow runs every day at 18:17 UTC and can also be
+`Retry Failed Latest Main CI` also covers `NVIDIA GB300 Tests`. Its hourly
+or manual scan retries failed jobs from completed, failed push runs on the
+latest `main` commit, using the original run and commit. The retry workflow
+stops after three total attempts (the original plus two retries); older
+commits are skipped.
+
+The `NVIDIA GB300 Nightly Tests` workflow runs every day at 18:17 UTC and can also be
 started manually from `main`. It selects only multi-node model tests with the
 `nightly` trigger, then restricts the generated matrix to `slurm-gb300-*`
 runners before submitting through the GB300 coordinator pool. The runner filter
@@ -358,6 +584,10 @@ test/ci/run_slurm.sh \
 # Every existing YAML for one exact runner label:
 test/ci/run_slurm.sh --all --runner gb200-4gpu --trigger manual
 
+# Migrated Qwen four-GPU evaluations and EPD unit test:
+test/ci/run_slurm.sh --all --runner slurm-gb200-4gpu \
+  --type eval --type ut --trigger manual
+
 # List Kimi eval/perf tasks from PR 795 for two runner labels:
 test/ci/run_slurm.sh \
   --pr 795 \
@@ -384,11 +614,22 @@ This is a manual launcher, not a GitHub Actions runner. Override its defaults
 with `TS_CI_ARTIFACT_ROOT`, `TS_CI_CACHE_DIR`, or
 `TS_CI_CONTAINER_IMAGE`.
 
+The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.0 by image digest.
+Keep the FlashInfer Python requirement, release cubin checksum, and runner
+JIT-cache version aligned when upgrading. FlashInfer 0.7.0 also requires
+cuDNN frontend 1.29.0 or newer and splits its JIT cache into provider packages.
+GB200/B200 setup resolves those providers from the matching FlashInfer CUDA
+index and checks their installed versions again after dependency installation.
+
 `--pr` accepts a pull request number or GitHub URL. It fetches the PR head and
 merges it into the launcher's committed `HEAD` in an isolated temporary
 worktree. The original checkout is not modified, and submitted jobs use an
 immutable archive of that merged commit. A merge conflict stops before any job
 is submitted.
+
+Concurrent submissions publish each commit's snapshot without replacing an
+existing archive. Reuse requires byte-for-byte agreement with a fresh Git
+archive; a mismatched snapshot fails submission and is left unchanged.
 
 `--source-pr` accepts the same values but only labels the report; it neither
 fetches nor merges, and is for callers that already checked out the pull
@@ -412,7 +653,8 @@ The manual `Slurm Dispatch` GitHub workflow runs on the organization runner
 with the `slurm-dispatch` label. That runner belongs on the Slurm coordinator and
 only needs GitHub runner prerequisites, this repository, Python/PyYAML, and
 Slurm client commands; it does not need GPUs. Leaving the PR input blank checks
-out and runs the latest `main`; otherwise the requested PR is merged into that
+out the exact commit selected by the workflow's branch/ref; selecting `main`
+tests its commit at dispatch time. Otherwise the requested PR is merged into a
 trusted `main` checkout. From the Actions UI, optionally provide a PR,
 comma-separated runner labels and task types, and an optional comma-separated
 task/model filter. The workflow submits the selected matrix, waits for all
@@ -432,8 +674,21 @@ GB200, every B200 or GB200 runner label declared by the selected YAML is
 submitted as its own Slurm job. On GB300, those logical labels are submitted on
 the corresponding GB300 runner; native GB300 labels are submitted unchanged.
 
-The manual workflow keeps the dispatcher checkout on trusted `main` and merges
-the requested PR only in the submitter's temporary worktree. The per-commit
+To test a same-repository branch without opening a PR, leave `pr` blank:
+
+```bash
+gh workflow run slurm-dispatch.yml --ref <branch> -f cluster=gb200
+```
+
+The Slurm wrapper defaults to the digest-pinned Torch 2.14 / CUDA 13.0 runner
+image. The install stage checks the final Torch, TRTLLM, and CuteDSL KDA versions
+against the checkout's requirements and checks Torch's CUDA runtime, so a later
+dependency install cannot silently downgrade the tested stack.
+
+For PR input, the manual workflow keeps the dispatcher checkout on trusted
+`main` and merges the requested PR only in the submitter's temporary worktree.
+Without PR input, the selected branch also supplies dispatcher code: select
+only trusted same-repository refs for the persistent coordinator. The per-commit
 workflow instead executes a same-repository PR's merge commit so dispatcher
 changes can be validated before merge. Fork PRs must not use that path while
 the coordinator pool is persistent.
@@ -455,3 +710,20 @@ from the compute node and should be on shared storage. Use `--artifact-root`
 persistent host cache at `/home/runner/.cache`, matching the NVIDIA release
 image, and points the Hugging Face and XDG caches there; the directory must
 likewise be visible on the compute node.
+
+### Retry unsuccessful Slurm cases
+
+Open **Actions → Retry Failed CI Cases → Run workflow** and enter the run URL
+or ID (for example `34550905154`) in `source_run`. The latest completed attempt
+of **Slurm Dispatch**, or a previous retry, supplies the failed cases.
+Only `COMPLETED` cases with exit code zero and `ok: true` are skipped.
+Retries reuse the original submission scripts and source snapshot, preserving
+the tested commit, image, configuration and GPU allocation. The original
+report artifact and coordinator's `scripts/` and `snapshots/` must still exist.
+The existing Slurm Dispatch scheduler defaults and PR installation mode apply.
+On retry, the known PyYAML bootstrap command is updated to use the mounted pip
+cache, a 120-second socket timeout, and at most three installation attempts
+10 seconds apart. Exhausted attempts stop before evaluation. This only changes
+dependency download handling; retained files, source commit, image and test
+configuration stay unchanged.
+For workflows with one case per GitHub job, use **Re-run failed jobs**.

@@ -65,6 +65,11 @@ class LoadConfig:
         checkpoints.
     decryption_key_file: If set, decrypts the output files with a password read
         from this file (after PBKDF2).
+    checkpoint_load_group: Global ranks a distributed loader (InstantTensor)
+        synchronizes with when the model declares no ``checkpoint_load_group``
+        of its own; None means every rank. A model loaded on a subset of the
+        ranks -- a pipeline stage's draft -- must name that subset, or the
+        collective waits for ranks that never load it.
     """
 
     load_format: str | LoadFormat = LoadFormat.AUTO
@@ -73,7 +78,8 @@ class LoadConfig:
     ignore_patterns: list[str] | str | None = None
     decryption_key_file: str | None = None
     weight_loader_prefetch_checkpoints: bool = True
-    weight_loader_prefetch_num_threads: int = 4
+    weight_loader_prefetch_num_threads: int = 8
+    checkpoint_load_group: tuple[int, ...] | None = None
 
     ext_yaml: str | None = None
 
@@ -85,8 +91,8 @@ class LoadConfig:
 
         if self.ignore_patterns is not None and len(self.ignore_patterns) > 0:
             logger.info(
-                "Ignoring the following patterns when downloading weights: %s",
-                self.ignore_patterns,
+                "Ignoring the following patterns when downloading weights: "
+                f"{self.ignore_patterns!s}",
             )
         else:
             self.ignore_patterns = ["original/**/*"]

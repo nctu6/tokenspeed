@@ -18,19 +18,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Triton MHA prefill/extend: SKIP_OOR_BLOCKS and CLAMP_KV_RANGE are bitwise.
+"""Triton MHA prefill/extend: SKIP_OOR_BLOCKS is bitwise.
 
-Both switches only drop work whose contribution is provably nothing:
-
-* SKIP_OOR_BLOCKS returns from query blocks that lie entirely past a
-  sequence's extend length (their stores are fully masked);
-* CLAMP_KV_RANGE bounds the KV loop to tiles that some row of the block can
-  see (causal upper bound, sliding-window lower bound).
-
-So every flag combination must reproduce the legacy kernel with
-``torch.equal`` -- not ``allclose``. The flags are module-level constants read
-from the environment at import; tests flip the module attributes directly and
+SKIP_OOR_BLOCKS returns from query blocks that lie entirely past a sequence's
+extend length (their stores are fully masked), so it only drops work whose
+contribution is provably nothing and must reproduce the legacy kernel with
+``torch.equal`` -- not ``allclose``. The flag is a module-level constant read
+from the environment at import; tests flip the module attribute directly and
 check the env parsing in a subprocess.
+
+The sliding-window KV-range trim is main's always-on ``begin_n``/``end_n``
+(#1559, covered by ``test_attention.py::test_mha_prefill_triton_window_bounds``);
+these tests run on top of it.
 """
 
 from __future__ import annotations
@@ -44,40 +43,39 @@ import sys
 import pytest
 import torch
 
-_MOD_NAME = "tokenspeed_kernel.ops.attention.triton.mha_prefill"
+_MOD_NAME = "tokenspeed_kernel.ops.attention.mha._triton.prefill"
 mha_prefill_mod = importlib.import_module(_MOD_NAME)
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required"
 )
 
-# (skip_oor, clamp_kv); the first entry is the legacy kernel.
-_LEGACY = (False, False)
-_VARIANTS = [(True, False), (False, True), (True, True)]
+# skip_oor values; the first entry is the legacy kernel.
+_LEGACY = False
+_VARIANTS = [True]
 
 
-def _run_with_flags(monkeypatch, skip_oor: bool, clamp_kv: bool, fn):
+def _run_with_flags(monkeypatch, skip_oor: bool, fn):
     with monkeypatch.context() as m:
         m.setattr(mha_prefill_mod, "_TRITON_PREFILL_SKIP_OOR", skip_oor)
-        m.setattr(mha_prefill_mod, "_TRITON_PREFILL_CLAMP_KV", clamp_kv)
         out = fn()
     torch.cuda.synchronize()
     return out if isinstance(out, tuple) else (out,)
 
 
 def _assert_bitwise_across_flags(monkeypatch, fn) -> None:
-    ref = _run_with_flags(monkeypatch, *_LEGACY, fn)
-    for skip_oor, clamp_kv in _VARIANTS:
-        got = _run_with_flags(monkeypatch, skip_oor, clamp_kv, fn)
+    ref = _run_with_flags(monkeypatch, _LEGACY, fn)
+    for skip_oor in _VARIANTS:
+        got = _run_with_flags(monkeypatch, skip_oor, fn)
         for idx, (a, b) in enumerate(zip(ref, got)):
             same_nan = torch.isnan(a) == torch.isnan(b)
-            assert bool(same_nan.all()), (skip_oor, clamp_kv, idx, "nan pattern")
+            assert bool(same_nan.all()), (skip_oor, idx, "nan pattern")
             a_ = torch.nan_to_num(a.float(), nan=0.0)
             b_ = torch.nan_to_num(b.float(), nan=0.0)
             if not torch.equal(a_, b_):
                 diff = (a_ - b_).abs()
                 pytest.fail(
-                    f"skip_oor={skip_oor} clamp_kv={clamp_kv} output[{idx}] "
+                    f"skip_oor={skip_oor} output[{idx}] "
                     f"not bitwise: max|diff|={diff.max().item():.3e}, "
                     f"mismatches={(diff > 0).sum().item()}"
                 )
@@ -116,33 +114,20 @@ def test_env_flag_parsing(monkeypatch) -> None:
 @pytest.mark.parametrize(
     "env,expected",
     [
-        ({}, (True, False)),
-        ({"TOKENSPEED_TRITON_PREFILL_SKIP_OOR": "0"}, (False, False)),
-        ({"TOKENSPEED_TRITON_PREFILL_CLAMP_KV": "1"}, (True, True)),
-        (
-            {
-                "TOKENSPEED_TRITON_PREFILL_SKIP_OOR": "0",
-                "TOKENSPEED_TRITON_PREFILL_CLAMP_KV": "1",
-            },
-            (False, True),
-        ),
+        ({}, True),
+        ({"TOKENSPEED_TRITON_PREFILL_SKIP_OOR": "0"}, False),
+        ({"TOKENSPEED_TRITON_PREFILL_SKIP_OOR": "1"}, True),
     ],
-    ids=["defaults", "skip-off", "clamp-on", "skip-off-clamp-on"],
+    ids=["defaults", "skip-off", "skip-on"],
 )
 def test_env_defaults_read_at_import(env, expected) -> None:
     child_env = {
-        k: v
-        for k, v in os.environ.items()
-        if k
-        not in (
-            "TOKENSPEED_TRITON_PREFILL_SKIP_OOR",
-            "TOKENSPEED_TRITON_PREFILL_CLAMP_KV",
-        )
+        k: v for k, v in os.environ.items() if k != "TOKENSPEED_TRITON_PREFILL_SKIP_OOR"
     }
     child_env.update(env)
     code = (
         f"import importlib; m = importlib.import_module({_MOD_NAME!r}); "
-        "print(int(m._TRITON_PREFILL_SKIP_OOR), int(m._TRITON_PREFILL_CLAMP_KV))"
+        "print(int(m._TRITON_PREFILL_SKIP_OOR))"
     )
     res = subprocess.run(
         [sys.executable, "-c", code],
@@ -152,7 +137,7 @@ def test_env_defaults_read_at_import(env, expected) -> None:
         timeout=600,
     )
     assert res.returncode == 0, res.stderr
-    got = tuple(bool(int(x)) for x in res.stdout.strip().split()[-2:])
+    got = bool(int(res.stdout.strip().split()[-1]))
     assert got == expected
 
 
@@ -193,7 +178,7 @@ def test_prefill_bitwise(monkeypatch, shape, head_dim, window_left, feature) -> 
     sinks = torch.randn(nq, device=device, dtype=dtype) if feat["sinks"] else None
 
     def fn():
-        return mha_prefill_mod.triton_mha_prefill(
+        return mha_prefill_mod._triton_mha_prefill_impl(
             q,
             k,
             v,
@@ -358,7 +343,7 @@ def test_extend_with_kvcache_bitwise(
     )
 
     def fn():
-        return mha_prefill_mod.triton_mha_extend_with_kvcache(
+        return mha_prefill_mod._triton_mha_extend_with_kvcache_impl(
             q,
             cu_q,
             cu_kv,
@@ -380,8 +365,8 @@ def test_extend_with_kvcache_bitwise(
 
 # --------------------------------------------------------------------------
 # Contract lock: cache_seqlens includes the extend tokens (queries are the
-# suffix of the KV sequence). The clamp bounds are derived from this, so check
-# the clamped kernel against an fp32 reference built on that contract.
+# suffix of the KV sequence). The window/causal KV bounds are derived from
+# this, so check the kernel against an fp32 reference built on that contract.
 # --------------------------------------------------------------------------
 
 
@@ -405,8 +390,7 @@ def test_extend_contract_matches_reference(monkeypatch, head_dim, window_left) -
 
     with monkeypatch.context() as m:
         m.setattr(mha_prefill_mod, "_TRITON_PREFILL_SKIP_OOR", True)
-        m.setattr(mha_prefill_mod, "_TRITON_PREFILL_CLAMP_KV", True)
-        out = mha_prefill_mod.triton_mha_extend_with_kvcache(
+        out = mha_prefill_mod._triton_mha_extend_with_kvcache_impl(
             q,
             cu_q,
             cu_kv,
@@ -444,21 +428,23 @@ def test_extend_contract_matches_reference(monkeypatch, head_dim, window_left) -
 
 
 # --------------------------------------------------------------------------
-# Regression: CLAMP_KV + DECODE_KV_SPLITS=auto under concurrent-like ragged
-# prefill. A dynamic range(kv_lo, kv_hi) clamp previously illegal-memory'd on
-# sm120 when overlapped with auto-split decode; keep the legacy 0..seq grid
-# and skip tiles instead. This stress hammers that pairing.
+# Regression: windowed KV-range trim + DECODE_KV_SPLITS=auto under
+# concurrent-like ragged prefill. A dynamic KV range previously
+# illegal-memory'd on sm120 when overlapped with auto-split decode (fixed by
+# the ``page_in_range`` gather bound). This stress hammers that pairing.
 # --------------------------------------------------------------------------
 
 
 @requires_cuda
 @pytest.mark.parametrize("window_left", [-1, 1024], ids=["full", "w1024"])
 @pytest.mark.parametrize("head_dim", [128, 256])
-def test_clamp_auto_concurrent_ragged_stress(monkeypatch, window_left, head_dim) -> None:
+def test_window_trim_auto_concurrent_ragged_stress(
+    monkeypatch, window_left, head_dim
+) -> None:
     device = "cuda"
     torch.manual_seed(6)
     # One long fresh chunk + many short multi-turn extends on long prefixes
-    # (the E2E shape that crashed once on raichu gemma3 with CLAMP+auto).
+    # (the E2E shape that crashed once on raichu gemma3 with a KV clamp+auto).
     # Sized to finish in CI while still mixing a long chunk, short extends on
     # multi-k prefixes, and a tight page-table width (no spare columns).
     prefix_lens = [0, 512, 2000] + [8192] * 6 + [1600] * 4
@@ -480,14 +466,13 @@ def test_clamp_auto_concurrent_ragged_stress(monkeypatch, window_left, head_dim)
     )
 
     mha_decode_mod = importlib.import_module(
-        "tokenspeed_kernel.ops.attention.triton.mha_decode"
+        "tokenspeed_kernel.ops.attention.mha._triton.decode"
     )
 
-    def run_extend(clamp: bool):
+    def run_extend(skip_oor: bool):
         with monkeypatch.context() as m:
-            m.setattr(mha_prefill_mod, "_TRITON_PREFILL_SKIP_OOR", True)
-            m.setattr(mha_prefill_mod, "_TRITON_PREFILL_CLAMP_KV", clamp)
-            return mha_prefill_mod.triton_mha_extend_with_kvcache(
+            m.setattr(mha_prefill_mod, "_TRITON_PREFILL_SKIP_OOR", skip_oor)
+            return mha_prefill_mod._triton_mha_extend_with_kvcache_impl(
                 q_ext,
                 cu_q,
                 cu_kv,
@@ -501,13 +486,13 @@ def test_clamp_auto_concurrent_ragged_stress(monkeypatch, window_left, head_dim)
                 window_left=window_left,
             )
 
-    # Bitwise: clamp on/off must still match on this stress shape.
+    # Bitwise: SKIP_OOR on/off must still match on this stress shape.
     out_off = run_extend(False)
     out_on = run_extend(True)
-    assert torch.equal(out_off, out_on), "CLAMP must stay bitwise on ragged stress"
+    assert torch.equal(out_off, out_on), "SKIP_OOR must stay bitwise on ragged stress"
 
-    # Interleave auto-split decode with clamped extend (no stream sync between)
-    # to approximate overlap_schedule_depth>=1 under CLAMP+auto.
+    # Interleave auto-split decode with windowed extend (no stream sync
+    # between) to approximate overlap_schedule_depth>=1 under auto splits.
     bs_dec = min(32, len(cache_lens))
     q_dec = torch.randn(bs_dec, nq, head_dim, device=device, dtype=torch.bfloat16)
     cache_dec = cache_seqlens[:bs_dec].contiguous()
@@ -516,13 +501,12 @@ def test_clamp_auto_concurrent_ragged_stress(monkeypatch, window_left, head_dim)
 
     with monkeypatch.context() as m:
         m.setattr(mha_prefill_mod, "_TRITON_PREFILL_SKIP_OOR", True)
-        m.setattr(mha_prefill_mod, "_TRITON_PREFILL_CLAMP_KV", True)
         m.setattr(mha_decode_mod, "_TRITON_DECODE_KV_SPLITS", "auto")
         m.setattr(mha_decode_mod, "_TRITON_DECODE_MAX_KV_SPLITS", 16)
         m.setattr(mha_decode_mod, "_TRITON_DECODE_SPLIT_MIN_TOKENS", 256)
         m.setattr(mha_decode_mod, "_BATCH_INVARIANT", False)
         for _ in range(8):
-            _ = mha_prefill_mod.triton_mha_extend_with_kvcache(
+            _ = mha_prefill_mod._triton_mha_extend_with_kvcache_impl(
                 q_ext,
                 cu_q,
                 cu_kv,
@@ -535,7 +519,7 @@ def test_clamp_auto_concurrent_ragged_stress(monkeypatch, window_left, head_dim)
                 is_causal=True,
                 window_left=window_left,
             )
-            _ = mha_decode_mod.triton_mha_decode_with_kvcache(
+            _ = mha_decode_mod._triton_mha_decode_with_kvcache_impl(
                 q_dec,
                 k_cache,
                 v_cache,

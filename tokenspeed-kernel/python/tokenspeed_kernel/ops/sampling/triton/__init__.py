@@ -20,11 +20,25 @@
 
 """Triton sampling kernel entry points."""
 
+from tokenspeed_kernel.ops.sampling.triton.draft_tree import (
+    draft_tree_expand,
+    draft_tree_finalize,
+    tree_ancestry,
+)
+from tokenspeed_kernel.ops.sampling.triton.dspark_block import (
+    dspark_block_candidate_tiles,
+    dspark_block_greedy_resolve,
+    dspark_block_greedy_step,
+)
+from tokenspeed_kernel.ops.sampling.triton.logprob_topk import logprob_topk
+from tokenspeed_kernel.ops.sampling.triton.tree_verify import verify_tree
+
 from .common import gather_and_expand_scalars
 from .generic import gumbel_sample_from_pools_generic
 from .gumbel import (
     gumbel_sample_from_pools,
     gumbel_sample_from_pools_compact,
+    gumbel_scratch_shape,
 )
 from .logprobs import selected_token_logprobs
 from .min_p import (
@@ -47,6 +61,7 @@ __all__ = [
     "gather_and_expand_scalars",
     "gumbel_sample_from_pools",
     "gumbel_sample_from_pools_compact",
+    "gumbel_scratch_shape",
     "gumbel_sample_min_p_from_pools",
     "gumbel_sample_min_p_from_pools_parallel",
     "gumbel_sample_from_pools_generic",
@@ -54,9 +69,17 @@ __all__ = [
     "gumbel_sample_top_k_top_p_from_pools",
     "gumbel_sample_top_k_top_p_qrita_from_pools",
     "dflash2_greedy_path",
+    "dspark_block_candidate_tiles",
+    "dspark_block_greedy_resolve",
+    "dspark_block_greedy_step",
     "min_p_renorm_prob",
     "apply_penalties_logit_bias_inplace",
     "accumulate_counts_inplace",
     "selected_token_logprobs",
     "verify_chain_target_sampled",
+    "draft_tree_expand",
+    "draft_tree_finalize",
+    "logprob_topk",
+    "tree_ancestry",
+    "verify_tree",
 ]

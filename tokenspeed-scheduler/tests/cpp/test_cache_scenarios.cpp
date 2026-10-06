@@ -35,6 +35,7 @@
 #include <spdlog/spdlog.h>
 
 #include "scheduler/operations/cache.h"
+#include "cache/core/cache_types.h"
 #include "cache_test_access.h"
 #include "integration_test_helper.h"
 
@@ -90,6 +91,24 @@ std::vector<std::int32_t> RealPages(const std::vector<std::vector<std::int32_t>>
     return out;
 }
 
+void ExpectDecodeWorkingState(const Scheduler& scheduler, const ForwardBatch& batch, std::int32_t computed_tokens,
+                              std::int32_t prefix_granularity, std::int32_t usable_blocks) {
+    ASSERT_EQ(batch.request_ids, std::vector<std::string>{"parent"});
+    const auto& state = batch.block_tables.at("state").at(0);
+    const std::int32_t input_slot = (computed_tokens - 1) / prefix_granularity;
+    ASSERT_GT(state.size(), static_cast<std::size_t>(input_slot));
+    for (std::int32_t slot = 0; slot < input_slot; ++slot) {
+        EXPECT_EQ(state[slot], 0) << "expired state at the exact accepted frontier: " << slot;
+    }
+    EXPECT_GT(state[input_slot], 0) << "the next forward still needs its input state";
+    for (const std::int32_t page : batch.block_tables.at("full").at(0)) {
+        EXPECT_GT(page, 0) << "full-history pages never expire";
+    }
+    // These prompts are shorter than P, so there is no retained prefill
+    // state. Once its table reference expires, a working state frees outright.
+    EXPECT_EQ(usable_blocks - scheduler.EmptyLcmBlocks(), scheduler.ActiveLcmBlocks());
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -120,7 +139,7 @@ protected:
 };
 
 TEST_F(ChunkedPrefillSuite, MultiChunkPrefillGrowsFullTableThenDecodes) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     // 8 tokens (4 pages) with max_scheduled_tokens=4 -> 2 prefill chunks.
     Submit(MakeRequestSpec("r1", /*num_pages=*/4));
@@ -151,7 +170,7 @@ TEST_F(ChunkedPrefillSuite, MultiChunkPrefillGrowsFullTableThenDecodes) {
     SendFinish("r1");
     PlanOnce();
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start)
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start)
         << "all pages returned to the pool after a chunked-prefill request finishes";
 }
 
@@ -210,7 +229,7 @@ TEST_F(MambaChunkAlignmentSuite, PartialPrefillEndsAtStatePageBoundary) {
     }
 }
 
-class MambaStateCheckpointSplitSuite : public MambaChunkAlignmentSuite {
+class MambaStateCheckpointSuite : public MambaChunkAlignmentSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = MambaChunkAlignmentSuite::MakeConfig();
@@ -220,31 +239,242 @@ protected:
     }
 };
 
-TEST_F(MambaStateCheckpointSplitSuite, ReservesAndBatchesDependentTails) {
+TEST_F(MambaStateCheckpointSuite, BatchesFinalExtentInOneForward) {
     RequestSpec first = MakeRequestSpec("a", /*num_pages=*/3);
     RequestSpec second = MakeRequestSpec("b", /*num_pages=*/3, /*start=*/100);
     first.tokens.resize(10);
     second.tokens.resize(10);
     Submit({first, second});
 
-    ExecutionPlan bodies = PlanOnce();
-    const ForwardBatch* body_op = FindForwardBatch(bodies);
-    ASSERT_NE(body_op, nullptr);
-    EXPECT_EQ(body_op->request_ids, (std::vector<std::string>{"a", "b"}));
-    EXPECT_EQ(body_op->input_lengths, (std::vector<std::int32_t>{8, 8}));
-    for (const auto& row : body_op->block_tables.at("state")) {
-        EXPECT_EQ(row.size(), 3u);
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->request_ids, (std::vector<std::string>{"a", "b"}));
+    EXPECT_EQ(op->input_lengths, (std::vector<std::int32_t>{10, 10}));
+    for (const auto& row : op->block_tables.at("state")) {
+        // Four logical slots, but only three physical blocks: the skipped
+        // token-4 checkpoint stays null; token-8, token-10 and growth are live.
+        ASSERT_EQ(row.size(), 4u);
+        EXPECT_EQ(row[0], 0);
+        EXPECT_GT(row[1], 0);
+        EXPECT_GT(row[2], 0);
+        EXPECT_GT(row[3], 0);
     }
-
-    ExecutionPlan tails = PlanOnce();
-    const ForwardBatch* tail_op = FindForwardBatch(tails);
-    ASSERT_NE(tail_op, nullptr);
-    EXPECT_EQ(tail_op->request_ids, (std::vector<std::string>{"a", "b"}));
-    EXPECT_EQ(tail_op->extend_prefix_lens, (std::vector<std::int32_t>{8, 8}));
-    EXPECT_EQ(tail_op->input_lengths, (std::vector<std::int32_t>{2, 2}));
 }
 
-TEST(MambaStateCheckpointCapacityTest, CountsEndpointGrowthAndChunkedInputCheckpoint) {
+TEST(MambaStateCheckpointTest, KeepsAlignedDecodeEndpointWorkingOnlyUnderWideVerify) {
+    for (const std::int32_t depth : {0, 1}) {
+        for (const bool lands_on_boundary : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "depth=" << depth << " aligned=" << lands_on_boundary);
+            SchedulerConfig cfg{};
+            cfg.prefix_granularity = 128;
+            cfg.max_scheduled_tokens = 256;
+            cfg.max_batch_size = 1;
+            cfg.decode_input_tokens = 4;
+            cfg.overlap_schedule_depth = depth;
+            cfg.disable_l2_cache = true;
+            cfg.disable_prefix_cache = false;
+            cfg.device_allocator.total_pages = 64;
+            cfg.cache_groups = {
+                MakeGroup("full", 128, 64, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History, 0),
+                MakeGroup("state", 128, 64, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State, 0)};
+            Scheduler scheduler{cfg};
+            const std::int32_t initially_empty = scheduler.EmptyLcmBlocks();
+            std::vector<std::int32_t> tokens(124, 1);
+            scheduler.SubmitRequests({RequestSpec{.request_id = "parent", .tokens = tokens, .max_new_tokens = 64}});
+            auto feedback = [&](std::vector<std::int32_t> output, bool decode) {
+                tokens.insert(tokens.end(), output.begin(), output.end());
+                ExecutionEvent done;
+                done.With(forward::ExtendResult{.request_id = "parent", .tokens = output});
+                if (decode) {
+                    done.With(forward::UpdateReserveNumTokens{
+                        .request_id = "parent",
+                        .reserve_num_tokens_in_next_schedule_event = static_cast<std::int32_t>(output.size())});
+                }
+                scheduler.Advance(std::move(done));
+            };
+            ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+            feedback({2}, false);
+            // Both routes end at 133 tokens, but only one forward stops
+            // exactly at 128 and writes S_128.
+            for (const auto count : {lands_on_boundary ? 4 : 3, lands_on_boundary ? 1 : 2, 4}) {
+                ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+                feedback(std::vector<std::int32_t>(count, 3), true);
+            }
+            ExecutionEvent finish;
+            finish.With(forward::Finish{.request_id = "parent"});
+            scheduler.Advance(std::move(finish));
+            scheduler.NextExecutionPlan();
+            EXPECT_EQ(scheduler.EmptyLcmBlocks(),
+                      initially_empty - (static_cast<std::int32_t>(tokens.size()) - 1) / cfg.prefix_granularity)
+                << "Finish retains complete history pages, but no generated state";
+            tokens.insert(tokens.end(), 11, 4);
+            scheduler.SubmitRequests({RequestSpec{.request_id = "resume", .tokens = tokens, .max_new_tokens = 16}});
+            const ExecutionPlan resumed = scheduler.NextExecutionPlan();
+            const ForwardBatch* batch = FindForwardBatch(resumed);
+            ASSERT_NE(batch, nullptr);
+            EXPECT_EQ(batch->extend_prefix_lens.at(0), 0);
+        }
+    }
+}
+
+TEST(MambaStateCheckpointTest, ReclaimsWorkingStateAtExactAcceptedFrontier) {
+    struct Case {
+        std::int32_t width;
+        std::vector<std::int32_t> accepted_counts;
+        std::int32_t shared_tokens;
+    };
+    // P=4. Aligned and crossed decode boundaries both remain working-only.
+    // Reclamation still uses the exact accepted frontier, not verify width.
+    const std::vector<Case> cases{
+        {4, {1, 4, 1}, 4},      {3, {1, 1, 3, 1}, 4},    {12, {1, 4, 4, 12}, 4},
+        {12, {1, 4, 4, 12}, 8}, {12, {1, 4, 4, 12}, 12}, {12, {2, 3, 12}, 4},
+    };
+    for (const std::int32_t depth : {0, 1}) {
+        for (const bool finish_parent : {false, true}) {
+            for (const Case& test : cases) {
+                SCOPED_TRACE(::testing::Message() << "depth=" << depth << " finish=" << finish_parent
+                                                  << " width=" << test.width << " shared=" << test.shared_tokens);
+                SchedulerConfig cfg{};
+                cfg.prefix_granularity = 4;
+                cfg.max_scheduled_tokens = 256;
+                cfg.max_batch_size = 2;
+                cfg.decode_input_tokens = test.width;
+                cfg.overlap_schedule_depth = depth;
+                cfg.disable_l2_cache = true;
+                cfg.disable_prefix_cache = false;
+                cfg.device_allocator.total_pages = 128;
+                cfg.cache_groups = {
+                    MakeGroup("full", 4, 128, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History, 0),
+                    MakeGroup("state", 4, 128, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State, 0)};
+                Scheduler scheduler{cfg};
+                std::vector<std::int32_t> tokens(3, 1);
+                scheduler.SubmitRequests(
+                    {RequestSpec{.request_id = "parent", .tokens = tokens, .max_new_tokens = 128}});
+                auto feedback = [&](std::int32_t count, bool decode) {
+                    const std::vector<std::int32_t> output(count, 2);
+                    tokens.insert(tokens.end(), output.begin(), output.end());
+                    ExecutionEvent done;
+                    done.With(forward::ExtendResult{.request_id = "parent", .tokens = output});
+                    if (decode) {
+                        done.With(forward::UpdateReserveNumTokens{.request_id = "parent",
+                                                                  .reserve_num_tokens_in_next_schedule_event = count});
+                    }
+                    scheduler.Advance(std::move(done));
+                };
+                ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+                feedback(1, false);
+                for (const std::int32_t count : test.accepted_counts) {
+                    ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+                    feedback(count, true);
+                }
+                if (finish_parent) {
+                    ExecutionEvent finish;
+                    finish.With(forward::Finish{.request_id = "parent"});
+                    scheduler.Advance(std::move(finish));
+                }
+                const ExecutionPlan after_feedback = scheduler.NextExecutionPlan();
+                if (!finish_parent) {
+                    const ForwardBatch* current = FindForwardBatch(after_feedback);
+                    ASSERT_NE(current, nullptr);
+                    ExpectDecodeWorkingState(scheduler, *current, static_cast<std::int32_t>(tokens.size()) - 1,
+                                             cfg.prefix_granularity, cfg.device_allocator.NumUsableBlocks());
+                } else {
+                    EXPECT_EQ(scheduler.EmptyLcmBlocks(),
+                              cfg.device_allocator.NumUsableBlocks() -
+                                  (static_cast<std::int32_t>(tokens.size()) - 1) / cfg.prefix_granularity);
+                }
+                // Diverge immediately after the boundary under test: reusing
+                // the whole prefix could hide its loss behind a newer hit.
+                tokens.resize(test.shared_tokens);
+                tokens.insert(tokens.end(), 4, 99);
+                scheduler.SubmitRequests({RequestSpec{.request_id = "resume", .tokens = tokens, .max_new_tokens = 16}});
+                const ExecutionPlan resumed = scheduler.NextExecutionPlan();
+                const ForwardBatch* batch = FindForwardBatch(resumed);
+                ASSERT_NE(batch, nullptr);
+                const auto it = std::ranges::find(batch->request_ids, "resume");
+                ASSERT_NE(it, batch->request_ids.end());
+                EXPECT_EQ(batch->extend_prefix_lens.at(it - batch->request_ids.begin()), 0);
+            }
+        }
+    }
+}
+
+TEST(MambaStateCheckpointTest, BackToBackResultsPublishExactHistoryButNoDecodeState) {
+    // Overlap plans step k+1 before step k's result lands, so two results can
+    // land back to back before the request's next admission. Both endpoints
+    // (4 and 8) must advance history hashing before the next admission,
+    // but neither state becomes reusable. A full-history-only control makes
+    // a lagging frontier observable even though the stateful hit is zero.
+    for (const bool with_state : {false, true}) {
+        for (const bool finish_parent : {false, true}) {
+            for (const std::int32_t shared : {4, 8}) {
+                SCOPED_TRACE(::testing::Message()
+                             << "state=" << with_state << " finish=" << finish_parent << " shared=" << shared);
+                SchedulerConfig cfg{};
+                cfg.prefix_granularity = 4;
+                cfg.max_scheduled_tokens = 256;
+                cfg.max_batch_size = 2;
+                cfg.decode_input_tokens = 4;
+                cfg.overlap_schedule_depth = 1;
+                cfg.disable_l2_cache = true;
+                cfg.disable_prefix_cache = false;
+                cfg.device_allocator.total_pages = 128;
+                cfg.cache_groups = {
+                    MakeGroup("full", 4, 128, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History, 0)};
+                if (with_state) {
+                    cfg.cache_groups.push_back(MakeGroup("state", 4, 128, CacheGroupConfig::Retention::FullHistory,
+                                                         CacheGroupFamily::State, 0));
+                }
+                Scheduler scheduler{cfg};
+                std::vector<std::int32_t> tokens(3, 1);
+                scheduler.SubmitRequests(
+                    {RequestSpec{.request_id = "parent", .tokens = tokens, .max_new_tokens = 128}});
+                auto feedback = [&](std::int32_t count, bool decode) {
+                    const std::vector<std::int32_t> output(count, 2);
+                    tokens.insert(tokens.end(), output.begin(), output.end());
+                    ExecutionEvent done;
+                    done.With(forward::ExtendResult{.request_id = "parent", .tokens = output});
+                    if (decode) {
+                        done.With(forward::UpdateReserveNumTokens{.request_id = "parent",
+                                                                  .reserve_num_tokens_in_next_schedule_event = count});
+                    }
+                    scheduler.Advance(std::move(done));
+                };
+                ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+                feedback(1, false);
+                // Two decode steps planned back to back, then both results land.
+                ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+                ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+                feedback(1, true);  // endpoint 4
+                feedback(4, true);  // endpoint 8
+                if (finish_parent) {
+                    ExecutionEvent finish;
+                    finish.With(forward::Finish{.request_id = "parent"});
+                    scheduler.Advance(std::move(finish));
+                }
+                const ExecutionPlan after_feedback = scheduler.NextExecutionPlan();
+                if (with_state && !finish_parent) {
+                    const ForwardBatch* current = FindForwardBatch(after_feedback);
+                    ASSERT_NE(current, nullptr);
+                    ExpectDecodeWorkingState(scheduler, *current, 8, cfg.prefix_granularity,
+                                             cfg.device_allocator.NumUsableBlocks());
+                }
+                tokens.resize(shared);
+                tokens.insert(tokens.end(), 4, 99);
+                scheduler.SubmitRequests({RequestSpec{.request_id = "resume", .tokens = tokens, .max_new_tokens = 16}});
+                const ExecutionPlan resumed = scheduler.NextExecutionPlan();
+                const ForwardBatch* batch = FindForwardBatch(resumed);
+                ASSERT_NE(batch, nullptr);
+                const auto it = std::ranges::find(batch->request_ids, "resume");
+                ASSERT_NE(it, batch->request_ids.end());
+                EXPECT_EQ(batch->extend_prefix_lens.at(it - batch->request_ids.begin()), with_state ? 0 : shared);
+            }
+        }
+    }
+}
+
+TEST(MambaStateCheckpointCapacityTest, CountsInternalCheckpointEvenWithoutPrefixCaching) {
     SchedulerConfig cfg{};
     cfg.prefix_granularity = 4;
     cfg.device_allocator.total_pages = 3;  // null + two usable state blocks
@@ -260,18 +490,51 @@ TEST(MambaStateCheckpointCapacityTest, CountsEndpointGrowthAndChunkedInputCheckp
 
     Scheduler scheduler{std::move(cfg)};
 
-    // Up to eight prompt tokens plus the decode reservation fit in two blocks
-    // (endpoint + banked growth block). A longer prompt is chunked and also
-    // retains the previous chunk's input checkpoint, which needs three.
-    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 9);
+    // Four prompt tokens plus decode fit in two blocks (endpoint + growth).
+    // A five-token prompt also materializes the token-4 checkpoint, requiring
+    // three blocks. Reject it at submission rather than waiting forever.
+    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 5);
     RequestSpec too_long{
         .request_id = "too-long",
-        .tokens = std::vector<std::int32_t>(14, 1),
+        .tokens = std::vector<std::int32_t>(6, 1),
     };
     EXPECT_THROW(scheduler.SubmitRequests({too_long}), std::invalid_argument);
 }
 
-TEST(MambaStateCheckpointCapacityTest, CountsFirstChunkBodyAndSubPageTail) {
+TEST(MambaStateCheckpointCapacityTest, CountsRetainedInputForChunkedSingleForward) {
+    for (const std::int32_t usable_blocks : {3, 4}) {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = 4;
+        cfg.device_allocator.total_pages = usable_blocks + 1;
+        cfg.max_scheduled_tokens = 8;
+        cfg.max_batch_size = 1;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = true;
+        cfg.cache_groups = {
+            MakeGroup("state", 4, cfg.device_allocator.total_pages, CacheGroupConfig::Retention::FullHistory,
+                      CacheGroupFamily::State, 0),
+        };
+        Scheduler scheduler{cfg};
+        RequestSpec spec{.request_id = "chunked", .tokens = std::vector<std::int32_t>(14, 1), .max_new_tokens = 1};
+        if (usable_blocks == 3) {
+            EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 9);
+            EXPECT_THROW(scheduler.SubmitRequests({spec}), std::invalid_argument);
+            continue;
+        }
+        scheduler.SubmitRequests({spec});
+        for (const std::int32_t length : {8, 6}) {
+            const ExecutionPlan plan = scheduler.NextExecutionPlan();
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            ASSERT_NE(batch, nullptr);
+            EXPECT_EQ(batch->input_lengths, (std::vector<std::int32_t>{length}));
+            ExecutionEvent done;
+            done.With(forward::ExtendResult{.request_id = "chunked", .tokens = {}});
+            scheduler.Advance(std::move(done));
+        }
+    }
+}
+
+TEST(MambaStateCheckpointCapacityTest, CountsFirstChunkSuffixAndSubPageGrowth) {
     SchedulerConfig cfg{};
     cfg.prefix_granularity = 4;
     cfg.device_allocator.total_pages = 4;  // null + three usable state blocks
@@ -286,11 +549,10 @@ TEST(MambaStateCheckpointCapacityTest, CountsFirstChunkBodyAndSubPageTail) {
 
     Scheduler scheduler{std::move(cfg)};
 
-    // A six-token prompt would split into a four-token body and a two-token
-    // tail. With the prefix cache on the body may retain a cached input
-    // checkpoint (one block) beside its own checkpoint, and the reserved tail
-    // takes two more, so three usable blocks cannot admit it and its decode.
-    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 6);
+    // A five-token prompt can retain a cached input beside its aligned
+    // checkpoint, one-token suffix, and growth block. Three usable blocks
+    // cannot hold all four, so only four prompt tokens plus decode fit.
+    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 5);
     RequestSpec too_long{
         .request_id = "too-long",
         .tokens = std::vector<std::int32_t>(6, 1),
@@ -298,10 +560,10 @@ TEST(MambaStateCheckpointCapacityTest, CountsFirstChunkBodyAndSubPageTail) {
     EXPECT_THROW(scheduler.SubmitRequests({too_long}), std::invalid_argument);
 }
 
-class MambaStateCheckpointNoPrefixCacheSuite : public MambaStateCheckpointSplitSuite {
+class MambaStateCheckpointNoPrefixCacheSuite : public MambaStateCheckpointSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg = MambaStateCheckpointSplitSuite::MakeConfig();
+        SchedulerConfig cfg = MambaStateCheckpointSuite::MakeConfig();
         cfg.disable_prefix_cache = true;
         return cfg;
     }
@@ -318,10 +580,10 @@ TEST_F(MambaStateCheckpointNoPrefixCacheSuite, KeepsSingleFinalChunk) {
     EXPECT_EQ(op->input_lengths, std::vector<std::int32_t>{10});
 }
 
-class MambaStateCheckpointPrefillRoleSuite : public MambaStateCheckpointSplitSuite {
+class MambaStateCheckpointPrefillRoleSuite : public MambaStateCheckpointSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg = MambaStateCheckpointSplitSuite::MakeConfig();
+        SchedulerConfig cfg = MambaStateCheckpointSuite::MakeConfig();
         cfg.role = Role::kP;
         for (CacheGroupConfig& group : cfg.cache_groups) {
             group.transfer_policy =
@@ -337,26 +599,7 @@ protected:
     }
 };
 
-TEST_F(MambaStateCheckpointPrefillRoleSuite, SplitsLocalPrefillOnPrefillWorker) {
-    RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/3);
-    spec.tokens.resize(10);
-    Submit(spec);
-    SendBootstrapped("r1");
-
-    ExecutionPlan body_plan = PlanOnce();
-    const ForwardBatch* body = FindForwardBatch(body_plan);
-    ASSERT_NE(body, nullptr);
-    EXPECT_EQ(body->extend_prefix_lens, std::vector<std::int32_t>{0});
-    EXPECT_EQ(body->input_lengths, std::vector<std::int32_t>{8});
-
-    ExecutionPlan tail_plan = PlanOnce();
-    const ForwardBatch* tail = FindForwardBatch(tail_plan);
-    ASSERT_NE(tail, nullptr);
-    EXPECT_EQ(tail->extend_prefix_lens, std::vector<std::int32_t>{8});
-    EXPECT_EQ(tail->input_lengths, std::vector<std::int32_t>{2});
-}
-
-TEST_F(MambaStateCheckpointPrefillRoleSuite, HoldsRemoteDecodeUntilTheFinalChunkResultLands) {
+TEST_F(MambaStateCheckpointPrefillRoleSuite, CompletesOneForwardBeforeRemoteDecode) {
     // A request turns PrefillDone when its last chunk is SCHEDULED, and its
     // remote decode needs the bootstrap token that lands with that chunk's
     // result.  The plan must hold the remote decode until then -- and emit
@@ -366,12 +609,19 @@ TEST_F(MambaStateCheckpointPrefillRoleSuite, HoldsRemoteDecodeUntilTheFinalChunk
     Submit(first);
     SendBootstrapped("r1");
 
-    PlanOnce();  // r1 body chunk
-    ExecutionPlan tail_plan = PlanOnce();
-    const ForwardBatch* tail = FindForwardBatch(tail_plan);
-    ASSERT_NE(tail, nullptr);
+    ExecutionPlan final_plan = PlanOnce();
+    const ForwardBatch* final = FindForwardBatch(final_plan);
+    ASSERT_NE(final, nullptr);
+    EXPECT_EQ(final->extend_prefix_lens, std::vector<std::int32_t>{0});
+    EXPECT_EQ(final->input_lengths, std::vector<std::int32_t>{10});
+    // A prefill-only worker owns the two outputs, but no local decode reserve.
+    const auto& state_row = final->block_tables.at("state").at(0);
+    ASSERT_EQ(state_row.size(), 3u);
+    EXPECT_EQ(state_row[0], 0);
+    EXPECT_GT(state_row[1], 0);
+    EXPECT_GT(state_row[2], 0);
     // r1 is PrefillDone from here on.
-    EXPECT_FALSE(tail_plan.remote_decode.has_value());
+    EXPECT_FALSE(final_plan.remote_decode.has_value());
 
     // Its ExtendResult has not arrived, so the plan holds the remote decode.
     ExecutionPlan while_pending = PlanOnce();
@@ -399,6 +649,41 @@ TEST_F(MambaStateCheckpointPrefillRoleSuite, HoldsRemoteDecodeUntilTheFinalChunk
     EXPECT_TRUE(forward->request_ids.empty());
 }
 
+// On the P role the PD pin is the request's page-holding state itself: it
+// appears with the first scheduled chunk, survives the PrefillDone hand-off,
+// and only the PD ACK -- which finishes the request -- releases it.
+TEST_F(MambaStateCheckpointPrefillRoleSuite, PdTransferPinFollowsThePageHoldingStates) {
+    RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/3);
+    first.tokens.resize(10);
+    Submit(first);
+    EXPECT_FALSE(scheduler_->PdTransferPinned("r1")) << "a waiting prompt holds no pages";
+    SendBootstrapped("r1");
+    EXPECT_FALSE(scheduler_->PdTransferPinned("r1"));
+
+    PlanOnce();
+    EXPECT_TRUE(scheduler_->PdTransferPinned("r1")) << "the first scheduled chunk pins";
+    EXPECT_FALSE(scheduler_->ClearL1Cache()) << "a flush must wait for the transfer";
+
+    ExecutionEvent result;
+    result.With(forward::ExtendResult{.request_id = "r1", .tokens = {42}, .spec_candidate_ids = {}});
+    scheduler_->Advance(std::move(result));
+    ASSERT_TRUE(PlanOnce().remote_decode.has_value());
+    EXPECT_TRUE(scheduler_->PdTransferPinned("r1")) << "PrefillDone and the remote decode keep the pin";
+
+    ExecutionEvent finish;
+    finish.With(forward::Finish{.request_id = "r1"});
+    EXPECT_THROW(scheduler_->Advance(std::move(finish)), std::logic_error)
+        << "a local Finish cannot release pages the peer is still reading";
+    EXPECT_TRUE(scheduler_->PdTransferPinned("r1"));
+
+    ExecutionEvent succeeded;
+    succeeded.With(pd::SucceededEvent{"r1"});
+    scheduler_->Advance(std::move(succeeded));
+    EXPECT_FALSE(scheduler_->PdTransferPinned("r1")) << "the ACK finishes the request and with it the pin";
+    PlanOnce();
+    EXPECT_TRUE(scheduler_->ClearL1Cache());
+}
+
 TEST_F(MambaStateCheckpointPrefillRoleSuite, EmitsRemoteDecodeAlongsideOngoingPrefillWork) {
     // Everything dispatchable dispatches in one round: a ready remote decode
     // rides plan.remote_decode while another request's prefill keeps filling
@@ -409,11 +694,10 @@ TEST_F(MambaStateCheckpointPrefillRoleSuite, EmitsRemoteDecodeAlongsideOngoingPr
     Submit(first);
     SendBootstrapped("r1");
 
-    PlanOnce();  // r1 body chunk
-    PlanOnce();  // r1 tail chunk -> r1 PrefillDone, result pending
+    PlanOnce();  // r1 PrefillDone, result pending
 
-    RequestSpec second = MakeRequestSpec("r2", /*num_pages=*/3, /*start=*/100);
-    second.tokens.resize(10);
+    RequestSpec second = MakeRequestSpec("r2", /*num_pages=*/18, /*start=*/100);
+    second.tokens.resize(70);
     Submit(second);
     SendBootstrapped("r2");
 
@@ -424,13 +708,13 @@ TEST_F(MambaStateCheckpointPrefillRoleSuite, EmitsRemoteDecodeAlongsideOngoingPr
     const ForwardBatch* body = FindForwardBatch(held);
     ASSERT_NE(body, nullptr);
     EXPECT_EQ(body->request_ids, std::vector<std::string>{"r2"});
-    EXPECT_EQ(body->input_lengths, std::vector<std::int32_t>{8});
+    EXPECT_EQ(body->input_lengths, std::vector<std::int32_t>{64});
 
     ExecutionEvent result;
     result.With(forward::ExtendResult{.request_id = "r1", .tokens = {42}});
     scheduler_->Advance(std::move(result));
 
-    // One round, both streams: r1's remote decode and r2's tail chunk.
+    // One round, both streams: r1's remote decode and r2's budget remainder.
     ExecutionPlan combined = PlanOnce();
     ASSERT_TRUE(combined.remote_decode.has_value());
     EXPECT_EQ(combined.remote_decode->request_ids, std::vector<std::string>{"r1"});
@@ -438,8 +722,8 @@ TEST_F(MambaStateCheckpointPrefillRoleSuite, EmitsRemoteDecodeAlongsideOngoingPr
     const ForwardBatch* tail = FindForwardBatch(combined);
     ASSERT_NE(tail, nullptr);
     EXPECT_EQ(tail->request_ids, std::vector<std::string>{"r2"});
-    EXPECT_EQ(tail->extend_prefix_lens, std::vector<std::int32_t>{8});
-    EXPECT_EQ(tail->input_lengths, std::vector<std::int32_t>{2});
+    EXPECT_EQ(tail->extend_prefix_lens, std::vector<std::int32_t>{64});
+    EXPECT_EQ(tail->input_lengths, std::vector<std::int32_t>{6});
 }
 
 class MambaStateCheckpointDecodeRoleSuite : public MambaStateCheckpointPrefillRoleSuite {
@@ -496,7 +780,7 @@ TEST_F(MambaSparsePrefillSuite, LocalChunkDefersStateDecodeReservationUntilCompl
 
     ASSERT_EQ(plan.pages_to_zero.count("state"), 1u);
     EXPECT_EQ(plan.pages_to_zero.at("state").size(), 2u);
-    const std::int64_t free_after_prefill = scheduler_->PoolFreeBlocks();
+    const std::int64_t free_after_prefill = scheduler_->AvailableLcmBlocks();
 
     // The first decode runs on the banked block: nothing acquired, nothing zeroed.
     SendForwardDone("r1", {42});
@@ -508,7 +792,7 @@ TEST_F(MambaSparsePrefillSuite, LocalChunkDefersStateDecodeReservationUntilCompl
     EXPECT_GT(decode_state[2], 0);
     EXPECT_GT(decode_state[3], 0);
     EXPECT_EQ(decode_state[3], state[3]);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_after_prefill);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_after_prefill);
     if (decode_plan.pages_to_zero.count("state") != 0) {
         EXPECT_TRUE(decode_plan.pages_to_zero.at("state").empty());
     }
@@ -653,7 +937,7 @@ protected:
 };
 
 TEST_F(ThreeGroupSuite, ThreeGroupsEachEmitARowAndReclaim) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/3));
     ExecutionPlan prefill = PlanOnce();
@@ -679,7 +963,7 @@ TEST_F(ThreeGroupSuite, ThreeGroupsEachEmitARowAndReclaim) {
     SendForwardDone("r1", {42});
     SendFinish("r1");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 // ---------------------------------------------------------------------------
@@ -714,7 +998,7 @@ protected:
 };
 
 TEST_F(SubPageWindowSuite, SubPageWindowsPlateauAtTwoRealPages) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/3));
     ExecutionPlan prefill = PlanOnce();
@@ -737,7 +1021,7 @@ TEST_F(SubPageWindowSuite, SubPageWindowsPlateauAtTwoRealPages) {
 
     SendFinish("r1");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 TEST_F(SubPageWindowSuite, StraddlingWindowHoldsPreviousPage) {
@@ -791,7 +1075,7 @@ protected:
 };
 
 TEST_F(AllFullTwoGroupSuite, BothFullGroupsKeepHistoryNoHoles) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/2));
     PlanOnce();  // prefill
@@ -815,7 +1099,7 @@ TEST_F(AllFullTwoGroupSuite, BothFullGroupsKeepHistoryNoHoles) {
 
     SendFinish("r1");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 // ---------------------------------------------------------------------------
@@ -846,7 +1130,7 @@ protected:
 };
 
 TEST_F(PoolAccountingSuite, ThreeRequestsOutOfOrderFinishReclaimExactly) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/2));
     Submit(MakeRequestSpec("r2", /*num_pages=*/4, /*start=*/101));
@@ -854,7 +1138,7 @@ TEST_F(PoolAccountingSuite, ThreeRequestsOutOfOrderFinishReclaimExactly) {
     PlanOnce();  // prefill all three (max_scheduled_tokens=64 covers them)
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
 
-    const std::int32_t free_after_prefill = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_after_prefill = scheduler_->AvailableLcmBlocks();
     EXPECT_LT(free_after_prefill, free_at_start) << "prefill must consume pages from the shared pool";
 
     SendForwardDone("r1", {42});
@@ -865,12 +1149,13 @@ TEST_F(PoolAccountingSuite, ThreeRequestsOutOfOrderFinishReclaimExactly) {
     PlanOnce();
     SendFinish("r1");
     PlanOnce();
-    EXPECT_LT(scheduler_->PoolFreeBlocks(), free_at_start) << "pool not fully reclaimed while r3 is still live";
+    EXPECT_LT(scheduler_->AvailableLcmBlocks(), free_at_start) << "pool not fully reclaimed while r3 is still live";
     SendFinish("r3");
     PlanOnce();
 
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "every page returns to the pool once all requests finish";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start)
+        << "every page returns to the pool once all requests finish";
 }
 
 // Chunked prefill slides the SWA window DURING prefill, then decode keeps
@@ -878,7 +1163,7 @@ TEST_F(PoolAccountingSuite, ThreeRequestsOutOfOrderFinishReclaimExactly) {
 // round's forward, the pending query at N attends keys [N-W+1, N], so the
 // first kept page is (N-W+1)/block_granularity and everything below it is freed.
 TEST_F(ChunkedPrefillSuite, ChunkedPrefillThenSwaSlidesToNullHole) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     // 12 tokens (6 pages), max_scheduled_tokens=4 -> 3 prefill chunks.
     Submit(MakeRequestSpec("r1", /*num_pages=*/6));
@@ -895,7 +1180,7 @@ TEST_F(ChunkedPrefillSuite, ChunkedPrefillThenSwaSlidesToNullHole) {
             << "N=4, W=4: no page fully below token 1, so chunk 2 punches nothing";
     }
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
-    const std::int32_t free_after_c2 = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_after_c2 = scheduler_->AvailableLcmBlocks();
 
     // Chunk 3: N=8 -> first kept token 5 -> page 5/2=2: slots 0,1 punched MID-PREFILL.
     ExecutionPlan chunk3 = PlanOnce();  // chunk 3 (last)
@@ -912,7 +1197,7 @@ TEST_F(ChunkedPrefillSuite, ChunkedPrefillThenSwaSlidesToNullHole) {
     }
     // Chunk-3 balance: slide frees 2 SWA pages, the chunk takes 2/group and
     // the physically-backed decode reservation takes 1/group.
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_after_c2 + 2 - 4 - 2)
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_after_c2 + 2 - 4 - 2)
         << "the mid-prefill slide must return the out-of-window pages to the pool";
 
     SendForwardDone("r1", {99});  // container size 13 (12 prompt + 1 sampled)
@@ -960,11 +1245,11 @@ TEST_F(ChunkedPrefillSuite, ChunkedPrefillThenSwaSlidesToNullHole) {
 
     SendFinish("r1");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 TEST_F(ThreeGroupSuite, TwoRequestsBatchedAcrossThreeGroupsNoCollision) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/2));
     Submit(MakeRequestSpec("r2", /*num_pages=*/3, /*start=*/101));
@@ -993,7 +1278,7 @@ TEST_F(ThreeGroupSuite, TwoRequestsBatchedAcrossThreeGroupsNoCollision) {
     SendFinish("r1");
     SendFinish("r2");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,7 +1311,7 @@ protected:
 };
 
 TEST_F(MixedBatchSuite, PrefillAndDecodeShareOnePlan) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/2));
     PlanOnce();                   // r1 prefill
@@ -1060,7 +1345,7 @@ TEST_F(MixedBatchSuite, PrefillAndDecodeShareOnePlan) {
     SendFinish("r2");
     PlanOnce();
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 // Swa eviction state is tracked independently per request, not batch-wide.
@@ -1140,7 +1425,7 @@ protected:
 };
 
 TEST_F(PrefixGranularityOneSuite, TokenGranularPagesSlideAndReclaim) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/3));
     ExecutionPlan prefill = PlanOnce();
@@ -1168,7 +1453,7 @@ TEST_F(PrefixGranularityOneSuite, TokenGranularPagesSlideAndReclaim) {
 
     SendFinish("r1");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 namespace {
@@ -1212,14 +1497,14 @@ protected:
 };
 
 TEST_F(TinyPoolSuite, ExhaustedPoolDefersSecondRequestUntilFirstFinishes) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     ASSERT_EQ(free_at_start, 10);
 
     // r1 exact admission acquires 8 prefill + 2 reserve blocks: free 0.
     Submit(MakeRequestSpec("r1", /*num_pages=*/4));
     ExecutionPlan plan1 = PlanOnce();
     ASSERT_NE(FindForwardBatch(plan1), nullptr);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 0);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
 
     // r2 needs 4 blocks while r1 owns the whole pool: deferred.
     Submit(MakeRequestSpec("r2", /*num_pages=*/1, /*start=*/101));
@@ -1231,7 +1516,7 @@ TEST_F(TinyPoolSuite, ExhaustedPoolDefersSecondRequestUntilFirstFinishes) {
     EXPECT_EQ(blocked_op->request_ids.at(0), "r1");
     EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "deferred r2 stays intact in the waiting set";
     // Finalize consumes the reservation and exposes two slid-out SWA parents.
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 2);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 2);
 
     SendForwardDone("r1", {100});
     SendFinish("r1");
@@ -1245,7 +1530,7 @@ TEST_F(TinyPoolSuite, ExhaustedPoolDefersSecondRequestUntilFirstFinishes) {
     SendForwardDone("r2", {142});
     SendFinish("r2");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start)
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start)
         << "pool back to baseline after the deferred request completes";
 }
 
@@ -1278,7 +1563,7 @@ protected:
 };
 
 TEST_F(PrefillSlideAdmissionSuite, LongPromptAdmittedOnlyBecausePrefillSlides) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     ASSERT_EQ(free_at_start, 12);
 
     // page=2, W=4, 4-token chunks: c1 charges 4 blocks (2/group), 12 -> 8;
@@ -1290,7 +1575,7 @@ TEST_F(PrefillSlideAdmissionSuite, LongPromptAdmittedOnlyBecausePrefillSlides) {
     ExecutionPlan c2 = PlanOnce();
     ASSERT_NE(FindForwardBatch(c2), nullptr);
     ASSERT_EQ(FindForwardBatch(c2)->request_ids.size(), 1u);
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 4);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 4);
 
     // c3 gate: chunk + reserve = 3 blocks/group = 6 vs raw free 4; the pending
     // slide at N=8 frees the 2 swa pages below token 5 -> 4 + 2 = 6, admitted.
@@ -1299,7 +1584,7 @@ TEST_F(PrefillSlideAdmissionSuite, LongPromptAdmittedOnlyBecausePrefillSlides) {
     ASSERT_NE(c3op, nullptr);
     ASSERT_EQ(c3op->request_ids.size(), 1u) << "final chunk must be admitted via the prefill slide credit";
     // Op balance: punch 2, acquire 2/group plus 1 reserved/group -> exact fit.
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 0);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
 
     // Decode transition: gate needs 2, finalize-slide credit at N=12 gives 2.
     SendForwardDone("r1", {99});
@@ -1307,12 +1592,12 @@ TEST_F(PrefillSlideAdmissionSuite, LongPromptAdmittedOnlyBecausePrefillSlides) {
     ASSERT_NE(FindForwardBatch(decode), nullptr);
     ASSERT_EQ(FindForwardBatch(decode)->request_ids.size(), 1u);
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 2);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 2);
 
     SendForwardDone("r1", {100});
     SendFinish("r1");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 TEST_F(PrefillSlideAdmissionSuite, InFlightStorePinsItsSourcesUntilAck) {
@@ -1325,7 +1610,7 @@ TEST_F(PrefillSlideAdmissionSuite, InFlightStorePinsItsSourcesUntilAck) {
     config_.disable_l2_cache = false;
     config_.host_allocator.total_pages = 13;
     scheduler_ = std::make_unique<Scheduler>(config_);
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     ASSERT_EQ(free_at_start, 12);
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/6));
@@ -1342,7 +1627,7 @@ TEST_F(PrefillSlideAdmissionSuite, InFlightStorePinsItsSourcesUntilAck) {
     ASSERT_EQ(op1.op_ids.size(), 1u);
     EXPECT_EQ(op1.src_pages.at(0).size(), 4u) << "the first completed Full+SWA pages stream together";
     EXPECT_EQ(op1.source_pinned, std::vector<bool>{true}) << "an ordinary publication pins its sources";
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 4);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 4);
 
     ExecutionPlan stalled = PlanOnce();  // slide credit 2 is pinned by op1: c3 cannot admit yet
     const ForwardBatch* stalled_forward = FindForwardBatch(stalled);
@@ -1362,7 +1647,7 @@ TEST_F(PrefillSlideAdmissionSuite, InFlightStorePinsItsSourcesUntilAck) {
     auto wb2 = ExtractCacheOpsOfKind<WriteBackBatch>(c3);
     ASSERT_EQ(wb2.size(), 1u);
     const auto op2 = std::get<WriteBackBatch>(wb2.front());
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 0);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
 
     SendForwardDone("r1", {99});
     ExecutionPlan decode = PlanOnce();  // last prefill pages stream on PrefillDone
@@ -1376,12 +1661,12 @@ TEST_F(PrefillSlideAdmissionSuite, InFlightStorePinsItsSourcesUntilAck) {
     SendForwardDone("r1", {100});
     SendFinish("r1");
     PlanOnce();
-    EXPECT_LT(scheduler_->PoolFreeBlocks(), free_at_start)
+    EXPECT_LT(scheduler_->AvailableLcmBlocks(), free_at_start)
         << "op2/op3 still pin their sources: the pool does not balance before their ACKs";
     SendWriteBackDone(op2.op_ids.at(0));
     SendWriteBackDone(op3.op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 12);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "the ACKs return every pinned source";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "the ACKs return every pinned source";
 }
 
 // Pool 17 -> 16 usable: swa at full prompt length would need 10+10+2 = 22
@@ -1398,7 +1683,7 @@ protected:
 };
 
 TEST_F(PrefillPlateauSuite, SwaWorkingSetPlateausWhileFullGrowsToPromptLength) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     ASSERT_EQ(free_at_start, 16);
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/10));  // 20 tokens, 5 chunks of 4
@@ -1427,7 +1712,7 @@ TEST_F(PrefillPlateauSuite, SwaWorkingSetPlateausWhileFullGrowsToPromptLength) {
     SendForwardDone("r1", {100});
     SendFinish("r1");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 // ---------------------------------------------------------------------------
@@ -1459,8 +1744,61 @@ protected:
     }
 };
 
+// Same pool arithmetic as CapacityBlockSuite, with the prefix cache live so
+// that page publication is observable through a later request's hit length.
+class CapacityBlockPrefixCacheSuite : public CapacityBlockSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = CapacityBlockSuite::MakeConfig();
+        cfg.disable_prefix_cache = false;
+        return cfg;
+    }
+};
+
+TEST_F(CapacityBlockPrefixCacheSuite, FailedAdmissionLeavesCacheProgressUncommitted) {
+    // A decode round advances the request's prefix-hash chain for the page
+    // its last step completed and asks admission to publish that page. When
+    // admission fails for capacity, NOTHING of that may stick: the retry must
+    // see the same page as still-unpublished, or it silently never enters the
+    // prefix cache. Resources and progress land when admission succeeds --
+    // never before.
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));  // tokens 1..4
+    Submit(MakeRequestSpec("r2", /*num_pages=*/2, /*start=*/101));
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    SendForwardDone("r2", {142});
+    PlanOnce();  // r1 = [1 2 3 4 42]: publishes pages 0,1
+    SendForwardDone("r1", {43});
+    SendForwardDone("r2", {143});
+    PlanOnce();  // r1 = [1 2 3 4 42 43]
+    SendForwardDone("r1", {44});
+    // r1 = [1 2 3 4 42 43 44]: page 2 ([42 43]) is complete and due for
+    // publication -- but the pool is full and r2's result is still out, so
+    // r1's decode admission fails and the round stays quiet.
+    ExecutionPlan quiet = PlanOnce();
+    ASSERT_TRUE(FindForwardBatch(quiet)->request_ids.empty());
+
+    // r2 leaves; r1's retried decode admission now succeeds and publishes
+    // page 2 as part of the same admission.
+    SendForwardDone("r2", {144});
+    SendFinish("r2");
+    ExecutionPlan resumed = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(resumed)->request_ids, std::vector<std::string>{"r1"});
+    SendForwardDone("r1", {45});
+    SendFinish("r1");
+    PlanOnce();
+
+    // A prompt sharing r1's first six tokens must hit all three pages.
+    Submit(RequestSpec{.request_id = "r3", .tokens = {1, 2, 3, 4, 42, 43, 7, 8}});
+    ExecutionPlan hit = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(hit);
+    ASSERT_EQ(op->request_ids, std::vector<std::string>{"r3"});
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 6)
+        << "page 2 was never published: the failed admission's progress leaked into the request";
+}
+
 TEST_F(CapacityBlockSuite, RetractsLargestRunningRequestImmediately) {
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 12);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 12);
 
     // Round 1: both exact admissions include physical decode reservations.
     Submit(MakeRequestSpec("r1", /*num_pages=*/2));
@@ -1469,7 +1807,7 @@ TEST_F(CapacityBlockSuite, RetractsLargestRunningRequestImmediately) {
     const ForwardBatch* op1 = FindForwardBatch(prefill);
     ASSERT_NE(op1, nullptr);
     ASSERT_EQ(op1->request_ids.size(), 2u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 0);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
     SendForwardDone("r1", {42});
     SendForwardDone("r2", {142});
 
@@ -1478,7 +1816,7 @@ TEST_F(CapacityBlockSuite, RetractsLargestRunningRequestImmediately) {
     const ForwardBatch* op2 = FindForwardBatch(round2);
     ASSERT_NE(op2, nullptr);
     ASSERT_EQ(op2->request_ids.size(), 2u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 0);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
     SendForwardDone("r1", {43});
     SendForwardDone("r2", {143});
 
@@ -1502,7 +1840,7 @@ TEST_F(CapacityBlockSuite, RetractsLargestRunningRequestImmediately) {
     ASSERT_NE(retract_op, nullptr);
     EXPECT_TRUE(retract_op->request_ids.empty());
     // r1 and r2 tie at 7 tokens; deterministic candidate order picks r1.
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 6) << "r1's 3 pages x 2 groups return to the pool";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 6) << "r1's 3 pages x 2 groups return to the pool";
     EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "r1 requeues as a fresh prefill";
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
 
@@ -1532,7 +1870,7 @@ TEST_F(CapacityBlockSuite, RetractsLargestRunningRequestImmediately) {
     SendForwardDone("r1", {46});
     SendFinish("r1");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 12);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 12);
 }
 
 class ConsumedHeadroomRetractionSuite : public SchedulerTestSuite {
@@ -1569,7 +1907,7 @@ TEST_F(ConsumedHeadroomRetractionSuite, ConsumedPartialHeadroomDoesNotDisableRet
     const ForwardBatch* prefill = FindForwardBatch(prefill_plan);
     ASSERT_NE(prefill, nullptr);
     ASSERT_EQ(prefill->request_ids, (std::vector<std::string>{"a", "b"}));
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 0);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
     SendForwardDone("a", {42});
     SendForwardDone("b", {43});
 
@@ -1593,7 +1931,7 @@ TEST_F(ConsumedHeadroomRetractionSuite, ConsumedPartialHeadroomDoesNotDisableRet
     EXPECT_TRUE(blocked->request_ids.empty());
     EXPECT_EQ(scheduler_->WaitingSize(), 1u);
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 2);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 2);
 
     SendFinish("b");
     const ExecutionPlan readmit_plan = PlanOnce();
@@ -1606,7 +1944,7 @@ TEST_F(ConsumedHeadroomRetractionSuite, ConsumedPartialHeadroomDoesNotDisableRet
     PlanOnce();
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 4);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 4);
 }
 
 class MambaFusedRetractionDrainSuite : public MambaSparsePrefillSuite {
@@ -1626,7 +1964,7 @@ protected:
 };
 
 TEST_F(MambaFusedRetractionDrainSuite, RetractionFreesCapacityWithoutPausingTheEngine) {
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 10);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 10);
 
     Submit(MakeRequestSpec("a", /*num_pages=*/2));
     Submit(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101));
@@ -1727,6 +2065,56 @@ TEST_F(FusedRetractionL2TestSuite, AReadmissionThatDoesNotFitWaitsWithoutRetract
     }
 }
 
+// RequestSpec::max_cached_prefix_tokens bounds the probe at the positions a
+// request still needs logits for. A decoding victim had produced them all, so
+// its readmission matches its whole snapshot back despite the bound.
+TEST_F(FusedRetractionL2TestSuite, ADecodingVictimReadmitsPastItsProbeBound) {
+    // r1 returns prompt logprobs from position 0: nothing may be matched at
+    // its first admission. r2 shares the pool and keeps decoding.
+    RequestSpec capped = MakeRequestSpec("r1", /*num_pages=*/2);
+    capped.max_cached_prefix_tokens = 0;
+    Submit(capped);
+    Submit(MakeRequestSpec("r2", /*num_pages=*/2, /*start=*/101));
+    ExecutionPlan prefill = PlanOnce();
+    const ForwardBatch* first = FindForwardBatch(prefill);
+    ASSERT_NE(first, nullptr);
+    ASSERT_EQ(first->request_ids.size(), 2u);
+    EXPECT_EQ(first->extend_prefix_lens.at(0), 0);
+    EXPECT_EQ(first->input_lengths.at(0), 4);
+    CompleteStores(prefill);
+    SendForwardDone("r1", {42});
+    SendForwardDone("r2", {142});
+    CompleteStores(PlanOnce());
+    SendForwardDone("r1", {43});
+    SendForwardDone("r2", {143});
+    CompleteStores(PlanOnce());
+    SendForwardDone("r1", {44});
+    SendForwardDone("r2", {144});
+    // r1 = [1 2 3 4 42 43 44]: the blocked round retracts it and snapshots
+    // its completed pages [1 2] [3 4] [42 43] to the host tier.
+    const ExecutionPlan retraction = PlanOnce();
+    CompleteStores(retraction);
+    ASSERT_EQ(scheduler_->WaitingSize(), 1u);
+    ASSERT_EQ(scheduler_->DecodingSize(), 1u);
+
+    // r2 leaves; r1 readmits. The bound of 0 would recompute all 7 tokens;
+    // the readmission instead matches its three snapshot pages back.
+    const ExecutionPlan resumed = PlanOnce();
+    const ForwardBatch* r2_only = FindForwardBatch(resumed);
+    ASSERT_NE(r2_only, nullptr);
+    ASSERT_EQ(r2_only->request_ids, std::vector<std::string>{"r2"});
+    CompleteStores(resumed);
+    SendForwardDone("r2", {145});
+    SendFinish("r2");
+    const ExecutionPlan readmit = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(readmit);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids, std::vector<std::string>{"r1"});
+    EXPECT_EQ(op->prefill_lengths.at(0), 7);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 6) << "the readmission must match the snapshot back";
+    EXPECT_EQ(op->input_lengths.at(0), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Cache retract: a blocked round picks the largest Decoding/PrefillDone
 // request, releases every page and requeues it as a fresh prefill. Accepted
@@ -1760,7 +2148,7 @@ protected:
     // capacity block that retracts "a".
     // Post: "a" Submitted with 9 tokens, "b" Decoding with 7 tokens, free = 8.
     void DriveToRetractOfA() {
-        ASSERT_EQ(scheduler_->PoolFreeBlocks(), 14);
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 14);
         Submit(MakeRequestSpec("a", /*num_pages=*/3));
         Submit(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101));
 
@@ -1768,7 +2156,7 @@ protected:
         const ForwardBatch* prefill_op = FindForwardBatch(prefill);
         ASSERT_NE(prefill_op, nullptr);
         ASSERT_EQ(prefill_op->request_ids.size(), 2u);
-        ASSERT_EQ(scheduler_->PoolFreeBlocks(), 0);
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
         SendForwardDone("a", {42});
         SendForwardDone("b", {142});
 
@@ -1777,7 +2165,7 @@ protected:
         const ForwardBatch* decode_op = FindForwardBatch(decode);
         ASSERT_NE(decode_op, nullptr);
         ASSERT_EQ(decode_op->request_ids.size(), 2u);
-        ASSERT_EQ(scheduler_->PoolFreeBlocks(), 0);
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
         SendForwardDone("a", {43});   // 8 tokens = a's capacity
         SendForwardDone("b", {143});  // 6 tokens = b's capacity
 
@@ -1794,7 +2182,7 @@ protected:
         const ForwardBatch* retract_op = FindForwardBatch(retract_round);
         ASSERT_NE(retract_op, nullptr);
         ASSERT_TRUE(retract_op->request_ids.empty());
-        ASSERT_EQ(scheduler_->PoolFreeBlocks(), 8) << "a's 4 pages x 2 groups return to the pool";
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 8) << "a's 4 pages x 2 groups return to the pool";
         ASSERT_EQ(scheduler_->WaitingSize(), 1u) << "a requeues as a fresh prefill";
         ASSERT_EQ(scheduler_->DecodingSize(), 1u);
     }
@@ -1828,7 +2216,7 @@ TEST_F(RetractSuite, DecodingRequestReleasesPagesAndRequeues) {
     SendForwardDone("a", {46});
     SendFinish("a");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 14) << "pool balances after the full retract cycle";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 14) << "pool balances after the full retract cycle";
 }
 
 TEST_F(RetractSuite, RetractedRequestPrefillCoversOldTokens) {
@@ -1865,7 +2253,7 @@ protected:
     // (9 tokens > b's 7), but "a"'s 6-token prompt prefills in two chunks.
     // Post: "a" requeued with 9 rebased tokens, "b" finished, pool fully free.
     void DriveToRetractOfAChunkedAndFreePool() {
-        ASSERT_EQ(scheduler_->PoolFreeBlocks(), 14);
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 14);
         Submit(MakeRequestSpec("a", /*num_pages=*/3));
         Submit(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101));
 
@@ -1900,7 +2288,7 @@ protected:
         const ForwardBatch* op4 = FindForwardBatch(p4);
         ASSERT_NE(op4, nullptr);
         ASSERT_EQ(op4->request_ids.size(), 2u);
-        ASSERT_EQ(scheduler_->PoolFreeBlocks(), 0);
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
         SendForwardDone("a", {43});   // 8 tokens = a's capacity
         SendForwardDone("b", {143});  // 6 tokens = b's capacity
 
@@ -1915,13 +2303,13 @@ protected:
         // The first fully blocked round retracts "a" (9 tokens > b's 7).
         ExecutionPlan retract_round = PlanOnce();
         ASSERT_TRUE(FindForwardBatch(retract_round)->request_ids.empty());
-        ASSERT_EQ(scheduler_->PoolFreeBlocks(), 8);
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 8);
         ASSERT_EQ(scheduler_->WaitingSize(), 1u);
         ASSERT_EQ(scheduler_->RequestTokenSize("a"), 9);
 
         // Free the survivor so a re-admits alone.
         SendFinish("b");
-        ASSERT_EQ(scheduler_->PoolFreeBlocks(), 14);
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 14);
     }
 };
 
@@ -2045,12 +2433,13 @@ TEST(ExtendResultEvent, AwaitingResultAbsorbsEmptyIntermediateResults) {
     // the request already sits in PrefillAwaitingResult. Only the final
     // chunk's result carries a token; an empty arrival must keep waiting,
     // or the handoff batch goes out before the bootstrap token is real.
-    BlockPool pool(/*num_lcm_blocks=*/8);
+    BlockPool pool(/*num_lcm_blocks=*/8, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -2073,17 +2462,63 @@ TEST(ExtendResultEvent, AwaitingResultAbsorbsEmptyIntermediateResults) {
     EXPECT_EQ(request.LastToken(), 42);
 }
 
+TEST(ExtendResultEvent, AwaitingResultCarriesForwardsInFlightIntoPrefillDone) {
+    // The mirror image of the test above: the final chunk's token lands
+    // FIRST, while an older intermediate chunk's forward is still out. The
+    // transition to PrefillDone must keep that forward on the books -- it is
+    // still writing KV into these pages -- so the late empty result can land
+    // (ResultLanded fatally rejects a result nobody is waiting for) and the
+    // retraction policy keeps treating the pages as busy.
+    BlockPool pool(/*num_lcm_blocks=*/8, {1});
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
+    ReqPoolAllocator req_pool{4};
+
+    RequestSpec spec{.request_id = "r", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
+    Request request{spec, /*prefix_granularity=*/2, Role::kFused};
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+    request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/2,
+                                                      /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
+                                                      fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
+                                                      /*hit_tokens=*/0, fsm::CacheProgress{},
+                                                      /*load_pairs=*/{},
+                                                      /*awaits_result=*/true});
+    request.TrackScheduledForward();
+    ASSERT_TRUE(request.Is<fsm::Prefilling>());
+    request.Apply(fsm::SchedulePrefillEvent{/*tokens_this_round=*/2, /*reserve_num_tokens_in_next_schedule_event=*/1,
+                                            /*awaits_result=*/true});
+    request.TrackScheduledForward();
+    ASSERT_TRUE(request.Is<fsm::PrefillAwaitingResult>());
+    ASSERT_EQ(request.ResultsInFlight(), 2);
+
+    request.NoteResultLanded();
+    request.Apply(fsm::ExtendResultEvent{{42}});  // the final chunk's token, ahead of chunk 1's result
+    EXPECT_TRUE(request.Is<fsm::PrefillDone>());
+    EXPECT_EQ(request.ResultsInFlight(), 1) << "chunk 1's forward is still out against these pages";
+
+    request.NoteResultLanded();
+    request.Apply(fsm::ExtendResultEvent{{}});  // chunk 1's empty result, late
+    EXPECT_TRUE(request.Is<fsm::PrefillDone>());
+    EXPECT_EQ(request.ResultsInFlight(), 0);
+}
+
 TEST(RetractEvent, StampsResumePriorityFromGeneratedOutput) {
     // The readmission order is derived off the Retracted states: a victim
     // with generated output a client is reading resumes ahead of one that
     // had produced nothing, whatever their retraction epochs say
     // (nextReadmission reads resumes_generation first, then the epoch).
-    BlockPool pool(/*num_lcm_blocks=*/8);
+    BlockPool pool(/*num_lcm_blocks=*/8, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -2094,7 +2529,7 @@ TEST(RetractEvent, StampsResumePriorityFromGeneratedOutput) {
                                                       /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
 
     request.Apply(
@@ -2132,12 +2567,13 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
     // demand prompt + generated + max_new -- more than the request can ever
     // write, and near the single-request limit more than the pool holds,
     // leaving it Retracted forever.
-    BlockPool pool(/*num_lcm_blocks=*/16);
+    BlockPool pool(/*num_lcm_blocks=*/16, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -2149,9 +2585,9 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
                                                       /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     request.Apply(fsm::ExtendResultEvent{{42}});
-    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, request.CacheProgress()});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
     request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(999, 7)});
     ASSERT_EQ(request.GeneratedTokens(), 1000);
 
@@ -2180,12 +2616,13 @@ TEST(RetractionHeadroom, SpendingTheWindowNeverMakesItCoverTheRemainder) {
     // remainder dipped under 4096 -- exactly when the spent window forces it
     // to ask for a new page. With every resident request misjudged that way
     // retraction has no victim and the pool never frees.
-    BlockPool pool(/*num_lcm_blocks=*/16);
+    BlockPool pool(/*num_lcm_blocks=*/16, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false,
+                                                   /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -2197,9 +2634,9 @@ TEST(RetractionHeadroom, SpendingTheWindowNeverMakesItCoverTheRemainder) {
                                                       /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     request.Apply(fsm::ExtendResultEvent{{42}});
-    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, request.CacheProgress()});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
     request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(4096, 7)});
     ASSERT_EQ(request.GeneratedTokens(), 4097);
 
@@ -2241,7 +2678,7 @@ TEST_F(RetractSuite, AFreshAdmissionPrepaysItsGenerationBudget) {
     const ForwardBatch* op = FindForwardBatch(plan);
     ASSERT_NE(op, nullptr);
     EXPECT_EQ(op->request_ids, std::vector<std::string>{"a"});
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 2);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 2);
 }
 
 class AdmissionHeadroomPrefillRoleSuite : public RetractSuite {
@@ -2263,9 +2700,11 @@ protected:
 };
 
 TEST_F(AdmissionHeadroomPrefillRoleSuite, ThePrefillRoleDoesNotPrepayDecodeHeadroom) {
-    // The P role never decodes locally and never retracts, so a declared
-    // generation budget -- even one far beyond this pool -- charges nothing
-    // at admission: the prompt's own 2*ceil(6/2) = 6 blocks and no more.
+    // The P role never retracts, so a declared generation budget -- even one
+    // far beyond this pool -- charges nothing at admission. What the
+    // completing chunk does hold is the same decode slot every role reserves
+    // (the drafter writes its first candidate block there): the prompt plus
+    // one token, 2*ceil(7/2) = 8 blocks, exactly the fused charge for "a".
     RequestSpec heavy = MakeRequestSpec("heavy", /*num_pages=*/3);
     heavy.max_new_tokens = 6000;
     Submit(heavy);
@@ -2275,7 +2714,7 @@ TEST_F(AdmissionHeadroomPrefillRoleSuite, ThePrefillRoleDoesNotPrepayDecodeHeadr
     const ForwardBatch* op = FindForwardBatch(plan);
     ASSERT_NE(op, nullptr);
     EXPECT_EQ(op->request_ids, std::vector<std::string>{"heavy"});
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 8);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 6);
 }
 
 TEST_F(PrefillHeadOfLineSuite, AnIncompletePrefillGivesWayBeforeACompletedOne) {
@@ -2329,7 +2768,7 @@ TEST_F(PrefillHeadOfLineSuite, AnIncompletePrefillIsNotRetractedWhileItsChunkIsI
 }
 
 TEST_F(PrefillHeadOfLineSuite, BlockedLaterChunkDoesNotStartSubmittedRequest) {
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 18);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 18);
 
     Submit(MakeRequestSpec("holder", /*num_pages=*/2));
     ExecutionPlan holder_prefill = PlanOnce();
@@ -2340,7 +2779,7 @@ TEST_F(PrefillHeadOfLineSuite, BlockedLaterChunkDoesNotStartSubmittedRequest) {
     ExecutionPlan first_chunk = PlanOnce();
     ASSERT_EQ(FindForwardBatch(first_chunk)->request_ids, std::vector<std::string>{"active"});
     ASSERT_EQ(FindForwardBatch(first_chunk)->input_lengths.at(0), 8);
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 4);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 4);
     SendForwardDone("active");  // the chunk landed; its pages are retractable
 
     Submit(MakeRequestSpec("queued", /*num_pages=*/1, /*start=*/201));
@@ -2353,7 +2792,7 @@ TEST_F(PrefillHeadOfLineSuite, BlockedLaterChunkDoesNotStartSubmittedRequest) {
     // The stalled prefill is the victim, not the completed "holder": it has
     // produced no output a client is reading, so it gives way and retries
     // once the capacity is there.
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 12) << "the incomplete prefill released its pages";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 12) << "the incomplete prefill released its pages";
     EXPECT_EQ(scheduler_->WaitingSize(), 2u) << "the retracted prefill and the untouched submitted request wait";
     EXPECT_EQ(scheduler_->DecodingSize(), 1u) << "the completed request keeps its pages";
 }
@@ -2430,19 +2869,19 @@ TEST(PdSlidingCapacityTest, CountsPrefixIslandPhasePageAndGroupPacking) {
 }
 
 TEST_F(RetractExactFitSuite, ReserveRefundBalances) {
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 8);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 8);
     Submit(MakeRequestSpec("a", /*num_pages=*/3));  // charge 2*ceil(7/2) = 8: exact fit
     ExecutionPlan prefill = PlanOnce();
     ASSERT_EQ(FindForwardBatch(prefill)->request_ids.size(), 1u);
     SendForwardDone("a", {42});
     PlanOnce();  // decode transition consumes the reserve: free 0
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 0);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
     SendForwardDone("a", {43});  // 8 tokens = capacity
     PlanOnce();                  // tail-page decode (0 fresh blocks)
     SendForwardDone("a", {44});  // 9 tokens: past capacity
 
     ExecutionPlan retract_round = PlanOnce();  // first blocked round retracts "a"
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 8);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 8);
     ASSERT_EQ(scheduler_->WaitingSize(), 1u);
 
     // "d" needs EXACTLY the released capacity: a leaked reservation from a
@@ -2462,7 +2901,7 @@ TEST_F(RetractExactFitSuite, ReserveRefundBalances) {
     SendFinish("d");
     SendAbort(*scheduler_, "a");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 8);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 8);
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
 }
 
@@ -2483,7 +2922,7 @@ protected:
 };
 
 TEST_F(RetractTrioSuite, TwoCapacityBlocksRetractDifferentRequests) {
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 24);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 24);
     Submit(MakeRequestSpec("r1", /*num_pages=*/4));
     Submit(MakeRequestSpec("r2", /*num_pages=*/3, /*start=*/101));
     Submit(MakeRequestSpec("r3", /*num_pages=*/2, /*start=*/201));
@@ -2496,7 +2935,7 @@ TEST_F(RetractTrioSuite, TwoCapacityBlocksRetractDifferentRequests) {
 
     ExecutionPlan decode = PlanOnce();  // all three consume their reserves
     ASSERT_EQ(FindForwardBatch(decode)->request_ids.size(), 3u);
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 0);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
     SendForwardDone("r1", {43});   // 10 = capacity
     SendForwardDone("r2", {143});  // 8 = capacity
     SendForwardDone("r3", {243});  // 6 = capacity
@@ -2508,7 +2947,7 @@ TEST_F(RetractTrioSuite, TwoCapacityBlocksRetractDifferentRequests) {
     // Cycle 1 immediately retracts r1 (11 tokens, the largest).
     ExecutionPlan first_retract = PlanOnce();
     ASSERT_TRUE(FindForwardBatch(first_retract)->request_ids.empty());
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 10) << "r1's 5 pages x 2 groups return";
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 10) << "r1's 5 pages x 2 groups return";
     ASSERT_EQ(scheduler_->WaitingSize(), 1u);
 
     // r2 and r3 ride the freed pages until capacity blocks again with r2 the
@@ -2556,7 +2995,7 @@ TEST_F(RetractTrioSuite, TwoCapacityBlocksRetractDifferentRequests) {
     SendForwardDone("r3", {249});
     SendFinish("r3");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 24);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 24);
 }
 
 // A retracted request whose config carries a mamba-style state group
@@ -2578,7 +3017,7 @@ protected:
 };
 
 TEST_F(RetractStateGroupSuite, StateGroupRequestRetractsCleanly) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     Submit(MakeRequestSpec("a", /*num_pages=*/2));
     ExecutionPlan prefill = PlanOnce();
     const ForwardBatch* prefill_op = FindForwardBatch(prefill);
@@ -2601,17 +3040,82 @@ TEST_F(RetractStateGroupSuite, StateGroupRequestRetractsCleanly) {
         }
     }
     ASSERT_TRUE(retracted) << "the lone grower must exhaust capacity and retract";
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start)
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start)
         << "retract must return full-history AND state pages to the pool";
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
 
     SendAbort(*scheduler_, "a");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
+}
+
+TEST(CacheProgressTest, PrefillBoundariesSurviveFeedbackAndFailedAdmission) {
+    TokenContainer tokens{{1, 1, 1}};
+    fsm::ForwardResources resources{.token_container = &tokens, .prefix_granularity = 4};
+    // Only scheduled prefill provenance supplies reusable boundaries.
+    // Exercise duplicate and unaligned rejection independently of feedback.
+    for (const std::int32_t boundary : {4, 4, 8, 13, 16}) {
+        resources.cache_progress.RecordMaterializedStateBoundary(boundary, 4);
+    }
+    // Back-to-back results land at 4, 8, 13 and 16, but must neither add
+    // decode checkpoints nor consume the scheduled prefill evidence.
+    for (const std::int32_t count : {1, 1, 4, 5, 3, 0}) {
+        resources.ExtendTokens(std::vector<std::int32_t>(count, 2));
+    }
+    EXPECT_EQ(resources.cache_progress.materialized_state_boundaries, (std::vector<std::int32_t>{4, 8, 16}));
+    resources.ExtendTokens(std::vector<std::int32_t>(4, 2));  // aligned decode endpoint 20
+    EXPECT_EQ(resources.cache_progress.materialized_state_boundaries, (std::vector<std::int32_t>{4, 8, 16}));
+
+    // Two state pages per prefix interval: only the interval's endpoint page
+    // is a snapshot slot.
+    BlockPool pool(8, {1});
+    const std::vector<CacheGroupSpec> specs{
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}};
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const auto admission = AdmitForTest(coordinator, tables, /*num_tokens=*/16);
+    ASSERT_TRUE(admission);
+    fsm::CacheProgress staged = resources.cache_progress;
+    staged.prefix_hashes = {"h4", "h8", "h12"};
+    GroupDemand demand{
+        .table = &tables[0], .extent = DenseGrowth{128},  // fails before either publication or reclamation
+    };
+    const RequestProgress progress{
+        .completed_pages =
+            CompletedPages{
+                .prefix_hashes = staged.prefix_hashes,
+                .first_new_prefix_page = 0,
+                .boundary_kind = CacheBoundaryKind::kEndpoint,
+                .materialized_state_boundaries = staged.materialized_state_boundaries,
+            },
+        .num_computed_tokens = 13,
+    };
+    EXPECT_FALSE(
+        coordinator.Admit(coordinator.ProbePrefix({}), std::span{&demand, 1}, progress, admission->access_epoch));
+    EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 0);
+    EXPECT_TRUE(resources.cache_progress.prefix_hashes.empty());
+    EXPECT_EQ(resources.cache_progress.materialized_state_boundaries, (std::vector<std::int32_t>{4, 8, 16}));
+
+    demand.extent = DenseGrowth{0};
+    ASSERT_TRUE(
+        coordinator.Admit(coordinator.ProbePrefix({}), std::span{&demand, 1}, progress, admission->access_epoch));
+    staged.DiscardHashedStateBoundaries(4);
+    resources.cache_progress = std::move(staged);
+    EXPECT_EQ(resources.cache_progress.materialized_state_boundaries, (std::vector<std::int32_t>{16}));
+    EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 2);
+    for (std::int32_t page = 0; page < 3; ++page) {
+        for (std::int32_t offset = 0; offset < 2; ++offset) {
+            const CacheKey key{
+                .group_id = 0, .content_hash = resources.cache_progress.prefix_hashes[page], .page_offset = offset};
+            EXPECT_EQ(coordinator.GroupPrefixIndex(0).Contains(pool, key), page < 2 && offset == 1);
+        }
+    }
+    coordinator.Free(tables);
 }
 
 TEST(CacheProgressTest, PromotionBoundarySurvivesPrefillRounds) {
-    BlockPool pool(/*num_lcm_blocks=*/8);
+    BlockPool pool(/*num_lcm_blocks=*/8, {1, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2620,7 +3124,8 @@ TEST(CacheProgressTest, PromotionBoundarySurvivesPrefillRounds) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/6, /*granularity=*/2)};
@@ -2638,14 +3143,14 @@ TEST(CacheProgressTest, PromotionBoundarySurvivesPrefillRounds) {
                                                           .access_epoch = admission->access_epoch,
                                                           .promotion_boundary_tokens = 8,
                                                       },
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
     EXPECT_EQ(request.CacheProgress().promotion_boundary_tokens, 8);
 
     request.Apply(fsm::SchedulePrefillEvent{
         /*tokens_this_round=*/4,
         /*reserve_num_tokens_in_next_schedule_event=*/1,
-        request.CacheProgress(),
+        /*awaits_result=*/false,
     });
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
     EXPECT_EQ(request.CacheProgress().promotion_boundary_tokens, 8);
@@ -2702,12 +3207,13 @@ TEST_F(PromotionBoundaryHeadOfLineSuite, DoesNotStartSecondIncompletePrefill) {
 }
 
 TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
-    BlockPool pool(/*num_lcm_blocks=*/8);
+    BlockPool pool(/*num_lcm_blocks=*/8, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -2715,7 +3221,7 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     request.Apply(fsm::BootstrappedEvent{});
     std::vector<BlockTable> tables(coordinator.NumGroups());
     const std::optional<CacheCoordinator::AdmissionResult> admission =
-        AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = 4, .reserve_tokens = 3});
+        AdmitForTest(coordinator, tables, GroupDemand{.extent = DenseGrowth{4}, .reserve_tokens = 3});
     ASSERT_TRUE(admission);
 
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
@@ -2723,7 +3229,7 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
                                                       fsm::PrefillSource::kRemote, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0,
                                                       fsm::CacheProgress{.access_epoch = admission->access_epoch},
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::RemotePrefilling>());
 
     request.Apply(fsm::RemotePrefillDoneEvent{/*token=*/42});
@@ -2733,18 +3239,19 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
 }
 
 TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) {
-    BlockPool device_pool(/*num_lcm_blocks=*/12);
+    BlockPool device_pool(/*num_lcm_blocks=*/12, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false,
+                                                   /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
     Request request{spec, /*prefix_granularity=*/2, Role::kD};
     request.Apply(fsm::BootstrappedEvent{});
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    auto admission = AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = 4, .reserve_tokens = 1});
+    auto admission = AdmitForTest(coordinator, tables, GroupDemand{.extent = DenseGrowth{4}, .reserve_tokens = 1});
     ASSERT_TRUE(admission);
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         /*tokens_this_round=*/4,
@@ -2756,9 +3263,10 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
         /*hit_tokens=*/0,
         fsm::CacheProgress{.access_epoch = admission->access_epoch},
         /*load_pairs=*/{},
+        /*awaits_result=*/false,
     });
     request.Apply(fsm::RemotePrefillDoneEvent{/*token=*/42});
-    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, request.CacheProgress()});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
     ASSERT_TRUE(request.Is<fsm::Decoding>());
 
     request.Apply(
@@ -2769,8 +3277,8 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
     EXPECT_EQ(device_pool.NumEmptyLcmBlocks(), device_pool.NumLcmBlocks());
 
     std::vector<BlockTable> recovery_tables(coordinator.NumGroups());
-    auto recovery_admission = AdmitForTest(coordinator, recovery_tables,
-                                           GroupDemand{.num_tokens = request.PrefillSize(), .reserve_tokens = 1});
+    auto recovery_admission = AdmitForTest(
+        coordinator, recovery_tables, GroupDemand{.extent = DenseGrowth{request.PrefillSize()}, .reserve_tokens = 1});
     ASSERT_TRUE(recovery_admission);
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         request.PrefillSize(),
@@ -2782,13 +3290,14 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
         /*hit_tokens=*/0,
         fsm::CacheProgress{.access_epoch = recovery_admission->access_epoch},
         /*load_pairs=*/{},
+        /*awaits_result=*/false,
     });
     EXPECT_TRUE(request.Is<fsm::PrefillDone>());
 }
 
 // Drive the FSM directly to pin the PrefillDone retract overload.
 TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
-    BlockPool pool(/*num_lcm_blocks=*/8);
+    BlockPool pool(/*num_lcm_blocks=*/8, {1, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2797,7 +3306,8 @@ TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -2813,7 +3323,7 @@ TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0,
                                                       fsm::CacheProgress{.access_epoch = admission->access_epoch},
-                                                      /*load_pairs=*/{}});
+                                                      /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.CacheProgress().access_epoch, admission->access_epoch);
     ASSERT_LT(pool.NumEmptyLcmBlocks(), 8);
@@ -2831,45 +3341,85 @@ TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
     EXPECT_EQ(request.PrefillSize(), 5) << "prompt + generated rebase into the prefill window";
 }
 
+// Drive the FSM directly to pin the PrefillAwaitingResult retract overload.
+TEST(RetractEvent, PrefillAwaitingResultVictimReleasesPagesAndRequeues) {
+    BlockPool pool(/*num_lcm_blocks=*/8, {1});
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
+    ReqPoolAllocator req_pool{4};
+
+    RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
+    Request request{spec, /*prefix_granularity=*/2, Role::kFused};
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const std::optional<CacheCoordinator::AdmissionResult> admission =
+        AdmitForTest(coordinator, tables, /*num_tokens=*/4);
+    ASSERT_TRUE(admission);
+
+    request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
+                                                      /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
+                                                      fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
+                                                      /*hit_tokens=*/0,
+                                                      fsm::CacheProgress{.access_epoch = admission->access_epoch},
+                                                      /*load_pairs=*/{},
+                                                      /*awaits_result=*/true});
+    ASSERT_TRUE(request.Is<fsm::PrefillAwaitingResult>());
+    ASSERT_LT(pool.NumEmptyLcmBlocks(), 8);
+
+    request.Apply(
+        fsm::RetractEvent{&coordinator, /*epoch=*/1, /*has_recoverable_snapshot=*/false, request.HasGeneratedOutput()});
+    EXPECT_TRUE(request.Is<fsm::Retracted>());
+    const auto* retracted = request.GetIf<fsm::Retracted>();
+    ASSERT_NE(retracted, nullptr);
+    EXPECT_FALSE(retracted->HasRecoverableSnapshot());
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 8) << "the retract must release every page";
+    EXPECT_EQ(request.TokenSize(), 4);
+    EXPECT_EQ(request.PrefillSize(), 4) << "no generated token has landed yet";
+}
+
 // ---------------------------------------------------------------------------
 // Abort-mid-flight pool balance: abort mid-chunked-prefill or mid-decode must
 // return every page to the pool.
 // ---------------------------------------------------------------------------
 TEST_F(ChunkedPrefillSuite, AbortMidPrefillRestoresPoolBaseline) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     // 12 tokens (6 pages), max_scheduled_tokens=4 -> abort lands mid-prefill.
     Submit(MakeRequestSpec("r1", /*num_pages=*/6));
     PlanOnce();  // chunk 1
     PlanOnce();  // chunk 2 -> still Prefilling
-    EXPECT_LT(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_LT(scheduler_->AvailableLcmBlocks(), free_at_start);
 
     SendAbort(*scheduler_, "r1");
     PlanOnce();  // reap the aborted request
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start)
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start)
         << "abort mid-prefill must return every page (both groups) to the pool";
 }
 
 TEST_F(ChunkedPrefillSuite, AbortDuringDecodeRestoresPoolBaseline) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/2));
     PlanOnce();  // single-chunk prefill (4 tokens)
     SendForwardDone("r1", {42});
     PlanOnce();  // decode step
     SendForwardDone("r1", {43});
-    EXPECT_LT(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_LT(scheduler_->AvailableLcmBlocks(), free_at_start);
 
     SendAbort(*scheduler_, "r1");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "abort during decode must return every page to the pool";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start)
+        << "abort during decode must return every page to the pool";
 }
 
 // Admission owns the prepared refs before the event. If the independent request
 // slot allocation fails, event destruction releases those refs through RAII.
 TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
-    BlockPool pool(/*num_lcm_blocks=*/31);  // Pages are not the constraint.
+    BlockPool pool(/*num_lcm_blocks=*/31, {1, 1});  // Pages are not the constraint.
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2878,7 +3428,8 @@ TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{1};
     ReqPoolIndex held = req_pool.Allocate();  // exhaust the single slot
     ASSERT_EQ(req_pool.AvailableSlots(), 0);
@@ -2895,7 +3446,7 @@ TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
                                                           fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                           /*hit_tokens=*/0,
                                                           /*cache_progress=*/{},
-                                                          /*load_pairs=*/{}}),
+                                                          /*load_pairs=*/{}, /*awaits_result=*/false}),
         std::runtime_error);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 31) << "a failed req-pool Allocate must not leak block-pool pages";
 
@@ -2909,7 +3460,7 @@ TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
 // computed before the pending query.
 // ---------------------------------------------------------------------------
 TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
-    BlockPool pool(/*num_lcm_blocks=*/32);
+    BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2918,12 +3469,15 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 1,
+                                 .extent = DenseGrowth{1},
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 4,
                              }));
 
@@ -2934,7 +3488,9 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     // N=5; keys [2,5] -> page 0 out: slot 0 punched, slot 1 kept.
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 1,
+                                 .extent = DenseGrowth{1},
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 5,
                              }));
     EXPECT_TRUE(swa_slot_null(0));
@@ -2944,7 +3500,9 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 1,
+                                 .extent = DenseGrowth{1},
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 6,
                              }));
     EXPECT_FALSE(swa_slot_null(1)) << "key 3 of the pending query lives in page 1; freeing it is the off-by-one";
@@ -2954,7 +3512,9 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     // N=7; keys [4,7] -> page 1 fully out, punched exactly now.
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
-                                 .num_tokens = 1,
+                                 .extent = DenseGrowth{1},
+                             },
+                             RequestProgress{
                                  .num_computed_tokens = 7,
                              }));
     EXPECT_TRUE(swa_slot_null(1));
@@ -2993,7 +3553,7 @@ protected:
 };
 
 TEST_F(PhysicalReserveSuite, LaterRequestCannotStealReservedDecodeHeadroom) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     ASSERT_EQ(free_at_start, 10);
 
     // a: exact admission acquires 6 prefill blocks plus 2 decode-reserve
@@ -3006,7 +3566,7 @@ TEST_F(PhysicalReserveSuite, LaterRequestCannotStealReservedDecodeHeadroom) {
     ASSERT_EQ(op1->request_ids.size(), 1u) << "b must not be admitted into a's reserved decode blocks";
     EXPECT_EQ(op1->request_ids.at(0), "a");
     EXPECT_EQ(scheduler_->WaitingSize(), 1u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 2);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 2);
 
     // a's decode transition consumes its already-owned reservation.
     SendForwardDone("a", {99});
@@ -3015,7 +3575,7 @@ TEST_F(PhysicalReserveSuite, LaterRequestCannotStealReservedDecodeHeadroom) {
     ASSERT_NE(op2, nullptr);
     ASSERT_EQ(op2->request_ids.size(), 1u) << "a's decode must proceed into its reserved pages";
     EXPECT_EQ(op2->request_ids.at(0), "a");
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 2);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 2);
     EXPECT_EQ(scheduler_->WaitingSize(), 1u);
 
     SendForwardDone("a", {100});
@@ -3029,22 +3589,22 @@ TEST_F(PhysicalReserveSuite, LaterRequestCannotStealReservedDecodeHeadroom) {
     SendForwardDone("b", {142});
     SendFinish("b");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 TEST_F(PhysicalReserveSuite, AbortWithOutstandingReservationLeavesNoPhantom) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     ASSERT_EQ(free_at_start, 10);
 
     // a owns a 2-block physical decode reservation (see above).
     Submit(MakeRequestSpec("a", /*num_pages=*/3));
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 2);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 2);
 
     // Abort before the reserve is consumed: RAII must release it too.
     SendAbort(*scheduler_, "a");
     PlanOnce();  // reap
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
     // b needs the whole pool: gate 2*ceil(9/2) = 10 <= 10 only without a phantom.
     Submit(MakeRequestSpec("b", /*num_pages=*/4, /*start=*/101));
@@ -3053,12 +3613,12 @@ TEST_F(PhysicalReserveSuite, AbortWithOutstandingReservationLeavesNoPhantom) {
     ASSERT_NE(op, nullptr);
     ASSERT_EQ(op->request_ids.size(), 1u) << "a leaked reservation would defer b forever";
     EXPECT_EQ(op->request_ids.at(0), "b");
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 0);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
 
     SendForwardDone("b", {142});
     SendFinish("b");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 // ---------------------------------------------------------------------------
@@ -3127,10 +3687,10 @@ protected:
 };
 
 TEST_F(PrefixHitSuite, TwoRequestsSharePrefixReusePages) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     const auto r1_rows = RunLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "r1 must fully reclaim before r2 runs";
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "r1 must fully reclaim before r2 runs";
     ASSERT_EQ(r1_rows.at("full").size(), 5u);
     ASSERT_EQ(r1_rows.at("swa").size(), 5u);
 
@@ -3164,19 +3724,19 @@ TEST_F(PrefixHitSuite, TwoRequestsSharePrefixReusePages) {
 
     // Pool: 4 hit blocks/group remain active, 2 fresh blocks/group are
     // acquired, and 1 decode-reserve block/group is physically held.
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 14);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 14);
 
     // Finalize registers pages 4..5 and consumes the existing reservation.
     SendForwardDone("r2", {199});
     ExecutionPlan decode = PlanOnce();
     ASSERT_NE(FindForwardBatch(decode), nullptr);
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 14);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 14);
 
     SendForwardDone("r2", {200});
     SendFinish("r2");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "pool back to baseline after r2 finishes";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "pool back to baseline after r2 finishes";
 }
 
 TEST_F(PrefixHitSuite, FinishPublishesPagesFromLastForward) {
@@ -3243,11 +3803,11 @@ TEST_F(PrefixHitSuite, ClearL1CacheRejectsAnActiveRequestAndPreservesItsPrefix) 
 // The hit is capped at (PrefillSize-1)/prefix_granularity pages so the last token is
 // always recomputed to produce logits.
 TEST_F(PrefixHitSuite, FullHitCapsAtLastToken) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4);  // 8 tokens
     RunLifecycle(r1);
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
     // r2 = the same 8 tokens: cap = (8-1)/2 = 3 pages -> hit 3 = 6 tokens.
     Submit(MakeSpecWithTokens("r2", r1.tokens));
@@ -3264,18 +3824,18 @@ TEST_F(PrefixHitSuite, FullHitCapsAtLastToken) {
     EXPECT_EQ(op->block_tables.at("full").at(0).size(), 5u);
     EXPECT_EQ(op->block_tables.at("swa").at(0).size(), 5u);
     // Pool: 3 hit + 1 fresh + 1 reserved block per group.
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 10);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 10);
 
     // Reserve: 1 fresh page per group (tail full).
     SendForwardDone("r2", {199});
     ExecutionPlan decode = PlanOnce();
     ASSERT_NE(FindForwardBatch(decode), nullptr);
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 10);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 10);
     SendForwardDone("r2", {200});
     SendFinish("r2");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 class PrefixReplaySuite : public PrefixHitSuite {
@@ -3290,10 +3850,10 @@ protected:
 };
 
 TEST_F(PrefixReplaySuite, FullHitReplaysPrivateTailPages) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     const RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/4);  // 8 tokens
     const auto first_rows = RunLifecycle(first);
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
     Submit(MakeSpecWithTokens("r2", first.tokens));
     const ExecutionPlan plan = PlanOnce();
@@ -3450,6 +4010,184 @@ TEST_F(PrefixReplayHeterogeneousSuite, ReplayTailIsPrivateAcrossPackedGroups) {
     EXPECT_GT(state[16], 0);
 }
 
+// A request returning prompt logprobs from position `s` caps its probe at `s`
+// (RequestSpec::max_cached_prefix_tokens) so positions >= s are recomputed.
+TEST_F(PrefixHitSuite, MaxCachedPrefixTokensCapsTheProbe) {
+    const RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/6);  // 12 tokens
+    const auto first_rows = RunLifecycle(first);
+
+    // Logprobs from position 5: the probe may claim at most 5 tokens, which
+    // rounds down to two 2-token pages; positions 4.. are recomputed.
+    RequestSpec capped = MakeSpecWithTokens("r2", first.tokens);
+    capped.max_cached_prefix_tokens = 5;
+    Submit(capped);
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 4);
+    EXPECT_EQ(op->input_lengths.at(0), 8);
+    EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/8, /*start=*/5));
+    const auto& row = op->block_tables.at("full").at(0);
+    ASSERT_GE(row.size(), 3u);
+    EXPECT_EQ(row[0], first_rows.at("full")[0]);
+    EXPECT_EQ(row[1], first_rows.at("full")[1]);
+    EXPECT_NE(row[2], first_rows.at("full")[2]) << "a recomputed page must not alias the cached one";
+    SendForwardDone("r2", {9001});
+    PlanOnce();
+    SendForwardDone("r2", {9002});
+    SendFinish("r2");
+    PlanOnce();
+
+    // A cap of zero means every position is recomputed: no hit at all.
+    RequestSpec uncached = MakeSpecWithTokens("r3", first.tokens);
+    uncached.max_cached_prefix_tokens = 0;
+    Submit(uncached);
+    plan = PlanOnce();
+    op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 0);
+    EXPECT_EQ(op->input_lengths.at(0), 12);
+    EXPECT_EQ(op->input_ids, first.tokens);
+}
+
+TEST_F(PrefixHitSuite, MaxCachedPrefixTokensDefaultLeavesTheProbeUnbounded) {
+    const RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/6);  // 12 tokens
+    RunLifecycle(first);
+
+    // The default (INT32_MAX) keeps the ordinary replay-tail rule: 12 - 1
+    // cacheable tokens -> 5 pages hit, one recomputed tail page.
+    Submit(MakeSpecWithTokens("r2", first.tokens));
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 10);
+    EXPECT_EQ(op->input_lengths.at(0), 2);
+
+    RequestSpec negative = MakeSpecWithTokens("r3", first.tokens);
+    negative.max_cached_prefix_tokens = -1;
+    EXPECT_THROW(Submit(negative), std::invalid_argument);
+}
+
+// The probe bound across a retraction. 8-token chunks, prefix cache live, no
+// host tier: a victim's own pages are gone when it readmits, and only another
+// request's equal pages can answer its probe -- which is exactly what the
+// bound must keep it from claiming past what it had computed.
+class ProbeBoundReadmissionSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = 2;
+        // 31 physical pages -> 30 usable. "twin" decoding over 18 tokens holds
+        // 2*9 = 18 blocks and "capped"'s first 8-token chunk 2*4 = 8, leaving
+        // 4: too few for the second chunk's 2*4 pages plus its decode slot.
+        cfg.device_allocator.total_pages = 31;
+        cfg.host_allocator.total_pages = 32;
+        cfg.max_scheduled_tokens = 8;
+        cfg.max_batch_size = 8;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = false;
+        cfg.cache_groups = {
+            MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages,
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+            MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+        };
+        return cfg;
+    }
+
+    // "twin" prefills a 16-token prompt in two chunks and takes one decode
+    // step, which publishes all eight prompt pages; it holds them while it
+    // decodes.
+    void RunTwinToDecoding() {
+        const RequestSpec twin = MakeRequestSpec("twin", /*num_pages=*/8);
+        prompt_ = twin.tokens;
+        Submit(twin);
+        ExecutionPlan chunk1 = PlanOnce();
+        ASSERT_NE(FindForwardBatch(chunk1), nullptr);
+        ASSERT_EQ(FindForwardBatch(chunk1)->input_lengths.at(0), 8);
+        SendForwardDone("twin");
+        ExecutionPlan chunk2 = PlanOnce();
+        ASSERT_NE(FindForwardBatch(chunk2), nullptr);
+        ASSERT_EQ(FindForwardBatch(chunk2)->extend_prefix_lens.at(0), 8);
+        SendForwardDone("twin", {42});
+        PlanOnce();  // first decode step: publishes the second chunk's pages
+        SendForwardDone("twin", {43});
+    }
+
+    // "capped" is the same prompt returning logprobs from position 0: its
+    // first admission may match nothing. Schedules its first chunk.
+    void SubmitCappedFirstChunk() {
+        RequestSpec capped = RequestSpec{.request_id = "capped", .tokens = prompt_};
+        capped.max_cached_prefix_tokens = 0;
+        Submit(capped);
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* op = FindForwardBatch(plan);
+        ASSERT_NE(op, nullptr);
+        const auto row = std::ranges::find(op->request_ids, "capped");
+        ASSERT_NE(row, op->request_ids.end());
+        const auto i = static_cast<std::size_t>(std::distance(op->request_ids.begin(), row));
+        ASSERT_EQ(op->extend_prefix_lens.at(i), 0) << "the bound of 0 must not match the twin's pages";
+        ASSERT_EQ(op->input_lengths.at(i), 8);
+    }
+
+    // Drives rounds until "capped" is scheduled again and returns that row's
+    // (extend_prefix_len, input_length).
+    std::pair<std::int32_t, std::int32_t> ReadmitCapped() {
+        for (int round = 0; round < 6; ++round) {
+            const ExecutionPlan plan = PlanOnce();
+            const ForwardBatch* op = FindForwardBatch(plan);
+            if (op == nullptr) {
+                continue;
+            }
+            const auto row = std::ranges::find(op->request_ids, "capped");
+            if (row == op->request_ids.end()) {
+                SendForwardDone("twin", {44 + round});
+                continue;
+            }
+            const auto i = static_cast<std::size_t>(std::distance(op->request_ids.begin(), row));
+            return {op->extend_prefix_lens.at(i), op->input_lengths.at(i)};
+        }
+        ADD_FAILURE() << "capped was never readmitted";
+        return {-1, -1};
+    }
+
+    std::vector<std::int32_t> prompt_;
+};
+
+// A victim retracted mid-prefill may match back exactly the chunks it had
+// computed -- their logits exist -- and no further, even though the twin's
+// equal pages reach the whole prompt: a hit there would stand in for logits
+// the request never produced.
+TEST_F(ProbeBoundReadmissionSuite, APrefillVictimReadmitsNoDeeperThanItsLandedChunks) {
+    RunTwinToDecoding();
+    SubmitCappedFirstChunk();
+    SendForwardDone("capped");  // the chunk landed: positions [0, 8) have logits
+
+    // The second chunk does not fit; the blocked round retracts the
+    // incomplete prefill (no host tier: it readmits like a new prompt).
+    PlanOnce();
+    SendForwardDone("twin", {44});
+    ASSERT_EQ(scheduler_->WaitingSize(), 1u) << "the incomplete prefill gave way";
+
+    const auto [prefix_len, input_len] = ReadmitCapped();
+    EXPECT_EQ(prefix_len, 8) << "match back what had landed, not the twin's deeper pages";
+    EXPECT_EQ(input_len, 8);
+}
+
+// A chunk whose forward was skipped (the runtime retracts after a failed
+// cache load) landed nothing: the readmission keeps the request's own bound.
+TEST_F(ProbeBoundReadmissionSuite, ASkippedChunkDoesNotRelaxTheProbeBound) {
+    RunTwinToDecoding();
+    SubmitCappedFirstChunk();
+    SendRetractEvent("capped");  // before the chunk landed: nothing computed
+
+    const auto [prefix_len, input_len] = ReadmitCapped();
+    EXPECT_EQ(prefix_len, 0) << "nothing landed, so the bound of 0 stands";
+    EXPECT_EQ(input_len, 8);
+}
+
 TEST(PrefixReplayConfigTest, RejectsNegativeReplayTokens) {
     SchedulerConfig cfg{};
     cfg.prefix_granularity = 2;
@@ -3470,10 +4208,10 @@ protected:
 };
 
 TEST_F(PrefixHitDisabledSuite, DisablePrefixCacheSkipsMatch) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     RunLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
     std::vector<std::int32_t> r2_tokens = MakeAlignedTokens(/*num_pages=*/4, PrefixGranularity());
     const std::vector<std::int32_t> tail = MakeTokens(/*count=*/4, /*start=*/901);
@@ -3491,21 +4229,21 @@ TEST_F(PrefixHitDisabledSuite, DisablePrefixCacheSkipsMatch) {
     EXPECT_EQ(op->block_tables.at("full").at(0).size(), 7u) << "six prompt pages plus one preallocated decode page";
     EXPECT_EQ(op->block_tables.at("swa").at(0).size(), 7u);
     // Pool: 6 live pages plus one physically reserved decode page per group.
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 14);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 14);
 
     SendForwardDone("r2", {199});
     PlanOnce();
     SendForwardDone("r2", {200});
     SendFinish("r2");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 TEST_F(PrefixHitSuite, PartialHit) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     const auto r1_rows = RunLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));  // tokens 1..8
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
     // r2: 12 tokens, only the first 4 match r1 (pages 0..1); the hash chain
     // propagates the divergence to every later page. Hit = 2 pages = 4 tokens.
@@ -3532,14 +4270,14 @@ TEST_F(PrefixHitSuite, PartialHit) {
     ExpectRowPrefixEq(op->block_tables.at("swa").at(0), swa_prefix, "swa row");
 
     // Pool: 2 hit + 4 fresh + 1 reserved block per group.
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 14);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 14);
 
     SendForwardDone("r2", {199});
     PlanOnce();
     SendForwardDone("r2", {200});
     SendFinish("r2");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 // Small window: the SWA group's bounded right-to-left scan stops once its
@@ -3550,12 +4288,12 @@ protected:
 };
 
 TEST_F(PrefixHitSmallWindowSuite, SwaGroupHitRespectsWindow) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     // r1's finalize REGISTERS all 4 swa hashes BEFORE ReclaimExpired(8) punches
     // slots 0,1 -- punched blocks reach the free list with hashes, matchable.
     const auto r1_rows = RunLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
     ASSERT_EQ(r1_rows.at("swa").size(), 5u);
 
     // r2: 10 tokens, first 8 == r1's. Fixpoint (W=4, page=2, pages_needed
@@ -3601,14 +4339,14 @@ TEST_F(PrefixHitSmallWindowSuite, SwaGroupHitRespectsWindow) {
 
     // Pool: full claims 4 + swa claims 2 (holes claim nothing) + 1 fresh
     // page/group + one physically reserved decode page/group = 10.
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 10);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 10);
 
     SendForwardDone("r2", {199});
     PlanOnce();
     SendForwardDone("r2", {200});
     SendFinish("r2");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 // Near capacity, exact admission must protect prefix-hit parents while finding
@@ -3619,25 +4357,25 @@ protected:
 };
 
 TEST_F(PrefixHitTightPoolSuite, ProtectedHitAndFreshDemandMustFitTogether) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     ASSERT_EQ(free_at_start, 10);
 
     // r1 leaves 4 cached, evictable parents plus 6 empty parents. The capacity
     // metric reports all 10 as available, but only the latter are unbound.
     RunLifecycle(MakeRequestSpec("r1", /*num_pages=*/2));
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
     // r3 holds 1 prefill page plus 1 decode-reserve page per group: 10 -> 6.
     Submit(MakeRequestSpec("r3", /*num_pages=*/1, /*start=*/501));
     ExecutionPlan r3_prefill = PlanOnce();
     ASSERT_NE(FindForwardBatch(r3_prefill), nullptr);
     ASSERT_EQ(FindForwardBatch(r3_prefill)->request_ids.size(), 1u);
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 6);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 6);
 
     // r3's finalize consumes its already physical decode reservation.
     SendForwardDone("r3", {599});
     PlanOnce();
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 6);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 6);
 
     // r2: 8 tokens, first 4 == r1's. The 4 cached hit parents are protected.
     // Its suffix and reserve need 6 empty parents, but r3 pins 4 and leaves only
@@ -3653,7 +4391,7 @@ TEST_F(PrefixHitTightPoolSuite, ProtectedHitAndFreshDemandMustFitTogether) {
     ASSERT_EQ(blocked_op->request_ids.size(), 1u) << "r2 must be deferred, not admitted into a short pool";
     EXPECT_EQ(blocked_op->request_ids.at(0), "r3");
     EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "deferred r2 stays intact in the waiting set";
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 6) << "a deferred first chunk must not touch the pool";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 6) << "a deferred first chunk must not touch the pool";
 
     // r3 finishes -> 10 available parents. r2 protects 4 hit parents and
     // acquires 4 fresh plus 2 physically reserved parents: exact fit.
@@ -3667,19 +4405,19 @@ TEST_F(PrefixHitTightPoolSuite, ProtectedHitAndFreshDemandMustFitTogether) {
     EXPECT_EQ(op2->input_lengths.at(0), 4) << "only the 4-token remainder is computed";
     EXPECT_EQ(op2->extend_prefix_lens.at(0), 4);
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 0);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
 
     // r2's finalize consumes the existing reservation, so capacity stays 0.
     SendForwardDone("r2", {699});
     ExecutionPlan decode = PlanOnce();
     ASSERT_NE(FindForwardBatch(decode), nullptr);
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 0);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
 
     SendForwardDone("r2", {700});
     SendFinish("r2");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "pool back to baseline after both complete";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "pool back to baseline after both complete";
 }
 
 // ---------------------------------------------------------------------------
@@ -3749,11 +4487,11 @@ protected:
 };
 
 TEST_F(DecodeCachingSuite, DecodeFilledPageBecomesHittable) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     const auto r1_rows = RunTurnOne();
     ASSERT_EQ(r1_rows.at("full").size(), 5u);
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "r1 must fully reclaim before r2 runs";
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "r1 must fully reclaim before r2 runs";
 
     // Hit: cap = (10-1)/2 = 4 -> pages 0..3, all registered by r1 (RunTurnOne);
     // swa (W=32, needed 16 > 4) keeps 4 -> fixpoint 4 blocks = 8 hit tokens.
@@ -3778,21 +4516,21 @@ TEST_F(DecodeCachingSuite, DecodeFilledPageBecomesHittable) {
     ExpectRowPrefixEq(op->block_tables.at("swa").at(0), swa_prefix, "swa row");
 
     // Pool: claim 4/group (8) + 1 fresh/group (2) + 1 reserved/group (2).
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 12);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 12);
 
     SendForwardDone("r2", {199});
     PlanOnce();
     SendForwardDone("r2", {200});
     SendFinish("r2");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "pool back to baseline after r2 finishes";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "pool back to baseline after r2 finishes";
 }
 
 TEST_F(DecodeCachingSuite, MultiTurnConversationReusesResponsePages) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     RunTurnOne();  // registers conversation pages 0..3
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
     // Turn 2: hit 4 pages, then decode 201..203: +201 finalize registers page
     // 4 = {901,902}; +203 (N=12) registers page 5 (tail one round late).
@@ -3807,7 +4545,7 @@ TEST_F(DecodeCachingSuite, MultiTurnConversationReusesResponsePages) {
     ASSERT_EQ(r2_rows.at("full").size(), 7u);  // ceil(13/2)
     SendFinish("r2");
     PlanOnce();  // reap
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
     // Turn 3 hit: cap = (16-1)/2 = 7; pages 0..5 registered (0..3 by r1, 4..5
     // by r2), page 6 never full in any request -> fixpoint 6 blocks = 12 hit
@@ -3833,14 +4571,14 @@ TEST_F(DecodeCachingSuite, MultiTurnConversationReusesResponsePages) {
     ExpectRowPrefixEq(op3->block_tables.at("swa").at(0), swa_prefix, "swa row");
 
     // Pool: 6 claimed/group (12) + 2 fresh/group (4) + 1 reserved/group (2).
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 18);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 18);
 
     SendForwardDone("r3", {299});
     PlanOnce();
     SendForwardDone("r3", {300});
     SendFinish("r3");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "pool back to baseline after all three turns";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "pool back to baseline after all three turns";
 }
 
 // A decode page registers before the admission slide, and a later
@@ -3851,7 +4589,7 @@ protected:
 };
 
 TEST_F(DecodeCachingSmallWindowSuite, SwaPunchedDecodePageStillHittable) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     // RunTurnOne's fill timing, inlined because the punch round +106 must land
     // BEFORE finish. W=4 slides on top (punched pages = (N-3)/2): +102 punches
@@ -3876,7 +4614,7 @@ TEST_F(DecodeCachingSmallWindowSuite, SwaPunchedDecodePageStillHittable) {
     EXPECT_EQ(punched.at("swa")[2], 0) << "the registered decode page must be punched by now";
     SendFinish("r1");
     PlanOnce();  // reap
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
     // r2: same 8-token prefix + 2 new. Fixpoint (W=4, needed 2): cap =
     // (10-1)/2 = 4, all four hashes cached (0,1,2 punched WITH hash); full
@@ -3908,33 +4646,33 @@ TEST_F(DecodeCachingSmallWindowSuite, SwaPunchedDecodePageStillHittable) {
     EXPECT_GT(swa_row[5], 0);
 
     // Pool: full claims 4 + swa claims 2 + 1 fresh/group + 1 reserved/group = 10.
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 10);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 10);
 
     SendForwardDone("r2", {199});
     PlanOnce();
     SendForwardDone("r2", {200});
     SendFinish("r2");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 // Registration writes hashes only -- never refcounts.
 TEST_F(DecodeCachingSuite, PoolBalanceAcrossDecodeCaching) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     RunTurnOne();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "turn 1: decode registration must not hold refs";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "turn 1: decode registration must not hold refs";
 
     Submit(MakeSpecWithTokens("r2", MakeTurnTwoPrompt()));
     ExecutionPlan turn2 = PlanOnce();
     ASSERT_NE(FindForwardBatch(turn2), nullptr);
-    EXPECT_LT(scheduler_->PoolFreeBlocks(), free_at_start) << "turn 2 holds claimed + fresh pages while live";
+    EXPECT_LT(scheduler_->AvailableLcmBlocks(), free_at_start) << "turn 2 holds claimed + fresh pages while live";
     AdvanceOneRound("r2", 201);
     AdvanceOneRound("r2", 202);
     AdvanceOneRound("r2", 203);
     SendFinish("r2");
     PlanOnce();  // reap
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "turn 2: claimed and fresh pages all return";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "turn 2: claimed and fresh pages all return";
 
     Submit(MakeSpecWithTokens("r3", MakeTurnThreePrompt()));
     ExecutionPlan turn3 = PlanOnce();
@@ -3946,7 +4684,7 @@ TEST_F(DecodeCachingSuite, PoolBalanceAcrossDecodeCaching) {
     SendForwardDone("r3", {300});
     SendFinish("r3");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "baseline restored after the whole conversation";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "baseline restored after the whole conversation";
 }
 
 // ---------------------------------------------------------------------------
@@ -4005,7 +4743,7 @@ protected:
 };
 
 TEST_F(StreamingSinkSuite, RegisteredPagesEmitWriteBackAndIndexOnDone) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     ExecutionPlan finalize = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
     auto stream_wb = FindWriteBack(finalize);
@@ -4019,18 +4757,18 @@ TEST_F(StreamingSinkSuite, RegisteredPagesEmitWriteBackAndIndexOnDone) {
 
     ExecutionPlan finish = FinishAndReap("r1");
     EXPECT_FALSE(FindWriteBack(finish).has_value()) << "already-streamed prefill pages must not rewrite at finish";
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 6)
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 6)
         << "the six sources stay pinned until the ACK: the finished request's other pages return, these do not";
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0);
 
     SendWriteBackDone(stream_wb->op_ids.at(0));
     PlanOnce();
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "the ACK returns the pinned sources";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "the ACK returns the pinned sources";
 }
 
 TEST_F(StreamingSinkSuite, DuplicateRegistrationsAreDroppedAtDrain) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     ExecutionPlan finalize1 = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
     auto stream_wb1 = FindWriteBack(finalize1);
@@ -4039,25 +4777,25 @@ TEST_F(StreamingSinkSuite, DuplicateRegistrationsAreDroppedAtDrain) {
     SendWriteBackDone(stream_wb1->op_ids.at(0));
     PlanOnce();
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
     ExecutionPlan finalize2 = RunToFinalize(MakeRequestSpec("r2", /*num_pages=*/4));  // identical tokens
     EXPECT_FALSE(FindWriteBack(finalize2).has_value()) << "already-indexed keys must not re-emit a write-back";
     ExecutionPlan finish2 = FinishAndReap("r2");
     EXPECT_FALSE(FindWriteBack(finish2).has_value()) << "finish must also dedupe already-indexed keys";
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start)
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start)
         << "duplicate candidates are unpinned at drain, pool back to baseline";
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
 }
 
 TEST_F(StreamingSinkSuite, HostPoolExhaustionSkipsSilently) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     ExecutionPlan finalize1 = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
     auto stream_wb1 = FindWriteBack(finalize1);
     ASSERT_TRUE(stream_wb1.has_value());
     EXPECT_FALSE(FindWriteBack(FinishAndReap("r1")).has_value());
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 6) << "r1's six sources stay pinned in flight";
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 6) << "r1's six sources stay pinned in flight";
     ASSERT_EQ(scheduler_->HostPoolFreeBlocks(), 0) << "r1 holds all 6 host pages in flight";
 
     ExecutionPlan finalize2 = RunToFinalize(MakeRequestSpec("r2", /*num_pages=*/4, /*start=*/501));
@@ -4066,12 +4804,12 @@ TEST_F(StreamingSinkSuite, HostPoolExhaustionSkipsSilently) {
     ExecutionPlan finish2 = FinishAndReap("r2");
     EXPECT_FALSE(FindWriteBack(finish2).has_value())
         << "finish-created candidates must also skip a fully-consumed host pool";
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 6)
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 6)
         << "dropped candidates pin nothing; only r1's in-flight sources are held";
 
     SendWriteBackDone(stream_wb1->op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "everything balances after r1's commit";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "everything balances after r1's commit";
 }
 
 TEST_F(StreamingSinkSuite, CommittedColdEntriesAreReplacedWhenHostPoolIsFull) {
@@ -4099,7 +4837,7 @@ TEST_F(StreamingSinkSuite, SameRoundDuplicateKeysDedupeAtDrain) {
     // 12 candidates into 6 pairs.
     config_.host_allocator.total_pages = 13;
     scheduler_ = std::make_unique<Scheduler>(config_);
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/4));
     Submit(MakeRequestSpec("r2", /*num_pages=*/4));
@@ -4116,13 +4854,13 @@ TEST_F(StreamingSinkSuite, SameRoundDuplicateKeysDedupeAtDrain) {
 
     EXPECT_FALSE(FindWriteBack(FinishAndReap("r1")).has_value());
     EXPECT_FALSE(FindWriteBack(FinishAndReap("r2")).has_value()) << "same-round duplicates must be dropped";
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 6)
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 6)
         << "one pinned source per emitted key; the dropped duplicates pin nothing";
 
     SendWriteBackDone(stream_wb->op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 6) << "the six cached host pages remain occupied";
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "the ACK returns the pinned sources";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "the ACK returns the pinned sources";
 }
 
 TEST_F(StreamingSinkSuite, MidDrainPoolFillEmitsPartialOp) {
@@ -4130,7 +4868,7 @@ TEST_F(StreamingSinkSuite, MidDrainPoolFillEmitsPartialOp) {
     // rest -- a partial op IS the contract when the pool fills mid-batch.
     config_.host_allocator.total_pages = 5;
     scheduler_ = std::make_unique<Scheduler>(config_);
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     ExecutionPlan finalize = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
     auto stream_wb = FindWriteBack(finalize);
@@ -4143,7 +4881,7 @@ TEST_F(StreamingSinkSuite, MidDrainPoolFillEmitsPartialOp) {
         << "in-flight Full pages still occupy the host pool, so leftover SWA must skip";
     SendWriteBackDone(stream_wb->op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "dropped candidates unpinned at drain";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "dropped candidates unpinned at drain";
 }
 
 TEST_F(StreamingSinkSuite, DuplicateWriteBackDoneIsIgnored) {
@@ -4151,17 +4889,17 @@ TEST_F(StreamingSinkSuite, DuplicateWriteBackDoneIsIgnored) {
     auto stream_wb = FindWriteBack(finalize);
     ASSERT_TRUE(stream_wb.has_value());
     EXPECT_FALSE(FindWriteBack(FinishAndReap("r1")).has_value());
-    const std::int32_t free_after_reap = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_after_reap = scheduler_->AvailableLcmBlocks();
 
     SendWriteBackDone(stream_wb->op_ids.at(0));
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
-    const std::int32_t free_after_ack = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_after_ack = scheduler_->AvailableLcmBlocks();
     EXPECT_EQ(free_after_ack, free_after_reap + 6) << "the ack publishes host entries and returns the six pins";
 
     // A replayed ack must be a no-op (the ledger already retired the op).
     SendWriteBackDone(stream_wb->op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_after_ack);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_after_ack);
 }
 
 // ---------------------------------------------------------------------------
@@ -4226,12 +4964,12 @@ protected:
             SendWriteBackDone(wb.op_ids.at(0));
         }
         ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 13);
-        ASSERT_EQ(scheduler_->PoolFreeBlocks(), 12) << "both seeding requests fully retired";
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 12) << "both seeding requests fully retired";
     }
 };
 
 TEST_F(HostHitSuite, HostHitLoadsBackAfterDeviceEviction) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     ASSERT_EQ(free_at_start, 12);
     SeedHostThenEvictDevice();
 
@@ -4273,11 +5011,11 @@ TEST_F(HostHitSuite, HostHitLoadsBackAfterDeviceEviction) {
 
     // The 6 matched host entries stay load-pinned until LoadBackDone retires the op.
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 6);
-    SendLoadBackDone(lb->op_ids.at(0));
+    SendLoadBackDone(lb->op_ids.at(0), /*success=*/true);
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
 
     // r2 holds 6 loaded blocks and 4 fresh blocks.
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 10);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 10);
 
     SendForwardDone("r2", {9001});
     ExecutionPlan finalize = PlanOnce();
@@ -4288,7 +5026,7 @@ TEST_F(HostHitSuite, HostHitLoadsBackAfterDeviceEviction) {
     SendFinish("r2");
     AckWriteBacks(PlanOnce());
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "pool balances after the host-hit request";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "pool balances after the host-hit request";
 }
 
 TEST_F(HostHitSuite, EmptyHostIndexEmitsNoLoadBack) {
@@ -4300,7 +5038,7 @@ TEST_F(HostHitSuite, EmptyHostIndexEmitsNoLoadBack) {
 }
 
 TEST_F(HostHitSuite, AbandonedAdmissionUnpins) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     SeedHostThenEvictDevice();
 
     // Filler: 5 pages -> 10 prefill + 2 reserve = the whole pool while it decodes.
@@ -4310,7 +5048,7 @@ TEST_F(HostHitSuite, AbandonedAdmissionUnpins) {
     ExecutionPlan filler_finalize = PlanOnce();  // finalization slides three expired SWA pages: free = 3
     auto filler_wb = FindWriteBack(filler_finalize);
     ASSERT_TRUE(filler_wb.has_value());
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 3);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 3);
 
     // r2's host match takes 6 pins, but the gate needs 4 + 6 ext > 3 free: the
     // abandoning return must give the pins back.
@@ -4336,7 +5074,7 @@ TEST_F(HostHitSuite, AbandonedAdmissionUnpins) {
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 6);
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
 
-    SendLoadBackDone(lb->op_ids.at(0));
+    SendLoadBackDone(lb->op_ids.at(0), /*success=*/true);
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
     SendForwardDone("r2", {9001});
     ExecutionPlan finalize = PlanOnce();
@@ -4347,11 +5085,11 @@ TEST_F(HostHitSuite, AbandonedAdmissionUnpins) {
     SendFinish("r2");
     AckWriteBacks(PlanOnce());
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "pool balances after the deferred host hit";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "pool balances after the deferred host hit";
 }
 
 TEST_F(HostHitSuite, AbortDuringLoadKeepsPagesPinned) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     SeedHostThenEvictDevice();
 
     Submit(MakeRequestSpec("r2", /*num_pages=*/5));
@@ -4359,17 +5097,18 @@ TEST_F(HostHitSuite, AbortDuringLoadKeepsPagesPinned) {
     auto lb = FindLoadBack(plan);
     ASSERT_TRUE(lb.has_value());
     ASSERT_EQ(lb->dst_pages.at(0).size(), 6u);
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 10);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 10);
 
     // Abort while the H2D copy is in flight: the reap returns only the 4 fresh pages;
     // the 6 load destinations must stay off the free list until LoadBackDone.
     SendAbort(*scheduler_, "r2");
     PlanOnce();  // reap
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 6) << "in-flight load destinations must not be reusable";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 6)
+        << "in-flight load destinations must not be reusable";
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 6) << "the host sources stay pinned too";
 
-    SendLoadBackDone(lb->op_ids.at(0));
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "LoadBackDone releases the destinations";
+    SendLoadBackDone(lb->op_ids.at(0), /*success=*/true);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "LoadBackDone releases the destinations";
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
 }
 
@@ -4377,7 +5116,7 @@ TEST_F(HostHitSuite, AbortDuringLoadKeepsPagesPinned) {
 // handling must wait for LoadBackDone rather than retract or abort a request
 // blocked on those pages.
 TEST_F(HostHitSuite, CapacityBlockWaitsForInFlightLoads) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     SeedHostThenEvictDevice();
 
     // Same shape as AbortDuringLoadKeepsPagesPinned: 6 destinations stay ticket-held.
@@ -4387,7 +5126,7 @@ TEST_F(HostHitSuite, CapacityBlockWaitsForInFlightLoads) {
     ASSERT_TRUE(lb.has_value());
     SendAbort(*scheduler_, "r2");
     PlanOnce();  // reap
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 6);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 6);
 
     // r3 (fresh tokens, no host hit) charges 8 prefill + 2 reserve = 10 > 6 free: deferred.
     Submit(MakeRequestSpec("r3", /*num_pages=*/4, /*start=*/901));
@@ -4401,8 +5140,8 @@ TEST_F(HostHitSuite, CapacityBlockWaitsForInFlightLoads) {
     EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "deferred r3 stays intact in the waiting set";
 
     // LoadBackDone frees the 6 destinations: r3's 10-block gate now clears.
-    SendLoadBackDone(lb->op_ids.at(0));
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    SendLoadBackDone(lb->op_ids.at(0), /*success=*/true);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
     ExecutionPlan admitted = PlanOnce();
     const ForwardBatch* op = FindForwardBatch(admitted);
     ASSERT_NE(op, nullptr);
@@ -4414,22 +5153,22 @@ TEST_F(HostHitSuite, CapacityBlockWaitsForInFlightLoads) {
 // A LoadBackDone whose op_id was already retired must hit the silent-ignore arm:
 // no crash, no double UnpinLoad, no double-free of the destination pages.
 TEST_F(HostHitSuite, DuplicateLoadBackDoneIsIgnored) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     SeedHostThenEvictDevice();
 
     Submit(MakeRequestSpec("r2", /*num_pages=*/5));
     ExecutionPlan plan = PlanOnce();
     auto lb = FindLoadBack(plan);
     ASSERT_TRUE(lb.has_value());
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 10);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 10);
 
-    SendLoadBackDone(lb->op_ids.at(0));
+    SendLoadBackDone(lb->op_ids.at(0), /*success=*/true);
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
-    const std::int32_t free_after_first = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_after_first = scheduler_->AvailableLcmBlocks();
     EXPECT_EQ(free_after_first, free_at_start - 10) << "destinations still table-held: no free-list change";
 
-    SendLoadBackDone(lb->op_ids.at(0));  // duplicate
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_after_first) << "a duplicate Done must not double-free";
+    SendLoadBackDone(lb->op_ids.at(0), /*success=*/true);  // duplicate
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_after_first) << "a duplicate Done must not double-free";
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
 
     SendForwardDone("r2", {9001});
@@ -4441,7 +5180,7 @@ TEST_F(HostHitSuite, DuplicateLoadBackDoneIsIgnored) {
     SendFinish("r2");
     AckWriteBacks(PlanOnce());
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "pool balances despite the duplicate event";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "pool balances despite the duplicate event";
 }
 
 // ---------------------------------------------------------------------------
@@ -4486,12 +5225,12 @@ protected:
         ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 8);
         RunChunkedSinkLifecycle(MakeRequestSpec("churn", /*num_pages=*/10, /*start=*/501), /*prefill_rounds=*/5);
         ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 28);
-        ASSERT_EQ(scheduler_->PoolFreeBlocks(), 20) << "both seeding requests fully retired";
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 20) << "both seeding requests fully retired";
     }
 };
 
 TEST_F(ChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     ASSERT_EQ(free_at_start, 20);
     SeedHostThenEvictDeviceChunked();
 
@@ -4512,7 +5251,7 @@ TEST_F(ChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
     EXPECT_EQ(op1->input_lengths.at(0), 4);
     EXPECT_EQ(op1->prefill_lengths.at(0), 16);
     // 6 ext + 2 fresh/group: 10 blocks held.
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 10);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 10);
 
     // Chunk 2 completes prefill; its slide at num_computed=12 punches swa ext slots
     // 2,3 = LOADED destinations mid-copy. The ticket must keep them off the free list.
@@ -4525,12 +5264,12 @@ TEST_F(ChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
     AckWriteBacks(c2);  // pages 4,5 registered this round; ack so only the ticket pins remain
     // Four input tokens plus one decode-reserve token require 3 new pages per
     // group; the 2 punched load destinations stay ticket-held.
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 16);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 16);
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 6) << "the copy is still in flight";
 
     // LoadBackDone releases exactly the 2 punched destinations (the other 4 stay table-held).
-    SendLoadBackDone(lb->op_ids.at(0));
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 14);
+    SendLoadBackDone(lb->op_ids.at(0), /*success=*/true);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 14);
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
 
     SendForwardDone("r2", {9001});
@@ -4541,7 +5280,624 @@ TEST_F(ChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
     SendForwardDone("r2", {9002});
     SendFinish("r2");
     AckWriteBacks(PlanOnce());  // any remaining decode write-back + reap
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "pool balances after the chunked host hit";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "pool balances after the chunked host hit";
+}
+
+// ---------------------------------------------------------------------------
+// Mooncake L3 under flat KV: Host writeback inserts storage_keys_; Host
+// eviction must not drop Mooncake objects. The scheduler shadow is bounded
+// to Host page capacity. A registration longer than that bound keeps the
+// prefix-start keys so prefix-closed matching still hits, even when
+// sequential write-backs left only this prompt's suffix in the shadow;
+// later unrelated keys LRU-evict older prompts. Admit-time
+// RegisterStorageKeys restores keys the shadow dropped. A later
+// Device+Host miss that is still in L3
+// allocates a Host page and emits LoadBack with prefetch_from_storage.
+// ---------------------------------------------------------------------------
+class L3StorageHitSuite : public HostHitSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = HostHitSuite::MakeConfig();
+        cfg.enable_l3_storage = true;
+        // 6 usable Host pages: r1 fills the pool; the churn request replaces r1.
+        cfg.host_allocator.total_pages = 7;
+        return cfg;
+    }
+};
+
+TEST_F(L3StorageHitSuite, HostEvictionKeepsL3HitAsPrefetchLoadBack) {
+    auto wb1 = RunSinkLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));
+    ASSERT_FALSE(wb1.empty());
+    SendWriteBackDone(wb1.front().op_ids.at(0));
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
+
+    auto wb2 = RunSinkLifecycle(MakeRequestSpec("churn", /*num_pages=*/5, /*start=*/501));
+    ASSERT_FALSE(wb2.empty()) << "committed Host entries must be replaceable so r1 leaves L2";
+    SendWriteBackDone(wb2.front().op_ids.at(0));
+    EXPECT_GT(scheduler_->HostPoolCachedBlocks(), 0);
+
+    // Same tokens as r1 plus one extra page: Device miss, Host miss, L3 hit.
+    // Re-register like the event loop's admit-time probe: Host eviction does
+    // not delete Mooncake objects, but the LRU shadow may have dropped r1.
+    RequestSpec r3 = MakeRequestSpec("r3", /*num_pages=*/5);
+    scheduler_->RegisterStorageKeys(scheduler_->ExpandPrefixKeys(scheduler_->PrefixHashesForTokens(r3.tokens)));
+    Submit(r3);
+    ExecutionPlan plan = PlanOnce();
+    auto lb = FindLoadBack(plan);
+    ASSERT_TRUE(lb.has_value()) << "L3-only prefix must emit a Host prefetch load-back";
+    ASSERT_EQ(lb->op_ids.size(), 1u);
+    ASSERT_EQ(lb->src_pages.at(0).size(), 6u);
+    ASSERT_EQ(lb->prefetch_from_storage.size(), 1u);
+    const auto& flags = lb->prefetch_from_storage.at(0);
+    ASSERT_EQ(flags.size(), lb->src_pages.at(0).size());
+    EXPECT_TRUE(std::all_of(flags.begin(), flags.end(), [](std::uint8_t flag) { return flag != 0; }))
+        << "Host-evicted L3 hits must prefetch, not treat leftover Host pages as warm";
+    EXPECT_FALSE(lb->content_hashes.at(0).empty());
+
+    SendLoadBackDone(lb->op_ids.at(0), /*success=*/true);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+
+    SendForwardDone("r3", {9001});
+    ExecutionPlan finalize = PlanOnce();
+    if (auto wb3 = FindWriteBack(finalize)) {
+        SendWriteBackDone(wb3->op_ids.at(0));
+    }
+    SendForwardDone("r3", {9002});
+    SendFinish("r3");
+    PlanOnce();
+}
+
+class L3ShortHostPoolSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.enable_l3_storage = true;
+        cfg.disable_l2_cache = false;
+        cfg.disable_prefix_cache = false;
+        cfg.host_allocator.total_pages = 3;
+        cfg.max_scheduled_tokens = 64;
+        for (auto& group : cfg.cache_groups) {
+            group.total_pages = cfg.device_allocator.total_pages;
+        }
+        return cfg;
+    }
+};
+
+TEST_F(L3ShortHostPoolSuite, FirstChunkWindowUsesAdmittedHostPrefix) {
+    RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/4);
+    std::vector<std::string> hashes = scheduler_->PrefixHashesForTokens(spec.tokens);
+    // 8 tokens, grain 2: (8 - 1) / 2 = 3 candidate prefix pages.
+    ASSERT_EQ(hashes.size(), 3u);
+    std::vector<CacheKey> keys;
+    keys.reserve(hashes.size());
+    for (const std::string& content_hash : hashes) {
+        keys.push_back(CacheKey{.group_id = 0, .content_hash = content_hash, .page_offset = 0});
+    }
+    scheduler_->RegisterStorageKeys(keys);
+
+    Submit(spec);
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->extend_prefix_lens.size(), 1u);
+    ASSERT_EQ(op->input_lengths.size(), 1u);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 4) << "retry must release the discarded admission's load_pairs or the Host "
+                                                  "pages stay pinned and the window collapses to a full miss";
+    EXPECT_EQ(op->input_lengths.at(0), 4);
+    EXPECT_EQ(op->extend_prefix_lens.at(0) + op->input_lengths.at(0), op->prefill_lengths.at(0));
+}
+
+class L3MixedGranularityHostPoolSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = 4;
+        cfg.device_allocator.total_pages = 32;
+        cfg.host_allocator.total_pages = 2;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.enable_l3_storage = true;
+        cfg.disable_l2_cache = false;
+        cfg.disable_prefix_cache = false;
+        cfg.cache_groups = {
+            MakeGroup("full_fine", /*block_granularity=*/2, cfg.device_allocator.total_pages,
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+            MakeGroup("full_coarse", /*block_granularity=*/4, cfg.device_allocator.total_pages,
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+        };
+        return cfg;
+    }
+};
+
+TEST_F(SchedulerTestSuite, WaitingPrefixHashesMatchSubmittedPrompt) {
+    RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/4);
+    std::vector<std::string> expected = scheduler_->PrefixHashesForTokens(spec.tokens);
+    ASSERT_FALSE(expected.empty());
+    EXPECT_TRUE(scheduler_->WaitingPrefixHashes().empty());
+    Submit(spec);
+    EXPECT_EQ(scheduler_->WaitingPrefixHashes(), expected);
+    PlanOnce();
+    EXPECT_TRUE(scheduler_->WaitingPrefixHashes().empty());
+}
+
+TEST_F(SchedulerTestSuite, WaitingPrefixHashesSkipWhenBatchCannotAdmit) {
+    config_.max_batch_size = 1;
+    config_.enable_l3_storage = true;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+    PlanOnce();
+    Submit(MakeRequestSpec("r2", /*num_pages=*/4, /*start=*/100));
+    EXPECT_TRUE(scheduler_->WaitingPrefixHashes().empty())
+        << "a full batch must not rehash a waiter that cannot be admitted";
+}
+
+TEST_F(SchedulerTestSuite, WaitingPrefixHashesSkipWhenPoolCannotAdmit) {
+    config_.device_allocator.total_pages = 11;
+    config_.host_allocator.total_pages = 11;
+    config_.enable_l3_storage = true;
+    config_.disable_prefix_cache = true;
+    config_.max_batch_size = 8;
+    config_.cache_groups = {
+        MakeGroup("full", /*block_granularity=*/2, config_.device_allocator.total_pages,
+                  CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+        MakeGroup("swa", /*block_granularity=*/2, config_.device_allocator.total_pages,
+                  CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+                  /*sliding_window_tokens=*/4),
+    };
+    scheduler_ = std::make_unique<Scheduler>(config_);
+
+    Submit(MakeRequestSpec("r1", /*num_pages=*/4));
+    PlanOnce();
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+    Submit(MakeRequestSpec("r2", /*num_pages=*/4, /*start=*/100));
+    EXPECT_GT(
+        config_.max_batch_size - static_cast<std::int32_t>(scheduler_->PrefillSize() + scheduler_->DecodingSize()), 0)
+        << "the waiter still has a free batch slot";
+    EXPECT_TRUE(scheduler_->WaitingPrefixHashes().empty())
+        << "an exhausted Device pool must not rehash a waiter that cannot obtain pages";
+}
+
+TEST_F(L3MixedGranularityHostPoolSuite, FirstChunkDoesNotSkipCoarseGroupWithoutKv) {
+    RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/2);
+    std::vector<std::string> hashes = scheduler_->PrefixHashesForTokens(spec.tokens);
+    // 8 tokens, grain 4: (8 - 1) / 4 = 1 candidate prefix page. A 4-token
+    // prompt yields zero hashes, so Host shortage would never run.
+    ASSERT_EQ(hashes.size(), 1u);
+    scheduler_->RegisterStorageKeys(scheduler_->ExpandPrefixKeys(hashes));
+
+    Submit(spec);
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->extend_prefix_lens.size(), 1u);
+    ASSERT_EQ(op->input_lengths.size(), 1u);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 0) << "a 2-token Host shortage must round down to the 4-token prefix grain";
+    EXPECT_EQ(op->input_lengths.at(0), 8);
+    EXPECT_EQ(op->extend_prefix_lens.at(0) + op->input_lengths.at(0), op->prefill_lengths.at(0));
+}
+
+class L3PrefetchRetractSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.enable_l3_storage = true;
+        cfg.disable_l2_cache = false;
+        cfg.disable_prefix_cache = false;
+        return cfg;
+    }
+};
+
+TEST_F(L3PrefetchRetractSuite, VanishedKeysRetractThenReadmitAsColdMiss) {
+    RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/4);
+    std::vector<std::string> hashes = scheduler_->PrefixHashesForTokens(spec.tokens);
+    ASSERT_FALSE(hashes.empty());
+    const std::vector<CacheKey> keys = scheduler_->ExpandPrefixKeys(hashes);
+    scheduler_->RegisterStorageKeys(keys);
+
+    Submit(spec);
+    ExecutionPlan plan = PlanOnce();
+    auto load_ops = ExtractCacheOpsOfKind<LoadBackBatch>(plan);
+    ASSERT_EQ(load_ops.size(), 1u) << "registered L3 keys must emit a prefetch load-back";
+    const auto& load = std::get<LoadBackBatch>(load_ops.front());
+    ASSERT_FALSE(load.op_ids.empty());
+    const ForwardBatch* first = FindForwardBatch(plan);
+    ASSERT_NE(first, nullptr);
+    ASSERT_EQ(first->request_ids, std::vector<std::string>{"r1"});
+    ASSERT_FALSE(first->extend_prefix_lens.empty());
+    EXPECT_GT(first->extend_prefix_lens.at(0), 0);
+
+    scheduler_->UnregisterStorageKeys(keys);
+    SendRetractEvent("r1");
+    SendLoadBackDone(load.op_ids.at(0), /*success=*/false);
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+
+    ExecutionPlan retry = PlanOnce();
+    EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(retry).empty())
+        << "unregistered L3 keys must not prefetch on the next admit";
+    const ForwardBatch* op = FindForwardBatch(retry);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids, std::vector<std::string>{"r1"});
+    ASSERT_FALSE(op->extend_prefix_lens.empty());
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 0) << "the next admit must recompute the vanished prefix";
+    EXPECT_EQ(op->extend_prefix_lens.at(0) + op->input_lengths.at(0), op->prefill_lengths.at(0));
+}
+
+// Bounded replay: the sliding groups leave prefix caching; a prefix hit
+// re-feeds the replay window before it, and no prompt's final chunk is left
+// shorter than the window. P=8 tokens; full g=8 (closed), replayable swa g=4
+// window 16 and tail g=2 window 2; budget 64.
+// ---------------------------------------------------------------------------
+class BoundedReplaySuite : public SchedulerTestSuite {
+protected:
+    static constexpr std::int32_t kReplayWindow = 16;
+
+    virtual std::int32_t MaxScheduledTokens() const { return 64; }
+    virtual std::int32_t MaxBatchSize() const { return 8; }
+    virtual bool MixedPrefillDecode() const { return false; }
+    virtual std::int32_t PrefixReplayTokens() const { return 0; }
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = 8;
+        cfg.device_allocator.total_pages = 256;
+        cfg.host_allocator.total_pages = 256;
+        cfg.max_scheduled_tokens = MaxScheduledTokens();
+        cfg.max_batch_size = MaxBatchSize();
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.enable_mixed_prefill_decode = MixedPrefillDecode();
+        cfg.prefix_replay_tokens = PrefixReplayTokens();
+
+        CacheGroupConfig swa = MakeGroup("swa", /*block_granularity=*/4, cfg.device_allocator.total_pages,
+                                         CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+                                         /*sliding_window_tokens=*/kReplayWindow);
+        swa.replayable = true;
+        CacheGroupConfig tail = MakeGroup("tail", /*block_granularity=*/2, cfg.device_allocator.total_pages,
+                                          CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+                                          /*sliding_window_tokens=*/2);
+        tail.replayable = true;
+        cfg.cache_groups = {
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+            swa,
+            tail,
+        };
+        return cfg;
+    }
+
+    RequestSpec MakeSpecWithTokens(const std::string& id, std::vector<std::int32_t> tokens) {
+        return RequestSpec{.request_id = id, .tokens = std::move(tokens)};
+    }
+
+    // Prefill (one chunk) -> one decode round -> finish; returns the prefill
+    // op's per-group rows. The decode round publishes the page hashes.
+    std::map<std::string, std::vector<std::int32_t>> RunLifecycle(const RequestSpec& spec) {
+        Submit(spec);
+        const ExecutionPlan prefill = PlanOnce();
+        const ForwardBatch* op = FindForwardBatch(prefill);
+        EXPECT_NE(op, nullptr);
+        std::map<std::string, std::vector<std::int32_t>> rows;
+        if (op != nullptr) {
+            EXPECT_EQ(op->extend_replay_lens.at(0), 0) << "a cold prompt re-feeds nothing";
+            for (const auto& [gid, table] : op->block_tables) {
+                rows[gid] = table.at(0);
+            }
+        }
+        SendForwardDone(spec.request_id, {9001});
+        PlanOnce();
+        SendForwardDone(spec.request_id, {9002});
+        SendFinish(spec.request_id);
+        PlanOnce();
+        return rows;
+    }
+
+    static std::vector<std::int32_t> Slice(const std::vector<std::int32_t>& tokens, std::int32_t begin,
+                                           std::int32_t end) {
+        return {tokens.begin() + begin, tokens.begin() + end};
+    }
+
+    static void ExpectHolesThenPages(const std::vector<std::int32_t>& row, std::int32_t first_page,
+                                     std::int32_t min_pages, const char* what) {
+        ASSERT_GE(static_cast<std::int32_t>(row.size()), min_pages) << what;
+        for (std::int32_t slot = 0; slot < first_page; ++slot) {
+            EXPECT_EQ(row[static_cast<std::size_t>(slot)], 0) << what << " slot " << slot << " must be a hole";
+        }
+        for (std::int32_t slot = first_page; slot < min_pages; ++slot) {
+            EXPECT_GT(row[static_cast<std::size_t>(slot)], 0) << what << " slot " << slot << " must be a page";
+        }
+    }
+};
+
+TEST_F(BoundedReplaySuite, FirstChunkAfterHitReplaysWindow) {
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
+    const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4);  // 32 tokens
+    const auto r1_rows = RunLifecycle(r1);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
+
+    // r2 = r1's 32 tokens + 8 new: the closed group hits P=32 on its own; the
+    // replayable groups claim nothing and the window [16, 32) is re-fed.
+    std::vector<std::int32_t> tokens = r1.tokens;
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/8, /*start=*/901);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+    Submit(MakeSpecWithTokens("r2", tokens));
+
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 16);
+    EXPECT_EQ(op->extend_replay_lens.at(0), kReplayWindow);
+    EXPECT_EQ(op->input_lengths.at(0), kReplayWindow + 8);
+    EXPECT_EQ(op->prefill_lengths.at(0), 40);
+    EXPECT_EQ(op->input_ids, Slice(tokens, 16, 40));
+
+    // Closed group: r1's four pages are shared, then fresh pages follow.
+    const auto& full_row = op->block_tables.at("full").at(0);
+    ASSERT_GE(full_row.size(), 5u);
+    for (std::size_t slot = 0; slot < 4; ++slot) {
+        EXPECT_EQ(full_row[slot], r1_rows.at("full").at(slot)) << "full slot " << slot;
+    }
+    EXPECT_GT(full_row[4], 0);
+    // Replayable groups: holes below s=16, private pages from there through
+    // the 40 computed tokens plus the decode slot.
+    ExpectHolesThenPages(op->block_tables.at("swa").at(0), /*first_page=*/16 / 4, /*min_pages=*/41 / 4 + 1, "swa");
+    ExpectHolesThenPages(op->block_tables.at("tail").at(0), /*first_page=*/16 / 2, /*min_pages=*/41 / 2 + 1, "tail");
+
+    // Progress is the chunk, not the replay: r2 decodes from position 40 and
+    // frees everything on finish.
+    SendForwardDone("r2", {199});
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+    SendForwardDone("r2", {200});
+    SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
+}
+
+TEST_F(BoundedReplaySuite, HitShorterThanWindowReplaysWholePrefix) {
+    const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/1);  // 8 tokens
+    RunLifecycle(r1);
+
+    std::vector<std::int32_t> tokens = r1.tokens;
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/8, /*start=*/901);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+    Submit(MakeSpecWithTokens("r2", tokens));
+
+    const ExecutionPlan op_plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(op_plan);
+    ASSERT_NE(op, nullptr);
+    // P=8 < W=16: the whole hit prefix is re-fed and the forward starts at 0.
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 0);
+    EXPECT_EQ(op->extend_replay_lens.at(0), 8);
+    EXPECT_EQ(op->input_lengths.at(0), 16);
+    EXPECT_EQ(op->input_ids, tokens);
+    EXPECT_GT(op->block_tables.at("swa").at(0).at(0), 0) << "no hole: the private suffix starts at 0";
+}
+
+TEST_F(BoundedReplaySuite, NoHitNoReplay) {
+    Submit(MakeSpecWithTokens("r1", MakeTokens(/*count=*/12)));
+    const ExecutionPlan op_plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(op_plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 0);
+    EXPECT_EQ(op->extend_replay_lens.at(0), 0);
+    EXPECT_EQ(op->input_lengths.at(0), 12);
+}
+
+TEST_F(BoundedReplaySuite, FinalChunkKeepsAtLeastTheWindow) {
+    // 70 tokens with a 64-token budget would leave a 6-token final chunk; the
+    // first chunk is shortened so the final chunk holds exactly the window.
+    const std::vector<std::int32_t> tokens = MakeTokens(/*count=*/70);
+    Submit(MakeSpecWithTokens("r1", tokens));
+
+    const ExecutionPlan chunk1_plan = PlanOnce();
+    const ForwardBatch* chunk1 = FindForwardBatch(chunk1_plan);
+    ASSERT_NE(chunk1, nullptr);
+    EXPECT_EQ(chunk1->extend_prefix_lens.at(0), 0);
+    EXPECT_EQ(chunk1->extend_replay_lens.at(0), 0);
+    EXPECT_EQ(chunk1->input_lengths.at(0), 70 - kReplayWindow);
+
+    const ExecutionPlan chunk2_plan = PlanOnce();
+    const ForwardBatch* chunk2 = FindForwardBatch(chunk2_plan);
+    ASSERT_NE(chunk2, nullptr);
+    EXPECT_EQ(chunk2->extend_prefix_lens.at(0), 70 - kReplayWindow);
+    EXPECT_EQ(chunk2->extend_replay_lens.at(0), 0);
+    EXPECT_EQ(chunk2->input_lengths.at(0), kReplayWindow);
+    EXPECT_EQ(chunk2->input_ids, Slice(tokens, 54, 70));
+
+    SendForwardDone("r1", {});
+    SendForwardDone("r1", {9001});
+    const ExecutionPlan decode_plan = PlanOnce();
+    ASSERT_NE(FindForwardBatch(decode_plan), nullptr);
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u) << "decode resumes at position 70";
+}
+
+TEST_F(BoundedReplaySuite, FinalChunkAlreadyAtLeastTheWindowIsUnchanged) {
+    Submit(MakeSpecWithTokens("r1", MakeTokens(/*count=*/84)));
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    const ExecutionPlan chunk2_plan = PlanOnce();
+    const ForwardBatch* chunk2 = FindForwardBatch(chunk2_plan);
+    ASSERT_NE(chunk2, nullptr);
+    EXPECT_EQ(chunk2->extend_prefix_lens.at(0), 64);
+    EXPECT_EQ(chunk2->extend_replay_lens.at(0), 0);
+    EXPECT_EQ(chunk2->input_lengths.at(0), 20);
+}
+
+TEST_F(BoundedReplaySuite, ReplayRowsDebitTokenBudget) {
+    const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4);
+    RunLifecycle(r1);
+
+    std::vector<std::int32_t> tokens = r1.tokens;
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/8, /*start=*/901);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+    // r2 costs 16 replay + 8 new rows; r3's first chunk gets the remaining 40.
+    Submit({MakeSpecWithTokens("r2", tokens), MakeSpecWithTokens("r3", MakeTokens(/*count=*/60, /*start=*/5001))});
+
+    const ExecutionPlan op_plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(op_plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids, (std::vector<std::string>{"r2", "r3"}));
+    EXPECT_EQ(op->extend_replay_lens, (std::vector<std::int32_t>{kReplayWindow, 0}));
+    EXPECT_EQ(op->input_lengths, (std::vector<std::int32_t>{kReplayWindow + 8, 64 - kReplayWindow - 8}));
+}
+
+// The DSpark cap (prefix_replay_tokens) shortens the probe first; bounded
+// replay then re-feeds its window before whatever hit remains.
+class BoundedReplayWithDSparkCapSuite : public BoundedReplaySuite {
+protected:
+    std::int32_t PrefixReplayTokens() const override { return 8; }
+};
+
+TEST_F(BoundedReplayWithDSparkCapSuite, DSparkCapComposesWithBoundedReplay) {
+    const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4);  // 32 tokens
+    RunLifecycle(r1);
+
+    std::vector<std::int32_t> tokens = r1.tokens;
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/4, /*start=*/901);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());  // 36 tokens
+    Submit(MakeSpecWithTokens("r2", tokens));
+
+    const ExecutionPlan op_plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(op_plan);
+    ASSERT_NE(op, nullptr);
+    // Cap: (36 - 8) / 8 = 3 pages -> P = 24; window 16 -> s = 8.
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 8);
+    EXPECT_EQ(op->extend_replay_lens.at(0), kReplayWindow);
+    EXPECT_EQ(op->input_lengths.at(0), 36 - 8);
+    EXPECT_EQ(op->input_ids, Slice(tokens, 8, 36));
+}
+
+// Mixed mode: the decode batch leaves two replay windows for a pending local
+// prefill, so a hit chunk always fits in one forward.
+class BoundedReplayMixedSuite : public BoundedReplaySuite {
+protected:
+    std::int32_t MaxScheduledTokens() const override { return 2 * kReplayWindow + 6; }
+    std::int32_t MaxBatchSize() const override { return 16; }
+    bool MixedPrefillDecode() const override { return true; }
+};
+
+TEST_F(BoundedReplayMixedSuite, DecodeBatchLeavesRoomForTheReplayWindow) {
+    // Seed the cache with a 24-token prompt (one chunk under the 38 budget).
+    const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/3);
+    RunLifecycle(r1);
+
+    // Eight decoding requests, each a 4-token prompt.
+    std::vector<std::string> decoders;
+    for (int i = 0; i < 8; ++i) {
+        const std::string id = "d" + std::to_string(i);
+        Submit(MakeSpecWithTokens(id, MakeTokens(/*count=*/4, /*start=*/2000 + 10 * i)));
+        ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+        SendForwardDone(id, {7000 + i});
+        decoders.push_back(id);
+    }
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    for (const std::string& id : decoders) {
+        SendForwardDone(id, {8000});
+    }
+    EXPECT_EQ(scheduler_->DecodingSize(), 8u);
+
+    // r2 hits P=24 (> W) and adds 15 new tokens: fewer than a window, so the
+    // whole W + 15 = 31 rows must go in one chunk. With a 38-token budget the
+    // decode batch must stop once 2W = 32 tokens remain, i.e. after 6 rows.
+    std::vector<std::int32_t> tokens = r1.tokens;
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/15, /*start=*/901);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+    Submit(MakeSpecWithTokens("r2", tokens));
+    const ExecutionPlan op_plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(op_plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->NumExtends(), 1);
+    EXPECT_EQ(op->request_ids.at(0), "r2");
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 24 - kReplayWindow);
+    EXPECT_EQ(op->extend_replay_lens.at(0), kReplayWindow);
+    EXPECT_EQ(op->input_lengths.at(0), kReplayWindow + 15);
+    EXPECT_EQ(op->request_ids.size(), 1u + 6u);
+}
+
+// PD: a replayable group travels like any sliding window -- the prefill role
+// replays locally on its own hits and transfers the retained tail; the decode
+// role lands that tail and never re-feeds anything.
+class BoundedReplayPrefillRoleSuite : public BoundedReplaySuite {
+protected:
+    virtual Role RoleUnderTest() const { return Role::kP; }
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = BoundedReplaySuite::MakeConfig();
+        cfg.role = RoleUnderTest();
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        return cfg;
+    }
+
+    void SendBootstrapped(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::BootstrappedEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+};
+
+TEST_F(BoundedReplayPrefillRoleSuite, LocalHitReplaysAndTheTailIsWhatTransfers) {
+    // r1: a 32-token prompt prefilled in one chunk; its ExtendResult lands
+    // the bootstrap token and the closed group's four pages are published.
+    const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4);
+    Submit(r1);
+    SendBootstrapped("r1");
+    const ExecutionPlan first_plan = PlanOnce();
+    const ForwardBatch* first = FindForwardBatch(first_plan);
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->extend_replay_lens, std::vector<std::int32_t>{0});
+    SendForwardDone("r1", {42});
+    ASSERT_TRUE(PlanOnce().remote_decode.has_value());
+
+    // r2 = r1's 32 tokens + 8 new: the closed group hits P=32 and the whole
+    // swa retention window [16, 32) is re-fed, so the tail a decode peer lands
+    // (`full_suffix`: from token 40 - 16 + 1 = 25, page 6) is materialized.
+    std::vector<std::int32_t> tokens = r1.tokens;
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/8, /*start=*/901);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+    Submit(MakeSpecWithTokens("r2", tokens));
+    SendBootstrapped("r2");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids, std::vector<std::string>{"r2"});
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 16);
+    EXPECT_EQ(op->extend_replay_lens.at(0), kReplayWindow);
+    EXPECT_EQ(op->input_lengths.at(0), kReplayWindow + 8);
+    EXPECT_EQ(op->input_ids, Slice(tokens, 16, 40));
+    ExpectHolesThenPages(op->block_tables.at("swa").at(0), /*first_page=*/16 / 4, /*min_pages=*/40 / 4, "swa");
+    ExpectHolesThenPages(op->block_tables.at("tail").at(0), /*first_page=*/16 / 2, /*min_pages=*/40 / 2, "tail");
+}
+
+class BoundedReplayDecodeRoleSuite : public BoundedReplayPrefillRoleSuite {
+protected:
+    Role RoleUnderTest() const override { return Role::kD; }
+};
+
+TEST_F(BoundedReplayDecodeRoleSuite, RemoteAdmissionLandsTheRetainedTailAndReplaysNothing) {
+    const RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/5);  // 40 tokens
+    Submit(spec);
+    SendBootstrapped("r1");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* admission = FindRemoteAdmission(plan);
+    ASSERT_NE(admission, nullptr);
+    EXPECT_EQ(admission->extend_prefix_lens, std::vector<std::int32_t>{0});
+    EXPECT_EQ(admission->extend_replay_lens, std::vector<std::int32_t>{0});
+    EXPECT_EQ(admission->input_lengths, std::vector<std::int32_t>{40});
+    // The closed group lands the whole prompt; the replayable groups land
+    // exactly the tail their retention keeps (swa window 16 -> from token 25,
+    // page 6; tail window 2 -> from token 39, page 19), as any sliding group.
+    const auto& full_row = admission->block_tables.at("full").at(0);
+    ASSERT_GE(full_row.size(), 5u);
+    for (std::size_t slot = 0; slot < 5; ++slot) {
+        EXPECT_GT(full_row[slot], 0) << "full slot " << slot;
+    }
+    ExpectHolesThenPages(admission->block_tables.at("swa").at(0), /*first_page=*/25 / 4, /*min_pages=*/40 / 4, "swa");
+    ExpectHolesThenPages(admission->block_tables.at("tail").at(0), /*first_page=*/39 / 2, /*min_pages=*/40 / 2, "tail");
+    EXPECT_EQ(FindForwardBatch(plan)->request_ids.size(), 0u) << "the peer prefills; nothing runs locally";
 }
 
 }  // namespace tokenspeed::test

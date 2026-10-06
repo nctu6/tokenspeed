@@ -7,8 +7,10 @@ check the fused triton fills against the same torch reference.
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
+import textwrap
 import unittest
 from types import SimpleNamespace
 
@@ -16,6 +18,12 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
+from runtime.cache_pool_test_utils import (
+    assert_no_alias,
+    binding_state,
+    reachable_tensors,
+    storages_of,
+)
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
@@ -88,7 +96,9 @@ class WriteLocationMathTest(unittest.TestCase):
         tables, page_sizes = self._tables()
         prefix = torch.tensor([4, 0], dtype=torch.int32)
         new = torch.tensor([5, 2], dtype=torch.int32)
-        locs = extend_write_locations(tables, page_sizes, prefix, new, total_tokens=7)
+        locs = extend_write_locations(
+            tables, page_sizes, prefix, new, 7, torch.empty((2, 7), dtype=torch.int32)
+        )
         self.assertEqual(tuple(locs.shape), (2, 7))
         # request 0, group 0: positions 4..8 -> page 8 slots 0..3, page 9 slot 0.
         self.assertEqual(locs[0, :5].tolist(), [32, 33, 34, 35, 36])
@@ -124,11 +134,150 @@ class WriteLocationMathTest(unittest.TestCase):
         prefix = torch.randint(0, 30, (bs,), dtype=torch.int32)
         new = torch.randint(1, 200, (bs,), dtype=torch.int32)
         total = int(new.sum())
-        ref = extend_write_locations(tables, page_sizes, prefix, new, total)
+        groups = tables.shape[0]
+        ref = extend_write_locations(
+            tables,
+            page_sizes,
+            prefix,
+            new,
+            total,
+            torch.empty((groups, total), dtype=torch.int32),
+        )
         out = extend_write_locations(
-            tables.cuda(), page_sizes.cuda(), prefix.cuda(), new.cuda(), total
+            tables.cuda(),
+            page_sizes.cuda(),
+            prefix.cuda(),
+            new.cuda(),
+            total,
+            torch.empty((groups, total), dtype=torch.int32, device="cuda"),
         )
         torch.testing.assert_close(out.cpu(), ref)
+
+
+class PersistentExtendSpanTest(unittest.TestCase):
+    """The extend span lives in the stack's buffer so a captured prologue can pad
+    over it; a span past the buffer is a fresh tensor."""
+
+    def _stacks(self, capacity):
+        specs = [
+            GroupTableSpec(
+                FULL, block_granularity=4, kernel_page_size=4, max_num_pages=3
+            )
+        ]
+        stacks = GroupTableStacks(
+            specs,
+            max_bs=2,
+            max_tokens_per_req=1,
+            max_extend_tokens=capacity,
+            device="cpu",
+        )
+        stacks.tables[0, :2] = torch.tensor([[8, 9, 0], [3, 0, 0]], dtype=torch.int32)
+        return stacks
+
+    def test_a_fitting_span_is_a_view_with_a_zero_tail(self):
+        stacks = self._stacks(capacity=8)
+        prefix = torch.tensor([4, 0], dtype=torch.int32)
+        new = torch.tensor([3, 2], dtype=torch.int32)
+        span = stacks.extend_locations(prefix, new, 5)[FULL]
+        self.assertEqual(span.data_ptr(), stacks.extend_locs[0].data_ptr())
+        self.assertEqual(span.tolist(), [36, 37, 38, 12, 13])
+        self.assertEqual(stacks.extend_locs[0, 5:].tolist(), [0, 0, 0])
+        stacks.extend_locations(prefix, torch.tensor([1, 1], dtype=torch.int32), 2)
+        self.assertEqual(stacks.extend_locs[0].tolist(), [36, 12, 0, 0, 0, 0, 0, 0])
+
+    def test_a_span_past_the_buffer_is_fresh(self):
+        stacks = self._stacks(capacity=3)
+        prefix = torch.tensor([4, 0], dtype=torch.int32)
+        new = torch.tensor([3, 2], dtype=torch.int32)
+        span = stacks.extend_locations(prefix, new, 5)[FULL]
+        self.assertNotEqual(span.data_ptr(), stacks.extend_locs[0].data_ptr())
+        self.assertEqual(span.tolist(), [36, 37, 38, 12, 13])
+
+    def test_the_padded_span_widens_over_the_zero_tail(self):
+        stacks = self._stacks(capacity=8)
+        span = stacks.extend_locations(
+            torch.tensor([4, 0], dtype=torch.int32),
+            torch.tensor([3, 2], dtype=torch.int32),
+            5,
+        )[FULL]
+        padded = stacks.padded_extend_span(FULL, 8)
+        self.assertEqual(padded.tolist(), [36, 37, 38, 12, 13, 0, 0, 0])
+        self.assertEqual(padded.data_ptr(), span.data_ptr())
+        self.assertEqual(stacks.padded_extend_span(FULL, 5).tolist(), span.tolist())
+        with self.assertRaisesRegex(ValueError, "cannot pad to 4 rows"):
+            stacks.padded_extend_span(FULL, 4)
+        # Past the buffer the forward runs eager: a fresh tensor, zero tail.
+        wide = stacks.padded_extend_span(FULL, 9)
+        self.assertNotEqual(wide.data_ptr(), span.data_ptr())
+        self.assertEqual(wide.tolist(), [36, 37, 38, 12, 13, 0, 0, 0, 0])
+
+    def test_a_span_past_the_buffer_pads_onto_a_fresh_tail(self):
+        stacks = self._stacks(capacity=3)
+        stacks.extend_locations(
+            torch.tensor([4, 0], dtype=torch.int32),
+            torch.tensor([3, 2], dtype=torch.int32),
+            5,
+        )
+        self.assertEqual(
+            stacks.padded_extend_span(FULL, 8).tolist(), [36, 37, 38, 12, 13, 0, 0, 0]
+        )
+        with self.assertRaisesRegex(ValueError, "cannot pad to 4 rows"):
+            stacks.padded_extend_span(FULL, 4)
+
+    def test_a_mixed_round_places_its_decode_rows_after_the_span(self):
+        """Request 0 extends three tokens; request 1 decodes one at slot 14."""
+        stacks = self._stacks(capacity=8)
+        span = stacks.extend_locations(
+            torch.tensor([4], dtype=torch.int32),
+            torch.tensor([3], dtype=torch.int32),
+            3,
+        )[FULL]
+        stacks.decode_locs[0, :2] = torch.tensor([39, 14], dtype=torch.int32)
+        stacks.append_decode_rows(1, 1)
+        padded = stacks.padded_extend_span(FULL, 8)
+        self.assertEqual(padded.data_ptr(), span.data_ptr())
+        self.assertEqual(padded.tolist(), [36, 37, 38, 14, 0, 0, 0, 0])
+        self.assertEqual(stacks.padded_extend_span(FULL, 4).tolist(), [36, 37, 38, 14])
+        with self.assertRaisesRegex(ValueError, "cannot pad to 3 rows"):
+            stacks.padded_extend_span(FULL, 3)
+        # Widening past capacity preserves the decode row as well.
+        self.assertEqual(
+            stacks.padded_extend_span(FULL, 9).tolist(),
+            [36, 37, 38, 14, 0, 0, 0, 0, 0],
+        )
+        # A new pure extend drops the decode rows again.
+        stacks.extend_locations(
+            torch.tensor([4], dtype=torch.int32),
+            torch.tensor([3], dtype=torch.int32),
+            3,
+        )
+        self.assertEqual(stacks.padded_extend_span(FULL, 4).tolist(), [36, 37, 38, 0])
+
+    def test_mixed_decode_rows_past_the_buffer_pad_onto_a_fresh_tail(self):
+        stacks = self._stacks(capacity=3)
+        stacks.extend_locations(
+            torch.tensor([4], dtype=torch.int32),
+            torch.tensor([3], dtype=torch.int32),
+            3,
+        )
+        stacks.decode_locs[0, :2] = torch.tensor([39, 14], dtype=torch.int32)
+        stacks.append_decode_rows(1, 1)
+        self.assertEqual(stacks.padded_extend_span(FULL, 4).tolist(), [36, 37, 38, 14])
+        self.assertEqual(
+            stacks.padded_extend_span(FULL, 6).tolist(), [36, 37, 38, 14, 0, 0]
+        )
+
+    def test_a_backend_without_a_padded_span_serves_exact_counts_only(self):
+        from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+
+        backend = object.__new__(AttentionBackend)
+        span = torch.tensor([7, 8, 9], dtype=torch.int32)
+        backend.forward_write_locations = lambda layer, mode: span
+        self.assertIs(
+            AttentionBackend.padded_write_locations(backend, None, None, 3), span
+        )
+        with self.assertRaisesRegex(ValueError, "3 write slots for 4 rows"):
+            AttentionBackend.padded_write_locations(backend, None, None, 4)
 
 
 class GroupTableStacksTest(unittest.TestCase):
@@ -142,7 +291,11 @@ class GroupTableStacksTest(unittest.TestCase):
             ),
         ]
         return GroupTableStacks(
-            specs, max_bs=max_bs, max_tokens_per_req=2, device=device
+            specs,
+            max_bs=max_bs,
+            max_tokens_per_req=2,
+            max_extend_tokens=16,
+            device=device,
         )
 
     def test_fill_expands_pads_and_nulls_holes(self):
@@ -283,15 +436,11 @@ class _StubLeaf(PagedAttentionBackend):
         )
         self.calls.append(("refresh", bs, actual_bs, num_extends, for_graph_replay))
 
-    def forward_decode(
-        self, q, k, v, layer, out_cache_loc, pool, bs, save_kv_cache=True, **kw
-    ):
+    def forward_decode(self, q, k, v, layer, out_cache_loc, pool, bs, **kw):
         self.calls.append(("decode", layer.group_id, out_cache_loc))
         return q
 
-    def forward_extend(
-        self, q, k, v, layer, out_cache_loc, pool, bs, save_kv_cache=True, **kw
-    ):
+    def forward_extend(self, q, k, v, layer, out_cache_loc, pool, bs, **kw):
         self.calls.append(("extend", layer.group_id, out_cache_loc))
         return q
 
@@ -301,6 +450,8 @@ def _geometry():
         granularities={FULL: 4, SWA: 4, "linear_attention_0": 8},
         families={FULL: "history", SWA: "history", "linear_attention_0": "state"},
         full_history_group_id=FULL,
+        row_geometry={FULL: (4, 1), SWA: (4, 1)},
+        retentions={FULL: ("full_history", None), SWA: ("sliding_window", 4)},
     )
 
 
@@ -315,7 +466,11 @@ class CacheGroupRouterTest(unittest.TestCase):
             SWA: _StubLeaf(2, is_draft=is_draft, spec=spec),
         }
         router = CacheGroupRouter(
-            None, is_draft=is_draft, spec_num_tokens=spec, device="cpu"
+            None,
+            is_draft=is_draft,
+            spec_num_tokens=spec,
+            device="cpu",
+            consumed_group_ids=None,
         )
         router.bind(_geometry(), leaves)
         router.init_cuda_graph_state(4)
@@ -341,9 +496,66 @@ class CacheGroupRouterTest(unittest.TestCase):
         self.assertFalse(router.supports_layer_sliding_window)
 
     def test_rejects_non_history_groups(self):
-        router = CacheGroupRouter(None, is_draft=False, spec_num_tokens=1, device="cpu")
+        router = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
         with self.assertRaisesRegex(ValueError, "family 'state'"):
             router.bind(_geometry(), {"linear_attention_0": _StubLeaf(8)})
+
+    def test_explicit_groups_do_not_build_indexer_attention_leaves(self):
+        created = []
+
+        def create_leaf(group_id, block_granularity):
+            created.append(group_id)
+            return _StubLeaf(block_granularity)
+
+        groups = (FULL, "qwen4_exp_qsa", "qwen4_exp_qsa_recent")
+        pool = SimpleNamespace(
+            paged_group_ids=groups,
+            arena=SimpleNamespace(
+                cache_group_specs=tuple(
+                    SimpleNamespace(
+                        group_id=gid,
+                        family="history",
+                        retention="full_history",
+                        block_granularity=4,
+                        rows_per_page=4,
+                        entry_stride_tokens=1,
+                        sliding_window_tokens=None,
+                    )
+                    for gid in groups
+                )
+            ),
+        )
+        router = CacheGroupRouter(
+            create_leaf,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=(FULL,),
+        )
+        router.set_cache_pool(pool)
+        router.init_cuda_graph_state(2)
+        # Rebinding must compare the same filtered group set as the first bind.
+        router.set_cache_pool(pool)
+        router.init_cuda_graph_state(2)
+        self.assertEqual(created, [FULL])
+        self.assertEqual(router.stacks.group_ids, (FULL,))
+        # Delivery belongs to the selected consumer; peer groups are not
+        # prerequisites for refreshing attention's own stable metadata.
+        router.refresh_decode_metadata(
+            2,
+            1,
+            torch.arange(2, dtype=torch.int32),
+            torch.tensor([1, 1], dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            block_tables={FULL: torch.tensor([[2]], dtype=torch.int32)},
+        )
+        self.assertEqual(router.stacks.table(FULL, 1)[0, 0].item(), 2)
 
     def test_refresh_hands_each_leaf_its_own_kernel_page_table(self):
         router, leaves = self._router()
@@ -389,7 +601,9 @@ class CacheGroupRouterTest(unittest.TestCase):
             block_tables=tables,
         )
         q = torch.zeros(2)
-        router.forward(q, None, None, _layer(SWA), None, ForwardMode.DECODE, 2)
+        router.forward(
+            q, None, None, _layer(SWA), None, ForwardMode.DECODE, 2, save_kv_cache=False
+        )
         kind, gid, loc = leaves[SWA].calls[-1]
         self.assertEqual((kind, gid), ("decode", SWA))
         # Slot math is page-size invariant: pos 8 of request 0 is raw page 7
@@ -402,7 +616,16 @@ class CacheGroupRouterTest(unittest.TestCase):
         )
         self.assertFalse(any(c[0] == "decode" for c in leaves[FULL].calls))
         with self.assertRaisesRegex(KeyError, "names cache group 'nope'"):
-            router.forward(q, None, None, _layer("nope"), None, ForwardMode.DECODE, 2)
+            router.forward(
+                q,
+                None,
+                None,
+                _layer("nope"),
+                None,
+                ForwardMode.DECODE,
+                2,
+                save_kv_cache=False,
+            )
 
     def test_decode_write_location_views_are_pointer_stable_per_bs(self):
         router, _ = self._router(spec=2)
@@ -454,6 +677,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.DECODE,
             2,
+            save_kv_cache=False,
         )
         self.assertIs(
             leaves[FULL].calls[-1][2],
@@ -504,7 +728,11 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_seq_lens_cpu=new.clone(),
             extend_prefix_lens=prefix,
             extend_prefix_lens_cpu=prefix.clone(),
+            extend_replay_lens_cpu=torch.zeros_like(prefix),
+            extend_prompt_lens_cpu=prefix + new,
             extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
         )
         kind, bs, num_extends, page_table, mode = leaves[FULL].calls[-2]
         self.assertEqual(
@@ -529,6 +757,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.EXTEND,
             2,
+            save_kv_cache=False,
         )
         self.assertIs(leaves[FULL].calls[-1][2], locs)
         no_extends = torch.zeros(0, dtype=torch.int32)
@@ -544,7 +773,38 @@ class CacheGroupRouterTest(unittest.TestCase):
                 extend_seq_lens_cpu=no_extends,
                 extend_prefix_lens=no_extends,
                 extend_prefix_lens_cpu=no_extends,
+                extend_replay_lens_cpu=torch.zeros_like(no_extends),
+                extend_prompt_lens_cpu=no_extends + no_extends,
                 extend_with_prefix=False,
+                query_shard=None,
+                block_tables_cpu={},
+            )
+
+    def test_extend_init_rejects_bounded_replay_rows(self):
+        """Paged leaves write every input row unconditionally, so a replayed
+        prefix (rows the hit already holds) must fail loud instead of being
+        rewritten into shared pages."""
+        router, _ = self._router()
+        seq_lens = torch.tensor([9, 4], dtype=torch.int32)
+        prefix = torch.tensor([4, 0], dtype=torch.int32)
+        new = torch.tensor([5, 4], dtype=torch.int32)
+        with self.assertRaisesRegex(RuntimeError, "cannot mask bounded-replay"):
+            router.init_forward_metadata(
+                2,
+                2,
+                torch.arange(2, dtype=torch.int32),
+                seq_lens,
+                ForwardMode.EXTEND,
+                block_tables=self._tables(),
+                extend_seq_lens=new,
+                extend_seq_lens_cpu=new.clone(),
+                extend_prefix_lens=prefix,
+                extend_prefix_lens_cpu=prefix.clone(),
+                extend_replay_lens_cpu=torch.tensor([2, 0], dtype=torch.int32),
+                extend_prompt_lens_cpu=prefix + new,
+                extend_with_prefix=True,
+                query_shard=None,
+                block_tables_cpu={},
             )
 
     def test_mixed_round_slices_decode_requests_after_the_extend_requests(self):
@@ -563,7 +823,14 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_seq_lens_cpu=torch.tensor([5], dtype=torch.int32),
             extend_prefix_lens=torch.tensor([4], dtype=torch.int32),
             extend_prefix_lens_cpu=torch.tensor([4], dtype=torch.int32),
+            extend_replay_lens_cpu=torch.zeros_like(
+                torch.tensor([4], dtype=torch.int32)
+            ),
+            extend_prompt_lens_cpu=torch.tensor([4], dtype=torch.int32)
+            + torch.tensor([5], dtype=torch.int32),
             extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
         )
         self.assertEqual(
             router.write_locations(_layer(FULL), ForwardMode.EXTEND).tolist(),
@@ -573,6 +840,16 @@ class CacheGroupRouterTest(unittest.TestCase):
         self.assertEqual(
             router.write_locations(_layer(FULL), ForwardMode.DECODE).tolist(), [39]
         )
+        # The prologue's slots for the whole forward: extend rows, decode rows,
+        # then padding; wider than the (here empty) buffer, so a fresh tensor.
+        self.assertEqual(
+            router.padded_write_locations(_layer(FULL), ForwardMode.MIXED, 6).tolist(),
+            [24, 25, 26, 27, 0, 39],
+        )
+        self.assertEqual(
+            router.padded_write_locations(_layer(FULL), ForwardMode.MIXED, 8).tolist(),
+            [24, 25, 26, 27, 0, 39, 0, 0],
+        )
         router.forward(
             torch.zeros(1),
             torch.zeros(1),
@@ -581,8 +858,34 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.DECODE,
             1,
+            save_kv_cache=False,
         )
         self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [39])
+
+    def test_a_graph_padded_mixed_round_records_the_persistent_buffer(self):
+        router, _ = self._router(spec=1)
+        router.init_cuda_graph_state(4, max_extend_tokens=8)
+        five, four = (torch.tensor([n], dtype=torch.int32) for n in (5, 4))
+        router.init_forward_metadata(
+            2,
+            1,
+            torch.arange(2, dtype=torch.int32),
+            torch.tensor([9, 4], dtype=torch.int32),
+            ForwardMode.MIXED,
+            block_tables=self._tables(),
+            extend_seq_lens=five,
+            extend_seq_lens_cpu=five.clone(),
+            extend_prefix_lens=four,
+            extend_prefix_lens_cpu=four.clone(),
+            extend_replay_lens_cpu=torch.zeros_like(four),
+            extend_prompt_lens_cpu=four + five,
+            extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
+        )
+        padded = router.padded_write_locations(_layer(FULL), ForwardMode.MIXED, 8)
+        self.assertEqual(padded.tolist(), [24, 25, 26, 27, 0, 39, 0, 0])
+        self.assertEqual(padded.data_ptr(), router.stacks.extend_locs[0].data_ptr())
 
     def test_draft_step_zero_local_decode_writes_the_full_extend_span(self):
         router, leaves = self._router(is_draft=True, spec=1)
@@ -600,7 +903,11 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_seq_lens_cpu=extend_seq_lens.clone(),
             extend_prefix_lens=extend_prefix_lens,
             extend_prefix_lens_cpu=extend_prefix_lens.clone(),
+            extend_replay_lens_cpu=torch.zeros_like(extend_prefix_lens),
+            extend_prompt_lens_cpu=extend_prefix_lens + extend_seq_lens,
             extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
         )
         router.refresh_decode_metadata(
             1,
@@ -619,6 +926,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.DECODE,
             1,
+            save_kv_cache=False,
         )
         self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [24, 25, 26, 27, 0])
 
@@ -638,7 +946,11 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_seq_lens_cpu=one.clone(),
             extend_prefix_lens=prefix,
             extend_prefix_lens_cpu=prefix.clone(),
+            extend_replay_lens_cpu=torch.zeros_like(prefix),
+            extend_prompt_lens_cpu=prefix + one,
             extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
         )
         router.refresh_decode_metadata(
             1,
@@ -650,10 +962,12 @@ class CacheGroupRouterTest(unittest.TestCase):
             num_extends=1,
         )
         q = torch.zeros(1)
-        router.forward_decode(q, q, q, _layer(FULL), None, 1)
+        router.forward_decode(q, q, q, _layer(FULL), None, 1, save_kv_cache=False)
         self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [24])
 
-    def test_draft_step_zero_mixed_decode_composes_both_windows(self):
+    def _mixed_draft_router(self):
+        """A draft router after a MIXED round's refresh: request 0 extends five
+        tokens, request 1 decodes one verify row."""
         router, leaves = self._router(is_draft=True, spec=1)
         seq_lens = torch.tensor([9, 4], dtype=torch.int32)
         extend_seq_lens = torch.tensor([5], dtype=torch.int32)
@@ -669,7 +983,11 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_seq_lens_cpu=extend_seq_lens.clone(),
             extend_prefix_lens=extend_prefix_lens,
             extend_prefix_lens_cpu=extend_prefix_lens.clone(),
+            extend_replay_lens_cpu=torch.zeros_like(extend_prefix_lens),
+            extend_prompt_lens_cpu=extend_prefix_lens + extend_seq_lens,
             extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
         )
         router.refresh_decode_metadata(
             2,
@@ -680,6 +998,10 @@ class CacheGroupRouterTest(unittest.TestCase):
             block_tables=self._tables(),
             num_extends=1,
         )
+        return router, leaves
+
+    def test_draft_step_zero_mixed_decode_composes_both_windows(self):
+        router, leaves = self._mixed_draft_router()
         router.forward(
             torch.zeros(2),
             torch.zeros(6),
@@ -688,6 +1010,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.DECODE,
             2,
+            save_kv_cache=False,
         )
         self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [24, 25, 26, 27, 0, 39])
 
@@ -702,9 +1025,16 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.DECODE,
             2,
+            save_kv_cache=False,
         )
         self.assertEqual(leaves[FULL].calls[-1][2].data_ptr(), later.data_ptr())
         self.assertEqual(later.tolist(), [24, 36])
+
+    def test_draft_step_zero_mixed_dispatch_writes_every_row(self):
+        """Eagle3 prepares a MIXED round's step 0 in the round's own mode."""
+        router, _ = self._mixed_draft_router()
+        slots = router.forward_write_locations(_layer(FULL), ForwardMode.MIXED)
+        self.assertEqual(slots.tolist(), [24, 25, 26, 27, 0, 39])
 
     def test_capture_seeds_with_idle_rows_then_calls_leaf_capture_hooks(self):
         router, leaves = self._router()
@@ -749,12 +1079,45 @@ class CacheGroupRouterTest(unittest.TestCase):
 
     def test_single_group_model_surface_proxies_to_the_sole_leaf(self):
         leaf = _StubLeaf(4)
-        router = CacheGroupRouter(None, is_draft=False, spec_num_tokens=1, device="cpu")
+        router = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
         router.bind(_geometry(), {FULL: leaf})
         self.assertEqual(router.chunked_prefill_metadata, "chunk-meta")
         multi, _ = self._router()
         with self.assertRaisesRegex(RuntimeError, "single attention cache group"):
             _ = multi.chunked_prefill_metadata
+
+    def test_dsa_query_shard_surface_proxies_to_the_sole_leaf(self):
+        """A DSA model's own selection over KVP pages reaches the leaf's
+        sharded-extend plan and index-K history gather through the router."""
+        leaf = _StubLeaf(4)
+        meta = object()
+        gathered = (object(), None)
+        calls = []
+        leaf.require_query_shard_metadata = lambda: meta
+        leaf.gather_history_index_k = lambda layer_id, pool, group: (
+            calls.append((layer_id, pool, group)) or gathered
+        )
+        router = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
+        router.bind(_geometry(), {FULL: leaf})
+        self.assertIs(router.require_query_shard_metadata(), meta)
+        pool, group = object(), object()
+        self.assertIs(router.gather_history_index_k(3, pool, group), gathered)
+        self.assertEqual(calls, [(3, pool, group)])
+        multi, _ = self._router()
+        with self.assertRaisesRegex(RuntimeError, "single attention cache group"):
+            multi.require_query_shard_metadata()
 
     def test_draft_write_locations_ride_the_history_stack(self):
         """The drafters' in-graph slot math reads the router's address-stable
@@ -808,6 +1171,37 @@ class CacheGroupRouterTest(unittest.TestCase):
         self.assertEqual(leaves[SWA].seq_lens_buf[:2].tolist(), [7, 7])
         self.assertEqual(router.child_backends(), (leaves[FULL], leaves[SWA]))
 
+    def test_mtp_frontier_reaches_each_leaf_through_its_own_hook(self):
+        """The MTP re-anchor is dispatched to the leaf's
+        ``update_draft_forward_metadata``: a leaf with per-row metadata (DSA)
+        re-expands its k-row shape there, while the leaf default is the plain
+        seq_lens edit, so leaves without an override keep today's behavior."""
+
+        class _KRowLeaf(_StubLeaf):
+            def __init__(self, kernel_page_size):
+                super().__init__(kernel_page_size)
+                self.frontiers: list[list[int]] = []
+
+            def update_draft_forward_metadata(self, frontier):
+                self.frontiers.append(frontier.tolist())
+
+        leaves = {FULL: _KRowLeaf(4), SWA: _StubLeaf(2)}
+        router = CacheGroupRouter(
+            None,
+            is_draft=True,
+            spec_num_tokens=4,
+            device="cpu",
+            consumed_group_ids=None,
+        )
+        router.bind(_geometry(), leaves)
+        router.init_cuda_graph_state(4)
+
+        router.update_draft_forward_metadata(torch.tensor([7, 3], dtype=torch.int32))
+
+        self.assertEqual(leaves[FULL].frontiers, [[7, 3]])
+        self.assertEqual(leaves[FULL].seq_lens_buf[:2].tolist(), [0, 0])
+        self.assertEqual(leaves[SWA].seq_lens_buf[:2].tolist(), [7, 3])
+
     def test_every_metadata_build_clears_the_sparse_topk_share(self):
         """The sparse layers' shared selection is per forward: extend init,
         decode refresh and capture seeding each start it empty, so a "shared"
@@ -834,7 +1228,11 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_seq_lens_cpu=new.clone(),
             extend_prefix_lens=prefix,
             extend_prefix_lens_cpu=prefix.clone(),
+            extend_replay_lens_cpu=torch.zeros_like(prefix),
+            extend_prompt_lens_cpu=prefix + new,
             extend_with_prefix=False,
+            query_shard=None,
+            block_tables_cpu={},
         )
         self.assertEqual((share.prefill, share.decode), (None, None))
 
@@ -865,6 +1263,439 @@ class CacheGroupRouterTest(unittest.TestCase):
         kept = (share.prefill, share.decode)
         router.advance_draft_forward_metadata(torch.ones(2, dtype=torch.int32))
         self.assertEqual((share.prefill, share.decode), kept)
+
+
+def _spec(
+    group_id,
+    family="history",
+    granularity=4,
+    retention="full_history",
+    rows_per_page=None,
+    entry_stride_tokens=None,
+    sliding_window_tokens=None,
+):
+    return SimpleNamespace(
+        group_id=group_id,
+        family=family,
+        retention=retention,
+        block_granularity=granularity,
+        rows_per_page=rows_per_page,
+        entry_stride_tokens=entry_stride_tokens,
+        sliding_window_tokens=sliding_window_tokens,
+    )
+
+
+def _pool(*specs, paged=(FULL, SWA)):
+    return SimpleNamespace(
+        arena=SimpleNamespace(cache_group_specs=tuple(specs)),
+        paged_group_ids=tuple(paged),
+    )
+
+
+class CacheGroupRouterRebindTest(unittest.TestCase):
+    """A same-geometry rebind must keep the leaves it already initialised."""
+
+    def _router(self):
+        built = []
+
+        def factory(group_id, granularity):
+            leaf = _StubLeaf(granularity)
+            built.append(group_id)
+            return leaf
+
+        router = CacheGroupRouter(
+            factory,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
+        return router, built
+
+    def test_same_geometry_rebind_keeps_leaves_and_their_state(self):
+        router, built = self._router()
+        specs = (_spec(FULL), _spec(SWA), _spec("linear_attention_0", "state", 8))
+        router.set_cache_pool(_pool(*specs))
+        self.assertEqual(sorted(built), sorted([FULL, SWA]))
+        first = dict(router.leaves)
+        counter = object()
+        router.register_step_counter(counter)
+        router._stacks = object()
+        router.decode_write_locations = object()
+
+        bigger = _pool(*specs)  # a different pool object, the same published geometry
+        router.set_cache_pool(bigger)
+
+        self.assertEqual(len(built), 2, "leaves must not be rebuilt")
+        self.assertIsNone(router._stacks)
+        self.assertIsNone(router.decode_write_locations)
+        self.assertIsNone(router._extend_write_locations)
+        self.assertEqual(router._decode_views, {})
+        self.assertEqual(router._decode_request_offset, 0)
+        for gid, leaf in router.leaves.items():
+            self.assertIs(leaf, first[gid])
+            self.assertIs(leaf.step_counter, counter)
+            self.assertIs(leaf.cache_pool, bigger)
+        self.assertIs(router.cache_pool, bigger)
+
+    def test_changed_geometry_rebind_is_rejected(self):
+        router, built = self._router()
+        original = _pool(_spec(FULL), _spec(SWA))
+        router.set_cache_pool(original)
+        first = dict(router.leaves)
+
+        with self.assertRaises(RuntimeError):
+            router.set_cache_pool(_pool(_spec(FULL, granularity=8), _spec(SWA)))
+
+        self.assertEqual(len(built), 2)
+        self.assertEqual(router.leaves, first)
+        self.assertIs(router.cache_pool, original)
+        router.set_cache_pool(original)
+        self.assertEqual(router.leaves, first)
+
+    def test_same_span_but_different_row_geometry_is_rejected(self):
+        """Equal products do not make two published row geometries identical."""
+        router, _ = self._router()
+        original = _pool(
+            _spec(FULL, granularity=4, rows_per_page=4, entry_stride_tokens=1),
+            paged=(FULL,),
+        )
+        changed = _pool(
+            _spec(FULL, granularity=4, rows_per_page=2, entry_stride_tokens=2),
+            paged=(FULL,),
+        )
+        router.set_cache_pool(original)
+
+        with self.assertRaisesRegex(RuntimeError, "different geometry"):
+            router.set_cache_pool(changed)
+
+        self.assertIs(router.cache_pool, original)
+
+    def test_reordered_full_history_groups_match_a_fresh_bind(self):
+        """Spec declaration order is not published geometry."""
+        probe_specs = (_spec(FULL), _spec("full_history_1"))
+        real_specs = tuple(reversed(probe_specs))
+        rebound, _ = self._router()
+        rebound.set_cache_pool(_pool(*probe_specs, paged=(FULL, "full_history_1")))
+
+        rebound.set_cache_pool(_pool(*real_specs, paged=("full_history_1", FULL)))
+
+        fresh, _ = self._router()
+        fresh.set_cache_pool(_pool(*real_specs, paged=("full_history_1", FULL)))
+        self.assertEqual(rebound.geometry, fresh.geometry)
+        self.assertEqual(
+            rebound.geometry.full_history_group_id,
+            fresh.geometry.full_history_group_id,
+        )
+
+    def test_rebind_rejects_a_changed_sliding_window(self):
+        """The window length is part of the scheduler's retention contract."""
+        router, _ = self._router()
+        original = _pool(
+            _spec(FULL, retention="full_history"),
+            _spec(SWA, retention="sliding_window", sliding_window_tokens=128),
+        )
+        changed = _pool(
+            _spec(FULL, retention="full_history"),
+            _spec(SWA, retention="sliding_window", sliding_window_tokens=256),
+        )
+        router.set_cache_pool(original)
+
+        with self.assertRaisesRegex(RuntimeError, "different geometry"):
+            router.set_cache_pool(changed)
+
+        self.assertIs(router.cache_pool, original)
+
+    def test_rebind_rejects_a_changed_group_retention_contract(self):
+        """A group's allocation/retention meaning is part of its published contract."""
+        router, _ = self._router()
+        original = _pool(
+            _spec(FULL, retention="full_history"),
+            _spec(SWA, retention="sliding_window", sliding_window_tokens=128),
+        )
+        changed = _pool(
+            _spec(FULL, retention="full_history"),
+            _spec(SWA, retention="full_history"),
+        )
+        router.set_cache_pool(original)
+
+        with self.assertRaisesRegex(RuntimeError, "different geometry"):
+            router.set_cache_pool(changed)
+
+        self.assertIs(router.cache_pool, original)
+
+    def test_the_alias_gate_sees_through_modules(self):
+        """Registered side backends are nn.Modules; a view they keep must be found."""
+        slab = torch.zeros(4, 4)
+
+        class _Side(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self._verify_scratch = slab[1:3]
+
+        node = SimpleNamespace(indexer_backend=_Side())
+        self.assertEqual(len(reachable_tensors(node)), 1)
+        with self.assertRaisesRegex(AssertionError, "indexer_backend"):
+            assert_no_alias(node, storages_of(slab))
+
+    def test_a_rebound_router_matches_a_fresh_one_field_by_field(self):
+        specs = (_spec(FULL), _spec(SWA))
+        rebound, _ = self._router()
+        rebound.set_cache_pool(_pool(*specs))
+        rebound.init_cuda_graph_state(2)
+        old_tensors = [
+            t
+            for node in (rebound, *rebound.leaves.values())
+            for t in reachable_tensors(node)
+        ]
+        old = storages_of(*old_tensors)
+        # A served round's per-forward state, which the rebind must forget.
+        rebound._decode_views[(1, 1)] = object()
+        rebound.decode_write_locations = object()
+        rebound._extend_write_locations = {FULL: torch.zeros(1)}
+        rebound._decode_request_offset = 3
+        rebound.set_cache_pool(_pool(*specs))
+        rebound.init_cuda_graph_state(2)
+        fresh, _ = self._router()
+        fresh.set_cache_pool(_pool(*specs))
+        fresh.init_cuda_graph_state(2)
+
+        self.assertEqual(binding_state(rebound), binding_state(fresh))
+        for node in (rebound, *rebound.leaves.values()):
+            assert_no_alias(node, old)
+        self.assertGreaterEqual(len(old_tensors), 2 * len(rebound.leaves))
+
+    def test_metadata_before_the_re_init_fails_loudly(self):
+        router, _ = self._router()
+        specs = (_spec(FULL), _spec(SWA))
+        router.set_cache_pool(_pool(*specs))
+        router.init_cuda_graph_state(2)
+
+        router.set_cache_pool(_pool(*specs))
+
+        with self.assertRaisesRegex(RuntimeError, "init_cuda_graph_state must run"):
+            router.stacks
+
+    def test_rebound_leaves_are_as_unbound_as_fresh_ones(self):
+        """Graph buffers and views only come back with init_cuda_graph_state."""
+        router, _ = self._router()
+        specs = (_spec(FULL), _spec(SWA))
+        router.set_cache_pool(_pool(*specs))
+        router.init_cuda_graph_state(2)
+        for leaf in router.leaves.values():
+            leaf._decode_views_by_bs[1] = object()
+
+        router.set_cache_pool(_pool(*specs))
+
+        for leaf in router.leaves.values():
+            self.assertIsNone(leaf.page_table_buf)
+            self.assertIsNone(leaf.seq_lens_buf)
+            self.assertEqual(leaf._decode_views_by_bs, {})
+
+
+class PagedLeafRebindTest(unittest.TestCase):
+    """Every leaf forgets the per-forward and per-graph state it annotates as optional.
+
+    The gate reads ``self.<name>: <Type> | None = None`` annotations in ``__init__``
+    whose name mentions ``metadata`` or ends in ``_buf``; state declared another way
+    (DSA's page-table alias, FlashMLA's keepalive list) gets its own test below.
+    """
+
+    def _optional_slots(self, backend_cls):
+        import inspect
+
+        init = ast.parse(textwrap.dedent(inspect.getsource(backend_cls.__init__)))
+        slots = []
+        for node in ast.walk(init):
+            if (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Attribute)
+                and isinstance(node.target.value, ast.Name)
+                and node.target.value.id == "self"
+                and ast.unparse(node.annotation).endswith("| None")
+            ):
+                slots.append(node.target.attr)
+        return slots
+
+    def _check(self, backend_cls, expected, **publish_reads):
+        slots = self._optional_slots(backend_cls)
+        self.assertTrue(slots)
+        self.assertEqual(sorted(slots), sorted(expected))
+        leaf = backend_cls.__new__(backend_cls)
+        leaf._init_pool_binding()
+        leaf.cache_pool = object()
+        for name, value in publish_reads.items():
+            setattr(leaf, name, value)
+        stale = object()
+        for name in slots:
+            setattr(leaf, name, stale)
+        pool = object()
+
+        leaf.set_cache_pool(pool)
+
+        self.assertIs(leaf.cache_pool, pool)
+        for name in slots:
+            self.assertIsNone(getattr(leaf, name), name)
+
+    def test_mha_leaf_forgets_the_previous_forward(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.mha import (
+            MHAAttnBackend,
+        )
+
+        self._check(
+            MHAAttnBackend, ["forward_decode_metadata", "forward_extend_metadata"]
+        )
+
+    def test_msa_leaf_forgets_the_previous_forward(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.msa import (
+            MSAAttnBackend,
+        )
+
+        self._check(
+            MSAAttnBackend, ["forward_decode_metadata", "forward_extend_metadata"]
+        )
+
+    def test_mla_leaf_forgets_the_previous_forward(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.mla import (
+            MLAAttnBackend,
+        )
+
+        self._check(
+            MLAAttnBackend,
+            [
+                "forward_decode_metadata",
+                "forward_prefill_metadata",
+                "chunked_prefill_metadata",
+                "_block_page_table_buf",
+                "_block_seq_lens_buf",
+            ],
+        )
+
+    def test_trtllm_mha_leaf_forgets_the_previous_forward(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.trtllm import (
+            TRTLLMMHAAttnBackend,
+        )
+
+        self._check(
+            TRTLLMMHAAttnBackend,
+            [
+                "forward_prefill_metadata",
+                "forward_decode_metadata",
+                "spec_cache_seqlens_buf",
+                "tree_prefix_lens_buf",
+            ],
+        )
+
+    def test_trtllm_mla_leaf_forgets_the_previous_forward(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
+            TRTLLMMLABackend,
+        )
+
+        self._check(
+            TRTLLMMLABackend,
+            [
+                "forward_decode_metadata",
+                "forward_prefill_metadata",
+                "chunked_prefill_metadata",
+            ],
+        )
+
+    @unittest.skipUnless(
+        torch.version.hip is None, "FlashInfer wrappers are NVIDIA-only"
+    )
+    def test_flashmla_leaf_forgets_the_previous_forward(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
+            FlashMLABackend,
+        )
+
+        self._check(
+            FlashMLABackend,
+            [
+                "forward_decode_metadata",
+                "forward_prefill_metadata",
+                "chunked_prefill_metadata",
+                "_decode_tile_metadata",
+                "dcp_block_granularity",
+                "dcp_virtual_block_count",
+                "dcp_metadata",
+            ],
+            workspace_buffer=torch.empty(1 << 20, dtype=torch.uint8, device="cuda"),
+            indices_updater_prefill=SimpleNamespace(prefill_wrapper_ragged=None),
+        )
+
+    def test_trtllm_leaf_forgets_the_verify_views(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.trtllm import (
+            TRTLLMMHAAttnBackend,
+        )
+
+        leaf = TRTLLMMHAAttnBackend.__new__(TRTLLMMHAAttnBackend)
+        leaf._init_pool_binding()
+        leaf._verify_views_by_bs = {1: object()}
+        leaf.set_cache_pool(object())
+        self.assertEqual(leaf._verify_views_by_bs, {})
+
+    @unittest.skipUnless(
+        torch.version.hip is None, "FlashInfer wrappers are NVIDIA-only"
+    )
+    def test_flashmla_leaf_forgets_the_tile_keepalives(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
+            FlashMLABackend,
+        )
+
+        leaf = FlashMLABackend.__new__(FlashMLABackend)
+        leaf._init_pool_binding()
+        leaf.cache_pool = object()
+        leaf._decode_tile_metadata_keepalive = [object()]
+        leaf.workspace_buffer = torch.empty(1 << 20, dtype=torch.uint8, device="cuda")
+        leaf.prefill_wrapper_ragged = leaf.prefill_wrapper_paged = object()
+        leaf.indices_updater_prefill = SimpleNamespace(prefill_wrapper_ragged=object())
+        leaf.set_cache_pool(object())
+        self.assertEqual(leaf._decode_tile_metadata_keepalive, [])
+        self.assertIsNot(leaf.prefill_wrapper_paged, leaf.prefill_wrapper_ragged)
+        self.assertIs(
+            leaf.indices_updater_prefill.prefill_wrapper_ragged,
+            leaf.prefill_wrapper_ragged,
+        )
+
+    def test_cutedsl_mla_leaf_forgets_the_previous_forward(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.tokenspeed_mla import (
+            CuteDSLMLABackend,
+        )
+
+        self._check(
+            CuteDSLMLABackend,
+            [
+                "forward_decode_metadata",
+                "forward_prefill_metadata",
+                "chunked_prefill_metadata",
+                "_block_page_table_buf",
+                "_block_seq_lens_buf",
+                "_dcp",
+            ],
+        )
+
+    def test_dsa_forgets_the_prefill_page_table_alias(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
+
+        backend = DSABackend.__new__(DSABackend)
+        backend._init_pool_binding()
+        backend._dense_backend = SimpleNamespace(
+            validate_cache_pool=lambda pool: None,
+            set_cache_pool=lambda pool: None,
+            _bind=lambda pool: None,
+        )
+        backend._prefill_page_table = object()
+        backend.kpool_runtime = SimpleNamespace(prefill_plan=object())
+        backend.kpool_runtime.reset_forward = lambda req_pool_indices: setattr(
+            backend.kpool_runtime, "prefill_plan", None
+        )
+        pool = object()
+
+        backend.set_cache_pool(pool)
+
+        self.assertIs(backend.cache_pool, pool)
+        self.assertIsNone(backend._prefill_page_table)
+        self.assertIsNone(backend.kpool_runtime.prefill_plan)
 
 
 if __name__ == "__main__":

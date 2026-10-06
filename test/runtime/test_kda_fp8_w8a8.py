@@ -29,6 +29,8 @@ asserted structurally unchanged.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -88,6 +90,7 @@ def _build_fp8_merged(rank: int):
         tp_rank=rank,
         tp_size=TP_SIZE,
         fp8_block_quant=True,
+        fp8_channel_quant=False,
     ).cuda()
     return module
 
@@ -96,6 +99,46 @@ def _load(module, ckpt) -> None:
     for name, (codes, scales) in ckpt.items():
         module.weight.weight_loader(module.weight, codes, name)
         module.weight_scale_inv.weight_loader(module.weight_scale_inv, scales, name)
+
+
+def test_trtllm_cutedsl_merged_preparation_and_dispatch(monkeypatch) -> None:
+    from tokenspeed_kernel.platform import current_platform
+
+    from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+    from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
+    from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "trtllm_cutedsl")
+    if not current_platform().is_blackwell:
+        pytest.skip("TRT-LLM CuTe-DSL preparation requires Blackwell")
+    module = _build_fp8_merged(0)
+    _load(module, _make_ckpt_segments(torch.Generator().manual_seed(42)))
+    module.verify_fp8_load_complete()
+    method = Fp8LinearMethod(
+        Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            ignored_layers=None,
+            weight_block_size=[128, 128],
+            scale_fmt=None,
+        )
+    )
+    method.process_weights_after_loading(module)
+    assert method.prepared_linear_plan(module) is not None
+    x = torch.randn(32, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    output = method.apply(module, x, bias=None, block_scale=None, output_dtype=None)
+    reference = x.float() @ _dequant(module.weight, module.weight_scale_inv).T
+    assert (output.float() - reference).norm() / reference.norm() < 0.06
+    assert torch.count_nonzero(output[:, module.used_rows :]) == 0
+    module.quant_method = method
+    attention = SimpleNamespace(
+        local_num_heads=NUM_HEADS // TP_SIZE, head_dim=HEAD_DIM, qkvgb_proj=module
+    )
+    parts = KimiLinearKDA._project_qkvfab(attention, x, attnres_partial_args=None)
+    torch.testing.assert_close(
+        torch.cat(parts, dim=-1), output[:, : module.used_rows], rtol=0, atol=0
+    )
 
 
 def _dequant(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -197,6 +240,7 @@ def test_bf16_mode_unchanged() -> None:
         head_dim=HEAD_DIM,
         tp_rank=0,
         tp_size=TP_SIZE,
+        fp8_channel_quant=False,
     )
     assert module.weight.dtype == torch.bfloat16
     used = module.used_rows
@@ -254,3 +298,67 @@ def test_qkvfab_fp8_w8a8_matches_dequant_reference_and_pins_flashinfer() -> None
     ref32 = x.float() @ w_dq.t()
     rel = ((out_pinned.float() - ref32).abs().amax() / ref32.abs().amax()).item()
     assert rel < 5e-2, f"pinned flashinfer path: {rel=:.3e}"
+
+
+def _quantize_per_channel(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    scale = w.float().abs().amax(dim=1).clamp(min=1e-12) / _FP8_MAX
+    codes = (w.float() / scale[:, None]).clamp(-_FP8_MAX, _FP8_MAX)
+    return codes.to(torch.float8_e4m3fn), scale
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_per_channel_merged_projection_matches_dequantized_reference(rank) -> None:
+    from tokenspeed_kernel.platform import current_platform
+
+    from tokenspeed.runtime.models.kimi_k3 import KimiKDAMergedProj, KimiLinearKDA
+
+    platform = current_platform()
+    if not (platform.is_cdna4_plus or platform.is_blackwell):
+        pytest.skip("per-token x per-channel FP8 GEMM needs CDNA4+ or Blackwell")
+    generator = torch.Generator().manual_seed(7)
+    rows = {"q": PROJ, "k": PROJ, "v": PROJ, "g": PROJ, "f_a": HEAD_DIM}
+    rows["b"] = NUM_HEADS
+    ckpt = {
+        name: _quantize_per_channel(
+            (torch.randn(n, HIDDEN, generator=generator) * 0.5).cuda()
+        )
+        for name, n in rows.items()
+    }
+    module = KimiKDAMergedProj(
+        hidden_size=HIDDEN,
+        proj=PROJ,
+        num_heads=NUM_HEADS,
+        head_dim=HEAD_DIM,
+        tp_rank=rank,
+        tp_size=TP_SIZE,
+        fp8_channel_quant=True,
+    ).cuda()
+    for name, (codes, scale) in ckpt.items():
+        module.weight.weight_loader(module.weight, codes, name)
+        module.weight_scale.weight_loader(module.weight_scale, scale, name)
+    module.verify_fp8_load_complete()
+
+    # This rank's rows of each segment, concatenated in [q|k|v|g|f_a|b] order.
+    def local(name):
+        codes, scale = ckpt[name]
+        n = module._rows[name]
+        start = 0 if name == "f_a" else rank * n
+        return codes[start : start + n], scale[start : start + n]
+
+    order = ("q", "k", "v", "g", "f_a", "b")
+    codes = torch.cat([local(name)[0] for name in order])
+    scales = torch.cat([local(name)[1] for name in order])
+    used = module.used_rows
+    assert torch.equal(module.weight[:used].view(torch.uint8), codes.view(torch.uint8))
+    torch.testing.assert_close(module.weight_scale[:used, 0], scales, rtol=0, atol=0)
+    assert torch.count_nonzero(module.weight[used:].view(torch.uint8)) == 0
+
+    x = torch.randn(33, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    attention = SimpleNamespace(
+        local_num_heads=NUM_HEADS // TP_SIZE, head_dim=HEAD_DIM, qkvgb_proj=module
+    )
+    parts = KimiLinearKDA._project_qkvfab(attention, x, attnres_partial_args=None)
+    reference = x.float() @ (codes.float() * scales[:, None]).T
+    output = torch.cat(parts, dim=-1).float()
+    # Per-token FP8 activation rounding bounds the error.
+    assert (output - reference).norm() / reference.norm() < 0.05

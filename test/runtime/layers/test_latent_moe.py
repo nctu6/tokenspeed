@@ -13,6 +13,7 @@ from tokenspeed.runtime.layers.moe.latent import (
     LatentMoELayer,
 )
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
+from tokenspeed.runtime.layers.moe.utils import MoeBackend
 
 
 def _up(x: torch.Tensor) -> tuple[torch.Tensor, None]:
@@ -129,94 +130,6 @@ class _Experts(nn.Module):
         return result
 
 
-def test_kimi3_join_reduce_moe_selects_lane_norm(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    lane = torch.arange(6, dtype=torch.float32).view(1, 6)
-    norm = _Norm()
-    norm.weight = nn.Parameter(torch.ones(2))
-    norm.variance_epsilon = 1e-6
-    monkeypatch.setattr(
-        latent_module,
-        "all_reduce_latent_norm",
-        lambda value, *_args, **_kwargs: value + 10,
-    )
-    monkeypatch.setattr(
-        latent_module,
-        "all_reduce",
-        lambda *_args, **_kwargs: pytest.fail("lane norm must own the reduction"),
-    )
-
-    routed, shared = latent_module.kimi3_join_reduce_moe(
-        lane[:, :2],
-        lane[:, 2:],
-        lane=lane,
-        routed_hidden=2,
-        routed_norm=norm,
-        group=(0, 1),
-        enable_lane_norm=True,
-        max_token_num=8,
-    )
-
-    torch.testing.assert_close(routed, lane[:, :2] + 10)
-    torch.testing.assert_close(shared, lane[:, 2:] + 10)
-
-
-def test_kimi3_join_reduce_moe_cats_small_partials(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    routed_partial = torch.arange(4, dtype=torch.float32).view(2, 2)
-    shared_partial = torch.arange(8, dtype=torch.float32).view(2, 4)
-    norm = _Norm()
-    monkeypatch.setattr(
-        latent_module,
-        "all_reduce",
-        lambda value, _group: value + 10,
-    )
-
-    routed, shared = latent_module.kimi3_join_reduce_moe(
-        routed_partial,
-        shared_partial,
-        lane=None,
-        routed_hidden=2,
-        routed_norm=norm,
-        group=(0, 1),
-        enable_lane_norm=True,
-        max_token_num=8,
-    )
-
-    torch.testing.assert_close(routed, routed_partial + 13)
-    torch.testing.assert_close(shared, shared_partial + 10)
-
-
-def test_kimi3_join_reduce_moe_grouped_reduce_for_large_partials(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    routed_partial = torch.arange(4, dtype=torch.float32).view(2, 2)
-    shared_partial = torch.arange(8, dtype=torch.float32).view(2, 4)
-    norm = _Norm()
-    monkeypatch.setattr(latent_module, "COMM_ONESHOT_MAX_BYTES", 1)
-    monkeypatch.setattr(
-        latent_module,
-        "all_reduce",
-        lambda values, group: tuple(value + 20 for value in values),
-    )
-
-    routed, shared = latent_module.kimi3_join_reduce_moe(
-        routed_partial,
-        shared_partial,
-        lane=None,
-        routed_hidden=2,
-        routed_norm=norm,
-        group=(0, 1),
-        enable_lane_norm=True,
-        max_token_num=8,
-    )
-
-    torch.testing.assert_close(routed, routed_partial + 23)
-    torch.testing.assert_close(shared, shared_partial + 20)
-
-
 def test_latent_expert_shared_acquires_outputs_and_reduces(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -295,10 +208,7 @@ def test_kimi3_moe_execution_policy_is_selected_outside_model() -> None:
             tp_ep_group=ep_group,
         )
     )
-    backend = SimpleNamespace(
-        is_auto=lambda: True,
-        is_flashinfer_trtllm=lambda: False,
-    )
+    backend = MoeBackend.AUTO
 
     with mock.patch.object(
         latent_module,
@@ -309,7 +219,6 @@ def test_kimi3_moe_execution_policy_is_selected_outside_model() -> None:
             mapping,
             backend,
             alt_stream=None,
-            enforce_eager=False,
         )
 
     assert plan.use_native
@@ -327,11 +236,7 @@ def test_kimi3_moe_execution_policy_preserves_nvidia_trtllm() -> None:
             tp_ep_group=object(),
         )
     )
-    backend = SimpleNamespace(
-        is_auto=lambda: True,
-        is_flashinfer_trtllm=lambda: False,
-        is_marlin=lambda: False,
-    )
+    backend = MoeBackend.AUTO
 
     with (
         mock.patch.object(
@@ -352,7 +257,6 @@ def test_kimi3_moe_execution_policy_preserves_nvidia_trtllm() -> None:
             mapping,
             backend,
             alt_stream=None,
-            enforce_eager=False,
         )
 
     assert not plan.use_native
@@ -373,21 +277,13 @@ def _plan_mapping():
     )
 
 
-def _backend(*, auto=False, trtllm=False, marlin=False):
-    return SimpleNamespace(
-        is_auto=lambda: auto,
-        is_flashinfer_trtllm=lambda: trtllm,
-        is_marlin=lambda: marlin,
-    )
-
-
 def test_kimi3_moe_execution_policy_honours_a_forced_marlin_backend() -> None:
     """Asked for Marlin, the plan must say Marlin rather than nothing at all."""
     with mock.patch.object(
         latent_module, "native_latent_moe_available", return_value=False
     ):
         plan = Kimi3MoEExecutionPlan.build(
-            _plan_mapping(), _backend(marlin=True), alt_stream=None, enforce_eager=False
+            _plan_mapping(), MoeBackend.MARLIN, alt_stream=None
         )
 
     assert plan.use_marlin
@@ -404,11 +300,28 @@ def test_kimi3_moe_execution_policy_takes_marlin_when_its_probe_says_yes() -> No
         mock.patch.object(latent_module, "_marlin_moe_available", return_value=True),
     ):
         plan = Kimi3MoEExecutionPlan.build(
-            _plan_mapping(), _backend(auto=True), alt_stream=None, enforce_eager=False
+            _plan_mapping(), MoeBackend.AUTO, alt_stream=None
         )
 
     assert plan.use_marlin
     assert not plan.use_trtllm
+
+
+@pytest.mark.parametrize("backend", [MoeBackend.MEGA_MOE, MoeBackend.GLUON_PETIT])
+def test_kimi3_moe_execution_policy_selects_mega_moe(backend) -> None:
+    with (
+        mock.patch.object(latent_module, "native_latent_moe_available") as native_probe,
+        mock.patch.object(latent_module, "_marlin_moe_available") as marlin_probe,
+    ):
+        plan = Kimi3MoEExecutionPlan.build(_plan_mapping(), backend, alt_stream=None)
+    assert plan.use_mega_moe
+    assert not plan.use_native
+    assert not plan.use_trtllm
+    assert not plan.use_marlin
+    assert not plan.overlap_shared_experts
+    assert not plan.joint_moe_reduce
+    native_probe.assert_not_called()
+    marlin_probe.assert_not_called()
 
 
 def test_the_marlin_probe_needs_both_an_arch_and_a_built_library() -> None:
@@ -431,51 +344,6 @@ def test_the_marlin_probe_needs_both_an_arch_and_a_built_library() -> None:
             ),
         ):
             assert latent_module._marlin_moe_available() is expected
-
-
-def test_kimi3_moe_execution_plan_prepares_latent_fusions(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    group = (0, 1)
-    mapping = SimpleNamespace(
-        moe=SimpleNamespace(
-            has_tp_ep=True,
-            tp_ep_group=group,
-        )
-    )
-    plan = Kimi3MoEExecutionPlan(
-        use_native=False,
-        use_trtllm=True,
-        overlap_shared_experts=False,
-        joint_moe_reduce=False,
-    )
-    lane_calls = []
-    norm_calls = []
-    monkeypatch.setattr(
-        latent_module,
-        "prepare_all_reduce_lane",
-        lambda actual_group, width: lane_calls.append((actual_group, width)) or True,
-    )
-    monkeypatch.setattr(
-        latent_module,
-        "prepare_all_reduce_fusion",
-        lambda actual_group, width, tokens: (
-            norm_calls.append((actual_group, width, tokens)) or True
-        ),
-    )
-
-    prepared = plan.prepare_latent_fusion(
-        mapping,
-        lane_width=10752,
-        has_latent_norm=True,
-        max_token_num=8,
-    )
-
-    assert prepared.fused_moe_ar
-    assert prepared.lane_latent_norm_ar
-    assert prepared.comm_fusion_max_num_tokens == 8
-    assert lane_calls == [(group, 10752)]
-    assert norm_calls == [(group, 10752, 8)]
 
 
 def test_latent_moe_runtime_preserves_widths_and_reduction_order() -> None:
@@ -835,7 +703,7 @@ def test_kimi3_latent_projection_shard_forward_add3_matches_replicated(
             for r in range(world):
                 output[r] = stripe(r)
 
-        monkeypatch.setattr(latent_module, "all_gather_into_tensor", gather_all)
+        monkeypatch.setattr(latent_module, "all_gather_single", gather_all)
         # The up projection must not follow the column band onto the backend's
         # own gather; that path is unmeasured for this width and rendezvouses
         # a second workspace.
@@ -848,51 +716,6 @@ def test_kimi3_latent_projection_shard_forward_add3_matches_replicated(
         proj.weight_loader(proj.weight, full)
         got = proj.forward_add3(x, a, c)
         torch.testing.assert_close(got, expected)
-
-
-def _plan_for_join(shard_up_projection: bool) -> Kimi3MoEExecutionPlan:
-    """prepare_latent_fusion on a native (lane-less) TP x EP layout."""
-    mapping = SimpleNamespace(
-        moe=SimpleNamespace(has_tp_ep=True, tp_ep_group=(0, 1)),
-    )
-    plan = Kimi3MoEExecutionPlan(
-        use_native=True,
-        use_trtllm=False,
-        overlap_shared_experts=False,
-        joint_moe_reduce=False,
-    )
-    return plan.prepare_latent_fusion(
-        mapping,
-        lane_width=10752,
-        has_latent_norm=False,
-        max_token_num=8,
-        shard_up_projection=shard_up_projection,
-    )
-
-
-def test_join_is_available_without_a_trtllm_lane() -> None:
-    """No lane, but the partials can still be reduced together.
-
-    prepare_all_reduce_lane is only implemented by the TRT-LLM backend, so a
-    native layout never arms fused_moe_ar. kimi3_join_reduce_moe handles
-    lane=None with a concatenated one-shot or a grouped all-reduce, so the
-    join is still available and the tail issues one collective instead of two.
-    """
-    prepared = _plan_for_join(shard_up_projection=False)
-    assert not prepared.fused_moe_ar
-    assert prepared.join_moe_reduce
-
-
-def test_sharded_up_projection_does_not_advertise_the_join() -> None:
-    """A sharded up projection cannot use the join, so it must not claim it.
-
-    _tail_fused_lane_ar_sharded folds the projection between two sequential
-    all-reduces rather than calling kimi3_join_reduce_moe: selecting the join
-    tier there would save no collective while also dropping routed_in_fork,
-    which overlaps the routed reduction with the shared branch.
-    """
-    prepared = _plan_for_join(shard_up_projection=True)
-    assert not prepared.join_moe_reduce
 
 
 def test_kimi3_latent_projection_rejects_out_of_range_shard_rank() -> None:
@@ -976,6 +799,103 @@ def test_kimi3_latent_projection_without_a_group_has_no_shard_size() -> None:
     assert proj.input_size == 64
 
 
+@pytest.mark.parametrize("tokens", [0, 1, 1280, 1281])
+@pytest.mark.parametrize("narrowed", [False, True])
+@pytest.mark.parametrize("nvfp4_available", [False, True])
+def test_latent_projection_nvfp4_dispatch_and_bf16_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tokens: int,
+    narrowed: bool,
+    nvfp4_available: bool,
+) -> None:
+    world, rank, out, k = 4, 1, 16, 8
+    weight = torch.arange(out * k, dtype=torch.float32).reshape(out, k) / 128
+    hidden = torch.arange(tokens * k, dtype=torch.float32).reshape(tokens, k) / 128
+    expected = hidden @ weight.T
+    expected_block = weight[rank * (out // world) : (rank + 1) * (out // world)]
+    packed = (
+        torch.empty(tokens, out // 2, dtype=torch.uint8),
+        torch.empty(tokens, 1, dtype=torch.uint8),
+    )
+    scale = nn.Parameter(torch.tensor(128.0), requires_grad=False)
+    mailbox = mock.Mock(rank=rank, shard_dim=out // world)
+    mailbox.handles.side_effect = lambda rows: 1 <= rows <= 1280
+    mailbox.nvfp4_available.return_value = nvfp4_available
+
+    def multicast(x, block, *, output_scale):
+        assert x is hidden
+        torch.testing.assert_close(block, expected_block)
+        if output_scale is not None:
+            assert output_scale.data_ptr() == scale.data_ptr()
+            mailbox.prepare_nvfp4.assert_called_once_with()
+            return packed
+        return expected
+
+    mailbox.side_effect = multicast
+    monkeypatch.setattr(
+        latent_module.tokenspeed_kernel,
+        "kimi3_latent_projection",
+        lambda x, w, solution: x @ w.T,
+    )
+    gathers = []
+
+    def gather(local, group, dim):
+        assert group == tuple(range(world))
+        assert dim == -1
+        torch.testing.assert_close(local, hidden @ expected_block.T)
+        gathers.append(local)
+        return expected
+
+    monkeypatch.setattr(latent_module, "all_gather", gather)
+    proj = latent_module.Kimi3LatentProjection(
+        k,
+        out,
+        params_dtype=torch.float32,
+        column_group=tuple(range(world)) if narrowed else None,
+        shard_rank=rank,
+        shard_size=world,
+        multicast_down=mailbox,
+    )
+    proj.weight_loader(proj.weight, weight)
+    proj.prepare_nvfp4_output(scale)
+    assert set(proj.state_dict()) == {"weight"}
+    if nvfp4_available:
+        mailbox.prepare_nvfp4.assert_called_once_with()
+    else:
+        mailbox.prepare_nvfp4.assert_not_called()
+    payload, bias = proj(hidden)
+    assert bias is None
+    if 1 <= tokens <= 1280:
+        mailbox.assert_called_once()
+        assert gathers == []
+        if nvfp4_available:
+            assert payload is packed
+        else:
+            torch.testing.assert_close(payload, expected)
+    else:
+        mailbox.assert_not_called()
+        assert len(gathers) == int(narrowed)
+        torch.testing.assert_close(payload, expected)
+
+
+def test_latent_projection_nvfp4_without_mailbox_stays_dense(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        latent_module.tokenspeed_kernel,
+        "kimi3_latent_projection",
+        lambda x, w, solution: x @ w.T,
+    )
+    proj = latent_module.Kimi3LatentProjection(8, 16, params_dtype=torch.float32)
+    weight = torch.arange(128, dtype=torch.float32).reshape(16, 8)
+    proj.weight_loader(proj.weight, weight)
+    proj.prepare_nvfp4_output(torch.tensor(128.0))
+    hidden = torch.ones(2, 8)
+    payload, bias = proj(hidden)
+    assert bias is None
+    torch.testing.assert_close(payload, hidden @ weight.T)
+
+
 class _FakeMulticastDown:
     """A multicast op that records what the projection dispatched to it."""
 
@@ -991,7 +911,8 @@ class _FakeMulticastDown:
     def handles(self, num_tokens: int) -> bool:
         return 1 <= num_tokens <= self.max_m
 
-    def __call__(self, hidden_states, block):
+    def __call__(self, hidden_states, block, *, output_scale):
+        assert output_scale is None
         # The caller hands over this rank's rows; the op does not carve them.
         self._calls.append((hidden_states.shape[0], tuple(block.shape)))
         return hidden_states @ block.T

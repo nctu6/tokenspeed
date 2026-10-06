@@ -18,12 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Softmax top-k routing entry point."""
+"""Softmax top-k routing implementations and internal dispatch."""
 
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import Platform, pdl_enabled
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import (
@@ -45,35 +45,37 @@ def _triton_eligible(router_logits: torch.Tensor, topk: int) -> bool:
         and router_logits.stride(1) == 1
         and router_logits.shape[1] <= _TRITON_MAX_EXPERTS
         and topk <= _TRITON_MAX_TOPK
-        and Platform.get().is_nvidia
     )
 
 
-def moe_softmax_topk(
+def _moe_softmax_topk(
     router_logits: torch.Tensor,
     topk: int,
     *,
+    topk_indices_dtype: torch.dtype,
     renormalize: bool = True,
     routed_scaling_factor: float = 1.0,
+    override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select experts using softmax routing in one fused launch when supported.
 
     Args:
-        router_logits: Router logits shaped ``[tokens, experts]``. CUDA FP16,
-            BF16, and FP32 inputs with a contiguous expert dimension use the
-            fused NVIDIA Triton kernel; other inputs use the PyTorch fallback.
+        router_logits: Router logits shaped ``[tokens, experts]``. Inputs
+            matching a registered Triton implementation use it; others use
+            the PyTorch fallback.
         topk: Number of experts selected per token.
+        topk_indices_dtype: Integer dtype for returned expert ids.
         renormalize: Normalize the selected weights to sum to one. When false,
             return probabilities from the softmax over all experts.
         routed_scaling_factor: Scale applied to every selected route weight.
-        solution: Optional implementation override, such as ``"triton"`` or
+        override: Optional exact registered kernel name.
+        solution: Optional implementation solution, such as ``"triton"`` or
             ``"torch"``.
 
     Returns:
         ``(topk_weights, topk_ids)`` shaped ``[tokens, topk]``. Weights are
-        FP32 and ids are INT64, matching ``torch.topk`` and DeepEP's routing
-        metadata contract.
+        FP32 and ids use ``topk_indices_dtype``.
     """
     if router_logits.ndim != 2:
         raise ValueError("router_logits must have shape [tokens, experts]")
@@ -82,20 +84,31 @@ def moe_softmax_topk(
         raise ValueError("router_logits must have a floating-point dtype")
     if not 0 < topk <= experts:
         raise ValueError(f"topk must be in [1, {experts}], got {topk}")
+    if topk_indices_dtype not in (torch.int32, torch.int64):
+        raise ValueError("topk_indices_dtype must be torch.int32 or torch.int64")
     if tokens == 0:
         shape = (0, topk)
         return (
             torch.empty(shape, device=router_logits.device, dtype=torch.float32),
-            torch.empty(shape, device=router_logits.device, dtype=torch.int64),
+            torch.empty(
+                shape,
+                device=router_logits.device,
+                dtype=topk_indices_dtype,
+            ),
         )
 
-    if solution is None and not _triton_eligible(router_logits, topk):
+    if (
+        override is None
+        and solution is None
+        and not _triton_eligible(router_logits, topk)
+    ):
         solution = "torch"
     enable_pdl = pdl_enabled()
-    if solution == "torch":
+    if override is None and solution == "torch":
         return torch_softmax_topk(
             router_logits=router_logits,
             topk=topk,
+            topk_indices_dtype=topk_indices_dtype,
             renormalize=renormalize,
             routed_scaling_factor=routed_scaling_factor,
             enable_pdl=enable_pdl,
@@ -107,11 +120,14 @@ def moe_softmax_topk(
         format_signature(
             router_logits=dense_tensor_format(router_logits.dtype),
         ),
+        traits={"tokens": int(tokens), "experts": int(experts), "topk": int(topk)},
+        override=override,
         solution=solution,
     )
     return kernel(
         router_logits=router_logits,
         topk=topk,
+        topk_indices_dtype=topk_indices_dtype,
         renormalize=renormalize,
         routed_scaling_factor=routed_scaling_factor,
         enable_pdl=enable_pdl,
@@ -125,25 +141,27 @@ def moe_softmax_topk(
     solution="torch",
     signatures=format_signatures("router_logits", "dense", set(_SUPPORTED_DTYPES)),
     priority=Priority.PORTABLE,
-    tags={"portability", "reference"},
 )
 def torch_softmax_topk(
     *,
     router_logits: torch.Tensor,
     topk: int,
+    topk_indices_dtype: torch.dtype,
     renormalize: bool,
     routed_scaling_factor: float,
     enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """PyTorch reference for ordinary softmax top-k routing."""
     del enable_pdl
-    scores = torch.softmax(router_logits.float(), dim=-1)
-    topk_weights, topk_ids = torch.topk(scores, topk, dim=-1)
+    logits = router_logits.float()
+    topk_logits, topk_ids = torch.topk(logits, topk, dim=-1, sorted=True)
     if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = torch.softmax(topk_logits, dim=-1)
+    else:
+        topk_weights = torch.softmax(logits, dim=-1).gather(-1, topk_ids)
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
-    return topk_weights, topk_ids
+    return topk_weights, topk_ids.to(topk_indices_dtype)
 
 
-__all__ = ["moe_softmax_topk", "torch_softmax_topk"]
+__all__ = ["torch_softmax_topk"]

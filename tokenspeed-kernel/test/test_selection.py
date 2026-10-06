@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import os
 from unittest import mock
 
@@ -27,20 +29,23 @@ import pytest
 import tokenspeed_kernel.ops.gemm as gemm
 import torch
 from tokenspeed_kernel.platform import PlatformInfo
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+from tokenspeed_kernel.registry import (
+    KernelRegistry,
+    KernelSpec,
+    Priority,
+    register_kernel,
+)
 from tokenspeed_kernel.selection import (
     AutotuneParams,
     NoKernelFoundError,
     ScoreBreakdown,
-    SelectionObjective,
     SelectionOracle,
     SelectionPolicy,
     SelectionStrategy,
     _filter_by_traits,
     _make_cache_key,
-    _rank_by_objective,
+    _rank,
     _score,
-    _score_objective,
     _score_priority,
     explain_selection,
     kernel_override,
@@ -73,24 +78,14 @@ GEMM_FP16 = next(iter(format_signatures(("a", "b"), "dense", {torch.float16})))
 INPUT_BF16 = next(iter(format_signatures("input", "dense", {torch.bfloat16})))
 
 
-class TestSelectionObjective:
-    def test_all_enum_values(self):
-        assert SelectionObjective.DEFAULT.value == "default"
-        assert SelectionObjective.LATENCY.value == "latency"
-        assert SelectionObjective.THROUGHPUT.value == "throughput"
-        assert SelectionObjective.PORTABILITY.value == "portability"
-        assert SelectionObjective.DETERMINISM.value == "determinism"
-        assert SelectionObjective.DEBUG.value == "debug"
-
-
 class TestScoreBreakdown:
     def test_str_format(self):
-        bd = ScoreBreakdown(priority=10, objective=12, oracle=14)
-        assert str(bd) == "ora=14 obj=12 pri=10"
+        bd = ScoreBreakdown(priority=10, oracle=14)
+        assert str(bd) == "ora=14 pri=10"
 
     def test_sort_key(self):
-        bd = ScoreBreakdown(priority=10, objective=12, oracle=14)
-        assert bd.sort_key() == (14, 12, 10)
+        bd = ScoreBreakdown(priority=10, oracle=14)
+        assert bd.sort_key() == (14, 10)
 
 
 class TestAutotuneParams:
@@ -128,58 +123,6 @@ class TestScorePriority:
         assert _score_priority(spec) == 19
 
 
-class TestScoreObjective:
-    def _spec(self, solution="triton", tags=frozenset()):
-        return KernelSpec(name="k", family="f", mode="m", solution=solution, tags=tags)
-
-    def test_default_ties_everyone(self):
-        assert _score_objective(self._spec(), SelectionObjective.DEFAULT) == 0
-        assert (
-            _score_objective(
-                self._spec(tags=frozenset({"latency"})),
-                SelectionObjective.DEFAULT,
-            )
-            == 0
-        )
-
-    def test_latency_tag_match(self):
-        spec = self._spec(tags=frozenset({"latency"}))
-        assert _score_objective(spec, SelectionObjective.LATENCY) == 1
-
-    def test_latency_no_match(self):
-        spec = self._spec(tags=frozenset({"throughput"}))
-        assert _score_objective(spec, SelectionObjective.LATENCY) == 0
-
-    def test_throughput_tag_match(self):
-        spec = self._spec(tags=frozenset({"throughput"}))
-        assert _score_objective(spec, SelectionObjective.THROUGHPUT) == 1
-
-    def test_throughput_no_match(self):
-        assert _score_objective(self._spec(), SelectionObjective.THROUGHPUT) == 0
-
-    def test_portability_tag_match(self):
-        spec = self._spec(tags=frozenset({"portability"}))
-        assert _score_objective(spec, SelectionObjective.PORTABILITY) == 1
-
-    def test_portability_no_match(self):
-        assert (
-            _score_objective(
-                self._spec(solution="triton"), SelectionObjective.PORTABILITY
-            )
-            == 0
-        )
-
-    def test_determinism_tag_match(self):
-        spec = self._spec(tags=frozenset({"determinism"}))
-        assert _score_objective(spec, SelectionObjective.DETERMINISM) == 1
-
-    def test_debug_uses_determinism_tag(self):
-        det = self._spec(tags=frozenset({"determinism"}))
-        plain = self._spec()
-        assert _score_objective(det, SelectionObjective.DEBUG) == 1
-        assert _score_objective(plain, SelectionObjective.DEBUG) == 0
-
-
 class TestScore:
     def test_score_returns_per_dimension_breakdown(self, h100_platform):
         spec = KernelSpec(
@@ -188,11 +131,9 @@ class TestScore:
             mode="m",
             solution="cutlass",
             priority=15,
-            tags=frozenset({"latency"}),
         )
-        bd = _score(spec, SelectionObjective.LATENCY, h100_platform, None)
+        bd = _score(spec, h100_platform, None)
         assert bd.priority == 15
-        assert bd.objective == 1  # latency tag matches
         assert bd.oracle == 10  # neutral, no oracle registered
 
 
@@ -207,30 +148,17 @@ class TestRanking:
             platform=h100_platform,
             format_signature=ATTN_DECODE_BF16,
         )
-        scored = _rank_by_objective(
-            candidates,
-            SelectionObjective.DEFAULT,
-            h100_platform,
-            None,
-        )
+        scored = _rank(candidates, h100_platform, None)
         keys = [bd.sort_key() for _, bd in scored]
         assert keys == sorted(keys, reverse=True)
 
-    def test_oracle_outranks_objective_and_priority(self, h100_platform):
+    def test_oracle_outranks_priority(self, h100_platform):
         oracle_winner = KernelSpec(
             name="oracle_winner",
             family="f",
             mode="m",
             solution="reference",
             priority=0,
-        )
-        objective_winner = KernelSpec(
-            name="objective_winner",
-            family="f",
-            mode="m",
-            solution="triton",
-            priority=0,
-            tags=frozenset({"latency"}),
         )
         priority_winner = KernelSpec(
             name="priority_winner",
@@ -246,28 +174,14 @@ class TestRanking:
 
         register_oracle("f", BoostOracleWinner())
 
-        scored = _rank_by_objective(
-            [priority_winner, objective_winner, oracle_winner],
-            SelectionObjective.LATENCY,
-            h100_platform,
-            None,
-        )
-        assert [s.name for s, _ in scored] == [
-            "oracle_winner",
-            "objective_winner",
-            "priority_winner",
-        ]
+        scored = _rank([priority_winner, oracle_winner], h100_platform, None)
+        assert [s.name for s, _ in scored] == ["oracle_winner", "priority_winner"]
 
     def test_priority_breaks_ties(self, h100_platform):
         low = KernelSpec(name="low", family="f", mode="m", priority=5)
         high = KernelSpec(name="high", family="f", mode="m", priority=15)
 
-        scored = _rank_by_objective(
-            [low, high],
-            SelectionObjective.DEFAULT,
-            h100_platform,
-            None,
-        )
+        scored = _rank([low, high], h100_platform, None)
         assert [s.name for s, _ in scored] == ["high", "low"]
 
 
@@ -387,6 +301,25 @@ class TestSpecMatchesTraits:
         assert spec_matches_traits(spec, {"ispp": 384})
         assert not spec_matches_traits(spec, {"ispp": 512})
 
+    def test_hidden_alignment_vetoes_misaligned_widths(self):
+        # Same contract as ispp_alignment, for the MoE input width: a kernel
+        # whose weight layout needs hidden % 128 == 0 drops out of selection
+        # for other widths instead of failing in weight preprocessing.
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"hidden_alignment": frozenset({128})},
+        )
+
+        assert spec_matches_traits(spec, {"hidden": 5120})
+        assert not spec_matches_traits(spec, {"hidden": 2880})
+        # Without a declared constraint the width is unconstrained; without a
+        # requested width an alignment-only kernel stays eligible.
+        assert spec_matches_traits(spec, {})
+        plain = KernelSpec(name="p", family="f", mode="m", traits={})
+        assert spec_matches_traits(plain, {"hidden": 2880})
+
 
 class TestSpecMatchesShapeTraits:
     def test_exact_dimension_traits_match(self):
@@ -403,45 +336,186 @@ class TestSpecMatchesShapeTraits:
         )
 
         assert spec_matches_shape_traits(
-            spec, {"batch": 12, "M": 1, "N": 512, "K": 128}
+            spec, {"batch": 12, "m": 1, "n": 512, "k": 128}
         )
         assert not spec_matches_shape_traits(
-            spec, {"batch": 8, "M": 1, "N": 512, "K": 128}
+            spec, {"batch": 8, "m": 1, "n": 512, "k": 128}
+        )
+        assert not spec_matches_shape_traits(
+            spec, {"batch": 12, "m": 2, "n": 512, "k": 128}
         )
 
-    def test_required_alignment_trait_matches(self):
+    def test_alignment_trait_accepts_any_declared_alignment(self):
         spec = KernelSpec(
             name="k",
             family="f",
             mode="m",
-            traits={"n_align_16": frozenset({True})},
+            traits={"n_align": frozenset({16}), "k_align": frozenset({64, 96})},
         )
 
-        assert spec_matches_shape_traits(spec, {"N": 32})
-        assert not spec_matches_shape_traits(spec, {"N": 30})
+        assert spec_matches_shape_traits(spec, {"n": 32, "k": 128})
+        assert spec_matches_shape_traits(spec, {"n": 32, "k": 96})
+        assert not spec_matches_shape_traits(spec, {"n": 30, "k": 128})
+        assert not spec_matches_shape_traits(spec, {"n": 32, "k": 80})
 
-    def test_missing_shape_dim_is_ignored(self):
+    def test_minimum_trait_matches(self):
         spec = KernelSpec(
             name="k",
             family="f",
             mode="m",
-            traits={"k_align_128": frozenset({True})},
+            traits={"n_min": frozenset({128}), "k_min": frozenset({128})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"n": 128, "k": 4096})
+        assert not spec_matches_shape_traits(spec, {"n": 64, "k": 4096})
+        assert not spec_matches_shape_traits(spec, {"n": 128, "k": 96})
+
+    def test_maximum_trait_matches(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"token_heads_max": frozenset({2048})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"token_heads": 2048})
+        assert spec_matches_shape_traits(spec, {"token_heads": 1})
+        assert not spec_matches_shape_traits(spec, {"token_heads": 2049})
+        assert not spec_matches_shape_traits(spec, {})
+
+    def test_constrained_dim_must_be_supplied(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={
+                "m": frozenset({1}),
+                "k_align": frozenset({128}),
+                "k_min": frozenset({128}),
+            },
+        )
+
+        assert spec_matches_shape_traits(spec, {"m": 1, "k": 4096})
+        assert spec_matches_shape_traits(spec, {"m": 1, "k": 4096, "n": 30})
+        assert not spec_matches_shape_traits(spec, {})
+        assert not spec_matches_shape_traits(spec, {"m": 1})
+        assert not spec_matches_shape_traits(spec, {"k": 4096})
+        assert not spec_matches_shape_traits(spec, {"m": 1, "k": None})
+
+    def test_unconstrained_dim_is_ignored(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"m": frozenset({1})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"m": 1})
+        assert spec_matches_shape_traits(spec, {"m": 1, "n": 30, "k": 70})
+
+    def test_bounds_apply_to_any_request_dimension(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={
+                "batch_size_align": frozenset({64}),
+                "num_q_heads_min": frozenset({16}),
+            },
+        )
+
+        assert spec_matches_shape_traits(spec, {"batch_size": 128, "num_q_heads": 64})
+        assert not spec_matches_shape_traits(
+            spec, {"batch_size": 96, "num_q_heads": 64}
+        )
+        assert not spec_matches_shape_traits(
+            spec, {"batch_size": 128, "num_q_heads": 12}
+        )
+        assert not spec_matches_shape_traits(spec, {"batch_size": 128})
+        assert not spec_matches_shape_traits(spec, {"num_q_heads": 64})
+
+    def test_exact_non_gemm_dimension_is_left_to_value_matching(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"batch_size": frozenset({1})},
         )
 
         assert spec_matches_shape_traits(spec, {})
+        assert spec_matches_shape_traits(spec, {"batch_size": 2})
+        assert not spec_matches_traits(spec, {"batch_size": 2})
+        assert not _filter_by_traits([spec], {"batch_size": 2})
 
-    def test_required_k64_alignment_trait_matches(self):
+    def test_uppercase_shape_keys_are_not_traits(self):
         spec = KernelSpec(
             name="k",
             family="f",
             mode="m",
-            traits={"k_align_64": frozenset({True})},
+            traits={"m": frozenset({1}), "k_align": frozenset({128})},
         )
 
-        assert spec_matches_shape_traits(spec, {"K": 128})
-        assert not spec_matches_shape_traits(spec, {"K": 96})
+        assert not spec_matches_shape_traits(spec, {"M": 1, "K": 128})
+        assert spec_matches_shape_traits(spec, {"m": 1, "k": 128})
 
-    def test_non_alignment_traits_do_not_affect_shape_matching(self):
+    def test_mnk_problem_filter_matches_concrete_shape(self):
+        def is_tuned_problem(m: int, n: int, k: int) -> bool:
+            return (
+                m % 256 == 0
+                and n % 256 == 0
+                and k >= 512
+                and k % 256 == 0
+                and (m >= 1024 or (n >= 4096 and k <= 1280))
+            )
+
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"mnk_problem_filter": frozenset({is_tuned_problem})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"m": 1024, "n": 1792, "k": 5120})
+        assert spec_matches_shape_traits(spec, {"m": 256, "n": 4096, "k": 1280})
+        assert not spec_matches_shape_traits(spec, {"m": 256, "n": 1792, "k": 5120})
+        assert not spec_matches_shape_traits(spec, {"m": 1024, "n": 1664, "k": 5120})
+        assert not spec_matches_shape_traits(spec, {"m": 1024, "n": 1792, "k": 256})
+        assert _filter_by_traits([spec], {"m": 1024, "n": 1792, "k": 5120}) == [spec]
+        assert not _filter_by_traits([spec], {"m": 256, "n": 1792, "k": 5120})
+
+    def test_mnk_problem_filter_requires_complete_shape(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"mnk_problem_filter": frozenset({lambda m, n, k: True})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"m": 256, "n": 4096, "k": 1280})
+        assert not spec_matches_shape_traits(spec, {"m": 256, "n": 4096})
+        assert not spec_matches_shape_traits(spec, {})
+
+    def test_filter_by_traits_applies_shape_and_value_traits(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={
+                "m": frozenset({1}),
+                "n_min": frozenset({128}),
+                "k_align": frozenset({128}),
+                "out_dtype": frozenset({"bf16"}),
+            },
+        )
+        request = {"m": 1, "n": 256, "k": 4096, "out_dtype": "bf16"}
+
+        assert _filter_by_traits([spec], request) == [spec]
+        assert not _filter_by_traits([spec], {**request, "m": 2})
+        assert not _filter_by_traits([spec], {**request, "n": 64})
+        assert not _filter_by_traits([spec], {**request, "k": 4000})
+        assert not _filter_by_traits([spec], {**request, "out_dtype": "fp16"})
+
+    def test_non_shape_traits_do_not_affect_shape_matching(self):
         spec = KernelSpec(
             name="k",
             family="f",
@@ -449,7 +523,7 @@ class TestSpecMatchesShapeTraits:
             traits={"persistent": frozenset({True})},
         )
 
-        assert spec_matches_shape_traits(spec, {"N": 30, "K": 70})
+        assert spec_matches_shape_traits(spec, {"n": 30, "k": 70})
 
 
 class TestMakeCacheKey:
@@ -459,7 +533,6 @@ class TestMakeCacheKey:
             "dec",
             INPUT_BF16,
             "sm_90",
-            SelectionObjective.DEFAULT,
             None,
             None,
         )
@@ -468,32 +541,10 @@ class TestMakeCacheKey:
             "dec",
             INPUT_BF16,
             "sm_90",
-            SelectionObjective.DEFAULT,
             None,
             None,
         )
         assert k1 == k2
-
-    def test_different_objective(self):
-        k1 = _make_cache_key(
-            "attn",
-            "dec",
-            INPUT_BF16,
-            "sm_90",
-            SelectionObjective.DEFAULT,
-            None,
-            None,
-        )
-        k2 = _make_cache_key(
-            "attn",
-            "dec",
-            INPUT_BF16,
-            "sm_90",
-            SelectionObjective.LATENCY,
-            None,
-            None,
-        )
-        assert k1 != k2
 
     def test_traits_order_independent(self):
         k1 = _make_cache_key(
@@ -501,7 +552,6 @@ class TestMakeCacheKey:
             "d",
             GEMM_FP16,
             "sm_90",
-            SelectionObjective.DEFAULT,
             None,
             {"a": 1, "b": 2},
         )
@@ -510,7 +560,6 @@ class TestMakeCacheKey:
             "d",
             GEMM_FP16,
             "sm_90",
-            SelectionObjective.DEFAULT,
             None,
             {"b": 2, "a": 1},
         )
@@ -519,12 +568,8 @@ class TestMakeCacheKey:
     def test_features_order_independent(self):
         f1 = frozenset({"paged", "mla"})
         f2 = frozenset({"mla", "paged"})
-        k1 = _make_cache_key(
-            "a", "d", GEMM_FP16, "sm_90", SelectionObjective.DEFAULT, f1, None
-        )
-        k2 = _make_cache_key(
-            "a", "d", GEMM_FP16, "sm_90", SelectionObjective.DEFAULT, f2, None
-        )
+        k1 = _make_cache_key("a", "d", GEMM_FP16, "sm_90", f1, None)
+        k2 = _make_cache_key("a", "d", GEMM_FP16, "sm_90", f2, None)
         assert k1 == k2
 
     def test_solution_is_selection_relevant(self):
@@ -533,7 +578,6 @@ class TestMakeCacheKey:
             "d",
             GEMM_FP16,
             "sm_90",
-            SelectionObjective.DEFAULT,
             None,
             None,
             "fa3",
@@ -543,7 +587,6 @@ class TestMakeCacheKey:
             "d",
             GEMM_FP16,
             "sm_90",
-            SelectionObjective.DEFAULT,
             None,
             None,
             "fa4",
@@ -563,6 +606,88 @@ class TestSelectKernel:
             platform=h100_platform,
         )
         assert callable(impl)
+
+    def test_stateful_kernel_class_selected_once(self, h100_platform):
+        @register_kernel(
+            "stateful",
+            "forward",
+            name="portable_stateful",
+            solution="python",
+            signatures={INPUT_BF16},
+            priority=Priority.PORTABLE,
+        )
+        class Portable(torch.nn.Module):
+            def __init__(self, scale):
+                super().__init__()
+                self.scale = scale
+                self.calls = 0
+
+            def forward(self, x):
+                self.calls += 1
+                return self.scale * x + self.calls
+
+        @register_kernel(
+            "stateful",
+            "forward",
+            name="specialized_stateful",
+            solution="python",
+            signatures={INPUT_BF16},
+            traits={"head_dim": frozenset({128})},
+            priority=Priority.SPECIALIZED,
+        )
+        class Specialized(Portable):
+            pass
+
+        selected = select_kernel(
+            "stateful",
+            "forward",
+            INPUT_BF16,
+            platform=h100_platform,
+            traits={"head_dim": 128},
+        )
+        assert selected.name == "specialized_stateful"
+        assert selected.impl is Specialized
+        first = selected(2)
+        second = selected(3)
+        assert (first(4), first(4)) == (9, 10)
+        assert second(4) == 13
+        assert first.calls == 2
+        assert second.calls == 1
+        assert (
+            select_kernel(
+                "stateful",
+                "forward",
+                INPUT_BF16,
+                platform=h100_platform,
+                traits={"head_dim": 128},
+            )
+            is selected
+        )
+        assert (
+            select_kernel(
+                "stateful",
+                "forward",
+                INPUT_BF16,
+                platform=h100_platform,
+                traits={"head_dim": 64},
+            ).impl
+            is Portable
+        )
+
+    def test_function_kernel_still_callable(self, h100_platform):
+        @register_kernel(
+            "stateless",
+            "forward",
+            solution="python",
+            signatures={INPUT_BF16},
+        )
+        def stateless(x):
+            return x + 1
+
+        selected = select_kernel(
+            "stateless", "forward", INPUT_BF16, platform=h100_platform
+        )
+        assert selected(2) == 3
 
     def test_cached_on_second_call(self, sample_specs, h100_platform):
         reg = KernelRegistry.get()
@@ -794,32 +919,75 @@ class TestSelectKernel:
             )
             assert impl() == "reference_decode"
 
-    def test_portability_objective_prefers_triton(self, sample_specs, h100_platform):
+    def test_override_refuses_a_kernel_lacking_a_required_feature(
+        self, sample_specs, h100_platform
+    ):
+        """An override skips platform, signature and trait matching, but a
+        required feature names a keyword or behaviour the facade relies on:
+        a kernel without it is refused at selection, by name or by solution,
+        and the error names the feature."""
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)
-
-        impl = select_kernel(
-            "attention",
-            "decode",
-            ATTN_DECODE_BF16,
-            platform=h100_platform,
-            objective=SelectionObjective.PORTABILITY,
+        reg.register(
+            KernelSpec(
+                name="triton_decode_plain",
+                family="attention",
+                mode="decode",
+                solution="triton",
+                format_signatures=frozenset({ATTN_DECODE_BF16}),
+                priority=12,
+            ),
+            lambda: "triton_decode_plain",
         )
-        assert impl() == "triton_decode"
 
-    def test_debug_objective_prefers_reference(self, sample_specs, h100_platform):
-        """DEBUG ranks the determinism-tagged reference kernel above others."""
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
+        # Every sample decode kernel declares "paged"; the plain one does not.
         impl = select_kernel(
             "attention",
             "decode",
             ATTN_DECODE_BF16,
             platform=h100_platform,
-            objective=SelectionObjective.DEBUG,
+            features=frozenset({"paged"}),
+            override="reference_decode",
         )
         assert impl() == "reference_decode"
+        with pytest.raises(NoKernelFoundError, match="'paged'"):
+            select_kernel(
+                "attention",
+                "decode",
+                ATTN_DECODE_BF16,
+                platform=h100_platform,
+                features=frozenset({"paged"}),
+                override="triton_decode_plain",
+            )
+        # By solution: the solution's highest-priority kernel declaring the
+        # feature, not its highest-priority kernel.
+        impl = select_kernel(
+            "attention",
+            "decode",
+            ATTN_DECODE_BF16,
+            platform=h100_platform,
+            features=frozenset({"paged"}),
+            override="triton",
+        )
+        assert impl() == "triton_decode"
+        with pytest.raises(NoKernelFoundError, match="'unpaged'"):
+            select_kernel(
+                "attention",
+                "decode",
+                ATTN_DECODE_BF16,
+                platform=h100_platform,
+                features=frozenset({"unpaged"}),
+                override="triton",
+            )
+        # Without required features an override is honoured as before.
+        impl = select_kernel(
+            "attention",
+            "decode",
+            ATTN_DECODE_BF16,
+            platform=h100_platform,
+            override="triton_decode_plain",
+        )
+        assert impl() == "triton_decode_plain"
 
     def test_amd_platform_selects_aiter(self, sample_specs, mi350_platform):
         reg = KernelRegistry.get()
@@ -911,6 +1079,77 @@ class TestKernelOverride:
             )
             assert impl3() == "reference_decode"
 
+    def test_verbose_logs_an_override_once_per_kernel(
+        self, sample_specs, h100_platform, monkeypatch, caplog
+    ):
+        """The override path bypasses the selection cache, so the verbose log
+        names each overriding kernel once; the ranked line is unchanged."""
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        monkeypatch.setenv("TOKENSPEED_KERNEL_VERBOSE", "1")
+
+        def select():
+            return select_kernel(
+                "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
+            )
+
+        with caplog.at_level(logging.INFO, logger="tokenspeed_kernel.selection"):
+            ranked = select()
+            select()  # cache hit: not logged
+            with kernel_override("attention", "decode", "reference_decode"):
+                for _ in range(3):
+                    select()
+            with kernel_override("attention", "decode", "triton"):
+                select()
+            with kernel_override("attention", "decode", "reference_decode"):
+                select()  # already logged
+
+        arch = h100_platform.arch
+        messages = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "tokenspeed_kernel.selection"
+        ]
+        assert len(messages) == 3
+        assert f"attention.decode({ATTN_DECODE_BF16}) -> {ranked.name} (ora=" in (
+            messages[0]
+        )
+        assert messages[1].endswith(
+            f"-> reference_decode (override reference_decode, {arch})"
+        )
+        assert messages[2].endswith(f"-> triton_decode (override triton, {arch})")
+
+    def test_override_log_waits_for_verbose(
+        self, sample_specs, h100_platform, monkeypatch, caplog
+    ):
+        """Without verbose mode an override is neither logged nor remembered,
+        so enabling verbose mode later still logs it once."""
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        monkeypatch.delenv("TOKENSPEED_KERNEL_VERBOSE", raising=False)
+
+        def select():
+            return select_kernel(
+                "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
+            )
+
+        def messages():
+            return [
+                r.getMessage()
+                for r in caplog.records
+                if r.name == "tokenspeed_kernel.selection"
+            ]
+
+        with (
+            caplog.at_level(logging.INFO, logger="tokenspeed_kernel.selection"),
+            kernel_override("attention", "decode", "reference_decode"),
+        ):
+            select()
+            assert messages() == []
+            monkeypatch.setenv("TOKENSPEED_KERNEL_VERBOSE", "1")
+            select()
+            select()
+        assert len(messages()) == 1
+        assert "-> reference_decode (override reference_decode, " in messages()[0]
+
 
 class TestSetPolicy:
     def test_set_policy_clears_cache(self, sample_specs, h100_platform):
@@ -937,7 +1176,9 @@ class TestExplainSelection:
         )
         assert "attention.decode" in explanation
         assert "NVIDIA H100" in explanation
+        assert "Override: none" in explanation
         assert "[SELECTED]" in explanation
+        assert "[SELECTED (override)]" not in explanation
         assert "Candidates" in explanation
 
     def test_filtered_out_section(self, sample_specs, h100_platform):
@@ -961,6 +1202,122 @@ class TestExplainSelection:
             platform=h100_platform,
         )
         assert "0 matched" in explanation
+
+    @pytest.mark.parametrize(
+        ("env", "context", "argument", "expected"),
+        [
+            (
+                None,
+                None,
+                "reference_decode",
+                "reference_decode (explicit override= argument)",
+            ),
+            (
+                None,
+                "triton",
+                "reference_decode",
+                "triton (kernel_override())",
+            ),
+            (
+                "triton_decode",
+                "reference_decode",
+                "flashinfer_decode",
+                "triton_decode (env TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DECODE)",
+            ),
+        ],
+        ids=["argument", "context", "env"],
+    )
+    def test_reports_the_override_select_kernel_honours(
+        self,
+        sample_specs,
+        h100_platform,
+        monkeypatch,
+        env,
+        context,
+        argument,
+        expected,
+    ):
+        """The Override line follows select_kernel's precedence (environment,
+        then kernel_override(), then the argument) and marks the kernel that
+        select_kernel forces instead of the ranking's first entry."""
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        ranked = select_kernel(
+            "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
+        ).name
+        env_key = "TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DECODE"
+        if env:
+            monkeypatch.setenv(env_key, env)
+        else:
+            monkeypatch.delenv(env_key, raising=False)
+
+        scope = (
+            kernel_override("attention", "decode", context)
+            if context
+            else contextlib.nullcontext()
+        )
+        with scope:
+            explanation = explain_selection(
+                "attention",
+                "decode",
+                ATTN_DECODE_BF16,
+                platform=h100_platform,
+                override=argument,
+            )
+            forced = select_kernel(
+                "attention",
+                "decode",
+                ATTN_DECODE_BF16,
+                platform=h100_platform,
+                override=argument,
+            ).name
+
+        assert f"Override: {expected}" in explanation
+        assert f"{forced}  [SELECTED (override)]" in explanation
+        assert f"{ranked}  [SELECTED]" not in explanation
+        assert "not among the matched" not in explanation
+
+    @pytest.mark.parametrize(
+        ("target", "features", "notes"),
+        [
+            (
+                "nonexistent_kernel",
+                None,
+                ["Override does not resolve: Override 'nonexistent_kernel'"],
+            ),
+            (
+                "triton_decode",
+                frozenset({"unpaged"}),
+                [
+                    "Override does not resolve: Override 'triton_decode'",
+                    "required feature(s) ['unpaged']",
+                ],
+            ),
+            (
+                "aiter_decode",
+                None,
+                ["Override selects aiter_decode, which is not among the matched"],
+            ),
+        ],
+        ids=["unknown", "missing-feature", "filtered-out"],
+    )
+    def test_reports_an_unresolved_or_filtered_override(
+        self, sample_specs, h100_platform, target, features, notes
+    ):
+        """An override select_kernel would refuse is reported as unresolved; one
+        that bypasses filtering (here an AMD-only kernel on H100) is named."""
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        with kernel_override("attention", "decode", target):
+            explanation = explain_selection(
+                "attention",
+                "decode",
+                ATTN_DECODE_BF16,
+                features=features,
+                platform=h100_platform,
+            )
+        assert f"Override: {target} (kernel_override())" in explanation
+        for note in notes:
+            assert note in explanation
+        assert "[SELECTED" not in explanation
 
 
 class TestWarmupSelection:

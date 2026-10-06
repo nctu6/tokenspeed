@@ -23,7 +23,9 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.gemm.flashinfer import autotune_bf16_gemm
 from tokenspeed_kernel.ops.gemm.kimi3 import KIMI3_HIDDEN_SIZE
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -129,6 +131,12 @@ def _select_registered_kernel(
         )
         and (out is None or out.is_contiguous()),
     }
+    try:
+        platform = current_platform()
+    except RuntimeError:
+        platform = None
+    if platform is not None and platform.is_cdna5:
+        traits["gfx1250_linear_attnres_enabled"] = True
     if not hidden_states.is_cuda:
         return None, traits
     try:
@@ -263,6 +271,8 @@ def linear_attnres_partials(
     )
 
     if kernel is not None:
+        if override is None and solution is None:
+            autotune_bf16_gemm(hidden_states, weight)
         ShapeCapture.get().record(
             "gemm",
             "linear_attnres_partials",
@@ -300,6 +310,8 @@ def linear_attnres_partials(
         else:
             out = projected
     else:
+        if override is None and solution is None:
+            autotune_bf16_gemm(hidden_states, weight)
         torch.mm(hidden_states, weight.T, out=out)
     triton_partial_eligible = (
         blocks.is_cuda

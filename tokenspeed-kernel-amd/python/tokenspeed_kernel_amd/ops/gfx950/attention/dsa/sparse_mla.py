@@ -31,14 +31,14 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.indexing import (
     _check_packed_fp8_inputs,
-    _dsa_decode_logits_fp8_kernel,
-    _dsa_prefill_logits_fp8_kernel,
+    gluon_dsa_decode_topk_fp8_gfx950,
+    gluon_dsa_prefill_topk_fp8_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.standard_cache_logits import (
-    _dsa_kpool_prefill_logits_kernel,
-    _dsa_kpool_prefill_plan_logits_kernel,
-    _dsa_standard_decode_logits_kernel,
-    _dsa_standard_prefill_logits_kernel,
+    gluon_dsa_decode_topk_standard_gfx950,
+    gluon_dsa_prefill_topk_standard_gfx950,
+    gluon_kpool_prefill_topk_fp8_gfx950,
+    gluon_kpool_prefill_topk_fp8_plan_gfx950,
 )
 
 _ONEBLOCK_RADIX_SCHEDULE = (12, 12, 8)
@@ -76,13 +76,13 @@ _persistent_topk_graph_workspace_keys: set[tuple[int, int, int]] = set()
 _persistent_topk_workspace_lock = Lock()
 
 __all__ = [
-    "gluon_dsa_decode_topk_fp8_gfx950",
-    "gluon_dsa_decode_topk_standard_gfx950",
+    "launch_gluon_dsa_decode_topk_fp8_gfx950",
+    "launch_gluon_dsa_decode_topk_standard_gfx950",
     "gluon_dsa_kpool_prefill_logits_gfx950",
     "gluon_dsa_kpool_prefill_plan_logits_gfx950",
     "gluon_dsa_logical_topk_gfx950",
-    "gluon_dsa_prefill_topk_fp8_gfx950",
-    "gluon_dsa_prefill_topk_standard_gfx950",
+    "launch_gluon_dsa_prefill_topk_fp8_gfx950",
+    "launch_gluon_dsa_prefill_topk_standard_gfx950",
 ]
 
 
@@ -358,7 +358,6 @@ def _dsa_persistent_radix_topk_kernel(
     # Initialize local state before this row's radix passes.
     shared_histogram.store(histogram_zeros)
     shared_output_counters.store(output_counter_zeros)
-    gl.barrier()
 
     bucket_offsets = gl.arange(
         0,
@@ -377,9 +376,7 @@ def _dsa_persistent_radix_topk_kernel(
     # radix loop.
     for pass_index in gl.static_range(_PERSISTENT_NUM_PASSES):
         if pass_index != 0:
-            gl.barrier()
             shared_histogram.store(histogram_zeros)
-            gl.barrier()
 
         shift = gl.maximum(21 - pass_index * 11, 0)
         bucket_mask = gl.where(pass_index == 2, 0x3FF, 0x7FF)
@@ -430,7 +427,6 @@ def _dsa_persistent_radix_topk_kernel(
                 value_layout,
             )
 
-        gl.barrier()
         local_counts = shared_histogram.load(hist_layout)
         row_histogram = (
             histograms
@@ -560,7 +556,6 @@ def _dsa_persistent_radix_topk_kernel(
             value_layout,
         )
 
-    gl.barrier()
     output_counter_offsets = gl.arange(0, 2, layout=output_counter_layout)
     local_output_counts = shared_output_counters.load(output_counter_layout)
     local_greater = gl.sum(
@@ -620,7 +615,6 @@ def _dsa_persistent_radix_topk_kernel(
         mask=equal_write,
     )
 
-    gl.barrier()
     reset_old = gl.atomic_add(
         reset_arrivals + row * _PERSISTENT_COUNTER_STRIDE,
         1,
@@ -658,7 +652,7 @@ def _dsa_persistent_radix_topk_kernel(
         )
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("block_table_cols",))
 def _dsa_trivial_topk_kernel(
     block_table,
     row_starts,
@@ -666,7 +660,7 @@ def _dsa_trivial_topk_kernel(
     out,
     lens_out,
     out_stride: gl.constexpr,
-    block_table_cols: gl.constexpr,
+    block_table_cols,
     page_size: gl.constexpr,
     topk: gl.constexpr,
     q_len_per_req: gl.constexpr,
@@ -1012,7 +1006,12 @@ def _emit_compact_final_topk(
     )
 
 
-@gluon.jit
+@gluon.jit(
+    do_not_specialize=(
+        "logits_stride",
+        "block_table_cols",
+    ),
+)
 def _dsa_oneblock_manual_radix_topk_kernel(
     logits,
     block_table,
@@ -1020,9 +1019,9 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     row_ends,
     out,
     lens_out,
-    logits_stride: gl.constexpr,
+    logits_stride,
     out_stride: gl.constexpr,
-    block_table_cols: gl.constexpr,
+    block_table_cols,
     page_size: gl.constexpr,
     topk: gl.constexpr,
     q_len_per_req: gl.constexpr,
@@ -1139,7 +1138,6 @@ def _dsa_oneblock_manual_radix_topk_kernel(
 
     shared_histogram.store(histogram_zeros)
     shared_output_counters.store(output_counter_zeros)
-    gl.barrier()
 
     candidate_logits = logits + row * logits_stride + candidate_start
     vector_end = candidate_len & -4
@@ -1160,9 +1158,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
             shift = 0
 
         if pass_index != 0:
-            gl.barrier()
             shared_histogram.store(histogram_zeros)
-            gl.barrier()
 
         full_end = candidate_len & -BLOCK_N
         if USE_COMPACT_FINAL and pass_index == 2:
@@ -1303,7 +1299,6 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                     True,
                 )
 
-        gl.barrier()
         counts = shared_histogram.load(histogram_layout)
         count_pairs = counts.reshape([MAX_BUCKETS // 2, 2])
         count_low, count_high = gl.split(count_pairs)
@@ -1389,6 +1384,8 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                     )
 
                 if IS_DECODE:
+                    # ``out`` was just written by other threads; the
+                    # compiler only orders shared-memory hazards.
                     gl.barrier()
                     logical_offsets = gl.load(
                         out + row * out_stride + output_offsets,
@@ -1468,6 +1465,8 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         )
 
     if IS_DECODE:
+        # ``out`` was just written by other threads; the compiler only
+        # orders shared-memory hazards.
         gl.barrier()
         logical_offsets = gl.load(
             out + row * out_stride + output_offsets,
@@ -2189,7 +2188,7 @@ def gluon_dsa_kpool_prefill_logits_gfx950(
 
     block_n = 128
     num_warps = 4
-    _dsa_kpool_prefill_logits_kernel[(tokens, 1)](
+    gluon_kpool_prefill_topk_fp8_gfx950[(tokens, 1)](
         q,
         weights,
         pooled_k_cache.view(torch.float8_e4m3fn),
@@ -2213,7 +2212,6 @@ def gluon_dsa_kpool_prefill_logits_gfx950(
         max_candidates,
         pool_offset,
         PAGE_SIZE=page_size,
-        ROW_BYTES=row_bytes,
         PAGE_STRIDE_BYTES=cache_page_stride_bytes,
         POOL_SIZE=pool_size,
         NUM_HEADS=q.shape[1],
@@ -2371,7 +2369,7 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx950(
 
     block_n = 128
     num_warps = 4
-    _dsa_kpool_prefill_plan_logits_kernel[(tokens, 1)](
+    gluon_kpool_prefill_topk_fp8_plan_gfx950[(tokens, 1)](
         q,
         weights,
         pooled_k_cache.view(torch.float8_e4m3fn),
@@ -2394,7 +2392,6 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx950(
         int(pool_workspace_slots.numel()),
         pool_offset,
         PAGE_SIZE=page_size,
-        ROW_BYTES=row_bytes,
         PAGE_STRIDE_BYTES=cache_page_stride_bytes,
         POOL_SIZE=pool_size,
         NUM_HEADS=q.shape[1],
@@ -2411,7 +2408,7 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx950(
     return out, row_ends_out
 
 
-def gluon_dsa_decode_topk_fp8_gfx950(
+def launch_gluon_dsa_decode_topk_fp8_gfx950(
     q: torch.Tensor,
     weights: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -2437,7 +2434,7 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         )
     if index_k_cache is None:
         raise RuntimeError("Gluon DSA paged top-k requires an FP8 index_k_cache")
-    row_bytes, page_stride_bytes = _check_packed_fp8_inputs(
+    _, page_stride_bytes = _check_packed_fp8_inputs(
         q, index_k_cache, weights, int(page_size)
     )
     if not weights.is_contiguous():
@@ -2487,7 +2484,7 @@ def gluon_dsa_decode_topk_fp8_gfx950(
     )
     block_n = 32
     score_grid = (q.shape[0], triton.cdiv(max_seq_len, block_n))
-    _dsa_decode_logits_fp8_kernel[score_grid](
+    gluon_dsa_decode_topk_fp8_gfx950[score_grid](
         q,
         index_k_cache.view(torch.float8_e4m3fn),
         index_k_cache.view(torch.float32),
@@ -2498,7 +2495,6 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         block_table.stride(0),
         logits.stride(0),
         page_size=int(page_size),
-        row_bytes=row_bytes,
         page_stride_bytes=page_stride_bytes,
         max_seq_len=max_seq_len,
         num_heads=q.shape[1],
@@ -2523,7 +2519,7 @@ def gluon_dsa_decode_topk_fp8_gfx950(
     )
 
 
-def gluon_dsa_prefill_topk_fp8_gfx950(
+def launch_gluon_dsa_prefill_topk_fp8_gfx950(
     q: torch.Tensor,
     weights: torch.Tensor,
     kv_workspace_slots: torch.Tensor,
@@ -2547,7 +2543,7 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
         raise RuntimeError(
             "Gluon DSA top-k requires an FP8 index_k_cache and page_size"
         )
-    row_bytes, page_stride_bytes = _check_packed_fp8_inputs(
+    _, page_stride_bytes = _check_packed_fp8_inputs(
         q, index_k_cache, weights, int(page_size)
     )
     if not weights.is_contiguous():
@@ -2605,7 +2601,7 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
         logits = torch.empty(
             (end - start, seq_len_sum), dtype=torch.float32, device=q.device
         )
-        _dsa_prefill_logits_fp8_kernel[
+        gluon_dsa_prefill_topk_fp8_gfx950[
             (end - start, triton.cdiv(seq_len_sum, block_n))
         ](
             q[start:end],
@@ -2619,7 +2615,6 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
             logits.stride(0),
             seq_len_sum=seq_len_sum,
             page_size=int(page_size),
-            row_bytes=row_bytes,
             page_stride_bytes=page_stride_bytes,
             num_heads=q.shape[1],
             head_dim=q.shape[2],
@@ -2717,7 +2712,7 @@ def _check_standard_scorer_inputs(
     return row_bytes, page_stride_bytes, q_is_fp8
 
 
-def gluon_dsa_decode_topk_standard_gfx950(
+def launch_gluon_dsa_decode_topk_standard_gfx950(
     q: torch.Tensor,
     weights: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -2743,7 +2738,7 @@ def gluon_dsa_decode_topk_standard_gfx950(
         raise ValueError(f"q_len_per_req must be in 1..6, got {q_len_per_req}")
     if index_k_cache is None:
         raise RuntimeError("standard-cache DSA scorer requires index_k_cache")
-    row_bytes, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
+    _, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
         q, q_scales, weights, index_k_cache, int(page_size)
     )
     if seq_lens.dtype != torch.int32 or block_table.dtype != torch.int32:
@@ -2781,7 +2776,7 @@ def gluon_dsa_decode_topk_standard_gfx950(
     num_warps = 1
     q_scale_arg = q_scales if q_scales is not None else weights
     grid = (q.shape[0], triton.cdiv(max_candidates, chunk_n))
-    _dsa_standard_decode_logits_kernel[grid](
+    gluon_dsa_decode_topk_standard_gfx950[grid](
         q,
         q_scale_arg,
         index_k_cache.view(torch.float8_e4m3fn),
@@ -2803,7 +2798,6 @@ def gluon_dsa_decode_topk_standard_gfx950(
         max_candidates,
         q_len_per_req,
         PAGE_SIZE=int(page_size),
-        ROW_BYTES=row_bytes,
         PAGE_STRIDE_BYTES=page_stride_bytes,
         NUM_HEADS=q.shape[1],
         HEAD_DIM=q.shape[2],
@@ -2833,7 +2827,7 @@ def gluon_dsa_decode_topk_standard_gfx950(
     )
 
 
-def gluon_dsa_prefill_topk_standard_gfx950(
+def launch_gluon_dsa_prefill_topk_standard_gfx950(
     q: torch.Tensor,
     weights: torch.Tensor,
     kv_workspace_slots: torch.Tensor,
@@ -2857,7 +2851,7 @@ def gluon_dsa_prefill_topk_standard_gfx950(
     _check_topk_contract(topk)
     if index_k_cache is None or page_size is None:
         raise RuntimeError("standard-cache DSA scorer requires cache and page_size")
-    row_bytes, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
+    _, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
         q, q_scales, weights, index_k_cache, int(page_size)
     )
     if (
@@ -2907,7 +2901,7 @@ def gluon_dsa_prefill_topk_standard_gfx950(
         logits = torch.empty(
             (end - start, workspace_rows), dtype=torch.float32, device=q.device
         )
-        _dsa_standard_prefill_logits_kernel[(end - start, 1)](
+        gluon_dsa_prefill_topk_standard_gfx950[(end - start, 1)](
             q[start:end],
             q_scale_arg[start:end],
             index_k_cache.view(torch.float8_e4m3fn),
@@ -2929,7 +2923,6 @@ def gluon_dsa_prefill_topk_standard_gfx950(
             float(softmax_scale),
             workspace_rows,
             PAGE_SIZE=int(page_size),
-            ROW_BYTES=row_bytes,
             PAGE_STRIDE_BYTES=page_stride_bytes,
             NUM_HEADS=q.shape[1],
             HEAD_DIM=q.shape[2],

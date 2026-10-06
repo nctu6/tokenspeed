@@ -31,10 +31,10 @@ reductions over one resident key tile.
 from tokenspeed_kernel_amd._triton import gl, gluon, tl
 
 __all__ = [
-    "_dsa_kpool_prefill_logits_kernel",
-    "_dsa_kpool_prefill_plan_logits_kernel",
-    "_dsa_standard_decode_logits_kernel",
-    "_dsa_standard_prefill_logits_kernel",
+    "gluon_kpool_prefill_topk_fp8_gfx950",
+    "gluon_kpool_prefill_topk_fp8_plan_gfx950",
+    "gluon_dsa_decode_topk_standard_gfx950",
+    "gluon_dsa_prefill_topk_standard_gfx950",
 ]
 
 
@@ -143,7 +143,6 @@ def _load_key_tile_to_shared(
     request_id,
     block_table_stride,
     PAGE_SIZE: gl.constexpr,
-    ROW_BYTES: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     BLOCK_N: gl.constexpr,
@@ -196,7 +195,6 @@ def _load_key_scales(
     block_table_stride,
     output_layout: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
-    ROW_BYTES: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     BLOCK_N: gl.constexpr,
@@ -478,7 +476,6 @@ def _standard_cache_logits_body(
     q_len_per_req,
     pool_offset,
     PAGE_SIZE: gl.constexpr,
-    ROW_BYTES: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     POOL_SIZE: gl.constexpr,
     NUM_HEADS: gl.constexpr,
@@ -601,7 +598,6 @@ def _standard_cache_logits_body(
         request_id,
         block_table_stride,
         PAGE_SIZE,
-        ROW_BYTES,
         PAGE_STRIDE_BYTES,
         HEAD_DIM,
         BLOCK_N,
@@ -620,7 +616,6 @@ def _standard_cache_logits_body(
         request_id,
         block_table_stride,
         PAGE_SIZE,
-        ROW_BYTES,
         PAGE_STRIDE_BYTES,
         HEAD_DIM,
         BLOCK_N,
@@ -644,7 +639,6 @@ def _standard_cache_logits_body(
             block_table_stride,
             output_layout,
             PAGE_SIZE,
-            ROW_BYTES,
             PAGE_STRIDE_BYTES,
             HEAD_DIM,
             BLOCK_N,
@@ -670,7 +664,6 @@ def _standard_cache_logits_body(
                 request_id,
                 block_table_stride,
                 PAGE_SIZE,
-                ROW_BYTES,
                 PAGE_STRIDE_BYTES,
                 HEAD_DIM,
                 BLOCK_N,
@@ -729,7 +722,7 @@ def _standard_cache_logits_body(
 
 
 @gluon.jit
-def _dsa_standard_prefill_logits_kernel(
+def gluon_dsa_prefill_topk_standard_gfx950(
     q,
     q_scales,
     index_k_fp8,
@@ -751,7 +744,6 @@ def _dsa_standard_prefill_logits_kernel(
     model_scale,
     workspace_rows,
     PAGE_SIZE: gl.constexpr,
-    ROW_BYTES: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     NUM_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
@@ -788,7 +780,6 @@ def _dsa_standard_prefill_logits_kernel(
         1,
         0,
         PAGE_SIZE,
-        ROW_BYTES,
         PAGE_STRIDE_BYTES,
         1,
         NUM_HEADS,
@@ -806,7 +797,7 @@ def _dsa_standard_prefill_logits_kernel(
 
 
 @gluon.jit
-def _dsa_kpool_prefill_logits_kernel(
+def gluon_kpool_prefill_topk_fp8_gfx950(
     q,
     q_scales,
     index_k_fp8,
@@ -830,7 +821,6 @@ def _dsa_kpool_prefill_logits_kernel(
     max_candidates,
     pool_offset,
     PAGE_SIZE: gl.constexpr,
-    ROW_BYTES: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     POOL_SIZE: gl.constexpr,
     NUM_HEADS: gl.constexpr,
@@ -876,7 +866,6 @@ def _dsa_kpool_prefill_logits_kernel(
         1,
         pool_offset,
         PAGE_SIZE,
-        ROW_BYTES,
         PAGE_STRIDE_BYTES,
         POOL_SIZE,
         NUM_HEADS,
@@ -894,7 +883,7 @@ def _dsa_kpool_prefill_logits_kernel(
 
 
 @gluon.jit
-def _dsa_kpool_prefill_plan_logits_kernel(
+def gluon_kpool_prefill_topk_fp8_plan_gfx950(
     q,
     q_scales,
     index_k_fp8,
@@ -917,7 +906,6 @@ def _dsa_kpool_prefill_plan_logits_kernel(
     workspace_rows,
     pool_offset,
     PAGE_SIZE: gl.constexpr,
-    ROW_BYTES: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     POOL_SIZE: gl.constexpr,
     NUM_HEADS: gl.constexpr,
@@ -963,7 +951,6 @@ def _dsa_kpool_prefill_plan_logits_kernel(
         1,
         pool_offset,
         PAGE_SIZE,
-        ROW_BYTES,
         PAGE_STRIDE_BYTES,
         POOL_SIZE,
         NUM_HEADS,
@@ -981,7 +968,7 @@ def _dsa_kpool_prefill_plan_logits_kernel(
 
 
 @gluon.jit
-def _dsa_standard_decode_logits_kernel(
+def gluon_dsa_decode_topk_standard_gfx950(
     q,
     q_scales,
     index_k_fp8,
@@ -1003,7 +990,6 @@ def _dsa_standard_decode_logits_kernel(
     max_candidates,
     q_len_per_req,
     PAGE_SIZE: gl.constexpr,
-    ROW_BYTES: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     NUM_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
@@ -1041,7 +1027,6 @@ def _dsa_standard_decode_logits_kernel(
         q_len_per_req,
         0,
         PAGE_SIZE,
-        ROW_BYTES,
         PAGE_STRIDE_BYTES,
         1,
         NUM_HEADS,

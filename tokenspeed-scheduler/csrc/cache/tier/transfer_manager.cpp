@@ -21,6 +21,7 @@
 #include "cache/tier/transfer_manager.h"
 
 #include <algorithm>
+#include <unordered_set>
 #include <utility>
 
 #include "utils.h"
@@ -31,10 +32,18 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
     std::vector<CacheKey> keys;
     std::vector<CacheBlockRef> device_block_refs;
     std::vector<std::uint32_t> group_ids;
-    std::unordered_set<CacheKey, CacheKeyHash> batch_keys;
+    // Keys already travelling: every ticket of every in-flight write-back.
+    // Derived from write_backs_ on demand rather than mirrored in a second
+    // container that would have to be kept in step with it. Candidates join
+    // the same set so a key queued twice in one round is stored once.
+    std::unordered_set<CacheKey, CacheKeyHash> storing_keys;
+    for (const auto& [op_id, write_back] : write_backs_) {
+        for (const StoreTicket& ticket : write_back.tickets) {
+            storing_keys.insert(ticket.key);
+        }
+    }
     for (auto& candidate : coordinator_.TakePendingStores()) {
-        if (coordinator_.ContainsHostCachedBlock(candidate.key) || store_keys_.contains(candidate.key) ||
-            !batch_keys.insert(candidate.key).second) {
+        if (coordinator_.ContainsHostCachedBlock(candidate.key) || !storing_keys.insert(candidate.key).second) {
             continue;
         }
 
@@ -70,6 +79,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
             .group_id = group_ids[i],
             .source_page = manager.ResolveCacheBlockId(device_block_refs[i]->Location()),
             .destination_page = manager.ResolveCacheBlockId(host_block_ref->Location()),
+            .content_hash = keys[i].content_hash,
+            .page_offset = keys[i].page_offset,
         });
         // A stream-ordered store resolves the source page id and lets the
         // reference go: the forward thread's stream orders the copy ahead of
@@ -85,9 +96,6 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
         return std::nullopt;
     }
     const std::uint32_t op_id = nextOpId();
-    for (const StoreTicket& ticket : tickets) {
-        store_keys_.insert(ticket.key);
-    }
     const bool inserted = write_backs_.emplace(op_id, InFlightWriteBack{guard, std::move(tickets)}).second;
     _assert(inserted, "duplicate store op id");
     return WriteBackOperation{
@@ -105,7 +113,7 @@ bool TierTransferManager::HasPinnedStoresInFlight() const {
 LoadBackOperation TierTransferManager::StartPrefixLoad(std::vector<BlockTransfer> block_transfers) {
     _assert(!block_transfers.empty(), "prefix load requires at least one block transfer");
     for (const BlockTransfer& pair : block_transfers) {
-        _assert(coordinator_.IsHostCachedBlock(pair.source->Location()),
+        _assert(pair.prefetch_from_storage || coordinator_.IsHostCachedBlock(pair.source->Location()),
                 "pinned Host block lost its cache entry before load emission");
     }
     return startLoadBack(std::move(block_transfers));
@@ -128,9 +136,6 @@ void TierTransferManager::CompleteWriteBack(std::uint32_t op_id) {
     }
     std::vector<StoreTicket> stores = std::move(it->second.tickets);
     write_backs_.erase(it);
-    for (const StoreTicket& ticket : stores) {
-        store_keys_.erase(ticket.key);
-    }
     // Publishing the Host entry also drops the tickets' Device pins (if any)
     // when `stores` goes out of scope: the source is evictable again.
     for (StoreTicket& ticket : stores) {
@@ -138,8 +143,29 @@ void TierTransferManager::CompleteWriteBack(std::uint32_t op_id) {
     }
 }
 
-void TierTransferManager::CompleteLoadBack(std::uint32_t op_id) {
-    load_backs_.erase(op_id);
+void TierTransferManager::CompleteLoadBack(std::uint32_t op_id, bool success) {
+    auto it = load_backs_.find(op_id);
+    if (it == load_backs_.end()) {
+        return;
+    }
+    // A missed batch_get_into must not publish empty Host or Device pages.
+    // Host-warm destinations of a mixed L3 hash were not CacheFullBlocks'd at
+    // admit (the hash had an L3 prefetch sibling). Publish every keyed filled
+    // destination. Host-only L2 load-backs leave key empty; those pages were
+    // already published at admit. CacheHostBlock remains prefetch-only
+    // because Host-warm sources are already in the Host index.
+    for (BlockTransfer& transfer : it->second) {
+        if (!success) {
+            continue;
+        }
+        if (transfer.prefetch_from_storage && transfer.source) {
+            coordinator_.CacheHostBlock(transfer.source, transfer.key);
+        }
+        if (transfer.destination && !transfer.key.content_hash.empty()) {
+            coordinator_.CacheDeviceBlock(transfer.destination, transfer.key);
+        }
+    }
+    load_backs_.erase(it);
 }
 
 std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const BlockTransfer> block_transfers) const {
@@ -153,6 +179,9 @@ std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const
             .group_id = block_transfer.group_id,
             .source_page = manager.ResolveCacheBlockId(block_transfer.source->Location()),
             .destination_page = manager.ResolveCacheBlockId(block_transfer.destination->Location()),
+            .content_hash = block_transfer.key.content_hash,
+            .page_offset = block_transfer.key.page_offset,
+            .prefetch_from_storage = block_transfer.prefetch_from_storage,
         });
     }
     return transfers;

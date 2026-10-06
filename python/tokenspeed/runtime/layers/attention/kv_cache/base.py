@@ -25,6 +25,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
+from tokenspeed_kernel.ops.attention.prologue import HeadKVCache, LatentKVCache
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -230,11 +231,8 @@ class CachePool(ABC):
         # default state for optional layer-wise transfer control
         self.layerwise_load_tracker = None
         logger.info(
-            "Initialized cache view over %d slots as %s, layers from %d, rank %d",
-            arena.size,
-            dtype,
-            self._field_layer_offset,
-            rank,
+            f"Initialized cache view over {arena.size:d} slots as {dtype!s}, layers "
+            f"from {self._field_layer_offset:d}, rank {rank:d}",
         )
 
     @property
@@ -272,6 +270,22 @@ class CachePool(ABC):
                 f"{self.layer_num} layers (ids are local to the view)"
             )
         return self._field_layer_offset + layer_id
+
+    @property
+    def field_layer_range(self) -> range:
+        """Global model-layer ids owned by this compute view.
+
+        Cache-plan field ids use global layer numbers, while target and draft
+        pools expose local layer numbers to their models.  Consumers that
+        inspect the shared plan use this range to keep only fields belonging
+        to their own view instead of accidentally including the adjacent
+        target or draft window.
+        """
+
+        return range(
+            self._field_layer_offset,
+            self._field_layer_offset + self.layer_num,
+        )
 
     # Per-layer plane name -> the attribute holding its per-layer list.
     # Subclasses declare only the planes their kernels read; a plane they do
@@ -380,3 +394,12 @@ class CachePool(ABC):
         cache_v: torch.Tensor,
     ) -> None:
         """Scatter one forward pass's K/V into this layer's planes."""
+
+    def kv_write_target(
+        self, layer_id: int, slots: torch.Tensor, write_mask: torch.Tensor | None
+    ) -> HeadKVCache | LatentKVCache:
+        """Where the attention prologue writes this layer's rows at ``slots``;
+        ``write_mask`` skips the rows another DCP rank owns."""
+        raise NotImplementedError(
+            f"{type(self).__name__} serves no attention prologue writes"
+        )

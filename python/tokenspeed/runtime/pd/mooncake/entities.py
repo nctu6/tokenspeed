@@ -20,6 +20,7 @@
 
 import dataclasses
 import struct
+from collections.abc import Mapping
 
 from tokenspeed.runtime.pd.cache_protocol import (
     CachePDBlockManifest,
@@ -30,6 +31,7 @@ from tokenspeed.runtime.pd.cache_protocol import (
 from tokenspeed.runtime.pd.topology import PDParallelTopology
 from tokenspeed.runtime.pd.transfer_plan import (
     MAX_CACHE_TP_SIZE,
+    CachePageOwnerFilter,
     CacheTransferFragment,
 )
 
@@ -57,10 +59,8 @@ class KVArgs:
     ib_device: str
     gpu_id: int
     cache_layout: CacheTransferContract
+    cache_fields_by_stage: tuple[tuple[str, ...], ...]
     cache_producer_schedule: CacheProducerSchedule | None = None
-    # Prefill chunk-pipeline: this rank's [start, end) global layer window.
-    # None when PP is off (the rank owns every layer).
-    pp_layer_window: tuple[int, int] | None = None
     # Full-model logical contract for the PD wire when the local arena/plan
     # is narrowed to a stage window; None means cache_layout is already it.
     wire_cache_layout: CacheTransferContract | None = None
@@ -157,6 +157,10 @@ class KVArgsRegisterInfo:
     decode_tp_rank: int
     # Computed once by the receiving Prefill rank from the typed registration.
     transfer_fragments: tuple[CacheTransferFragment, ...] = ()
+    # The route's decision for every DCP-sharded group: the blocks this
+    # Prefill rank owns and sends, or None for a group its route carries no
+    # fragment of. None as a whole until the route has been planned.
+    transfer_owner_filters: Mapping[str, CachePageOwnerFilter | None] | None = None
     is_dummy: bool = False
     expected_decode_ranks: frozenset[int] = frozenset()
 

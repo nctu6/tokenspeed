@@ -57,6 +57,11 @@ setattr(threading, "_register_atexit", _ignore_threading_atexit)
 import torch
 import uvloop
 
+from tokenspeed.runtime.cache.l3.backend import (
+    L3_FLUSH_REQUIRES_WEIGHT_VERSION,
+    resolve_l3_weight_version,
+)
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.engine.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -66,13 +71,16 @@ from tokenspeed.runtime.engine.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    RebalanceExpertsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromMooncakeReqInput,
     UpdateWeightsFromTensorReqInput,
+    mooncake_load_weight_version,
 )
 from tokenspeed.runtime.entrypoints.engine_base import EngineBase
 from tokenspeed.runtime.utils import (
@@ -129,7 +137,7 @@ class Engine(EngineBase):
 
         # Allocate ports for inter-process communications
         self.port_args = PortArgs.init_new(server_args)
-        logger.info("server_args=%r", server_args)
+        logger.info(f"server_args={server_args!r}")
 
         # Launch subprocesses
         tokenizer_manager, _, scheduler_info = _launch_subprocesses(
@@ -312,19 +320,12 @@ class Engine(EngineBase):
     def stop_profile(self):
         self.llm.run(self.tokenizer_manager.stop_profile())
 
-    def start_expert_distribution_record(self):
-        self.llm.run(self.tokenizer_manager.start_expert_distribution_record())
-
-    def stop_expert_distribution_record(self):
-        self.llm.run(self.tokenizer_manager.stop_expert_distribution_record())
-
-    def dump_expert_distribution_record(self):
-        self.llm.run(self.tokenizer_manager.dump_expert_distribution_record())
-
     def get_server_info(self):
         internal_states = self.llm.run(self.tokenizer_manager.get_internal_state())
+        server_args = dataclasses.asdict(self.tokenizer_manager.server_args)
+        server_args.pop("rl_control_api_key", None)
         return {
-            **dataclasses.asdict(self.tokenizer_manager.server_args),
+            **server_args,
             **self.scheduler_info,
             "internal_states": internal_states,
             "version": __version__,
@@ -365,16 +366,86 @@ class Engine(EngineBase):
         shapes: list[list[int]],
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
+        *,
+        weight_version: str | None,
     ):
-        """Update weights from distributed source."""
+        """Update weights from distributed source.
+
+        ``weight_version`` is required. Pass ``None`` to keep the current
+        namespace on an intermediate update. Flushed L3 updates must pass
+        a caller-supplied identity so independent checkpoints cannot share
+        a minted successor.
+        """
+        if (
+            flush_cache
+            and weight_version is None
+            and self.server_args.kvstore_storage_backend is not None
+        ):
+            return False, L3_FLUSH_REQUIRES_WEIGHT_VERSION
+        weight_version = resolve_l3_weight_version(
+            self.server_args.weight_version,
+            weight_version,
+            flush_cache=flush_cache,
+            storage_backend=self.server_args.kvstore_storage_backend,
+        )
         obj = UpdateWeightsFromDistributedReqInput(
             names=names,
             dtype_names=dtypes,
             shapes=shapes,
             group_name=group_name,
             flush_cache=flush_cache,
+            weight_version=weight_version,
         )
-        return self.llm.run(self.tokenizer_manager.update_weights_from_distributed(obj))
+        result = self.llm.run(
+            self.tokenizer_manager.update_weights_from_distributed(obj)
+        )
+        success = result[0] if isinstance(result, tuple) else bool(result)
+        if success and weight_version is not None:
+            self.server_args.weight_version = str(weight_version)
+        return result
+
+    def update_weights_from_mooncake(
+        self,
+        version: int,
+        *,
+        flush_cache: bool,
+        weight_version: str | None,
+    ):
+        """Load one committed Model Updater SDK version on every worker.
+
+        ``flush_cache`` selects whether the KV caches are dropped and a new
+        weight namespace published, so it is explicit here; only the HTTP
+        route defaults it, for the reference engine's trainer clients.
+        ``weight_version`` is required. Pass ``None`` to publish
+        ``str(version)`` on a flushed load, or to keep the current namespace
+        on an intermediate (unflushed) one (``mooncake_load_weight_version``).
+        """
+        weight_version = resolve_l3_weight_version(
+            self.server_args.weight_version,
+            mooncake_load_weight_version(
+                version=version,
+                flush_cache=flush_cache,
+                weight_version=weight_version,
+            ),
+            flush_cache=flush_cache,
+            storage_backend=self.server_args.kvstore_storage_backend,
+        )
+        obj = UpdateWeightsFromMooncakeReqInput(
+            version=version,
+            flush_cache=flush_cache,
+            weight_version=weight_version,
+        )
+        result = self.llm.run(self.tokenizer_manager.update_weights_from_mooncake(obj))
+        success = result[0] if isinstance(result, tuple) else bool(result)
+        if success and weight_version is not None:
+            self.server_args.weight_version = str(weight_version)
+        return result
+
+    def rebalance_experts(self) -> tuple[bool, str]:
+        """Start one online expert rebalance now (``--enable-eplb``)."""
+        return self.llm.run(
+            self.tokenizer_manager.rebalance_experts(RebalanceExpertsReqInput())
+        )
 
     def update_weights_from_tensor(
         self,
@@ -487,6 +558,24 @@ def _set_envs_and_config(server_args: ServerArgs):
         # explicit env wins; --disable-tf32 is the documented opt-out.
         os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "1")
         os.environ.setdefault("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
+    if server_args.numerics in BITWISE_ENVELOPES:
+        # Bitwise envelopes: no TF32 anywhere, and pin NCCL to one
+        # algorithm/protocol so the reduction association order cannot switch
+        # with message size. The envelope's promise beats ambient
+        # environment: a conflicting value is replaced, loudly, instead of
+        # silently voiding the contract.
+        for key, value in (
+            ("NVIDIA_TF32_OVERRIDE", "0"),
+            ("NCCL_ALGO", "Ring"),
+            ("NCCL_PROTO", "Simple"),
+        ):
+            prior = os.environ.get(key)
+            if prior is not None and prior != value:
+                logger.warning(
+                    f"--numerics {server_args.numerics} replaces {key}={prior} "
+                    f"with {value}"
+                )
+            os.environ[key] = value
 
     _set_socket_interface(server_args)
 
@@ -526,7 +615,7 @@ def _launch_subprocesses(
     # Allocate ports for inter-process communications
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
-        logger.info("server_args=%r", server_args)
+        logger.info(f"server_args={server_args!r}")
 
     # If using model from www.modelscope.cn, first download the model.
     server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
@@ -596,9 +685,8 @@ def _launch_subprocesses(
         for proc in scheduler_procs:
             proc.join()
             logger.error(
-                "Scheduler or DataParallelController %s terminated with %s",
-                proc.pid,
-                proc.exitcode,
+                f"Scheduler or DataParallelController {proc.pid!s} terminated with "
+                f"{proc.exitcode!s}",
             )
         return None, None, None
 
@@ -613,10 +701,11 @@ def _launch_subprocesses(
             data = scheduler_pipe_readers[i].recv()
         except EOFError:
             logger.error(
-                "Rank %s scheduler is dead. Please check if there are relevant logs.", i
+                f"Rank {i!s} scheduler is dead. Please check if there are relevant "
+                "logs.",
             )
             scheduler_procs[i].join()
-            logger.error("Exit code: %s", scheduler_procs[i].exitcode)
+            logger.error(f"Exit code: {scheduler_procs[i].exitcode!s}")
             raise
 
         if data["status"] != "ready":
@@ -632,6 +721,9 @@ def _launch_subprocesses(
         "max_single_request_tokens"
     ]
     tokenizer_manager.context_len = scheduler_info["max_model_len"]
+    tokenizer_manager.supports_prompt_logprobs = scheduler_info[
+        "supports_prompt_logprobs"
+    ]
     return tokenizer_manager, None, scheduler_info
 
 
@@ -662,7 +754,7 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     # PortArgs is still derived (nccl_port drives torch.distributed); the pickle
     # scheduler_input/tokenizer IPC names it carries are unused in msgpack mode.
     port_args = PortArgs.init_new(server_args)
-    logger.info("headless server_args=%r", server_args)
+    logger.info(f"headless server_args={server_args!r}")
 
     server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
         server_args.model, server_args.tokenizer
@@ -679,7 +771,7 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     def _terminate_schedulers(signum=None, _frame=None):
         """Forward a shutdown (or child-failure SIGUSR1) to every scheduler."""
         if signum is not None:
-            logger.info("received signal %s; terminating scheduler(s)", signum)
+            logger.info(f"received signal {signum!s}; terminating scheduler(s)")
         if signum == signal.SIGUSR1:
             child_failed.set()
         for proc in scheduler_procs:
@@ -728,20 +820,19 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
                 data = reader.recv()
             except EOFError:
                 logger.error(
-                    "Rank %s scheduler is dead. Please check if there are "
+                    f"Rank {i!s} scheduler is dead. Please check if there are "
                     "relevant logs.",
-                    i,
                 )
                 scheduler_procs[i].join()
-                logger.error("Exit code: %s", scheduler_procs[i].exitcode)
+                logger.error(f"Exit code: {scheduler_procs[i].exitcode!s}")
                 raise
             if data.get("status") != "ready":
                 raise RuntimeError(
                     "Scheduler initialization failed. See the error messages above."
                 )
         logger.info(
-            "headless scheduler(s) ready; SMG handshake endpoint=%s",
-            server_args.zmq_handshake_endpoint(),
+            "headless scheduler(s) ready; SMG handshake endpoint="
+            f"{server_args.zmq_handshake_endpoint()!s}",
         )
 
         # Supervise until every scheduler exits. If any rank dies (e.g. OOM
@@ -757,14 +848,13 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
                 alive.remove(proc)
                 if proc.exitcode == 0:
                     logger.info(
-                        "scheduler %s exited with code %s", proc.pid, proc.exitcode
+                        f"scheduler {proc.pid!s} exited with code {proc.exitcode!s}",
                     )
                 else:
                     logger.error(
-                        "scheduler %s exited with code %s; terminating the "
+                        f"scheduler {proc.pid!s} exited with code {proc.exitcode!s}; "
+                        "terminating the "
                         "remaining scheduler(s)",
-                        proc.pid,
-                        proc.exitcode,
                     )
                     failed = True
                     _terminate_schedulers()

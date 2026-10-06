@@ -35,33 +35,29 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel import (
-    NoKernelFoundError,
-    dsa_decode_topk,
-    dsa_prefill_topk,
-    dsv4_decode_topk,
     dsv4_grouped_output_projection,
     dsv4_grouped_output_projection_plan,
     dsv4_grouped_output_projection_warmup_model,
-    dsv4_indexer_cache_format,
-)
-from tokenspeed_kernel import dsv4_linear_fp32 as _kernel_dsv4_linear_fp32
-from tokenspeed_kernel import (
-    dsv4_mega_moe_apply,
-    dsv4_mega_moe_plan,
-    dsv4_mega_moe_process_weights,
-    dsv4_mega_moe_warmup,
-    dsv4_padded_heads,
-    dsv4_plan,
-    dsv4_prefill_topk,
-)
-from tokenspeed_kernel import dsv4_select_experts as _kernel_dsv4_select_experts
-from tokenspeed_kernel import (
-    dsv4_warmup,
+    dsv4_linear_fp32,
 )
 from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed_kernel import mhc_post as fast_mhc_post
 from tokenspeed_kernel import mhc_pre as fast_mhc_pre
-from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+from tokenspeed_kernel import (
+    moe_topk,
+)
+from tokenspeed_kernel.ops.attention.dsa import dsa_decode_topk, dsa_prefill_topk
+from tokenspeed_kernel.ops.attention.dsv4 import (
+    dsv4_decode_topk,
+    dsv4_index_candidates,
+    dsv4_indexer_cache_format,
+    dsv4_padded_heads,
+    dsv4_plan,
+    dsv4_prefill_topk,
+    dsv4_warmup,
+)
+from tokenspeed_kernel.ops.attention.dsv4.triton import (
+    dsv4_group_slot_mapping,
     dsv4_indexer_decode_metadata_compute,
 )
 from torch import nn
@@ -82,6 +78,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.attention.dcp.indexer import merge_index_candidates
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4ForwardMetadata,
     DeepseekV4IndexerBatchMetadata,
@@ -128,12 +125,12 @@ from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
-from tokenspeed.runtime.layers.moe.topk import (
-    BypassedTopKOutput,
-    StandardTopKOutput,
-    TopK,
+from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopK, TopKOutput
+from tokenspeed.runtime.layers.moe.utils import (
+    RoutingMethodType,
+    get_all2all_backend,
+    get_moe_backend,
 )
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
@@ -249,6 +246,8 @@ def mhc_pre(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return fast_mhc_pre(
         residual,
@@ -258,6 +257,8 @@ def mhc_pre(
         rms_eps,
         hc_eps,
         sinkhorn_iters,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
 
 
@@ -281,6 +282,8 @@ def mhc_fused_hc(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return fast_mhc_fused_hc(
         x_prev,
@@ -293,6 +296,8 @@ def mhc_fused_hc(
         rms_eps,
         hc_eps,
         sinkhorn_iters,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
 
 
@@ -311,30 +316,6 @@ def hc_head(
     pre = torch.sigmoid(mixes * hc_scale.float() + hc_base.float()) + hc_eps
     y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
     return y.to(dtype)
-
-
-def pack_topk_as_router_logits(
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    num_experts: int,
-) -> torch.Tensor:
-    """Encode preselected top-k weights for BYPASSED TokenSpeed MoE backends.
-
-    MXFP4 backends currently build routing data from logits internally. Packing
-    the normalized top-k weights as log-probabilities with very negative values
-    elsewhere makes their TopK -> Softmax/Renormalize route recover the same
-    selected ids and weights without changing the shared backend.
-    """
-
-    router_logits = torch.full(
-        (topk_ids.shape[0], num_experts),
-        -1e20,
-        dtype=torch.float32,
-        device=topk_weights.device,
-    )
-    safe_weights = topk_weights.clamp_min(torch.finfo(torch.float32).tiny)
-    router_logits.scatter_(1, topk_ids.long(), safe_weights.log())
-    return router_logits
 
 
 @dataclass(frozen=True)
@@ -906,9 +887,24 @@ def _deepseek_v4_indexer_decode_schedule_metadata(
         if indexer_metadata is None
         else indexer_metadata.decode_schedule_metadata_cache
     )
+    refreshed_keys = (
+        None
+        if indexer_metadata is None
+        else indexer_metadata.decode_schedule_metadata_refreshed_keys
+    )
     schedule_metadata = (
         schedule_cache.get(schedule_key) if schedule_cache is not None else None
     )
+    # The attention backend refreshes cached schedule buffers once after the
+    # decode metadata changes.  Every indexer layer sees the same positions and
+    # geometry, so re-planning and copying the same schedule per layer only adds
+    # graph work without changing the result.
+    if (
+        schedule_metadata is not None
+        and refreshed_keys is not None
+        and schedule_key in refreshed_keys
+    ):
+        return schedule_metadata
 
     with nvtx_range("indexer_decode_schedule_metadata"):
         refreshed = dsv4_plan(
@@ -925,13 +921,19 @@ def _deepseek_v4_indexer_decode_schedule_metadata(
         ):
             with torch.inference_mode():
                 schedule_metadata.copy_(refreshed)
+            if refreshed_keys is not None:
+                refreshed_keys.add(schedule_key)
             return schedule_metadata
         if schedule_cache is not None:
             schedule_cache[schedule_key] = refreshed
+        if refreshed_keys is not None:
+            refreshed_keys.add(schedule_key)
         return refreshed
     schedule_metadata = refreshed
     if schedule_cache is not None:
         schedule_cache[schedule_key] = schedule_metadata
+    if refreshed_keys is not None:
+        refreshed_keys.add(schedule_key)
     return schedule_metadata
 
 
@@ -1241,7 +1243,7 @@ def _deepseek_v4_sparse_attn_indexer(
     *,
     indexer_metadata: DeepseekV4SparseIndexerMetadata,
     indexer_cache: torch.Tensor,
-    indexer_page_table: torch.Tensor,
+    indexer_block_table: torch.Tensor,
     indexer_block_size: int,
     compress_ratio: int,
     packed_q_values: torch.Tensor,
@@ -1280,14 +1282,14 @@ def _deepseek_v4_sparse_attn_indexer(
     if decode_block_table is None:
         decode_block_table = torch.empty(
             (0, 1),
-            dtype=indexer_page_table.dtype,
-            device=indexer_page_table.device,
+            dtype=indexer_block_table.dtype,
+            device=indexer_block_table.device,
         )
     return torch.ops.tokenspeed.deepseek_v4_sparse_attn_indexer(
         indexer_cache,
         positions,
         batch_metadata.token_to_req_indices,
-        indexer_page_table,
+        indexer_block_table,
         batch_metadata.seq_lens_cpu,
         batch_metadata.query_lens_cpu,
         prefill_metadata.chunk_specs,
@@ -1360,6 +1362,32 @@ class _DeepseekV4TopKBuffer:
         return self.buffer[:num_tokens]
 
 
+def _deepseek_v4_group_slot_mapping(
+    positions: torch.Tensor,
+    req_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    rows_per_block: int,
+    is_valid_token: torch.Tensor | None,
+) -> torch.Tensor:
+    if positions.is_cuda and block_table.is_cuda:
+        return dsv4_group_slot_mapping(
+            positions=positions,
+            req_indices=req_indices,
+            block_table=block_table,
+            rows_per_block=rows_per_block,
+            entry_stride_tokens=1,
+            base_offsets=None,
+            is_valid_token=is_valid_token,
+        )
+    mapping = _group_slot_mapping_from_raw(
+        positions,
+        req_indices,
+        block_table,
+        rows_per_block,
+    )
+    return _mask_invalid_graph_tokens(mapping, is_valid_token)
+
+
 def _deepseek_v4_sanitize_swa_slot_mapping(
     slot_mapping: torch.Tensor,
     capacity: int,
@@ -1402,6 +1430,9 @@ def _deepseek_v4_swa_slot_mapping(
         raise RuntimeError("DeepSeek V4 attention requires forward metadata")
     cache_metadata = metadata.cache
     token_to_req_indices = metadata.token_to_req_indices[: positions.numel()]
+    is_valid_token = getattr(metadata, "is_valid_token", None)
+    if is_valid_token is not None:
+        is_valid_token = is_valid_token[: positions.numel()]
     if cache_metadata.swa_page_table is None or (
         token_to_req_indices.numel() != positions.numel()
         and (
@@ -1413,15 +1444,13 @@ def _deepseek_v4_swa_slot_mapping(
             (positions.numel(),), -1, dtype=torch.int64, device=positions.device
         )
     else:
-        slot_mapping = _group_slot_mapping_from_raw(
+        slot_mapping = _deepseek_v4_group_slot_mapping(
             positions,
             token_to_req_indices,
             cache_metadata.swa_page_table,
             ctx.token_to_kv_pool.swa_block_size,
+            is_valid_token,
         )
-    is_valid_token = getattr(metadata, "is_valid_token", None)
-    if is_valid_token is not None:
-        is_valid_token = is_valid_token[: positions.numel()]
     # Attribute access is deliberately unguarded: a pool without
     # swa_capacity_slots must fail fast here rather than skip the bounds
     # check that protects the fused cache-insert kernels.
@@ -1529,73 +1558,6 @@ class DeepseekV4MLP(nn.Module):
         return out
 
 
-def dsv4_select_experts(
-    router_logits: torch.Tensor,
-    top_k: int,
-    renormalize: bool,
-    correction_bias: torch.Tensor | None = None,
-    hash_indices_table: torch.Tensor | None = None,
-    input_ids: torch.Tensor | None = None,
-    need_scores: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Use an accelerator router when available, otherwise run eager routing."""
-    try:
-        return _kernel_dsv4_select_experts(
-            router_logits,
-            top_k,
-            renormalize,
-            correction_bias,
-            hash_indices_table,
-            input_ids,
-            need_scores,
-        )
-    except (NoKernelFoundError, AttributeError, RuntimeError):
-        pass
-
-    scores = torch.sqrt(F.softplus(router_logits.float()))
-    if hash_indices_table is not None:
-        if input_ids is None:
-            raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
-        table = hash_indices_table.to(device=scores.device, dtype=torch.int64)
-        ids = input_ids.reshape(-1).to(device=scores.device, dtype=torch.int64)
-        topk_ids = table[ids]
-    else:
-        scores_for_choice = scores
-        if correction_bias is not None:
-            scores_for_choice = scores_for_choice + correction_bias.to(
-                device=scores.device,
-                dtype=scores.dtype,
-            ).unsqueeze(0)
-        topk_ids = torch.topk(
-            scores_for_choice,
-            k=top_k,
-            dim=-1,
-            sorted=True,
-        ).indices
-
-    topk_weights = scores.gather(1, topk_ids.long())
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(
-            dim=-1,
-            keepdim=True,
-        ).clamp_min(torch.finfo(topk_weights.dtype).tiny)
-    return topk_weights.to(torch.float32), topk_ids.to(torch.int32), scores
-
-
-def dsv4_linear_fp32(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-) -> torch.Tensor:
-    """Use the registered accelerator projection or an eager FP32 fallback."""
-    try:
-        return _kernel_dsv4_linear_fp32(
-            hidden_states,
-            weight,
-        )
-    except NoKernelFoundError:
-        return F.linear(hidden_states.float(), weight.float())
-
-
 class DeepseekV4MoEGate(nn.Module):
     def __init__(
         self,
@@ -1635,158 +1597,48 @@ class DeepseekV4MoEGate(nn.Module):
         )
 
 
-class DeepseekV4MegaMoEExperts(nn.Module):
+class DeepseekV4TopK(TopK):
     def __init__(
         self,
-        *,
-        num_experts: int,
-        num_local_experts: int,
         top_k: int,
-        hidden_size: int,
-        intermediate_size: int,
-        mapping: Mapping,
-        prefix: str,
-        swiglu_limit: float | None,
+        renormalize: bool,
+        correction_bias: torch.Tensor | None,
+        routed_scaling_factor: float,
+        hash_routing: bool,
     ) -> None:
-        super().__init__()
-        self.prefix = prefix
-        self.num_experts = num_experts
-        self.num_local_experts = num_local_experts
-        self.top_k = top_k
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.max_num_tokens = _deepseek_v4_mega_moe_max_num_tokens()
-        process_group = (
-            None
-            if mapping is None
-            else pg_manager.get_device_process_group(mapping.moe.tp_ep_group)
-        )
-        self._plan = dsv4_mega_moe_plan(
-            num_experts=num_experts,
-            num_local_experts=num_local_experts,
+        super().__init__(
             top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            max_num_tokens=self.max_num_tokens,
-            process_group=process_group,
-            activation_clamp=swiglu_limit,
+            renormalize=renormalize,
+            correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
-        self._processed_state: object | None = None
-
-        weight_attrs = {"weight_loader": self.weight_loader}
-        self.w13_weight = nn.Parameter(
-            torch.zeros(
-                num_local_experts,
-                2 * intermediate_size,
-                hidden_size // 2,
-                dtype=torch.uint8,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(self.w13_weight, weight_attrs)
-
-        self.w13_weight_scale = nn.Parameter(
-            torch.zeros(
-                num_local_experts,
-                2 * intermediate_size,
-                hidden_size // DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
-                dtype=torch.uint8,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(self.w13_weight_scale, weight_attrs)
-
-        self.w2_weight = nn.Parameter(
-            torch.zeros(
-                num_local_experts,
-                hidden_size,
-                intermediate_size // 2,
-                dtype=torch.uint8,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(self.w2_weight, weight_attrs)
-
-        self.w2_weight_scale = nn.Parameter(
-            torch.zeros(
-                num_local_experts,
-                hidden_size,
-                intermediate_size // DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
-                dtype=torch.uint8,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(self.w2_weight_scale, weight_attrs)
-
-    def weight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        shard_id: str,
-        local_expert_id: int,
-    ) -> None:
-        expert_data = param.data[local_expert_id]
-        if shard_id in ("w1", "w3"):
-            if param is not self.w13_weight and param is not self.w13_weight_scale:
-                raise ValueError(f"Unexpected MegaMoE w13 shard target: {shard_id}")
-            shard_offset = 0 if shard_id == "w1" else self.intermediate_size
-            expert_data = expert_data.narrow(0, shard_offset, self.intermediate_size)
-        elif shard_id == "w2":
-            if param is not self.w2_weight and param is not self.w2_weight_scale:
-                raise ValueError(f"Unexpected MegaMoE w2 shard target: {shard_id}")
-        else:
-            raise ValueError(f"Unsupported DeepSeek V4 MegaMoE shard id: {shard_id}")
-
-        if expert_data.dtype == torch.uint8 and loaded_weight.dtype == getattr(
-            torch, "float8_e8m0fnu", None
-        ):
-            loaded_weight = loaded_weight.view(torch.uint8)
-        if expert_data.shape != loaded_weight.shape:
-            raise ValueError(
-                f"DeepSeek V4 MegaMoE expert weight shape mismatch for "
-                f"{self.prefix}: parameter shard {tuple(expert_data.shape)} "
-                f"vs checkpoint {tuple(loaded_weight.shape)}"
-            )
-        expert_data.copy_(loaded_weight)
-
-    def finalize_weights(self) -> None:
-        if self._processed_state is not None:
-            return
-        self._processed_state = dsv4_mega_moe_process_weights(
-            self._plan,
-            self.w13_weight.data,
-            self.w13_weight_scale.data,
-            self.w2_weight.data,
-            self.w2_weight_scale.data,
-        )
-
-        del self.w13_weight
-        del self.w13_weight_scale
-        del self.w2_weight
-        del self.w2_weight_scale
-
-    def warmup(self) -> None:
-        if self._processed_state is not None:
-            dsv4_mega_moe_warmup(self._plan, self._processed_state)
+        self.hash_routing = hash_routing
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        if self._processed_state is None:
-            raise RuntimeError(
-                "DeepseekV4MegaMoEExperts.finalize_weights() must run via "
-                "post_load_weights() before forward()"
-            )
-        return dsv4_mega_moe_apply(
-            self._plan,
-            self._processed_state,
-            hidden_states,
-            topk_weights,
-            topk_ids,
+        router_logits: torch.Tensor,
+        routing_correction_bias: torch.Tensor | None = None,
+        hash_indices_table: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
+    ) -> TopKOutput:
+        correction_bias = (
+            self.topk_config.correction_bias
+            if routing_correction_bias is None
+            else routing_correction_bias
         )
+        topk_weights, topk_ids = moe_topk(
+            router_logits,
+            self.topk_config.top_k,
+            "sqrt_softplus",
+            "hash" if self.hash_routing else "topk",
+            self.topk_config.renormalize,
+            self.topk_config.routed_scaling_factor,
+            correction_bias=correction_bias,
+            hash_indices_table=hash_indices_table,
+            input_ids=input_ids,
+        )
+        return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 
 def _deepseek_v4_routed_expert_quant_config(
@@ -1841,9 +1693,13 @@ class DeepseekV4MoE(nn.Module):
             raise ValueError(
                 f"Unsupported DeepSeek V4 MoE scoring: {self.scoring_func}"
             )
-        self.stream_fork = StreamFork(aux_stream)
-
-        self.use_mega_moe = get_moe_backend().is_mega_moe()
+        moe_backend = get_moe_backend()
+        self.use_mega_moe = moe_backend.is_mega_moe()
+        self.use_gluon_petit = moe_backend.is_gluon_petit()
+        self.owns_ep_communication = self.use_mega_moe or self.use_gluon_petit
+        # Petit's VMM-backed collective and auxiliary-stream shared experts do
+        # not replay safely together. Keep both branches on the main stream.
+        self.stream_fork = StreamFork(None if self.use_gluon_petit else aux_stream)
         if mapping.moe.ep_size > 1:
             if global_server_args_dict.get("enable_eplb", False):
                 raise ValueError(
@@ -1886,7 +1742,7 @@ class DeepseekV4MoE(nn.Module):
                 raise ValueError(
                     "DeepSeek V4 normal EP requires hidden_size divisible by 256."
                 )
-        self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
+        self.hash_indices_dtype = torch.int32
         self.gate = DeepseekV4MoEGate(
             config,
             layer_index,
@@ -1904,94 +1760,118 @@ class DeepseekV4MoE(nn.Module):
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 reduce_results=False,
                 # Normal EP sums routed and shared partials over the same TPxEP
-                # group. MegaMoE retains its existing dense placement and
-                # CommManager-owned shared-expert communication.
-                is_shared_expert=not self.use_mega_moe,
+                # group. Fused MegaMoE paths return complete routed outputs and
+                # therefore keep the shared expert dense and local.
+                is_shared_expert=not (self.use_mega_moe or self.use_gluon_petit),
             )
         else:
             self.shared_experts = None
 
-        if self.use_mega_moe:
-            self.experts = DeepseekV4MegaMoEExperts(
-                num_experts=config.n_routed_experts,
-                num_local_experts=config.n_routed_experts // mapping.moe.ep_size,
-                top_k=config.num_experts_per_tok,
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size,
-                mapping=mapping,
-                prefix=add_prefix("experts", prefix),
-                swiglu_limit=getattr(config, "swiglu_limit", None),
+        if self.use_mega_moe and global_server_args_dict["moe_mxfp4_fp8_activation"]:
+            raise ValueError(
+                "--moe-mxfp4-fp8-activation selects the FlashInfer cutlass W4A8 "
+                "MoE; it does not apply to MegaMoE"
             )
-            self.topk = None
-        else:
-            routed_quant_config, _ = _deepseek_v4_routed_expert_quant_config(
-                config, quant_config
-            )
-            self.experts = MoELayer(
-                top_k=config.num_experts_per_tok,
-                num_experts=config.n_routed_experts
-                + global_server_args_dict["ep_num_redundant_experts"],
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size,
-                quant_config=routed_quant_config,
-                layer_index=layer_index,
-                prefix=prefix,
-                tp_rank=mapping.moe.tp_rank,
-                tp_size=mapping.moe.tp_size,
-                ep_rank=mapping.moe.ep_rank,
-                ep_size=mapping.moe.ep_size,
-                activation="swiglu",
-                swiglu_limit=getattr(config, "swiglu_limit", None),
-                with_bias=False,
-                routing_mode="precomputed_topk",
-                routing_config={
-                    "routed_scaling_factor": self.routed_scaling_factor,
-                    "normalize_topk_weights": config.norm_topk_prob,
-                    "correction_bias": self.gate.e_score_correction_bias,
-                    "routing_method_type": RoutingMethodType.Renormalize,
-                },
-            )
-            self.topk = TopK(
-                top_k=config.num_experts_per_tok,
-                renormalize=config.norm_topk_prob,
-                correction_bias=self.gate.e_score_correction_bias,
-                routed_scaling_factor=self.routed_scaling_factor,
-                output_format=self.experts.topk_output_format,
-            )
+        routed_quant_config, _ = _deepseek_v4_routed_expert_quant_config(
+            config, quant_config
+        )
+        self.experts = MoELayer(
+            top_k=config.num_experts_per_tok,
+            num_experts=config.n_routed_experts,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            quant_config=routed_quant_config,
+            layer_index=layer_index,
+            prefix=prefix,
+            tp_rank=mapping.moe.tp_rank,
+            tp_size=mapping.moe.tp_size,
+            ep_rank=mapping.moe.ep_rank,
+            ep_size=mapping.moe.ep_size,
+            activation="swiglu",
+            swiglu_limit=getattr(config, "swiglu_limit", None),
+            with_bias=False,
+            routing_mode="precomputed_topk",
+            routing_config={
+                "routed_scaling_factor": 1.0,
+                "normalize_topk_weights": config.norm_topk_prob,
+                "correction_bias": self.gate.e_score_correction_bias,
+                "routing_method_type": RoutingMethodType.Renormalize,
+            },
+            persistent_max_num_tokens_per_gpu=(
+                _deepseek_v4_mega_moe_max_num_tokens() if self.use_mega_moe else None
+            ),
+        )
+        self.topk = DeepseekV4TopK(
+            top_k=config.num_experts_per_tok,
+            renormalize=self._renormalize_routing_weights(),
+            correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+            hash_routing=self.gate.tid2eid is not None,
+        )
 
-    def _select_experts(
+    def warmup(self) -> None:
+        warmup = self.experts.plan.get("warmup")
+        if warmup is not None:
+            if not self.experts._weights_processed:
+                raise RuntimeError("MoE weights must be processed before warmup")
+            warmup(self.experts.plan, self.experts)
+
+    def _routing_inputs(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        router_logits = self.gate(hidden_states)
-        fmt = getattr(self.experts, "topk_output_format", None)
-        need_scores = fmt is not None and not fmt.is_bypassed()
-        return dsv4_select_experts(
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        if hidden_states.shape[0] == 0:
+            router_logits = hidden_states.new_empty(
+                (0, self.config.n_routed_experts), dtype=torch.float32
+            )
+        else:
+            router_logits = self.gate(hidden_states)
+        hash_indices_table = self.gate.tid2eid
+        return (
             router_logits,
-            self.config.num_experts_per_tok,
-            self.config.norm_topk_prob,
-            correction_bias=self.gate.e_score_correction_bias,
-            hash_indices_table=self.gate.tid2eid,
-            input_ids=input_ids,
-            need_scores=need_scores,
+            self.gate.e_score_correction_bias,
+            hash_indices_table,
+            input_ids if hash_indices_table is not None else None,
         )
 
-    def _make_topk_output(
+    def _renormalize_routing_weights(self) -> bool:
+        return self.config.norm_topk_prob
+
+    def _compute_topk_output(
         self,
         hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        router_scores: torch.Tensor,
-    ):
-        if self.experts.topk_output_format.is_bypassed():
-            router_logits = pack_topk_as_router_logits(
-                topk_weights, topk_ids, self.config.n_routed_experts
-            )
-            return BypassedTopKOutput(
-                hidden_states, router_logits, self.topk.topk_config
-            )
-        return StandardTopKOutput(topk_weights, topk_ids, router_scores)
+        input_ids: torch.Tensor | None,
+    ) -> TopKOutput:
+        router_logits, correction_bias, hash_indices_table, routing_input_ids = (
+            self._routing_inputs(hidden_states, input_ids)
+        )
+        return self.topk(
+            hidden_states,
+            router_logits,
+            routing_correction_bias=correction_bias,
+            hash_indices_table=hash_indices_table,
+            input_ids=routing_input_ids,
+        )
+
+    def _forward_routed_experts(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+    ) -> torch.Tensor:
+        return self.experts(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+            num_global_tokens=num_global_tokens,
+            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+        )
 
     def _forward_shared_experts(
         self,
@@ -2015,33 +1895,21 @@ class DeepseekV4MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
         ctx: ForwardContext,
         comm_manager: CommManager,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
-            topk_weights = hidden_states.new_empty(
-                (0, self.config.num_experts_per_tok), dtype=torch.float32
-            )
-            topk_ids = torch.empty(
-                (0, self.config.num_experts_per_tok),
-                device=hidden_states.device,
-                dtype=torch.int64,
-            )
-        else:
-            with nvtx_range("moe_select_experts"):
-                topk_weights, topk_ids, _ = self._select_experts(
-                    hidden_states, input_ids
-                )
-
+        with nvtx_range("moe_select_experts"):
+            topk_output = self._compute_topk_output(hidden_states, input_ids)
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with nvtx_range("moe_mega_experts"):
-                if self.routed_scaling_factor != 1.0:
-                    topk_weights = topk_weights * self.routed_scaling_factor
-                routed = self.experts(
+                routed = self._forward_routed_experts(
                     hidden_states,
-                    topk_weights,
-                    topk_ids,
+                    topk_output,
+                    num_global_tokens,
+                    max_num_tokens_per_gpu,
                 )
             with fork.branch():
                 shared = self._forward_shared_experts(
@@ -2058,27 +1926,19 @@ class DeepseekV4MoE(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
+        if hidden_states.shape[0] == 0 and not self.use_gluon_petit:
             return hidden_states
         with nvtx_range("moe_select_experts"):
-            topk_weights, topk_ids, router_scores = self._select_experts(
-                hidden_states, input_ids
-            )
-        with nvtx_range("moe_make_topk_output"):
-            topk_output = self._make_topk_output(
-                hidden_states, topk_weights, topk_ids, router_scores
-            )
+            topk_output = self._compute_topk_output(hidden_states, input_ids)
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with nvtx_range("moe_experts"):
-                routed = self.experts(
-                    hidden_states=hidden_states,
-                    topk_output=topk_output,
-                    num_global_tokens=num_global_tokens,
-                    max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                routed = self._forward_routed_experts(
+                    hidden_states,
+                    topk_output,
+                    num_global_tokens,
+                    max_num_tokens_per_gpu,
                 )
-                if self.routed_scaling_factor != 1.0:
-                    routed *= self.routed_scaling_factor
             with fork.branch():
                 shared = self._forward_shared_experts(hidden_states)
         return routed + shared if shared is not None else routed
@@ -2096,6 +1956,8 @@ class DeepseekV4MoE(nn.Module):
             return self.forward_mega_moe(
                 hidden_states,
                 input_ids,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
                 ctx,
                 comm_manager,
             )
@@ -2225,14 +2087,15 @@ class DeepseekV4Compressor(nn.Module):
                         "DeepSeek V4 missing cache-group block table for compressor "
                         f"state ratio={self.compress_ratio}"
                     )
-                mapping = _group_slot_mapping_from_raw(
+                mapping = _deepseek_v4_group_slot_mapping(
                     positions,
                     metadata.token_to_req_indices[: positions.numel()],
                     resolved_state_block_table,
                     state_block_size,
+                    valid_token,
                 )
                 return (
-                    _mask_invalid_graph_tokens(mapping, valid_token),
+                    mapping,
                     resolved_state_block_table,
                 )
 
@@ -2258,9 +2121,9 @@ class DeepseekV4Compressor(nn.Module):
 
         kv_cache_block_size = pool.get_compressed_block_size(layer_index)
 
-        def resolve_compressed_slots() -> torch.Tensor:
+        def resolve_compressed_slots() -> tuple[torch.Tensor, torch.Tensor]:
             with nvtx_range(f"{profile_prefix}_compressed_slot_mapping"):
-                return cache_metadata.compressed_slot_mapping(
+                slots = cache_metadata.compressed_slot_mapping(
                     positions,
                     self.compress_ratio,
                     token_to_req_indices=metadata.token_to_req_indices[
@@ -2268,6 +2131,7 @@ class DeepseekV4Compressor(nn.Module):
                     ],
                     query_start_loc=metadata.query_start_loc,
                     seq_lens=metadata.seq_lens,
+                    indexer=False,
                     kv_cache_block_size=kv_cache_block_size,
                     use_decode_cache=(
                         ctx.forward_mode is not None and ctx.forward_mode.is_decode()
@@ -2275,12 +2139,16 @@ class DeepseekV4Compressor(nn.Module):
                     is_valid_token=valid_token,
                 )
 
+            return cache_metadata.local_compressed_write_slots(
+                slots, self.compress_ratio
+            )
+
         if memo is not None:
-            compressed_slots = memo.get_or_compute(
+            compressed_slots, compressed_write_mask = memo.get_or_compute(
                 ("compressed", self.compress_ratio), resolve_compressed_slots
             )
         else:
-            compressed_slots = resolve_compressed_slots()
+            compressed_slots, compressed_write_mask = resolve_compressed_slots()
         with nvtx_range(f"{profile_prefix}_cache_insert"):
             insert = (
                 deepseek_v4_csa_compress_kv_cache_insert
@@ -2299,6 +2167,7 @@ class DeepseekV4Compressor(nn.Module):
                 cos_sin_cache=cos_sin_cache,
                 kv_cache_2d=pool.get_compressed_kv_buffer_2d(layer_index),
                 kv_slot_mapping=compressed_slots,
+                kv_write_mask=compressed_write_mask,
                 kv_cache_block_size=kv_cache_block_size,
                 compress_ratio=self.compress_ratio,
             )
@@ -2424,11 +2293,11 @@ class DeepseekV4Indexer(nn.Module):
             if getattr(metadata, "is_valid_token", None) is not None
             else None
         )
-        indexer_page_table = metadata.cache.compressed_page_table(self.compress_ratio)
+        indexer_block_table = metadata.cache.indexer_block_table()
         decode_plan = _deepseek_v4_indexer_decode_plan(
             positions=decode_positions,
             token_to_req_indices=metadata.token_to_req_indices[decode_start:decode_end],
-            block_table=indexer_page_table,
+            block_table=indexer_block_table,
             cache_block_size=indexer_block_size,
             compress_ratio=self.compress_ratio,
             metadata=metadata,
@@ -2475,10 +2344,12 @@ class DeepseekV4Indexer(nn.Module):
                 row_ends,
                 topk=self.topk_tokens,
                 softmax_scale=self.softmax_scale,
+                batch_invariant=False,
                 index_k_cache=indexer_cache,
                 page_size=indexer_block_size,
                 max_logits_bytes=max_logits_mb * 1024 * 1024,
                 out=topk_out[token_slice],
+                slot_order=global_server_args_dict["dsa_slot_order"],
             )
             selected_i64 = selected.to(torch.int64)
             row_starts_i64 = row_starts.to(torch.int64)
@@ -2508,11 +2379,65 @@ class DeepseekV4Indexer(nn.Module):
             page_size=indexer_block_size,
             topk=self.topk_tokens,
             softmax_scale=self.softmax_scale,
+            batch_invariant=False,
             index_k_cache=indexer_cache,
             topk_layout="logical_offsets",
             out=topk_out[decode_slice],
+            slot_order=global_server_args_dict["dsa_slot_order"],
         )
         return topk_out
+
+    def _forward_sharded_indexer(
+        self,
+        packed_q: tuple[torch.Tensor, torch.Tensor],
+        weights: torch.Tensor,
+        indexer_cache: torch.Tensor,
+        page_size: int,
+        positions: torch.Tensor,
+        metadata: DeepseekV4ForwardMetadata,
+        group: tuple[int, ...],
+    ) -> torch.Tensor:
+        table = metadata.cache.indexer_page_table()
+        requests = metadata.token_to_req_indices[: positions.numel()]
+        lengths = ((positions + 1) // self.compress_ratio).to(torch.int32)
+        if metadata.is_valid_token is not None:
+            lengths = torch.where(
+                metadata.is_valid_token[: positions.numel()], lengths, 0
+            )
+        tile = max(
+            1,
+            _deepseek_v4_indexer_prefill_max_logits_bytes(None)
+            // (table.shape[1] * page_size * 4),
+        )
+        output = (
+            self.topk_buffer.get(positions.numel(), positions.device)
+            if self.topk_buffer is not None
+            else torch.empty(
+                (positions.numel(), self.topk_tokens),
+                device=positions.device,
+                dtype=torch.int32,
+            )
+        )
+        for start in range(0, positions.numel(), tile):
+            end = min(positions.numel(), start + tile)
+            offsets, scores = dsv4_index_candidates(
+                (packed_q[0][start:end], packed_q[1][start:end]),
+                weights[start:end],
+                indexer_cache,
+                table,
+                requests[start:end],
+                lengths[start:end],
+                page_size=page_size,
+                topk=self.topk_tokens,
+                softmax_scale=self.softmax_scale,
+                index_k_format="mxfp4" if self.use_fp4_cache else "fp8_scaled",
+                solution=None,
+            )
+            indices, _ = merge_index_candidates(
+                offsets, scores, topk=self.topk_tokens, group=group
+            )
+            output[start:end].copy_(indices)
+        return output[: positions.numel()]
 
     def _forward_sparse_indexer_custom_op(
         self,
@@ -2569,6 +2494,17 @@ class DeepseekV4Indexer(nn.Module):
                     head_scale=self.n_head**-0.5,
                 )
 
+        if metadata.cache.dcp_size > 1:
+            return self._forward_sharded_indexer(
+                packed_index_q,
+                packed_weights,
+                indexer_cache,
+                indexer_block_size,
+                positions,
+                metadata,
+                tuple(ctx.attn_backend.dcp_group),
+            )
+
         empty_cpu = torch.empty(0, dtype=torch.int32, device="cpu")
         seq_lens_cpu = (
             metadata.seq_lens_cpu[: metadata.num_prefill_reqs]
@@ -2580,10 +2516,10 @@ class DeepseekV4Indexer(nn.Module):
             if metadata.query_lens_cpu is not None and num_prefill_tokens > 0
             else empty_cpu
         )
-        indexer_page_table = metadata.cache.compressed_page_table(self.compress_ratio)
+        indexer_block_table = metadata.cache.indexer_block_table()
         prefill_metadata = _deepseek_v4_indexer_prefill_metadata(
             metadata=metadata,
-            block_table=indexer_page_table,
+            block_table=indexer_block_table,
             cache_block_size=indexer_block_size,
             compress_ratio=self.compress_ratio,
             num_prefill_tokens=num_prefill_tokens,
@@ -2605,7 +2541,7 @@ class DeepseekV4Indexer(nn.Module):
                 token_to_req_indices=metadata.token_to_req_indices[
                     decode_start:decode_end
                 ],
-                block_table=indexer_page_table,
+                block_table=indexer_block_table,
                 cache_block_size=indexer_block_size,
                 compress_ratio=self.compress_ratio,
                 metadata=metadata,
@@ -2663,7 +2599,7 @@ class DeepseekV4Indexer(nn.Module):
         return _deepseek_v4_sparse_attn_indexer(
             indexer_metadata=indexer_metadata,
             indexer_cache=indexer_cache,
-            indexer_page_table=indexer_page_table,
+            indexer_block_table=indexer_block_table,
             indexer_block_size=indexer_block_size,
             compress_ratio=self.compress_ratio,
             packed_q_values=packed_index_q[0],
@@ -2708,14 +2644,15 @@ class DeepseekV4Indexer(nn.Module):
                     "compressor state"
                 )
             block_size = pool.get_indexer_state_block_size(layer_index)
-            mapping = _group_slot_mapping_from_raw(
+            mapping = _deepseek_v4_group_slot_mapping(
                 positions,
                 metadata.token_to_req_indices[: positions.numel()],
                 block_table,
                 block_size,
+                valid_token,
             )
             return (
-                _mask_invalid_graph_tokens(mapping, valid_token),
+                mapping,
                 block_table,
                 block_size,
             )
@@ -2764,6 +2701,11 @@ class DeepseekV4Indexer(nn.Module):
                     ctx.forward_mode is not None and ctx.forward_mode.is_decode()
                 ),
                 is_valid_token=valid_token,
+                indexer=True,
+            )
+        if cache_metadata.dcp_size > 1:
+            compressed_slots = cache_metadata.local_indexer_write_slots(
+                compressed_slots, indexer_block_size
             )
         with nvtx_range("indexer_cache_insert"):
             deepseek_v4_csa_indexer_cache_insert(
@@ -2999,6 +2941,7 @@ class DeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         block_size: int,
+        validate_positions: bool,
     ) -> None:
         # slot_mapping arrives pre-sanitized from _deepseek_v4_swa_slot_mapping
         # (invalid tokens and out-of-capacity slots masked to -1); sanitizing
@@ -3014,6 +2957,7 @@ class DeepseekV4Attention(nn.Module):
             cos_sin_cache=cos_sin_cache,
             rms_norm_eps=self.q_norm.variance_epsilon,
             block_size=block_size,
+            validate_positions=validate_positions,
         )
 
     def _project_attention_output(
@@ -3079,6 +3023,14 @@ class DeepseekV4Attention(nn.Module):
                 hidden_states,
             )
 
+        # Every layer sees the same position values.  Keep the public kernel
+        # check enabled, but execute its five comparison/reduction/assert
+        # launches only once per distinct RoPE-cache capacity in this forward.
+        position_capacity = int(cos_sin_cache.shape[0])
+        validate_positions = slot_mappings.first_use(
+            ("position_capacity", position_capacity)
+        )
+
         # --- Phase 1: pre-compute input GEMMs in parallel ---
         # Q/KV projection on main stream; compressor GEMM(s) on aux stream.
         # After this phase, each compressor's forward() receives its
@@ -3118,6 +3070,7 @@ class DeepseekV4Attention(nn.Module):
                     positions=positions,
                     cos_sin_cache=cos_sin_cache,
                     block_size=pool.swa_block_size,
+                    validate_positions=validate_positions,
                 )
 
         def run_compressor() -> None:
@@ -3287,6 +3240,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             layer_id=layer_id,
             is_moe=True,
             prev_is_moe=True,
+            dense_batch_invariant=False,
+            query_sharded=False,
         )
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -3312,6 +3267,8 @@ class DeepseekV4DecoderLayer(nn.Module):
     def _pre_mlp_input_ids_comm(
         self, input_ids: torch.Tensor, ctx: ForwardContext
     ) -> torch.Tensor:
+        if get_all2all_backend().is_gluon_petit():
+            return input_ids
         if not self.mapping.moe.has_tp_ep:
             return input_ids
         if self.comm_manager.use_all_reduce(is_moe=True):
@@ -3356,6 +3313,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.rms_norm_eps,
                     self.hc_eps,
                     self.hc_sinkhorn_iters,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
                 )
         else:
             residual = hidden_states
@@ -3368,9 +3327,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.rms_norm_eps,
                     self.hc_eps,
                     self.hc_sinkhorn_iters,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
                 )
-        with nvtx_range("attn_norm"):
-            hidden_states = self.attn_norm(hidden_states)
 
         with nvtx_range("attn_total"):
             hidden_states = self.attn(positions, hidden_states, ctx)
@@ -3387,13 +3346,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.rms_norm_eps,
                 self.hc_eps,
                 self.hc_sinkhorn_iters,
+                norm_weight=self.ffn_norm.weight,
+                norm_eps=self.ffn_norm.variance_epsilon,
             )
-        with nvtx_range("ffn_norm"):
-            hidden_states = self.ffn_norm(hidden_states)
 
         ffn_input_ids = input_ids
         use_mega_moe = getattr(self.ffn, "use_mega_moe", False)
-        if use_mega_moe:
+        owns_ep_communication = getattr(self.ffn, "owns_ep_communication", False)
+        if owns_ep_communication:
             token_counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
             num_global_tokens = sum(token_counts)
             max_num_tokens_per_gpu = max(token_counts) if token_counts else 0
@@ -3417,7 +3377,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 ctx=ctx if use_mega_moe else None,
                 comm_manager=self.comm_manager if use_mega_moe else None,
             )
-        if not use_mega_moe:
+        if not owns_ep_communication:
             with nvtx_range("post_mlp_comm"):
                 hidden_states, _ = self.comm_manager.post_mlp_comm(
                     hidden_states, None, ctx
@@ -3654,6 +3614,18 @@ class DeepseekV4Model(nn.Module):
 class DeepseekV4ForCausalLM(BaseCausalLM):
     model_cls = DeepseekV4Model
 
+    def resolve_lm_head(
+        self,
+        config: PretrainedConfig,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> nn.Module:
+        # V4 checkpoints store the LM head as BF16 without FP8 scales even when
+        # the rest of the model declares serialized FP8 quantization.
+        if self.mapping.attn.has_dp and isinstance(quant_config, Fp8Config):
+            quant_config = None
+        return super().resolve_lm_head(config, quant_config, prefix)
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         self.capture_aux_hidden_states = True
         self.model.set_dspark_layers_to_capture(layer_ids)
@@ -3785,8 +3757,6 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         for module in self.modules():
             if isinstance(module, DeepseekV4Compressor):
                 module.process_weights_after_loading()
-            elif isinstance(module, DeepseekV4MegaMoEExperts):
-                module.finalize_weights()
             elif isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
 
@@ -3795,7 +3765,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         gc.collect()
         torch.cuda.empty_cache()
         for module in self.modules():
-            if isinstance(module, DeepseekV4MegaMoEExperts):
+            if isinstance(module, DeepseekV4MoE):
                 module.warmup()
         config = self.config
         tp_size = self.mapping.attn.tp_size if self.mapping else 1

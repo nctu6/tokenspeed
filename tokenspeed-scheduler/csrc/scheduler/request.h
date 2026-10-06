@@ -22,6 +22,7 @@
 
 #include <concepts>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -99,6 +100,12 @@ public:
         return std::max(0, max_new_tokens_ - (PrefillSize() - submitted_prompt_size_));
     }
 
+    // Longest prompt prefix the admission probe may claim from the prefix
+    // cache (RequestSpec::max_cached_prefix_tokens); INT32_MAX means
+    // unbounded. A readmission after retraction relaxes it to the positions
+    // whose results had landed before (fsm::Retracted::LandedTokens).
+    std::int32_t MaxCachedPrefixTokens() const { return max_cached_prefix_tokens_; }
+
     template <typename Event>
     void Apply(Event&& event) {
         state_ = std::visit(
@@ -111,9 +118,24 @@ public:
         return std::holds_alternative<State>(state_);
     }
 
+    template <typename... States>
+    bool IsAnyOf() const {
+        return (std::holds_alternative<States>(state_) || ...);
+    }
+
     template <typename State>
     const State* GetIf() const {
         return std::get_if<State>(&state_);
+    }
+
+    // True in every state that carries ForwardResources; Bootstrapping,
+    // Submitted, Retracted and Finished hold no pages.
+    bool HoldsPages() const {
+        return std::visit(Overloaded{
+                              [](const fsm::HoldsForwardResources auto&) { return true; },
+                              [](const auto&) { return false; },
+                          },
+                          state_);
     }
 
     // Forwards scheduled for this request whose results have not come back.
@@ -121,7 +143,7 @@ public:
     // (Submitted, Retracted, Finished) owe nothing by construction.
     std::int32_t ResultsInFlight() const {
         return std::visit(Overloaded{
-                              [](const std::derived_from<fsm::ForwardState> auto& s) { return s.ResultsInFlight(); },
+                              [](const fsm::HoldsForwardResources auto& s) { return s.resources.results_in_flight; },
                               [](const auto&) { return 0; },
                           },
                           state_);
@@ -129,7 +151,7 @@ public:
 
     void TrackScheduledForward() {
         std::visit(Overloaded{
-                       [](std::derived_from<fsm::ForwardState> auto& s) { s.TrackScheduledForward(); },
+                       [](fsm::HoldsForwardResources auto& s) { s.resources.TrackScheduledForward(); },
                        [](auto&) {},
                    },
                    state_);
@@ -137,7 +159,7 @@ public:
 
     void NoteResultLanded() {
         std::visit(Overloaded{
-                       [](std::derived_from<fsm::ForwardState> auto& s) { s.ResultLanded(); },
+                       [](fsm::HoldsForwardResources auto& s) { s.resources.ResultLanded(); },
                        [](auto&) {},
                    },
                    state_);
@@ -155,6 +177,12 @@ public:
     std::vector<std::int32_t> TakeSpecCandidates() { return std::exchange(spec_candidate_ids_, {}); }
     std::int32_t PrefillSize() const { return token_container_.PrefillSize(); }
     PrefillInfo CurrentPrefillInfo() const;
+    // Tokens whose KV and state the ordered forward stream has written, or
+    // is writing, ahead of any later plan: the end of a scheduled prefill
+    // window, or -- once decoding -- every token but the last, which is the
+    // sampled input the next forward computes. Exact for any verify width;
+    // the frontier for prefix publication and retention.
+    std::int32_t NumComputedTokens() const;
 
     std::int32_t UnscheduledPrefillSize() const {
         return std::visit(Overloaded{
@@ -167,13 +195,17 @@ public:
                           state_);
     }
 
-    std::int32_t RequestPoolIndex() const { return forwardState("RequestPoolIndex").RequestPoolIndex(); }
+    std::int32_t RequestPoolIndex() const { return forwardResources("RequestPoolIndex").RequestPoolIndex(); }
 
-    const std::vector<BlockTable>& BlockTablesRef() const { return forwardState("BlockTablesRef").BlockTables(); }
+    const std::vector<BlockTable>& BlockTablesRef() const { return forwardResources("BlockTablesRef").block_tables; }
 
-    std::vector<BlockTable>& BlockTablesRef() { return forwardState("BlockTablesRef").BlockTables(); }
+    std::vector<BlockTable>& BlockTablesRef() { return forwardResources("BlockTablesRef").block_tables; }
 
-    fsm::CacheProgress CacheProgress() const { return forwardState("CacheProgress").CacheProgressRef(); }
+    fsm::CacheProgress CacheProgress() const { return forwardResources("CacheProgress").cache_progress; }
+    // Written by the scheduler when an admission succeeds, like the block
+    // tables the same admission fills: resources and progress land at
+    // admission time, and a state transition only moves them on.
+    fsm::CacheProgress& CacheProgressRef() { return forwardResources("CacheProgressRef").cache_progress; }
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {
         return std::visit(
@@ -206,13 +238,14 @@ public:
     }
 
 private:
-    fsm::ForwardState& forwardState(const char* operation);
-    const fsm::ForwardState& forwardState(const char* operation) const;
+    fsm::ForwardResources& forwardResources(const char* operation);
+    const fsm::ForwardResources& forwardResources(const char* operation) const;
 
     std::string id_;
     TokenContainer token_container_;
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};
+    std::int32_t max_cached_prefix_tokens_{std::numeric_limits<std::int32_t>::max()};
     std::int32_t retraction_count_{0};
     std::vector<std::int32_t> spec_candidate_ids_;
     std::int32_t prefix_granularity_{};

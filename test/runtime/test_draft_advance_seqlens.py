@@ -12,9 +12,12 @@ KV pool.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.paged.msa import (
     MSAAttnBackend,
@@ -72,6 +75,74 @@ def _seqlens_field(be, metadata):
 def _capture(be, bs, seq_lens):
     page_table = torch.zeros((bs, be.max_num_pages), dtype=torch.int32)
     be.init_forward_metadata_capture_cuda_graph(bs, seq_lens, page_table)
+
+
+def test_trtllm_mixed_prefill_metadata_uses_extend_rows():
+    be = _mha_backend(TRTLLMMHAAttnBackend)
+    be.init_cuda_graph_state(8)
+    seq_lens = torch.tensor([10, 20, 30], dtype=torch.int32)
+    extend_lens = torch.tensor([3, 5], dtype=torch.int32)
+    prefix_lens = torch.tensor([7, 15], dtype=torch.int32)
+    page_table = torch.arange(3 * MAX_NUM_PAGES, dtype=torch.int32).reshape(
+        3, MAX_NUM_PAGES
+    )
+
+    be.init_forward_metadata(
+        bs=3,
+        num_extends=2,
+        seq_lens=seq_lens,
+        page_table=page_table,
+        forward_mode=ForwardMode.MIXED,
+        extend_seq_lens=extend_lens,
+        extend_seq_lens_cpu=extend_lens,
+        extend_prefix_lens=prefix_lens,
+        extend_prefix_lens_cpu=prefix_lens,
+        extend_with_prefix=True,
+        query_shard=None,
+        page_table_cpu=None,
+    )
+
+    metadata = be.forward_prefill_metadata
+    assert metadata.cache_seqlens_int32.tolist() == [10, 20]
+    assert metadata.cu_seqlens_q.tolist() == [0, 3, 8]
+    assert metadata.cu_seqlens_k.tolist() == [0, 10, 30]
+    assert metadata.max_seq_len_q == 5
+    assert torch.equal(metadata.page_table, page_table[:2])
+
+    be.refresh_decode_metadata(3, 3, seq_lens, page_table, num_extends=2)
+    assert be.forward_prefill_metadata is metadata
+    assert torch.equal(be.forward_decode_metadata.cache_seqlens_int32, seq_lens)
+
+
+def test_trtllm_target_mixed_metadata_keeps_decode_rows():
+    cfg = replace(_cfg(), is_draft=False, speculative_num_draft_tokens=1)
+    be = TRTLLMMHAAttnBackend(
+        cfg, cfg.component(SoftmaxAttnConfig), kernel_page_size=64
+    )
+    # With no cached prefixes, the target context kernel handles the whole
+    # packed batch, including the final single-token decode request.
+    seq_lens = torch.tensor([3, 5, 1], dtype=torch.int32)
+    prefix_lens = torch.zeros(2, dtype=torch.int32)
+    page_table = torch.zeros((3, MAX_NUM_PAGES), dtype=torch.int32)
+    be.init_forward_metadata(
+        bs=3,
+        num_extends=2,
+        seq_lens=seq_lens,
+        page_table=page_table,
+        forward_mode=ForwardMode.MIXED,
+        extend_seq_lens=seq_lens[:2],
+        extend_seq_lens_cpu=seq_lens[:2],
+        extend_prefix_lens=prefix_lens,
+        extend_prefix_lens_cpu=prefix_lens,
+        extend_with_prefix=False,
+        query_shard=None,
+        page_table_cpu=None,
+    )
+
+    metadata = be.forward_prefill_metadata
+    assert metadata.cu_seqlens_q.tolist() == [0, 3, 8, 9]
+    assert torch.equal(metadata.cache_seqlens_int32, seq_lens)
+    assert torch.equal(metadata.page_table, page_table)
 
 
 @pytest.mark.parametrize("backend_cls", [MHAAttnBackend, TRTLLMMHAAttnBackend])
@@ -158,12 +229,19 @@ def test_msa_hybrid_fans_pool_binding_out_to_both_routers():
         def __init__(self):
             self.cache_pool = None
 
+        def validate_cache_pool(self, cache_pool):
+            del cache_pool
+
         def set_cache_pool(self, cache_pool):
             self.cache_pool = cache_pool
+
+        def _bind(self, cache_pool):
+            self.set_cache_pool(cache_pool)
 
     dense = ChildRouter()
     sparse = ChildRouter()
     backend = object.__new__(MSAHybridAttnBackend)
+    backend._init_pool_binding()
     backend.full_router = dense
     backend.sparse_router = sparse
     pool = object()
@@ -205,12 +283,16 @@ def test_router_fans_advance_out_to_every_leaf():
 
     leaf = _mha_backend()
     leaf.init_cuda_graph_state(8)
-    router = CacheGroupRouter(None, is_draft=True, spec_num_tokens=4, device="cpu")
+    router = CacheGroupRouter(
+        None, is_draft=True, spec_num_tokens=4, device="cpu", consumed_group_ids=None
+    )
     router.bind(
         CacheGroupGeometry(
             granularities={"full_attention": 64},
             families={"full_attention": "history"},
             full_history_group_id="full_attention",
+            row_geometry={"full_attention": (64, 1)},
+            retentions={"full_attention": ("full_history", None)},
         ),
         {"full_attention": leaf},
     )
@@ -235,6 +317,34 @@ def test_hybrid_composite_forwards_advance_to_full_attn_child():
     seq_lens = torch.tensor([21, 22, 23, 24], dtype=torch.int32)
     hybrid.advance_draft_forward_metadata(seq_lens)
     assert torch.equal(full.decode_seq_lens_buffer[:4], seq_lens)
+
+
+def test_hybrid_composite_forwards_every_draft_length_hook_to_full_attn_child():
+    """The MTP frontier re-anchor and the block drafter's in-graph seq_lens
+    reach the full-attention router through the composite, like the Eagle
+    advance does; the composite's base class would otherwise swallow them."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
+    )
+
+    router = SimpleNamespace(
+        update_draft_forward_metadata=Mock(),
+        fill_block_decode_seq_lens=Mock(),
+    )
+    hybrid = object.__new__(HybridLinearAttnBackend)
+    hybrid.full_attn_backend = router
+    hybrid.linear_attn_backend = None
+
+    frontier = torch.tensor([7, 3], dtype=torch.int32)
+    block_seq_lens = torch.tensor([9, 5, -1], dtype=torch.int32)
+    hybrid.update_draft_forward_metadata(frontier)
+    hybrid.fill_block_decode_seq_lens(2, block_seq_lens)
+
+    router.update_draft_forward_metadata.assert_called_once_with(frontier)
+    router.fill_block_decode_seq_lens.assert_called_once_with(2, block_seq_lens)
 
 
 # Step 0: the drafter publishes the accepted frontier (vc + N -> vc + a); the

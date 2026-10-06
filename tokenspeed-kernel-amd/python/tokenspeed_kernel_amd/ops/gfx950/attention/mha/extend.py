@@ -39,6 +39,7 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2,
     _INV_LN2_VALUE,
     _LN2,
+    MAX_KV_SPLITS,
     InputStrides,
     attention_layouts,
     max,
@@ -48,6 +49,13 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
+
+# The reduce kernel reads all split LSEs at once, one per lane of its single
+# wave, so the split count must fit in a wave.
+_LSE_TILE = gl.constexpr(64)
+assert MAX_KV_SPLITS <= _LSE_TILE.value
+# Split partials the reduce kernel loads per loop iteration.
+_SPLIT_CHUNK = gl.constexpr(8)
 
 
 @gluon.jit
@@ -135,7 +143,6 @@ class ExtendConfig:
     BLOCK_Q: gl.constexpr
     BLOCK_N: gl.constexpr
     NUM_WARPS: gl.constexpr
-    NUM_KV_SPLITS: gl.constexpr
     PAGE_SIZE: gl.constexpr
     PAGE_TABLE_STRIDE: gl.constexpr
     IS_CAUSAL: gl.constexpr
@@ -166,7 +173,6 @@ class ExtendConfig:
         BLOCK_Q,
         BLOCK_N,
         NUM_WARPS,
-        NUM_KV_SPLITS,
         PAGE_SIZE,
         PAGE_TABLE_STRIDE,
         IS_CAUSAL,
@@ -211,7 +217,6 @@ class ExtendConfig:
         self.BLOCK_Q = gl.constexpr(BLOCK_Q)
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
-        self.NUM_KV_SPLITS = gl.constexpr(NUM_KV_SPLITS)
         self.PAGE_SIZE = gl.constexpr(PAGE_SIZE)
         self.PAGE_TABLE_STRIDE = gl.constexpr(PAGE_TABLE_STRIDE)
         self.IS_CAUSAL = gl.constexpr(IS_CAUSAL)
@@ -514,7 +519,9 @@ class ExtendProgram:
             cdna4.buffer_store(lse, self.lse_ptr, offsets, mask=mask)
 
     @gluon.jit
-    def store_partial(self, acc, l_i, m_i, split_id, mid_o_ptr, mid_lse_ptr):
+    def store_partial(
+        self, acc, l_i, m_i, split_id, num_kv_splits, mid_o_ptr, mid_lse_ptr
+    ):
         # Split-K partial store: mid_o[row, head, split] = acc / l_i (this
         # split's local softmax normalization) and mid_lse[row, head, split] =
         # m_i * SM_SCALE + log2(l_i) in base-2 units, matching the decode
@@ -542,16 +549,15 @@ class ExtendProgram:
             -float("inf"),
         )
         o_off = (
-            (row[:, None] * cfg.N_HEADS + q_head[:, None]) * cfg.NUM_KV_SPLITS
-            + split_id
+            (row[:, None] * cfg.N_HEADS + q_head[:, None]) * num_kv_splits + split_id
         ) * cfg.HEAD_DIM + offs_d[None, :]
-        lse_off = (row * cfg.N_HEADS + q_head) * cfg.NUM_KV_SPLITS + split_id
+        lse_off = (row * cfg.N_HEADS + q_head) * num_kv_splits + split_id
         cdna4.buffer_store(part_o, mid_o_ptr, o_off, mask=valid[:, None])
         cdna4.buffer_store(part_lse, mid_lse_ptr, lse_off, mask=valid)
 
 
 @gluon.jit
-def _mha_extend(
+def gluon_mha_extend_gfx950(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
@@ -591,7 +597,6 @@ def _mha_extend(
         BLOCK_Q,
         BLOCK_N,
         NUM_WARPS,
-        1,  # NUM_KV_SPLITS: single-pass path has no split-K
         PAGE_SIZE,
         PAGE_TABLE_STRIDE,
         IS_CAUSAL,
@@ -718,7 +723,7 @@ def _mha_extend(
 
 
 @gluon.jit
-def _mha_extend_split(
+def gluon_mha_extend_split_gfx950(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
@@ -742,7 +747,9 @@ def _mha_extend_split(
     BLOCK_Q: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    NUM_KV_SPLITS: gl.constexpr,
+    # Picked per batch by select_kv_splits; runtime so every batch shape shares
+    # one binary.
+    NUM_KV_SPLITS,
     IS_CAUSAL: gl.constexpr,
     IS_FP8: gl.constexpr,
     RAGGED: gl.constexpr,
@@ -766,7 +773,6 @@ def _mha_extend_split(
         BLOCK_Q,
         BLOCK_N,
         NUM_WARPS,
-        NUM_KV_SPLITS,
         PAGE_SIZE,
         PAGE_TABLE_STRIDE,
         IS_CAUSAL,
@@ -823,7 +829,7 @@ def _mha_extend_split(
     # Partition [0, kv_end) into NUM_KV_SPLITS page-aligned slices (BLOCK_N ==
     # PAGE_SIZE), mirroring the decode kernel's split math.
     num_pages = gl.cdiv(kv_end, cfg.PAGE_SIZE)
-    pages_per_split = gl.cdiv(num_pages, cfg.NUM_KV_SPLITS)
+    pages_per_split = gl.cdiv(num_pages, NUM_KV_SPLITS)
     split_start_page = split_id * pages_per_split
     split_end_page = min(split_start_page + pages_per_split, num_pages)
     split_start = split_start_page * cfg.PAGE_SIZE
@@ -874,18 +880,19 @@ def _mha_extend_split(
         v = program.shared_load_v(v_smem)
         acc = program.compute_pv(p, v, acc)
 
-    program.store_partial(acc, l_i, m_i, split_id, mid_o_ptr, mid_lse_ptr)
+    program.store_partial(
+        acc, l_i, m_i, split_id, NUM_KV_SPLITS, mid_o_ptr, mid_lse_ptr
+    )
 
 
 @gluon.jit
-def _mha_extend_reduce(
+def gluon_mha_extend_reduce_gfx950(
     mid_o_ptr,
     mid_lse_ptr,
     out_ptr,
     lse_out_ptr,
     sink_ptr,
-    SM_SCALE: gl.constexpr,
-    NUM_KV_SPLITS: gl.constexpr,
+    NUM_KV_SPLITS,
     N_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     HAS_SINK: gl.constexpr,
@@ -894,31 +901,48 @@ def _mha_extend_reduce(
     # Combine the NUM_KV_SPLITS partials for one (query token, head) with a
     # global softmax rescale. Empty splits carry -inf lse (written by the
     # compute pass) so they drop out. Grid is (total_q, N_HEADS).
+    #
+    # NUM_KV_SPLITS is a runtime value so one binary serves every batch shape.
+    # Pass 1 reads all split LSEs (one per lane) to get the global max and
+    # denominator; pass 2 streams the partial outputs in _SPLIT_CHUNK-row tiles,
+    # so registers stay bounded by the chunk rather than the largest split
+    # count.
     reduce_layout: gl.constexpr = gl.BlockedLayout(
         [1, HEAD_DIM // 64], [1, 64], [1, 1], [1, 0]
     )
+    lse_layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
     row = gl.program_id(0)
     q_head = gl.program_id(1)
+    base = (row * N_HEADS + q_head) * NUM_KV_SPLITS
 
-    # SPLIT_TILE pads NUM_KV_SPLITS up to a power of 2 for the tensor shape.
-    SPLIT_TILE: gl.constexpr = 1 << (NUM_KV_SPLITS - 1).bit_length()
-    offs_s = gl.arange(0, SPLIT_TILE, layout=gl.SliceLayout(1, reduce_layout))
-    offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, reduce_layout))
-    split_valid = offs_s < NUM_KV_SPLITS
-    base = (row * N_HEADS + q_head) * NUM_KV_SPLITS + offs_s
-    part_lse = gl.load(mid_lse_ptr + base, mask=split_valid, other=-float("inf"))
-    o_off = base[:, None] * HEAD_DIM + offs_d[None, :]
-    part_o = cdna4.buffer_load(mid_o_ptr, o_off, mask=split_valid[:, None], other=0.0)
-
-    m_i = max(part_lse, axis=0)
+    offs_l = gl.arange(0, _LSE_TILE, layout=lse_layout)
+    all_lse = gl.load(
+        mid_lse_ptr + base + offs_l,
+        mask=offs_l < NUM_KV_SPLITS,
+        other=-float("inf"),
+    )
+    m_i = max(all_lse, axis=0)
     if HAS_SINK:
         sink = gl.load(sink_ptr + q_head).to(gl.float32) * _INV_LN2
         m_i = maximum(m_i, sink)
-    beta = gl.exp2(part_lse - m_i)
-    l_i = gl.sum(beta, axis=0)
+    l_i = gl.sum(gl.exp2(all_lse - m_i), axis=0)
     if HAS_SINK:
         l_i = l_i + gl.exp2(sink - m_i)
-    acc = gl.sum(part_o * beta[:, None], axis=0)
+
+    offs_c = gl.arange(0, _SPLIT_CHUNK, layout=gl.SliceLayout(1, reduce_layout))
+    offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, reduce_layout))
+    acc = gl.zeros([HEAD_DIM], gl.float32, layout=gl.SliceLayout(0, reduce_layout))
+    for chunk_start in range(0, NUM_KV_SPLITS, _SPLIT_CHUNK):
+        offs_s = chunk_start + offs_c
+        split_valid = offs_s < NUM_KV_SPLITS
+        part_lse = gl.load(
+            mid_lse_ptr + base + offs_s, mask=split_valid, other=-float("inf")
+        )
+        o_off = (base + offs_s)[:, None] * HEAD_DIM + offs_d[None, :]
+        part_o = cdna4.buffer_load(
+            mid_o_ptr, o_off, mask=split_valid[:, None], other=0.0
+        )
+        acc += gl.sum(part_o * gl.exp2(part_lse - m_i)[:, None], axis=0)
 
     denom = gl.where(l_i > 0.0, l_i, 1.0)
     output = acc * (1.0 / denom)
@@ -933,7 +957,7 @@ def _mha_extend_reduce(
 _GFX950_SM_COUNT = 256
 
 
-def gluon_mha_extend_gfx950(
+def launch_gluon_mha_extend_gfx950(
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_kv: torch.Tensor,
@@ -1029,7 +1053,7 @@ def gluon_mha_extend_gfx950(
             split_grid = (ragged_num_q_blocks, n_kv_heads, num_kv_splits)
         else:
             split_grid = (blocks_per_req * num_kv_splits, batch, n_kv_heads)
-        _mha_extend_split[split_grid](
+        gluon_mha_extend_split_gfx950[split_grid](
             q,
             k_cache,
             v_cache,
@@ -1060,13 +1084,12 @@ def gluon_mha_extend_gfx950(
             num_warps=num_warps,
         )
         reduce_grid = (total_q, n_heads)
-        _mha_extend_reduce[reduce_grid](
+        gluon_mha_extend_reduce_gfx950[reduce_grid](
             mid_o,
             mid_lse,
             output,
             lse_arg,
             sink_arg,
-            sm_scale,
             num_kv_splits,
             n_heads,
             head_dim,
@@ -1082,7 +1105,7 @@ def gluon_mha_extend_gfx950(
         grid = (ragged_num_q_blocks, n_kv_heads)
     else:
         grid = (blocks_per_req, batch, n_kv_heads)
-    _mha_extend[grid](
+    gluon_mha_extend_gfx950[grid](
         q,
         k_cache,
         v_cache,

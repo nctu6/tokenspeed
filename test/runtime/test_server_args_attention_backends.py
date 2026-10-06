@@ -1,8 +1,9 @@
-"""Regression tests for --attention-backend / --drafter-attention-backend choices.
+"""Regression tests for --attention-backend / --drafter-attention-backend names.
 
 Guards against the bug where --drafter-attention-backend rejected valid main-model
 backends (e.g. trtllm_mla) because its argparse `choices` was a narrower subset
-of --attention-backend's.
+of --attention-backend's. Both flags are now validated against one backend
+registry after plugin discovery, so they accept exactly the same names.
 """
 
 import os
@@ -15,14 +16,15 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 import argparse
-import contextlib
-import io
+import pickle
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.layers.attention import registry
+from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
+from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.utils.server_args import ServerArgs, prepare_server_args
 
@@ -65,10 +67,14 @@ class TestAttentionBackendChoices(unittest.TestCase):
             self.assertEqual(args.attention_backend, backend)
 
     def test_attention_backend_uses_generic_mha_for_ascend(self):
-        choices = set(self._action(self._build_parser(), "attention_backend").choices)
-        self.assertIn("mha", choices)
-        self.assertNotIn("ascend_mha", choices)
-        self.assertNotIn("npu", choices)
+        import tokenspeed.runtime.layers.attention.backends  # noqa: F401
+
+        registry.validate_attention_backend_name("mha", flag="--attention-backend")
+        for name in ("ascend_mha", "npu"):
+            with self.assertRaisesRegex(ValueError, "Unknown --attention-backend"):
+                registry.validate_attention_backend_name(
+                    name, flag="--attention-backend"
+                )
 
     def test_drafter_attention_backend_accepts_trtllm_mla(self):
         """Regression: trtllm_mla must be accepted here too."""
@@ -83,32 +89,92 @@ class TestAttentionBackendChoices(unittest.TestCase):
         )
         self.assertEqual(args.drafter_attention_backend, "gluon")
 
-    def test_drafter_choices_match_main_choices(self):
+    def test_flags_defer_backend_names_to_the_registry(self):
         parser = self._build_parser()
-        main = set(self._action(parser, "attention_backend").choices)
-        drafter = set(self._action(parser, "drafter_attention_backend").choices)
-        self.assertEqual(main, drafter)
+        # Plugins register backends after argument parsing, so neither flag
+        # may carry a closed argparse choice list.
+        self.assertIsNone(self._action(parser, "attention_backend").choices)
+        self.assertIsNone(self._action(parser, "drafter_attention_backend").choices)
 
     def test_invalid_backend_rejected_on_both_flags(self):
-        for flag in ("--attention-backend", "--drafter-attention-backend"):
-            parser = self._build_parser()
-            with (
-                contextlib.redirect_stderr(io.StringIO()),
-                self.assertRaises(SystemExit),
-            ):
-                parser.parse_args(["--model", "x", flag, "bogus"])
+        import tokenspeed.runtime.layers.attention.backends  # noqa: F401
 
-    def test_inline_detokenizer_flag_removed_from_cli(self):
-        parser = self._build_parser()
-        with (
-            contextlib.redirect_stderr(io.StringIO()),
-            self.assertRaises(SystemExit),
-        ):
-            parser.parse_args(["--model", "x", "--enable-inline-detokenizer"])
+        for flag in ("--attention-backend", "--drafter-attention-backend"):
+            registry.validate_attention_backend_name("trtllm_mla", flag=flag)
+            registry.validate_attention_backend_name(
+                registry.HYBRID_LINEAR_ATTN_BACKEND, flag=flag
+            )
+            registry.validate_attention_backend_name(None, flag=flag)
+            with self.assertRaisesRegex(ValueError, f"Unknown {flag} 'bogus'"):
+                registry.validate_attention_backend_name("bogus", flag=flag)
 
     def test_inline_detokenizer_is_forced_on(self):
         args = prepare_server_args(["--model", "x"])
         self.assertTrue(args.enable_inline_detokenizer)
+
+    def test_kda_prefill_graph_uses_shared_args_not_worker_environment(self):
+        spec = MHAConfig(
+            num_attention_heads=4, num_kv_heads=4, head_dim=128, attn_tp_size=1
+        )
+        components = {
+            SoftmaxAttnConfig: spec,
+            LinearAttnConfig: SimpleNamespace(
+                layer_ids=(0,),
+                replay_ssm=False,
+                draft_tree=False,
+                tree_node_state_workspace=True,
+            ),
+        }
+        config = SimpleNamespace(
+            device="cpu",
+            dtype=None,
+            is_draft=False,
+            speculative_num_draft_tokens=1,
+            max_bs=4,
+            component=components.get,
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(full_attention_layer_ids=[1]),
+            attention_arch=AttentionArch.MLA,
+        )
+        for disabled in (False, True):
+            argv = ["--model", "x"]
+            if disabled:
+                argv.append("--disable-kda-prefill-graph")
+            shared_args = prepare_server_args(argv)
+            self.assertIs(shared_args.disable_kda_prefill_graph, disabled)
+            self.assertFalse(shared_args.disable_prefill_graph)
+            self.assertFalse(shared_args.enforce_eager)
+            # Simulate workers receiving the same serialized server arguments
+            # despite conflicting legacy environment settings. Keep the real
+            # KDA constructor so reintroducing a local env read fails this test.
+            for worker_env in ("0", "1"):
+                with (
+                    self.subTest(disabled=disabled, worker_env=worker_env),
+                    mock.patch.dict(
+                        os.environ, {"TOKENSPEED_KDA_PREFILL_GRAPH": worker_env}
+                    ),
+                    mock.patch.object(
+                        registry,
+                        "_create_attn_backend_with_name",
+                        return_value=SimpleNamespace(device="cpu"),
+                    ),
+                    mock.patch.object(
+                        registry, "_resolve_kda_backend", return_value="cutedsl_kda"
+                    ),
+                    mock.patch.object(registry, "is_qwen4_exp", return_value=False),
+                ):
+                    backend = registry._create_hybrid_linear_attn_backend(
+                        pickle.loads(pickle.dumps(shared_args)),
+                        model_config,
+                        config,
+                        pool=SimpleNamespace(state_group_by_layer={0: "state"}),
+                        full_attn_backend_name="mla",
+                        linear_attention="kda",
+                    )
+                    self.assertIs(
+                        backend.linear_attn_backend._prefill_graph_enabled, not disabled
+                    )
 
     def test_model_path_alias_sets_model(self):
         args = self._build_parser().parse_args(["--model-path", "x"])
@@ -279,7 +345,18 @@ class TestAttentionBackendChoices(unittest.TestCase):
             attention_backend=None,
             drafter_attention_backend=None,
             attn_tp_size=None,
-            mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=2, dp_size=1)),
+            mapping=SimpleNamespace(
+                attn=SimpleNamespace(
+                    tp_size=2,
+                    dp_size=1,
+                    dcp_size=1,
+                    dcp_rank=0,
+                    dcp_group=(0,),
+                    qcp_size=1,
+                    qcp_rank=0,
+                    qcp_group=(0,),
+                )
+            ),
             kv_cache_dtype="auto",
             max_num_seqs=8,
             data_parallel_size=None,
@@ -293,6 +370,7 @@ class TestAttentionBackendChoices(unittest.TestCase):
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
             spec_context_pad=12,  # 3 overshoot spans * 4 draft tokens
+            skip_softmax_threshold=0.0,
         )
         model_config = SimpleNamespace(
             hf_config=SimpleNamespace(),
@@ -369,17 +447,186 @@ class TestDecodeHostL2(unittest.TestCase):
     def test_decode_enables_host_l2_without_prefix_matching(self):
         args = object.__new__(ServerArgs)
         args.disaggregation_mode = "decode"
+        args.decode_context_parallel_size = 1
         args.disable_kvstore = False
         args.enable_kvstore = False
         args.enable_prefix_caching = False
-        args.kvstore_storage_backend = None
-        args.kvstore_mem_layout = "layer_first"
         args.kvstore_io_backend = "kernel"
 
         args._handle_kvstore()
         args.validate_cache_options()
 
         self.assertTrue(args.enable_kvstore)
+
+
+class TestDisaggregationGraphFlags(unittest.TestCase):
+    """The prefill role is a role with no decode step, not an eager role."""
+
+    def test_prefill_role_keeps_the_ordinary_graph_flags(self):
+        args = prepare_server_args(["--model", "x", "--disaggregation-mode", "prefill"])
+        self.assertFalse(args.enforce_eager)
+        self.assertFalse(args.disable_prefill_graph)
+
+    def test_prefill_role_honours_explicit_eager(self):
+        args = prepare_server_args(
+            ["--model", "x", "--disaggregation-mode", "prefill", "--enforce-eager"]
+        )
+        self.assertTrue(args.enforce_eager)
+
+    def test_pipeline_parallelism_forces_eager(self):
+        args = prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--disaggregation-mode",
+                "prefill",
+                "--pipeline-parallel-size",
+                "2",
+            ]
+        )
+        self.assertTrue(args.enforce_eager)
+
+    def test_pipeline_debug_without_pd_forces_eager(self):
+        with mock.patch.dict(os.environ, {"TS_PP_DEBUG_ALLOW_NON_PREFILL": "1"}):
+            args = prepare_server_args(
+                ["--model", "x", "--pipeline-parallel-size", "2"]
+            )
+        self.assertTrue(args.enforce_eager)
+
+    @staticmethod
+    def _pipeline_prefill_args(algorithm: str, *extra: str) -> list[str]:
+        return [
+            "--model",
+            "x",
+            "--disaggregation-mode",
+            "prefill",
+            "--pipeline-parallel-size",
+            "2",
+            "--speculative-algorithm",
+            algorithm,
+            *extra,
+        ]
+
+    def test_pipeline_prefill_accepts_last_stage_drafters(self):
+        # The drafter runs on the last stage, the only stage that samples;
+        # DSPARK additionally produces context across stages.
+        for algorithm in ("MTP", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                args = prepare_server_args(self._pipeline_prefill_args(algorithm))
+                self.assertEqual(args.speculative_algorithm, algorithm)
+                self.assertTrue(args.enforce_eager)
+
+    def test_pipeline_speculation_requires_the_prefill_role(self):
+        with self.assertRaisesRegex(ValueError, "disaggregation-mode prefill"):
+            prepare_server_args(
+                [
+                    "--model",
+                    "x",
+                    "--disaggregation-mode",
+                    "decode",
+                    "--pipeline-parallel-size",
+                    "2",
+                    "--speculative-algorithm",
+                    "MTP",
+                ]
+            )
+        # The PP debug escape hatch runs without PD; it has no decode token
+        # feedback to draft against either.
+        with (
+            mock.patch.dict(os.environ, {"TS_PP_DEBUG_ALLOW_NON_PREFILL": "1"}),
+            self.assertRaisesRegex(ValueError, "only on a prefill server"),
+        ):
+            prepare_server_args(
+                [
+                    "--model",
+                    "x",
+                    "--pipeline-parallel-size",
+                    "2",
+                    "--speculative-algorithm",
+                    "MTP",
+                ]
+            )
+
+    def test_pipeline_rejects_drafts_that_read_taps_from_several_stages(self):
+        # DFLASH has no cross-stage context production; EAGLE3's aux taps
+        # are not carried through the stage boundary.
+        for algorithm in ("DFLASH", "EAGLE3"):
+            with (
+                self.subTest(algorithm=algorithm),
+                self.assertRaisesRegex(ValueError, f"{algorithm} is not supported"),
+            ):
+                prepare_server_args(self._pipeline_prefill_args(algorithm))
+
+    def test_pipeline_dspark_keeps_matching_dense_and_attention_tp(self):
+        # The DSPARK draft reduces attention-TP embedding partials over the
+        # dense TP group; MTP embeds with a reduced lookup and carries no
+        # such rule.
+        narrow_dense = (
+            "--world-size",
+            "4",
+            "--attn-tp-size",
+            "2",
+            "--dense-tp-size",
+            "1",
+        )
+        with self.assertRaisesRegex(ValueError, "matching dense/attention TP"):
+            prepare_server_args(self._pipeline_prefill_args("DSPARK", *narrow_dense))
+        args = prepare_server_args(self._pipeline_prefill_args("MTP", *narrow_dense))
+        self.assertEqual(args.mapping.dense.tp_size, 1)
+        self.assertEqual(args.mapping.attn.tp_size, 2)
+
+
+class TestL3StorageBackend(unittest.TestCase):
+    def test_cli_accepts_mooncake_and_memory(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        action = None
+        for candidate in parser._actions:
+            if candidate.dest == "kvstore_storage_backend":
+                action = candidate
+                break
+        self.assertIsNotNone(action)
+        self.assertEqual(set(action.choices), {"mooncake", "memory"})
+
+    def test_memory_backend_keeps_host_io(self):
+        args = object.__new__(ServerArgs)
+        args.disaggregation_mode = "null"
+        args.disable_kvstore = False
+        args.enable_kvstore = False
+        args.enable_prefix_caching = True
+        args.kvstore_storage_backend = "memory"
+        args.kvstore_io_backend = "direct"
+
+        args._handle_kvstore()
+
+        self.assertTrue(args.enable_kvstore)
+        self.assertEqual(args.kvstore_io_backend, "direct")
+
+    def test_l3_requires_host_l2(self):
+        args = object.__new__(ServerArgs)
+        args.disaggregation_mode = "null"
+        args.disable_kvstore = True
+        args.enable_kvstore = False
+        args.enable_prefix_caching = True
+        args.kvstore_storage_backend = "mooncake"
+        args.kvstore_io_backend = "direct"
+
+        with self.assertRaisesRegex(ValueError, "requires Host L2"):
+            args._handle_kvstore()
+
+    def test_mooncake_backend_keeps_host_io(self):
+        args = object.__new__(ServerArgs)
+        args.disaggregation_mode = "null"
+        args.disable_kvstore = False
+        args.enable_kvstore = False
+        args.enable_prefix_caching = True
+        args.kvstore_storage_backend = "mooncake"
+        args.kvstore_io_backend = "direct"
+
+        args._handle_kvstore()
+
+        self.assertTrue(args.enable_kvstore)
+        self.assertEqual(args.kvstore_io_backend, "direct")
 
 
 if __name__ == "__main__":

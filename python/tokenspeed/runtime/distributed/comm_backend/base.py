@@ -56,6 +56,22 @@ class CommBackend(ABC):
 
         return False
 
+    def prepare_all_reduce_buffers(
+        self,
+        group: Group,
+        *,
+        staged_max_numel: int,
+        producer_direct_max_numel: int,
+        attnres_max_numel: int,
+        attnres_max_rows: int,
+        enable_lamport: bool,
+        moe_tail_max_rows: int,
+        dtype: torch.dtype,
+    ) -> bool:
+        """Return false when the backend has no persistent buffers to prepare."""
+
+        return False
+
     def can_acquire_all_reduce_outputs(
         self,
         shapes: tuple[tuple[int, ...], ...],
@@ -107,7 +123,7 @@ class CommBackend(ABC):
     ) -> torch.Tensor: ...
 
     @abstractmethod
-    def all_gather_into_tensor(
+    def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None: ...
 
@@ -116,10 +132,19 @@ class CommBackend(ABC):
 
     @abstractmethod
     def all_to_all_single(
-        self, output: torch.Tensor, input: torch.Tensor, group: Group
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        group: Group,
+        output_split_sizes: list[int] | None = None,
+        input_split_sizes: list[int] | None = None,
     ) -> None:
-        """Even-split all_to_all. output and input must have same numel
-        divisible by len(group).
+        """All-to-all along dim 0 into a pre-allocated output buffer.
+
+        Without split sizes both tensors split evenly into ``len(group)``
+        chunks. With them, ``input_split_sizes[i]`` rows go to the group's
+        ``i``-th rank and ``output_split_sizes[i]`` rows arrive from it (a
+        zero-row chunk is allowed); the sizes must sum to the tensors' rows.
         """
         ...
 

@@ -34,6 +34,10 @@ from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
 logger = get_colorful_logger(__name__)
 
+# Launches of the in-switch all-reduce whose results must agree bitwise before
+# a batch-invariant deployment serves.
+MULTIMEM_SELF_CHECK_REPETITIONS = 8
+
 
 @dataclass
 class DistributedConfig:
@@ -81,6 +85,9 @@ class DistributedConfig:
 
     # Feature flags
     force_deterministic_rsag: bool = False
+    # --batch-invariant-collectives: the in-switch all-reduce it routes to is
+    # verified on this deployment's groups before anything serves.
+    batch_invariant_collectives: bool = False
 
     # The full Mapping object for pg_manager initialization
     mapping: object = None
@@ -120,6 +127,7 @@ class DistributedConfig:
             hidden_size=hidden_size,
             max_num_tokens=max_num_tokens,
             force_deterministic_rsag=server_args.force_deterministic_rsag,
+            batch_invariant_collectives=server_args.batch_invariant_collectives,
             mapping=mapping,
         )
 
@@ -129,8 +137,8 @@ class DistributedInitializer:
     def initialize(config: DistributedConfig) -> float:
         torch.get_device_module(config.device).set_device(config.gpu_id)
         logger.info(
-            "Init torch distributed begin. Avail mem=%.4f GB",
-            get_available_gpu_memory(config.device, config.gpu_id),
+            "Init torch distributed begin. Avail mem="
+            f"{get_available_gpu_memory(config.device, config.gpu_id):.4f} GB",
         )
         if config.device == "cuda":
             maybe_set_numa_aware_cpu_affinity(config.gpu_id)
@@ -165,11 +173,22 @@ class DistributedInitializer:
             device_id=device_id,
         )
         pg_manager.init_process_group(config.mapping.world_group)
+        pg_manager.init_process_group(config.mapping.attn.world_group)
         pg_manager.init_process_group(config.mapping.attn.tp_group)
+        # A DCP group of one is still the group the decode path collectives
+        # address; init_process_group is idempotent and handles size 1.
+        pg_manager.init_process_group(config.mapping.attn.dcp_group)
+        # The query-context-parallel group of a sharded extend; equal to the
+        # attention TP group while qcp == tp, so this is idempotent there.
+        pg_manager.init_process_group(config.mapping.attn.qcp_group)
         pg_manager.init_process_group(config.mapping.attn.dp_group)
         # No-op at the default linear_attn.tp == attn.tp (same group,
         # idempotent).
         pg_manager.init_process_group(config.mapping.linear_attn.tp_group)
+        # Head-sharded attention projections and the vocab-sharded LM head
+        # under attention DP; both default to groups created above.
+        pg_manager.init_process_group(config.mapping.attn.head_tp_group)
+        pg_manager.init_process_group(config.mapping.lm_head.tp_group)
         pg_manager.init_process_group(config.mapping.dense.tp_group)
         pg_manager.init_process_group(config.mapping.moe.tp_ep_group)
         if config.mapping.has_pp:
@@ -185,6 +204,10 @@ class DistributedInitializer:
         if config.hidden_size > 0:
             from tokenspeed.runtime.distributed.comm_backend import (
                 get_global_backend,
+            )
+            from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+            from tokenspeed.runtime.distributed.comm_backend.self_check import (
+                verify_multimem_all_reduce,
             )
 
             backend = get_global_backend()
@@ -206,21 +229,43 @@ class DistributedInitializer:
                             hidden_dim=config.hidden_size,
                         )
                         logger.info(
-                            "trtllm one-shot all-reduce for group %s: %s",
-                            group,
-                            "enabled" if ok else "unavailable (NCCL fallback)",
+                            f"trtllm one-shot all-reduce for group {group!s}: "
+                            f"{('enabled' if ok else 'unavailable (NCCL fallback)')!s}",
                         )
 
+            # Verify, don't trust: the batch-invariant all-reduce routes to
+            # the in-switch reduction on the groups below; it serves only
+            # where it reproduces its bits here (comm_backend/self_check.py).
+            if config.batch_invariant_collectives and isinstance(backend, AutoBackend):
+                outcome = verify_multimem_all_reduce(
+                    backend,
+                    groups=(
+                        ("attention TP", config.mapping.attn.tp_group),
+                        ("dense TP", config.mapping.dense.tp_group),
+                        ("MoE TP-EP", config.mapping.moe.tp_ep_group),
+                    ),
+                    world_group=config.mapping.world_group,
+                    rank=config.mapping.rank,
+                    hidden_size=config.hidden_size,
+                    device=torch.device(config.device, config.gpu_id),
+                    repetitions=MULTIMEM_SELF_CHECK_REPETITIONS,
+                )
+                routes = ", ".join(f"{kind}: {route.value}" for kind, route in outcome)
+                logger.info(
+                    "batch-invariant all-reduce: in-switch reduction verified "
+                    f"bitwise -- {routes or 'no group headed for the switch'}; every "
+                    "other reduction takes the ordered fold"
+                )
+
         logger.info(
-            "Init comm buff end. Avail mem=%.4f GB",
-            get_available_gpu_memory(config.device, config.gpu_id),
+            "Init comm buff end. Avail mem="
+            f"{get_available_gpu_memory(config.device, config.gpu_id):.4f} GB",
         )
         mapping = config.mapping
         logger.info(
-            "Current Process distributed state:  global rank: %s  attn_tp_rank: %s  attn_dp_rank: %s",
-            mapping.rank,
-            mapping.attn.tp_rank,
-            mapping.attn.dp_rank,
+            f"Current Process distributed state:  global rank: {mapping.rank!s}  "
+            f"attn_tp_rank: {mapping.attn.tp_rank!s}  attn_dp_rank: "
+            f"{mapping.attn.dp_rank!s}",
         )
 
         # Get minimum available GPU memory across all ranks

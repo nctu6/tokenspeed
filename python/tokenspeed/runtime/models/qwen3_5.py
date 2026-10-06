@@ -27,13 +27,8 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
-import triton
-import triton.language as tl
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.ops.layernorm.triton import (
-    fused_qk_rmsnorm_rope_gate,
-    qk_rmsnorm,
-)
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
@@ -88,9 +83,6 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
 )
 from tokenspeed.runtime.models.qwen3_vision import Qwen3VLMoeVisionModel
 from tokenspeed.runtime.models.utils import validate_attention_partition
-from tokenspeed.runtime.moe.distribution_recorder import (
-    get_global_expert_distribution_recorder,
-)
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
@@ -112,6 +104,7 @@ from tokenspeed.runtime.utils import (
     set_weight_attrs,
 )
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.triton import tl, triton
 
 logger = logging.getLogger(__name__)
 
@@ -592,6 +585,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_moe = True
         elif config.model_type == "qwen3_5_text":
             self.mlp = Qwen3_5MoeMLP(
+                parallelism="dense",
                 mapping=self.mapping,
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -615,8 +609,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             layer_id=self.layer_id,
             is_moe=is_moe,
             prev_is_moe=is_moe,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def forward(
@@ -762,17 +758,22 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            rotary_emb=self.rotary_emb,
+            qk_norm=(self.q_norm, self.k_norm),
         )
 
         # Dense MLP for non-MoE variant
         if config.model_type == "qwen3_5_text":
             self.mlp = Qwen3_5MoeMLP(
+                parallelism="dense",
                 mapping=self.mapping,
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -800,71 +801,43 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-
         self.is_moe = is_moe
         self.comm_manager = CommManager(
             mapping=self.mapping,
             layer_id=self.layer_id,
             is_moe=is_moe,
             prev_is_moe=is_moe,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # qk_rmsnorm expects GemmaRMSNorm's effective gamma.
-        return qk_rmsnorm(
-            q,
-            k,
-            self.q_norm.gemma_weight,
-            self.k_norm.gemma_weight,
-            self.q_norm.variance_epsilon,
-        )
-
-    def _project_qkv_rope(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+    def _project_qkv(
+        self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """qkv_proj + split + rope (+ optional gate). ``gate`` is ``None`` when ``attn_output_gate=False``."""
+        """qkv_proj split into views; ``gate`` is ``None`` without ``attn_output_gate``."""
         qkv, _ = self.qkv_proj(hidden_states)
-        if self.attn_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
-            )
-            q, k, gate = fused_qk_rmsnorm_rope_gate(
-                q_gate,
-                k,
-                self.q_norm.gemma_weight,
-                self.k_norm.gemma_weight,
-                self.rotary_emb.cos_sin_cache,
-                positions,
-                self.q_norm.variance_epsilon,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.rotary_emb.rotary_dim,
-            )
-            return q, k, v, gate
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
-        return q, k, v, None
+        if not self.attn_output_gate:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            return q, k, v, None
+        q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+        heads = q_gate.view(q_gate.shape[0], self.num_heads, 2, self.head_dim)
+        q, gate = heads.unbind(dim=2)
+        return q, k, v, gate
 
     def _attn(
         self,
+        positions: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         gate: torch.Tensor | None,
         ctx: ForwardContext,
+        **kwargs,
     ) -> torch.Tensor:
-        """Backend attention call + optional gate apply. Subclasses override."""
-        attn_output = self.attn(q, k, v, ctx)
+        """Attention with the optional output gate; draft subclasses override."""
+        attn_output = self.attn(q, k, v, positions, ctx, **kwargs)
         if gate is not None:
             sigmoid_mul(attn_output, gate)
         return attn_output
@@ -876,8 +849,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         ctx: ForwardContext,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
-        attn_output = self._attn(q, k, v, gate, ctx)
+        q, k, v, gate = self._project_qkv(hidden_states)
+        attn_output = self._attn(positions, q, k, v, gate, ctx)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1062,15 +1035,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                 aux_hidden_states.append(
                     gathered if gathered is aux else gathered.clone()
                 )
-            with get_global_expert_distribution_recorder().with_current_layer(
-                layer_idx
-            ):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    ctx=ctx,
-                )
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+                ctx=ctx,
+            )
 
             # Process deepstack embeddings if provided
             if (
@@ -1139,7 +1109,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
-                    logger.warning("Parameter %s not found in params_dict", name)
+                    logger.warning(f"Parameter {name!s} not found in params_dict")
                     continue
                 param = params_dict[name]
 
@@ -1263,7 +1233,7 @@ class Qwen3_5MoeModel(Qwen3_5ForCausalLM):
                     )
                     weight_loader(param, loaded_weight)
                 else:
-                    logger.warning("Parameter %s not found in params_dict", name)
+                    logger.warning(f"Parameter {name!s} not found in params_dict")
             loaded_params.add(name)
 
         return loaded_params
@@ -1563,7 +1533,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             # embed) weight up front, before any rename or params_dict lookup,
             # so none is routed into a None module. self.model is None here, so
             # named_parameters() exposes only visual params.
-            if getattr(self, "encoder_only", False) and "visual" not in name:
+            if self.encoder_only and "visual" not in name:
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
@@ -1600,7 +1570,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 if name not in params_dict:
                     if _is_ignored_checkpoint_param(self, name):
                         continue
-                    logger.warning("Parameter %s not found in params_dict", name)
+                    logger.warning(f"Parameter {name!s} not found in params_dict")
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -1689,7 +1659,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             # lookup, or moe_loader.load (which would KeyError on a missing
             # expert param). self.model is None here, so named_parameters()
             # exposes only visual params.
-            if getattr(self, "encoder_only", False) and "visual" not in name:
+            if self.encoder_only and "visual" not in name:
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
@@ -1738,7 +1708,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                     )
                     weight_loader(param, loaded_weight)
                 else:
-                    logger.warning("Parameter %s not found in params_dict", name)
+                    logger.warning(f"Parameter {name!s} not found in params_dict")
             loaded_params.add(name)
 
         return loaded_params
@@ -1798,110 +1768,53 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     a,
     mixed_qkvz,
     mixed_ba,
-    stride_qkvz,
-    stride_ba,
+    stride_qkvz: tl.constexpr,
+    stride_ba: tl.constexpr,
     NUM_HEADS_QK: tl.constexpr,
     NUM_HEADS_V: tl.constexpr,
     HEAD_QK: tl.constexpr,
     HEAD_V: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BLOCK_BA: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
-    i_bs, i_qk = tl.program_id(0), tl.program_id(1)
-
-    V_PER_GROUP: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK
-
-    # ── Input dimensions ──
-    TOTAL_Q: tl.constexpr = NUM_HEADS_QK * HEAD_QK
-    TOTAL_K: tl.constexpr = NUM_HEADS_QK * HEAD_QK
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
+    row, tile = tl.program_id(0), tl.program_id(1)
     TOTAL_V: tl.constexpr = NUM_HEADS_V * HEAD_V
-
-    # ── Output dimensions ──
-    QKV_DIM_T: tl.constexpr = TOTAL_Q + TOTAL_K + TOTAL_V
-
-    # ── Read from input (supports non-contiguous stride) ──
-    # q for head group i_qk: in the all_q region, offset i_qk * HEAD_QK
-    blk_q_ptr = mixed_qkvz + i_bs * stride_qkvz + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
-    # k for head group i_qk: in the all_k region
-    blk_k_ptr = (
-        mixed_qkvz
-        + i_bs * stride_qkvz
-        + TOTAL_Q
-        + i_qk * HEAD_QK
-        + tl.arange(0, HEAD_QK)
+    QKV_DIM: tl.constexpr = 2 * NUM_HEADS_QK * HEAD_QK + TOTAL_V
+    QKVZ_DIM: tl.constexpr = QKV_DIM + TOTAL_V
+    # QKVZ is already ordered, including non-power-of-two head ratios.
+    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(
+        mixed_qkvz + row * stride_qkvz + offsets,
+        offsets < QKVZ_DIM,
+        other=0,
     )
-    # ── Write to output (identical layout to the interleaved kernel) ──
-    blk_q_st_ptr = mixed_qkv + i_bs * QKV_DIM_T + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
-    blk_k_st_ptr = (
-        mixed_qkv
-        + i_bs * QKV_DIM_T
-        + NUM_HEADS_QK * HEAD_QK
-        + i_qk * HEAD_QK
-        + tl.arange(0, HEAD_QK)
+    # Keep output bases separate: pointer selection breaks AMD canonicalization.
+    tl.store(
+        mixed_qkv + row * QKV_DIM + offsets,
+        values,
+        offsets < QKV_DIM,
+    )
+    tl.store(
+        z + row * TOTAL_V + offsets - QKV_DIM,
+        values,
+        (offsets >= QKV_DIM) & (offsets < QKVZ_DIM),
     )
 
-    tl.store(blk_q_st_ptr, tl.load(blk_q_ptr))
-    tl.store(blk_k_st_ptr, tl.load(blk_k_ptr))
-
-    # Compile-time branch keeps the fast
-    # vectorized path for pow2 ratios and loops per head otherwise
-    IS_POW2: tl.constexpr = (V_PER_GROUP & (V_PER_GROUP - 1)) == 0
-
-    if IS_POW2:
-        blk_v_ptr = (
-            mixed_qkvz
-            + i_bs * stride_qkvz
-            + TOTAL_Q
-            + TOTAL_K
-            + i_qk * V_PER_GROUP * HEAD_V
-            + tl.arange(0, V_PER_GROUP * HEAD_V)
+    # One tile owns each row's gates; adjacent lanes copy adjacent heads.
+    if tile == 0:
+        heads = tl.arange(0, BLOCK_BA)
+        mask = heads < NUM_HEADS_V
+        b_values = tl.load(mixed_ba + row * stride_ba + heads, mask, other=0)
+        a_values = tl.load(
+            mixed_ba + row * stride_ba + NUM_HEADS_V + heads, mask, other=0
         )
-        blk_z_ptr = (
-            mixed_qkvz
-            + i_bs * stride_qkvz
-            + TOTAL_Q
-            + TOTAL_K
-            + TOTAL_V
-            + i_qk * V_PER_GROUP * HEAD_V
-            + tl.arange(0, V_PER_GROUP * HEAD_V)
-        )
-        blk_v_st_ptr = (
-            mixed_qkv
-            + i_bs * QKV_DIM_T
-            + NUM_HEADS_QK * HEAD_QK * 2
-            + i_qk * V_PER_GROUP * HEAD_V
-            + tl.arange(0, V_PER_GROUP * HEAD_V)
-        )
-        blk_z_st_ptr = (
-            z
-            + i_bs * NUM_HEADS_V * HEAD_V
-            + i_qk * V_PER_GROUP * HEAD_V
-            + tl.arange(0, V_PER_GROUP * HEAD_V)
-        )
-        tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
-        tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
-    else:
-        for i in tl.static_range(V_PER_GROUP):
-            head_off = (i_qk * V_PER_GROUP + i) * HEAD_V + tl.arange(0, HEAD_V)
-            blk_v_ptr = mixed_qkvz + i_bs * stride_qkvz + TOTAL_Q + TOTAL_K + head_off
-            blk_z_ptr = (
-                mixed_qkvz + i_bs * stride_qkvz + TOTAL_Q + TOTAL_K + TOTAL_V + head_off
-            )
-            blk_v_st_ptr = (
-                mixed_qkv + i_bs * QKV_DIM_T + NUM_HEADS_QK * HEAD_QK * 2 + head_off
-            )
-            blk_z_st_ptr = z + i_bs * NUM_HEADS_V * HEAD_V + head_off
-            tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
-            tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
-
-    # ── b and a ──
-    for i in tl.static_range(V_PER_GROUP):
-        blk_b_ptr = mixed_ba + i_bs * stride_ba + i_qk * V_PER_GROUP + i
-        blk_b_st_ptr = b + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
-        tl.store(blk_b_st_ptr, tl.load(blk_b_ptr))
-
-    for i in tl.static_range(V_PER_GROUP):
-        blk_a_ptr = mixed_ba + i_bs * stride_ba + NUM_HEADS_V + i_qk * V_PER_GROUP + i
-        blk_a_st_ptr = a + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
-        tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
+        tl.store(b + row * NUM_HEADS_V + heads, b_values, mask)
+        tl.store(a + row * NUM_HEADS_V + heads, a_values, mask)
 
 
 def fused_qkvzba_split_reshape_cat_contiguous(
@@ -1912,7 +1825,11 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     head_qk,
     head_v,
 ):
-    """Fused split/reshape/cat for Qwen3.5. Supports non-contiguous inputs.
+    """Repack Qwen3.5 projections into contiguous, independently owned outputs.
+
+    Inputs have unit inner strides; row strides and storage offsets may vary.
+    The leading dimension counts tokens, including flattened MTP tokens.
+    QKV and Z retain the QKVZ dtype; B and A retain the BA dtype.
 
     Input layout (per row):
         mixed_qkvz: [all_q | all_k | all_v | all_z]
@@ -1924,6 +1841,7 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         b: [num_v_heads]
         a: [num_v_heads]
     """
+    enable_pdl = pdl_enabled()
     batch, seq_len = mixed_qkvz.shape[0], 1
     qkv_dim_t = num_heads_qk * head_qk * 2 + num_heads_v * head_v
     mixed_qkv = torch.empty(
@@ -1942,7 +1860,7 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         device=mixed_ba.device,
     )
     a = torch.empty_like(b)
-    grid = (batch * seq_len, num_heads_qk)
+    grid = (batch * seq_len, triton.cdiv(qkv_dim_t + num_heads_v * head_v, 2048))
     fused_qkvzba_split_reshape_cat_contiguous_kernel[grid](
         mixed_qkv,
         z,
@@ -1956,8 +1874,12 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         num_heads_v,
         head_qk,
         head_v,
-        num_warps=1,
-        num_stages=3,
+        BLOCK=2048,
+        BLOCK_BA=triton.next_power_of_2(num_heads_v),
+        num_warps=4,
+        num_stages=1,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return mixed_qkv, z, b, a
 

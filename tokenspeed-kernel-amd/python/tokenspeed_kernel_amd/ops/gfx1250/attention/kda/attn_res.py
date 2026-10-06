@@ -55,7 +55,7 @@ def _load_candidate(
 
 
 @gluon.jit
-def _attn_res_rmsnorm_kernel(
+def gluon_attn_res_fwd_gfx1250(
     layer_residual,
     delta,
     block_residual,
@@ -144,8 +144,7 @@ def _attn_res_rmsnorm_kernel(
                 N,
             )
             square_sum = gl.sum(value * value, axis=0)
-            # Match the established high-precision score reduction.
-            dot = gl.sum((value * scorer).to(gl.float64), axis=0).to(gl.float32)
+            dot = gl.sum(value * scorer, axis=0)
             score = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
             next_max = gl.maximum(max_logit, score)
             old_scale = gl.exp(max_logit - next_max)
@@ -226,9 +225,30 @@ def attn_res_rmsnorm_gfx1250(
         raise ValueError("gfx1250 AttnRes requires a contiguous hidden dimension")
 
     output = torch.empty_like(layer_residual)
-    num_warps = 4
+    # Use 8 warps and waves_per_eu=2 under 256 tokens with snapshots to mix.
+    # Larger grids and the no-snapshot case keep 4 warps and default waves.
+    eight_warps = tokens < 256 and num_valid_blocks >= 1
+    num_warps = 8 if eight_warps else 4
     delta_tensor = layer_residual if delta is None else delta
-    _attn_res_rmsnorm_kernel[(tokens,)](
+    launch_kwargs = {
+        "stride_layer_t": layer_residual.stride(0),
+        "stride_delta_t": delta_tensor.stride(0),
+        "stride_block_t": block_residual.stride(0),
+        "stride_block_n": block_residual.stride(1),
+        "stride_output_t": output.stride(0),
+        "H": hidden,
+        "N": num_valid_blocks + 1,
+        "BLOCK_WRITE_IDX": 0 if block_write_idx < 0 else block_write_idx,
+        "HAS_DELTA": delta is not None,
+        "WRITE_BLOCK": block_write_idx >= 0,
+        "SCORE_EPS": score_eps,
+        "OUTPUT_EPS": output_eps,
+        "NUM_WARPS": num_warps,
+        "num_warps": num_warps,
+    }
+    if eight_warps:
+        launch_kwargs["waves_per_eu"] = 2
+    gluon_attn_res_fwd_gfx1250[(tokens,)](
         layer_residual,
         delta_tensor,
         block_residual,
@@ -236,20 +256,7 @@ def attn_res_rmsnorm_gfx1250(
         score_rms_weight,
         output_rms_weight,
         output,
-        stride_layer_t=layer_residual.stride(0),
-        stride_delta_t=delta_tensor.stride(0),
-        stride_block_t=block_residual.stride(0),
-        stride_block_n=block_residual.stride(1),
-        stride_output_t=output.stride(0),
-        H=hidden,
-        N=num_valid_blocks + 1,
-        BLOCK_WRITE_IDX=0 if block_write_idx < 0 else block_write_idx,
-        HAS_DELTA=delta is not None,
-        WRITE_BLOCK=block_write_idx >= 0,
-        SCORE_EPS=score_eps,
-        OUTPUT_EPS=output_eps,
-        NUM_WARPS=num_warps,
-        num_warps=num_warps,
+        **launch_kwargs,
     )
     return output
 

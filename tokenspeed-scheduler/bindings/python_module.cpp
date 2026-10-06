@@ -28,8 +28,11 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
+#include <stdexcept>
+
 #include "scheduler/outside_events/inc.h"
 #include "scheduler/operations/inc.h"
+#include "scheduler/capacity_model.h"
 #include "scheduler/execution_event.h"
 #include "scheduler/kv_cache_events.h"
 #include "scheduler/request.h"
@@ -111,23 +114,28 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](tokenspeed::CacheGroupConfig* self, std::string group_id, std::int32_t block_granularity,
                std::int32_t total_pages, tokenspeed::CacheGroupConfig::Retention retention,
                std::optional<std::int32_t> sliding_window_tokens, tokenspeed::CacheGroupFamily family,
-               std::int32_t cache_blocks_per_lcm_block, tokenspeed::CacheTransferPolicy transfer_policy) {
+               std::int32_t cache_blocks_per_lcm_block, tokenspeed::CacheTransferPolicy transfer_policy,
+               std::int32_t shard_count, bool replayable) {
                 new (self) tokenspeed::CacheGroupConfig{
                     std::move(group_id), block_granularity,     total_pages, cache_blocks_per_lcm_block,
-                    retention,           sliding_window_tokens, family,      transfer_policy,
+                    retention,           sliding_window_tokens, replayable,  family,
+                    transfer_policy,     shard_count,
                 };
             },
             nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"),
             nb::arg("retention") = tokenspeed::CacheGroupConfig::Retention::FullHistory,
             nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("family") = tokenspeed::CacheGroupFamily::History,
             nb::arg("cache_blocks_per_lcm_block") = 1,
-            nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified)
+            nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified, nb::arg("shard_count") = 1,
+            nb::arg("replayable") = false)
         .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
         .def_rw("block_granularity", &tokenspeed::CacheGroupConfig::block_granularity)
         .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
         .def_rw("cache_blocks_per_lcm_block", &tokenspeed::CacheGroupConfig::cache_blocks_per_lcm_block)
+        .def_rw("shard_count", &tokenspeed::CacheGroupConfig::shard_count)
         .def_rw("retention", &tokenspeed::CacheGroupConfig::retention)
         .def_rw("sliding_window_tokens", &tokenspeed::CacheGroupConfig::sliding_window_tokens)
+        .def_rw("replayable", &tokenspeed::CacheGroupConfig::replayable)
         .def_rw("family", &tokenspeed::CacheGroupConfig::family)
         .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
         .def("validate", &tokenspeed::CacheGroupConfig::Validate);
@@ -153,11 +161,31 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens);
 
+    // The config-only sizing model. Python builds it from a SchedulerConfig
+    // whose page counts are still zero, sizes the pool from its answers, and
+    // the Scheduler later bounds requests against that pool with the same
+    // model. Group results are indexed like config.cache_groups.
+    nb::class_<tokenspeed::CapacityModel>(m, "CapacityModel")
+        .def(nb::init<const tokenspeed::SchedulerConfig&>(), nb::arg("config"))
+        .def_prop_ro("num_groups", &tokenspeed::CapacityModel::NumGroups)
+        .def("single_request_group_pages", &tokenspeed::CapacityModel::SingleRequestGroupPages, nb::arg("token_limit"))
+        .def("concurrent_group_pages", &tokenspeed::CapacityModel::ConcurrentGroupPages, nb::arg("max_total_tokens"),
+             nb::arg("max_context_len"))
+        .def(
+            "lcm_blocks_needed_for",
+            [](const tokenspeed::CapacityModel& model, const std::vector<std::int64_t>& group_pages) {
+                return model.LcmBlocksNeededFor(group_pages);
+            },
+            nb::arg("group_pages"))
+        .def("max_single_request_tokens", &tokenspeed::CapacityModel::MaxSingleRequestTokens,
+             nb::arg("usable_lcm_blocks"));
+
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::RequestSpec::request_id)
         .def_rw("tokens", &tokenspeed::RequestSpec::tokens)
-        .def_rw("max_new_tokens", &tokenspeed::RequestSpec::max_new_tokens);
+        .def_rw("max_new_tokens", &tokenspeed::RequestSpec::max_new_tokens)
+        .def_rw("max_cached_prefix_tokens", &tokenspeed::RequestSpec::max_cached_prefix_tokens);
 
     nb::module_ forward_event = m.def_submodule("ForwardEvent");
     nb::class_<tokenspeed::forward::ExtendResult>(forward_event, "ExtendResult")
@@ -173,6 +201,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::forward::Abort>(forward_event, "Abort")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::forward::Abort::request_id);
+
+    nb::class_<tokenspeed::forward::Retract>(forward_event, "Retract")
+        .def(nb::init<>())
+        .def_rw("request_id", &tokenspeed::forward::Retract::request_id);
 
     nb::class_<tokenspeed::forward::UpdateReserveNumTokens>(forward_event, "UpdateReserveNumTokens")
         .def(nb::init<>())
@@ -190,8 +222,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("op_id", &tokenspeed::cache::WriteBackDone::op_id);
 
     nb::class_<tokenspeed::cache::LoadBackDone>(cache, "LoadBackDoneEvent")
-        .def(nb::init<>())
-        .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id);
+        .def(nb::init<std::uint32_t, bool>(), nb::arg("op_id"), nb::arg("success"))
+        .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id)
+        .def_rw("success", &tokenspeed::cache::LoadBackDone::success);
 
     nb::class_<tokenspeed::pd::BootstrappedEvent>(pd, "BootstrappedEvent")
         .def(nb::init<std::string>(), nb::arg("request_id"))
@@ -226,6 +259,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     forward_batch.def_ro("input_ids", &tokenspeed::ForwardBatch::input_ids)
         .def_ro("shifted_input_ids", &tokenspeed::ForwardBatch::shifted_input_ids)
         .def_ro("extend_prefix_lens", &tokenspeed::ForwardBatch::extend_prefix_lens)
+        .def_ro("extend_replay_lens", &tokenspeed::ForwardBatch::extend_replay_lens)
         .def_prop_ro(
             "prefill_lengths",
             [](const tokenspeed::ForwardBatch& op) -> const std::vector<std::int32_t>& { return op.prefill_lengths; },
@@ -260,13 +294,18 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("op_ids", &tokenspeed::LoadBackBatch::op_ids)
         .def_ro("group_ids", &tokenspeed::LoadBackBatch::group_ids)
         .def_ro("src_pages", &tokenspeed::LoadBackBatch::src_pages)
-        .def_ro("dst_pages", &tokenspeed::LoadBackBatch::dst_pages);
+        .def_ro("dst_pages", &tokenspeed::LoadBackBatch::dst_pages)
+        .def_ro("content_hashes", &tokenspeed::LoadBackBatch::content_hashes)
+        .def_ro("page_offsets", &tokenspeed::LoadBackBatch::page_offsets)
+        .def_ro("prefetch_from_storage", &tokenspeed::LoadBackBatch::prefetch_from_storage);
 
     nb::class_<tokenspeed::WriteBackBatch>(cache, "WriteBackOp")
         .def_ro("op_ids", &tokenspeed::WriteBackBatch::op_ids)
         .def_ro("group_ids", &tokenspeed::WriteBackBatch::group_ids)
         .def_ro("src_pages", &tokenspeed::WriteBackBatch::src_pages)
         .def_ro("dst_pages", &tokenspeed::WriteBackBatch::dst_pages)
+        .def_ro("content_hashes", &tokenspeed::WriteBackBatch::content_hashes)
+        .def_ro("page_offsets", &tokenspeed::WriteBackBatch::page_offsets)
         .def_ro("source_pinned", &tokenspeed::WriteBackBatch::source_pinned);
 
     auto collect_forward = [](const tokenspeed::ExecutionPlan& plan) -> nb::list {
@@ -307,10 +346,24 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                          }
                          return nb::cast(*plan.remote_prefill, nb::rv_policy::copy);
                      })
-        .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero);
+        .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero)
+        .def("pages_to_zero_arrays", [](nb::handle self) {
+            // Zero-copy 1-D int32 views of pages_to_zero, one per cache group
+            // (empty groups included); `self` keeps the ExecutionPlan alive
+            // for the lifetime of each ndarray. The list export builds one
+            // Python int per page, which for a long prompt's admission is
+            // thousands of objects on the forward thread's critical path.
+            auto& plan = nb::cast<tokenspeed::ExecutionPlan&>(self);
+            nb::dict out;
+            for (auto& [gid, pages] : plan.pages_to_zero) {
+                out[nb::str(gid.c_str())] =
+                    nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>>(pages.data(), {pages.size()}, self);
+            }
+            return out;
+        });
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
-        .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config") = tokenspeed::SchedulerConfig{})
+        .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config"))
         .def("submit_requests",
              nb::overload_cast<const std::vector<tokenspeed::RequestSpec>&>(&tokenspeed::Scheduler::SubmitRequests),
              nb::arg("request_specs"))
@@ -326,16 +379,84 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                  }
                  return result;
              })
-        .def("waiting_size", &tokenspeed::Scheduler::WaitingSize)
-        .def("decoding_size", &tokenspeed::Scheduler::DecodingSize)
-        .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize)
+        .def("bootstrapping_size", &tokenspeed::Scheduler::BootstrappingSize,
+             "Count requests waiting for their PD bootstrap handshake.")
+        .def("waiting_size", &tokenspeed::Scheduler::WaitingSize,
+             "Count Submitted and Retracted requests awaiting admission or readmission.")
+        .def("decoding_size", &tokenspeed::Scheduler::DecodingSize, "Count requests in the Decoding FSM state.")
+        .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize,
+             "Count local/remote prefills, PrefillAwaitingResult, and PrefillDone requests.")
+        .def("remote_prefilling_size", &tokenspeed::Scheduler::RemotePrefillSize,
+             "Count RemotePrefilling requests; these are also included in prefilling_size().")
+        .def("pd_transfer_size", &tokenspeed::Scheduler::PdTransferSize,
+             "Count requests with PD-pinned pages; this resource count overlaps lifecycle states.")
         .def("pd_transfer_pinned", &tokenspeed::Scheduler::PdTransferPinned, nb::arg("request_id"))
-        .def("available_kv_pages", &tokenspeed::Scheduler::AvailableKvPages)
-        .def("active_kv_pages", &tokenspeed::Scheduler::ActiveKvPages)
+        .def("available_lcm_blocks", &tokenspeed::Scheduler::AvailableLcmBlocks)
+        .def("empty_lcm_blocks", &tokenspeed::Scheduler::EmptyLcmBlocks)
+        .def("active_lcm_blocks", &tokenspeed::Scheduler::ActiveLcmBlocks)
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
         .def("clear_cache", &tokenspeed::Scheduler::ClearCache)
+        .def("can_clear_cache", &tokenspeed::Scheduler::CanClearCache)
         .def("cache_group_total_pages", &tokenspeed::Scheduler::CacheGroupTotalPages, nb::arg("group_id"))
-        .def("cache_group_available_pages", &tokenspeed::Scheduler::CacheGroupAvailablePages, nb::arg("group_id"));
+        .def("cache_group_available_pages", &tokenspeed::Scheduler::CacheGroupAvailablePages, nb::arg("group_id"))
+        .def("prefix_hashes_for_tokens", &tokenspeed::Scheduler::PrefixHashesForTokens, nb::arg("tokens"))
+        .def("waiting_prefix_hashes", &tokenspeed::Scheduler::WaitingPrefixHashes)
+        .def(
+            "expand_prefix_keys",
+            [](const tokenspeed::Scheduler& scheduler, const std::vector<std::string>& content_hashes) {
+                const std::vector<tokenspeed::CacheKey> keys = scheduler.ExpandPrefixKeys(content_hashes);
+                std::vector<std::uint32_t> group_ids;
+                std::vector<std::string> hashes;
+                std::vector<std::int32_t> page_offsets;
+                group_ids.reserve(keys.size());
+                hashes.reserve(keys.size());
+                page_offsets.reserve(keys.size());
+                for (const tokenspeed::CacheKey& key : keys) {
+                    group_ids.push_back(key.group_id);
+                    hashes.push_back(key.content_hash);
+                    page_offsets.push_back(key.page_offset);
+                }
+                return std::tuple{std::move(group_ids), std::move(hashes), std::move(page_offsets)};
+            },
+            nb::arg("content_hashes"))
+        .def(
+            "register_storage_keys",
+            [](tokenspeed::Scheduler& scheduler, const std::vector<std::uint32_t>& group_ids,
+               const std::vector<std::string>& content_hashes, const std::vector<std::int32_t>& page_offsets) {
+                if (group_ids.size() != content_hashes.size() || group_ids.size() != page_offsets.size()) {
+                    throw std::invalid_argument("register_storage_keys requires aligned group/hash/offset lists");
+                }
+                std::vector<tokenspeed::CacheKey> keys;
+                keys.reserve(group_ids.size());
+                for (std::size_t i = 0; i < group_ids.size(); ++i) {
+                    keys.push_back(tokenspeed::CacheKey{
+                        .group_id = group_ids[i],
+                        .content_hash = content_hashes[i],
+                        .page_offset = page_offsets[i],
+                    });
+                }
+                scheduler.RegisterStorageKeys(keys);
+            },
+            nb::arg("group_ids"), nb::arg("content_hashes"), nb::arg("page_offsets"))
+        .def(
+            "unregister_storage_keys",
+            [](tokenspeed::Scheduler& scheduler, const std::vector<std::uint32_t>& group_ids,
+               const std::vector<std::string>& content_hashes, const std::vector<std::int32_t>& page_offsets) {
+                if (group_ids.size() != content_hashes.size() || group_ids.size() != page_offsets.size()) {
+                    throw std::invalid_argument("unregister_storage_keys requires aligned group/hash/offset lists");
+                }
+                std::vector<tokenspeed::CacheKey> keys;
+                keys.reserve(group_ids.size());
+                for (std::size_t i = 0; i < group_ids.size(); ++i) {
+                    keys.push_back(tokenspeed::CacheKey{
+                        .group_id = group_ids[i],
+                        .content_hash = content_hashes[i],
+                        .page_offset = page_offsets[i],
+                    });
+                }
+                scheduler.UnregisterStorageKeys(keys);
+            },
+            nb::arg("group_ids"), nb::arg("content_hashes"), nb::arg("page_offsets"));
 }

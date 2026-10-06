@@ -19,6 +19,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+!tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/gluon_petit/lib/
+!tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/gluon_petit/lib/**
 lib64/
 parts/
 sdist/
@@ -156,6 +158,8 @@ cython_debug/
 *.dylib
 *.dll
 *.so.*
+# Local CUDA build identities contain host-specific toolchain paths.
+tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cuda/objs/**/build-identity.*
 
 # Fortran module files
 *.mod
@@ -196,6 +200,7 @@ Testing/
 .serena/*
 
 AGENTS.local.md
+AGENTS.override.md
 outputs/
 
 # kiro

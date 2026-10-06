@@ -25,6 +25,9 @@ import torch
 from tokenspeed_kernel.ops.sampling.triton import (
     _QRITA_PERCENTILE_TO_STD_TABLE,
     dflash2_greedy_path,
+    dspark_block_candidate_tiles,
+    dspark_block_greedy_resolve,
+    dspark_block_greedy_step,
     gumbel_sample_from_pools,
     gumbel_sample_from_pools_compact,
     gumbel_sample_from_pools_generic,
@@ -33,6 +36,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gumbel_sample_top_k_top_p_from_pools,
     gumbel_sample_top_k_top_p_qrita_from_pools,
     gumbel_sample_top_p_parallel_from_pools,
+    gumbel_scratch_shape,
 )
 
 # Sentinel matching tokenspeed.runtime.sampling.sampling_params._TOP_K_DISABLED.
@@ -40,11 +44,20 @@ _TOP_K_DISABLED = 1 << 30
 
 
 def _gumbel_scratch(rows: int, vocab_size: int, device: str):
-    num_blocks = (vocab_size + 1023) // 1024
-    local_ids = torch.empty((rows, num_blocks), dtype=torch.int32, device=device)
-    local_scores = torch.empty((rows, num_blocks), dtype=torch.float32, device=device)
+    shape = gumbel_scratch_shape(rows, vocab_size)
+    local_ids = torch.empty(shape, dtype=torch.int32, device=device)
+    local_scores = torch.empty(shape, dtype=torch.float32, device=device)
     out = torch.empty((rows,), dtype=torch.int32, device=device)
     return local_ids, local_scores, out
+
+
+def test_gumbel_scratch_shape_covers_the_kernel_blocks() -> None:
+    # One (id, score) per 1024-token block, rounded up for the ragged tail.
+    assert gumbel_scratch_shape(4, 1024) == (4, 1)
+    assert gumbel_scratch_shape(4, 1025) == (4, 2)
+    assert gumbel_scratch_shape(0, 129280) == (0, 127)
+    with pytest.raises(ValueError, match="vocab_size > 0"):
+        gumbel_scratch_shape(4, 0)
 
 
 def _top_k_top_p_gumbel_scratch(rows: int, vocab_size: int, device: str):
@@ -177,6 +190,32 @@ def test_gumbel_sample_from_pools_takes_tail_token(device: str) -> None:
     ).clone()
 
     torch.testing.assert_close(compact.cpu(), sampled.cpu())
+
+
+def test_gumbel_sample_from_pools_rows_beyond_int32_offsets(device: str) -> None:
+    """Verify rows x vocab past 2**31 elements (e.g. 136 requests x 64 tree nodes)."""
+    rows, vocab_size = 8704, 248320
+    assert (rows - 1) * vocab_size > 2**31
+    logits = torch.full((rows, vocab_size), -10.0, dtype=torch.bfloat16, device=device)
+    logits[:, 777] = 1.0e3
+    logits[-1, 777] = -10.0
+    logits[-1, 12345] = 1.0e3
+    req_pool_indices = torch.arange(rows, dtype=torch.int32, device=device)
+    temperature_pool = torch.ones((rows,), dtype=torch.float32, device=device)
+    seed_pool = torch.arange(rows, dtype=torch.int64, device=device)
+    offsets_pool = torch.zeros((rows,), dtype=torch.int64, device=device)
+    local_ids, local_scores, out = _gumbel_scratch(rows, vocab_size, device)
+    pools = (req_pool_indices, temperature_pool, seed_pool, offsets_pool)
+
+    sampled = gumbel_sample_from_pools(logits, *pools, local_ids, local_scores, out)
+    compact_out = torch.empty((rows,), dtype=torch.int32, device=device)
+    compact = gumbel_sample_from_pools_compact(
+        logits, *pools, compact_out, block_size=1024
+    )
+
+    for got in (sampled, compact):
+        assert int(got[0]) == 777
+        assert int(got[-1]) == 12345
 
 
 def test_gumbel_no_filter_verify_idx_mapping_matches_expanded_rows(
@@ -803,3 +842,212 @@ def test_dflash2_greedy_path_rejects_a_lattice_it_cannot_read(device: str) -> No
         dflash2_greedy_path(candidate_ids, scores[:, :, :, :2], anchors, out)
     with pytest.raises(ValueError, match="out must be int32"):
         dflash2_greedy_path(candidate_ids, scores, anchors, out.long())
+
+
+def _dspark_block_reference(base, anchors, embedding, projection):
+    """FP32 bias GEMM plus ``torch.argmax`` over the whole vocabulary."""
+    previous = anchors.long()
+    expected = torch.empty(base.shape[:2], dtype=torch.int64, device=base.device)
+    for step in range(base.shape[1]):
+        bias = embedding[previous].float() @ projection.float().T
+        previous = torch.argmax(base[:, step] + bias, dim=-1)
+        expected[:, step] = previous
+    return expected
+
+
+def _dspark_block_on_shards(base, anchors, embedding, projection, tp):
+    """Run every shard's step kernel on one device and hand-gather the candidates."""
+    rows, block, vocab = base.shape
+    local = vocab // tp
+    tiles = dspark_block_candidate_tiles(local)
+    candidates = torch.empty(tp, rows, tiles, dtype=torch.int64, device=base.device)
+    partials = torch.empty(tp, rows, tiles, dtype=torch.int64, device=base.device)
+    out = torch.empty(rows, block, dtype=torch.int32, device=base.device)
+    for step in range(block):
+        for rank in range(tp):
+            shard = slice(rank * local, (rank + 1) * local)
+            dspark_block_greedy_step(
+                base[:, :, shard].contiguous(),
+                step,
+                anchors,
+                candidates,
+                embedding,
+                projection[shard].contiguous(),
+                rank * local,
+                local,
+                partials[rank],
+                out,
+            )
+        candidates.copy_(partials)
+    dspark_block_greedy_resolve(candidates, out, block - 1)
+    return out
+
+
+@pytest.mark.parametrize(
+    ("rows", "block", "vocab", "tp", "rank"),
+    ((10, 5, 8 * 2048, 8, 256), (3, 4, 1000, 1, 32), (17, 3, 4096, 4, 64)),
+)
+def test_dspark_block_greedy_matches_the_full_vocabulary_argmax(
+    rows: int, block: int, vocab: int, tp: int, rank: int, device: str
+) -> None:
+    torch.manual_seed(rows)
+    embedding = torch.randn(vocab, rank, device=device).to(torch.bfloat16)
+    projection = torch.randn(vocab, rank, device=device).to(torch.bfloat16)
+    base = torch.randn(rows, block, vocab, device=device) * 4
+    anchors = torch.randint(0, vocab, (rows,), device=device, dtype=torch.int32)
+
+    out = _dspark_block_on_shards(base, anchors, embedding, projection, tp)
+
+    expected = _dspark_block_reference(base, anchors, embedding, projection)
+    assert torch.equal(out.long(), expected)
+
+
+def test_dspark_block_greedy_reads_strided_anchors(device: str) -> None:
+    """The drafters hand over a column of their ``[rows, spec]`` token table.
+
+    Every column of that table holds the row's bonus token, so a kernel that
+    read the column as a contiguous vector would give rows after the first
+    another row's anchor -- and a wrong bigram bias at step 0 -- while the
+    first row, and any single-request batch, stayed correct.
+    """
+    torch.manual_seed(11)
+    rows, block, vocab, rank, spec = 8, 3, 2048, 64, 6
+    embedding = torch.randn(vocab, rank, device=device).to(torch.bfloat16)
+    projection = torch.randn(vocab, rank, device=device).to(torch.bfloat16)
+    base = torch.randn(rows, block, vocab, device=device) * 4
+    table = torch.randint(0, vocab, (rows, 1), device=device, dtype=torch.int32)
+    table = table.expand(rows, spec).contiguous()
+    anchors = table[:, 0]
+    assert anchors.stride(0) == spec
+
+    out = _dspark_block_on_shards(base, anchors, embedding, projection, 2)
+
+    expected = _dspark_block_reference(
+        base, anchors.contiguous(), embedding, projection
+    )
+    assert torch.equal(out.long(), expected)
+
+
+def test_dspark_block_greedy_breaks_ties_toward_the_lowest_token(device: str) -> None:
+    """Rounded logits tie constantly; the winner must be the first maximum."""
+    torch.manual_seed(1)
+    vocab, rank = 4 * 700, 16
+    embedding = torch.zeros(vocab, rank, device=device, dtype=torch.bfloat16)
+    projection = torch.zeros(vocab, rank, device=device, dtype=torch.bfloat16)
+    base = torch.randint(-3, 3, (6, 3, vocab), device=device).float()
+    anchors = torch.zeros(6, device=device, dtype=torch.int64)
+
+    out = _dspark_block_on_shards(base, anchors, embedding, projection, 4)
+
+    assert torch.equal(out.long(), torch.argmax(base, dim=-1))
+    # A shard's padding columns and its tokens past ``num_valid`` never win.
+    tiles = dspark_block_candidate_tiles(vocab + 64)
+    candidates = torch.empty(1, 6, tiles, dtype=torch.int64, device=device)
+    padded = torch.full((6, 3, vocab + 64), 100.0, device=device)
+    padded[:, :, :vocab] = base
+    padded_projection = torch.zeros(vocab + 64, rank, device=device).to(torch.bfloat16)
+    dspark_block_greedy_step(
+        padded,
+        0,
+        anchors,
+        candidates,
+        embedding,
+        padded_projection,
+        0,
+        vocab,
+        candidates[0],
+        out,
+    )
+    dspark_block_greedy_resolve(candidates, out, 0)
+    assert torch.equal(out[:, 0].long(), torch.argmax(base[:, 0], dim=-1))
+
+
+def test_dspark_block_greedy_clamps_out_of_range_anchors(device: str) -> None:
+    vocab, rank, rows = 512, 16, 4
+    embedding = torch.randn(vocab, rank, device=device).to(torch.bfloat16)
+    projection = torch.randn(vocab, rank, device=device).to(torch.bfloat16)
+    base = torch.randn(rows, 1, vocab, device=device)
+    anchors = torch.tensor([-5, vocab + 9, 0, vocab - 1], device=device)
+
+    out = _dspark_block_on_shards(base, anchors, embedding, projection, 1)
+
+    expected = _dspark_block_reference(
+        base, anchors.clamp(0, vocab - 1), embedding, projection
+    )
+    assert torch.equal(out.long(), expected)
+
+
+def test_dspark_block_greedy_rejects_mismatched_workspaces(device: str) -> None:
+    vocab, rank, rows, block = 512, 16, 4, 2
+    embedding = torch.randn(vocab, rank, device=device).to(torch.bfloat16)
+    projection = torch.randn(vocab, rank, device=device).to(torch.bfloat16)
+    base = torch.randn(rows, block, vocab, device=device)
+    anchors = torch.zeros(rows, device=device, dtype=torch.int32)
+    tiles = dspark_block_candidate_tiles(vocab)
+    candidates = torch.empty(2, rows, tiles, dtype=torch.int64, device=device)
+    partials = torch.empty(rows, tiles, dtype=torch.int64, device=device)
+    out = torch.empty(rows, block, dtype=torch.int32, device=device)
+
+    with pytest.raises(ValueError, match="candidates shape"):
+        dspark_block_greedy_step(
+            base,
+            0,
+            anchors,
+            candidates[:, :, :-1],
+            embedding,
+            projection,
+            0,
+            vocab,
+            partials,
+            out,
+        )
+    with pytest.raises(ValueError, match="outside the block"):
+        dspark_block_greedy_step(
+            base,
+            block,
+            anchors,
+            candidates,
+            embedding,
+            projection,
+            0,
+            vocab,
+            partials,
+            out,
+        )
+    with pytest.raises(ValueError, match="must be BF16"):
+        dspark_block_greedy_step(
+            base,
+            0,
+            anchors,
+            candidates,
+            embedding.float(),
+            projection,
+            0,
+            vocab,
+            partials,
+            out,
+        )
+    with pytest.raises(ValueError, match="num_valid"):
+        dspark_block_greedy_step(
+            base,
+            0,
+            anchors,
+            candidates,
+            embedding,
+            projection,
+            0,
+            vocab + 1,
+            partials,
+            out,
+        )
+    with pytest.raises(ValueError, match="output must be int32"):
+        dspark_block_greedy_resolve(candidates, out.long(), 0)
+    # A step that resolves candidates may not write its tiles over them.
+    single = torch.empty(1, rows, tiles, dtype=torch.int64, device=device)
+    dspark_block_greedy_step(
+        base, 0, anchors, single, embedding, projection, 0, vocab, single[0], out
+    )
+    with pytest.raises(ValueError, match="must not overlap"):
+        dspark_block_greedy_step(
+            base, 1, anchors, single, embedding, projection, 0, vocab, single[0], out
+        )

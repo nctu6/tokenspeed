@@ -177,7 +177,7 @@ def _store_16x16_block(
 
 
 @gluon.jit
-def _solve_merge_64_fwd_kernel(
+def gluon_kda_paged_prefill_solve_merge_gfx950(
     akk,
     tinv,
     cu_seqlens,
@@ -291,7 +291,7 @@ def _add(a, b):
 
 
 @gluon.jit
-def _preprocess_intra_fwd_kernel(
+def gluon_kda_paged_prefill_preprocess_gfx950(
     q,
     k,
     raw_g,
@@ -370,7 +370,6 @@ def _preprocess_intra_fwd_kernel(
     q_smem.store(normalized_q)
     k_smem.store(normalized_k)
     bg_smem.store(cumulative_gate)
-    gl.barrier()
 
     load_layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [NUM_WARPS, 1], [1, 0])
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
@@ -452,7 +451,7 @@ def _preprocess_intra_fwd_kernel(
 
 
 @gluon.jit
-def _wu_vector_fwd_kernel(
+def gluon_kda_paged_prefill_wu_vector_gfx950(
     tinv,
     kn,
     v,
@@ -461,6 +460,7 @@ def _wu_vector_fwd_kernel(
     u,
     w,
     kg,
+    chunk_starts,
     cu_seqlens,
     chunk_indices,
     H: gl.constexpr,
@@ -484,6 +484,9 @@ def _wu_vector_fwd_kernel(
     end = gl.load(cu_seqlens + sequence + 1).to(gl.int32)
     length = end - begin
     token0 = local_chunk * BT
+    # Publish where each sequence's chunks start in the chunk-major Kg.
+    if (local_chunk == 0) & (head == 0) & (out_block == 0):
+        gl.store(chunk_starts + sequence, chunk)
 
     load_t_layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [4, 1], [1, 0])
     load_x_layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [4, 1], [1, 0])
@@ -556,11 +559,23 @@ def _wu_vector_fwd_kernel(
     last_gate = gl.min(gl.where(valid_keys, gate, float("inf")), axis=0)
     gated_key = gl.load(kn + bk_offsets, mask=key_mask, other=0.0).to(gl.float32)
     gated_key *= gl.exp(last_gate[None, :] - gate)
-    gl.store(kg + bk_offsets, gated_key.to(gl.bfloat16), mask=key_mask)
+    # Kg is stored per chunk as [key, token] so the state scan can load its
+    # MFMA operand (8 consecutive tokens per lane) with 16-byte vector loads.
+    # Tail tokens are already zero, so whole chunks are written unmasked.
+    kg_store_layout: gl.constexpr = gl.BlockedLayout([8, 1], [8, 8], [1, 4], [0, 1])
+    kg_tokens = gl.arange(0, BT, layout=gl.SliceLayout(1, kg_store_layout))
+    kg_keys = gl.arange(0, BO, layout=gl.SliceLayout(0, kg_store_layout))
+    gl.store(
+        kg
+        + (chunk * H + head) * K * BT
+        + (out_block * BO + kg_keys[None, :]) * BT
+        + kg_tokens[:, None],
+        gl.convert_layout(gated_key.to(gl.bfloat16), kg_store_layout),
+    )
 
 
 @gluon.jit
-def _state_scan_fwd_kernel(
+def gluon_kda_paged_prefill_state_scan_gfx950(
     w,
     u,
     kg,
@@ -570,6 +585,7 @@ def _state_scan_fwd_kernel(
     vnew,
     output,
     final_state,
+    chunk_starts,
     cu_seqlens,
     H: gl.constexpr,
     K: gl.constexpr,
@@ -647,6 +663,9 @@ def _state_scan_fwd_kernel(
     out_values = value_block * BO + uv_values
     key_base = (begin * H + head) * K
     value_base = (begin * H + head) * V
+    # Kg is chunk-major; the W/U kernel recorded this sequence's first chunk.
+    # Empty sequences have no entry, but they also run no chunks below.
+    chunk_base = gl.load(chunk_starts + sequence)
 
     for local_chunk in range(num_chunks):
         token0 = local_chunk * BT
@@ -711,23 +730,10 @@ def _state_scan_fwd_kernel(
             result_offsets,
             mask=result_mask,
         )
-        kg_offsets0 = ((token0 + kg_rows[:, None]) * H * K + kg_keys[None, :]).to(
-            gl.int32
-        )
-        kg_offsets1 = kg_offsets0 + BK
-        kg_mask = (token0 + kg_rows[:, None] < length) & (kg_keys[None, :] < BK)
-        state_rhs0 = cdna4.buffer_load(
-            kg + key_base,
-            kg_offsets0,
-            mask=kg_mask,
-            other=0.0,
-        )
-        state_rhs1 = cdna4.buffer_load(
-            kg + key_base,
-            kg_offsets1,
-            mask=kg_mask,
-            other=0.0,
-        )
+        kg_chunk = kg + ((chunk_base + local_chunk) * H + head) * K * BT
+        kg_offsets = (kg_keys[None, :] * BT + kg_rows[:, None]).to(gl.int32)
+        state_rhs0 = cdna4.buffer_load(kg_chunk, kg_offsets)
+        state_rhs1 = cdna4.buffer_load(kg_chunk, kg_offsets + BK * BT)
         last_token = gl.minimum(token0 + BT, length) - 1
         bg0 = cdna4.buffer_load(
             bg + key_base,
@@ -766,7 +772,7 @@ def _state_scan_fwd_kernel(
 
 
 @gluon.jit
-def _output_fwd_kernel(
+def gluon_kda_paged_prefill_gfx950(
     aqk,
     vnew,
     output,
@@ -857,10 +863,11 @@ def _launch_producer(
     u: torch.Tensor,
     w: torch.Tensor,
     kg: torch.Tensor,
+    chunk_starts: torch.Tensor,
     cu_seqlens: torch.Tensor,
     chunk_indices: torch.Tensor,
 ) -> None:
-    _solve_merge_64_fwd_kernel[(num_chunks, heads)](
+    gluon_kda_paged_prefill_solve_merge_gfx950[(num_chunks, heads)](
         akk,
         tinv,
         cu_seqlens,
@@ -869,7 +876,7 @@ def _launch_producer(
         BT=chunk_size,
         num_warps=1,
     )
-    _wu_vector_fwd_kernel[(num_chunks, heads, 1)](
+    gluon_kda_paged_prefill_wu_vector_gfx950[(num_chunks, heads, 1)](
         tinv,
         kn,
         v,
@@ -878,6 +885,7 @@ def _launch_producer(
         u,
         w,
         kg,
+        chunk_starts,
         cu_seqlens,
         chunk_indices,
         H=heads,
@@ -889,7 +897,7 @@ def _launch_producer(
     )
 
 
-def gluon_kda_paged_prefill_gfx950(
+def launch_gluon_kda_paged_prefill_gfx950(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -949,9 +957,7 @@ def gluon_kda_paged_prefill_gfx950(
     if cu_seqlens.numel() - 1 != initial_state.shape[0]:
         raise ValueError("cu_seqlens and initial_state must describe the same batch")
 
-    from tokenspeed_kernel.ops.attention.triton.linear.index import (
-        prepare_chunk_indices,
-    )
+    from tokenspeed_kernel.ops.attention.gdn.triton import prepare_chunk_indices
 
     chunk_size = _CHUNK_SIZE
     subchunk_size = _SUBCHUNK_SIZE
@@ -980,9 +986,12 @@ def gluon_kda_paged_prefill_gfx950(
         device=q.device,
         dtype=torch.bfloat16,
     )
-    kg = torch.empty_like(k, dtype=torch.bfloat16)
+    kg = torch.empty(
+        num_chunks, heads, key_dim, chunk_size, device=q.device, dtype=torch.bfloat16
+    )
+    chunk_starts = torch.empty(num_sequences, device=q.device, dtype=torch.int32)
     qg = torch.empty_like(q, dtype=torch.bfloat16)
-    _preprocess_intra_fwd_kernel[(num_chunks, heads)](
+    gluon_kda_paged_prefill_preprocess_gfx950[(num_chunks, heads)](
         q,
         k,
         g_raw,
@@ -1036,10 +1045,11 @@ def gluon_kda_paged_prefill_gfx950(
         u=u,
         w=w,
         kg=kg,
+        chunk_starts=chunk_starts,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
-    _state_scan_fwd_kernel[
+    gluon_kda_paged_prefill_state_scan_gfx950[
         (triton.cdiv(value_dim, scan_output_block), num_sequences * heads)
     ](
         w,
@@ -1051,6 +1061,7 @@ def gluon_kda_paged_prefill_gfx950(
         vnew,
         output,
         final_state,
+        chunk_starts,
         cu_seqlens,
         H=heads,
         K=key_dim,
@@ -1060,8 +1071,11 @@ def gluon_kda_paged_prefill_gfx950(
         num_warps=4,
         num_stages=2,
         waves_per_eu=4,
+        # iterative-ilp overlaps the per-chunk loads with the MFMAs better than
+        # the default scheduler (~5% on long prefills).
+        llvm_fn_attrs=(("amdgpu-sched-strategy", "iterative-ilp"),),
     )
-    _output_fwd_kernel[(num_chunks, heads)](
+    gluon_kda_paged_prefill_gfx950[(num_chunks, heads)](
         aqk,
         vnew,
         output,
@@ -1077,4 +1091,4 @@ def gluon_kda_paged_prefill_gfx950(
     return output.unsqueeze(0), final_state
 
 
-__all__ = ["gluon_kda_paged_prefill_gfx950"]
+__all__ = ["launch_gluon_kda_paged_prefill_gfx950"]

@@ -22,7 +22,7 @@ from dataclasses import dataclass
 import torch
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
+from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
@@ -31,8 +31,6 @@ class FusedSetKVBufferArg:
     value: torch.Tensor
     k_buffer: torch.Tensor
     v_buffer: torch.Tensor
-    k_scale: float | None
-    v_scale: float | None
     cache_loc: torch.Tensor
 
 
@@ -41,67 +39,12 @@ class FusedMLASetKVBufferArg:
     k_nope: torch.Tensor
     kv_buffer: torch.Tensor
     cache_loc: torch.Tensor
-    # Setting the absorbed query half switches the write from updating the
-    # query's rotated columns in place to assembling the whole query, which
-    # widens the caller's output accordingly. supports_fused_mla_kv_write
-    # requires the selected solution to explicitly declare
-    # fused_mla_full_query -- select_kernel alone treats an undeclared trait
-    # as a non-match rather than a rejection, so this is checked separately
-    # -- and declines to fuse otherwise, rather than run a solution that
-    # would silently leave the unrotated columns unwritten.
-    q_nope: torch.Tensor | None = None
-    # RoPE tables for the fused write. ``cos_sin_cache=None`` selects the NoPE
-    # form, where the halves are assembled without rotation -- a model with no
-    # rotary module then needs no separate path.
-    cos_sin_cache: torch.Tensor | None = None
-    is_neox: bool = True
+    # Setting the absorbed query half makes the write assemble the whole query.
+    q_nope: torch.Tensor | None
     # Clamp NaN/inf on the latent store only, as set_mla_kv_buffer_triton does.
-    sanitize: bool = False
-
-
-def supports_fused_mla_kv_write(
-    *,
-    q_dtype: torch.dtype,
-    k_dtype: torch.dtype,
-    has_rope: bool,
-    is_neox: bool,
-    has_q_nope: bool = False,
-) -> bool:
-    """Whether a registered kernel can do the fused MLA query + KV write.
-
-    Resolves the same (mode, signature, traits) key ``apply_rope_mla_set_kv``
-    dispatches on, so a caller that gets ``True`` here runs the kernel this
-    answered for.
-    """
-    try:
-        kernel = select_kernel(
-            "embedding",
-            "rope_mla_set_kv",
-            format_signature(
-                q_rope=dense_tensor_format(q_dtype),
-                k_rope=dense_tensor_format(k_dtype),
-            ),
-            traits={
-                "has_rope": has_rope,
-                "is_neox": is_neox,
-                "fused_mla_full_query": has_q_nope,
-            },
-        )
-    except NoKernelFoundError:
-        return False
-    if has_q_nope:
-        # An explicit override resolves without trait filtering, and a
-        # solution that never declared this trait matches by omission, so
-        # neither route proves the selected kernel writes the query's
-        # unrotated columns. Require the declaration to cover the True case
-        # and decline otherwise -- falling back is always correct, a
-        # half-written query is not.
-        from tokenspeed_kernel.registry import KernelRegistry
-
-        spec = KernelRegistry.get().get_by_name(kernel.name)
-        if spec is None or True not in spec.traits.get("fused_mla_full_query", ()):
-            return False
-    return True
+    sanitize: bool
+    # True per token to store its latent row; None stores every row.
+    write_mask: torch.Tensor | None
 
 
 def apply_rope(
@@ -114,7 +57,6 @@ def apply_rope(
     # embedding options
     is_neox: bool = True,
     fused_set_kv_buffer_arg: FusedSetKVBufferArg | None = None,
-    fused_mla_set_kv_buffer_arg: FusedMLASetKVBufferArg | None = None,
     q_rope_out: torch.Tensor | None = None,
     k_rope_out: torch.Tensor | None = None,
     # dispatch options
@@ -132,13 +74,8 @@ def apply_rope(
             as concat(cos, sin) along the last dimension.
         is_neox: Whether to use Neox-style half-split rotation. False uses
             GPT-J interleaved-pair rotation.
-        fused_set_kv_buffer_arg: Optional fused KV-cache write arguments. Both
-            CUDA and Triton implementations currently require k_scale and
-            v_scale to be None.
-        fused_mla_set_kv_buffer_arg: Optional fused MLA KV-cache write
-            arguments. When provided, rotated K is written to the MLA cache
-            instead of k/k_rope_out because MLA stores [k_nope | k_rope] in a
-            single cache row with different component widths.
+        fused_set_kv_buffer_arg: Optional fused KV-cache write arguments; the
+            cache is written at unit scale.
         q_rope_out: Optional output buffer for the rotated query. If omitted,
             q is updated in place.
         k_rope_out: Optional output buffer for the rotated key. If omitted,
@@ -153,10 +90,6 @@ def apply_rope(
     rotary_dim = cos_sin_cache.shape[-1]
     assert rotary_dim % 2 == 0, "embedding.rope requires even rotary_dim"
     assert rotary_dim <= head_size, "embedding.rope requires rotary_dim <= head_size"
-    if fused_set_kv_buffer_arg is not None and fused_mla_set_kv_buffer_arg is not None:
-        raise ValueError("standard and MLA fused KV writes are mutually exclusive")
-    if fused_mla_set_kv_buffer_arg is not None and k_rope_out is not None:
-        raise ValueError("MLA fused KV write stores rotated K directly in the cache")
 
     positions = positions.flatten()
     num_tokens = positions.shape[0]
@@ -168,17 +101,12 @@ def apply_rope(
     num_q_heads = q.numel() // (num_tokens * head_size)
     num_kv_heads = k.numel() // (num_tokens * head_size)
 
-    fused_mla_full_query = (
-        fused_mla_set_kv_buffer_arg is not None
-        and fused_mla_set_kv_buffer_arg.q_nope is not None
-    )
     traits = {
         "head_size": head_size,
+        "rotary_dim": rotary_dim,
         "partial_rotary": rotary_dim != head_size,
         "is_neox": is_neox,
         "has_fused_kv": fused_set_kv_buffer_arg is not None,
-        "has_fused_mla_kv": fused_mla_set_kv_buffer_arg is not None,
-        "fused_mla_full_query": fused_mla_full_query,
         "has_q_out": q_rope_out is not None,
         "has_k_out": k_rope_out is not None,
     }
@@ -202,8 +130,6 @@ def apply_rope(
         "head_size": head_size,
         "rotary_dim": rotary_dim,
         "has_fused_kv": fused_set_kv_buffer_arg is not None,
-        "has_fused_mla_kv": fused_mla_set_kv_buffer_arg is not None,
-        "fused_mla_full_query": fused_mla_full_query,
         "has_q_out": q_rope_out is not None,
         "has_k_out": k_rope_out is not None,
     }
@@ -230,7 +156,6 @@ def apply_rope(
             cos_sin_cache=cos_sin_cache,
             is_neox=is_neox,
             fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
-            fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
             q_rope_out=q_rope_out,
             k_rope_out=k_rope_out,
             enable_pdl=pdl_enabled(),
@@ -484,8 +409,8 @@ __all__ = [
     "apply_k_rope",
     "apply_rope",
     "apply_rope_mla",
-    "apply_rope_mla_set_kv",
-    "supports_fused_mla_kv_write",
+    "vocab_shard_embedding",
+    "engram_hash",
 ]
 
 
@@ -495,76 +420,186 @@ import tokenspeed_kernel.ops.embedding.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.embedding.triton_host_gather  # noqa: E402,F401
 
 
-def apply_rope_mla_set_kv(
-    *,
-    positions: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_rope: torch.Tensor,
-    fused_mla_set_kv_buffer_arg: FusedMLASetKVBufferArg,
-    q_rope_out: torch.Tensor,
-) -> None:
-    """Assemble the MLA query and write the latent KV cache in one launch.
-
-    The RoPE tables ride on ``fused_mla_set_kv_buffer_arg``, so a model with a
-    rotary embedding and one without (NoPE) make the same call; the kernel
-    specializes on whether the tables are present. Destination dtypes are free
-    to differ from the sources -- the stores convert.
+def mxfp8_embedding(weight, scales, indices, row_start, row_end):
+    """Gather BF16 embeddings from a row shard of an MXFP8 table.
 
     Args:
-        positions: ``[tokens]`` token positions. Read only when the arg
-            carries a ``cos_sin_cache``, but still required: the launch reads
-            its length and dtype either way.
-        q_rope: ``[tokens, heads, rope_dim]`` query RoPE half.
-        k_rope: ``[tokens, 1, rope_dim]`` latent RoPE half.
-        fused_mla_set_kv_buffer_arg: destination pool, write locations, the
-            latent NoPE half, the absorbed query half, and the RoPE tables.
-        q_rope_out: ``[tokens, heads, nope_dim + rope_dim]`` query destination.
-    Returns:
-        ``None``. The kernel writes through ``q_rope_out`` and the pool buffer
-        named by the arg; there is no value to hand back.
-    """
-    has_rope = fused_mla_set_kv_buffer_arg.cos_sin_cache is not None
-    traits = {
-        "has_rope": has_rope,
-        "is_neox": bool(fused_mla_set_kv_buffer_arg.is_neox),
-        "fused_mla_full_query": fused_mla_set_kv_buffer_arg.q_nope is not None,
-    }
-    signature = format_signature(
-        q_rope=dense_tensor_format(q_rope.dtype),
-        k_rope=dense_tensor_format(k_rope.dtype),
-    )
-    kernel = select_kernel("embedding", "rope_mla_set_kv", signature, traits=traits)
+        weight: FP8 E4M3 codes [local_capacity,D], with contiguous columns.
+        scales: E8M0 exponent bytes [local_capacity,D/32].
+        indices: Contiguous integer IDs of any shape, on the table's GPU.
+        row_start: Global ID of the first locally owned row.
+        row_end: Exclusive end of locally owned rows, before capacity padding.
 
-    shape_params = {
-        "num_tokens": q_rope.shape[0],
-        "q_heads": q_rope.shape[1],
-        "rope_dim": q_rope.shape[-1],
-        "nope_dim": fused_mla_set_kv_buffer_arg.k_nope.shape[-1],
-        **traits,
-    }
-    ShapeCapture.get().record(
-        "embedding",
-        "rope_mla_set_kv",
-        kernel.name,
-        q_rope.dtype,
-        shape_params,
-    )
-    with kernel_scope(
-        "embedding",
-        "rope_mla_set_kv",
-        q_rope.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        kernel(
-            positions=positions,
-            q_rope=q_rope,
-            k_rope=k_rope,
-            cos_sin_cache=fused_mla_set_kv_buffer_arg.cos_sin_cache,
-            is_neox=fused_mla_set_kv_buffer_arg.is_neox,
-            fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
-            q_rope_out=q_rope_out,
-            enable_pdl=pdl_enabled(),
+    Returns:
+        BF16 embeddings [*indices.shape,D]; nonlocal IDs produce zero rows.
+        The caller owns any collective needed to combine shards.
+    """
+    if weight.ndim != 2 or weight.shape[1] % 32 or weight.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            "MXFP8 embedding weight must be E4M3 [rows,D] with D divisible by 32"
         )
+    if (
+        scales.shape != (weight.shape[0], weight.shape[1] // 32)
+        or scales.dtype != torch.uint8
+    ):
+        raise ValueError("MXFP8 embedding scales must be E8M0 bytes [rows,D/32]")
+    if not 0 <= row_start <= row_end <= row_start + weight.shape[0]:
+        raise ValueError("MXFP8 embedding shard range exceeds table capacity")
+    if (
+        not indices.is_cuda
+        or indices.dtype not in (torch.int32, torch.int64)
+        or not indices.is_contiguous()
+        or weight.stride(1) != 1
+        or scales.stride(1) != 1
+        or weight.device != indices.device
+        or scales.device != indices.device
+    ):
+        raise ValueError(
+            "MXFP8 embedding requires colocated GPU tensors and contiguous IDs/columns"
+        )
+    kernel = select_kernel(
+        "embedding",
+        "mxfp8_embedding",
+        format_signature(weight=dense_tensor_format(weight.dtype)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(weight, scales, indices, row_start, row_end)
+
+
+def vocab_shard_embedding(
+    weight: torch.Tensor,
+    indices: torch.Tensor,
+    org_range: tuple[int, int],
+    num_org_padding: int,
+    added_range: tuple[int, int],
+) -> torch.Tensor:
+    """Gather one vocabulary shard's embeddings, zeroing IDs of other shards.
+
+    The shard holds its original-vocabulary rows ``org_range`` (global
+    ``[start, end)``), ``num_org_padding`` padding rows, then its added
+    (LoRA) rows ``added_range``. IDs outside both ranges produce zero rows,
+    so summing every shard's output over the model-parallel group yields the
+    full embedding; the caller owns that collective.
+
+    Args:
+        weight: Floating ``[local_capacity, D]`` shard with contiguous columns.
+        indices: Contiguous integer IDs of any shape, on the shard's GPU.
+        org_range: Global ``(start, end)`` of the shard's original rows.
+        num_org_padding: Padding rows between the original and added rows.
+        added_range: Global ``(start, end)`` of the shard's added rows.
+
+    Returns:
+        ``[*indices.shape, D]`` embeddings in the weight's dtype.
+    """
+    org_start, org_end = org_range
+    added_start, added_end = added_range
+    if weight.ndim != 2 or weight.stride(1) != 1 or not weight.is_floating_point():
+        raise ValueError(
+            "vocabulary shard weight must be floating [rows, D] with contiguous columns"
+        )
+    if not (0 <= org_start <= org_end and 0 <= added_start <= added_end):
+        raise ValueError("vocabulary shard ranges must be ordered and non-negative")
+    if (org_end - org_start) + num_org_padding + (
+        added_end - added_start
+    ) > weight.shape[0]:
+        raise ValueError("vocabulary shard ranges exceed the weight's rows")
+    if (
+        not indices.is_cuda
+        or indices.dtype not in (torch.int32, torch.int64)
+        or not indices.is_contiguous()
+        or weight.device != indices.device
+    ):
+        raise ValueError(
+            "vocabulary shard gather requires colocated GPU tensors and contiguous IDs"
+        )
+    kernel = select_kernel(
+        "embedding",
+        "vocab_shard_embedding",
+        format_signature(weight=dense_tensor_format(weight.dtype)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(weight, indices, org_range, num_org_padding, added_range)
+
+
+def engram_hash(
+    input_ids: torch.Tensor,
+    previous_token_ids: torch.Tensor,
+    token_mask: torch.Tensor,
+    token_map: torch.Tensor,
+    multipliers: torch.Tensor,
+    primes: torch.Tensor,
+    offsets: torch.Tensor,
+    pad_id: int,
+    dead_id: int,
+) -> torch.Tensor:
+    """Hash every token's 2/3/4-gram windows into Engram table rows.
+
+    For each token the current id and its three predecessors are mapped to
+    the compressed vocabulary; a predecessor that is ``dead_id`` (a barrier
+    or the sequence start), or a current token whose mask is false, and every
+    older predecessor hash as ``pad_id``. Per layer, the rolling XOR of the
+    mapped tokens times the layer's multipliers is reduced modulo each head's
+    prime and shifted by that bucket's offset into the layer's table.
+
+    Args:
+        input_ids: ``[tokens]`` int32/int64 current ids.
+        previous_token_ids: ``[tokens, 3]`` int32/int64 predecessors, newest
+            first, ``dead_id`` where none exists.
+        token_mask: ``[tokens]`` bool, false for padding or image placeholders
+            whose ids may lie outside the vocabulary.
+        token_map: ``[vocab]`` int64 raw-to-compressed id map.
+        multipliers: ``[layers, 4]`` int64 odd hash multipliers.
+        primes: ``[layers, 3, heads]`` int64 bucket sizes per n-gram order.
+        offsets: ``[layers, 3 * heads]`` int64 first row of every bucket.
+        pad_id: Compressed id hashed for blocked positions.
+        dead_id: Raw id marking a missing predecessor.
+
+    Returns:
+        ``[tokens, layers, 3 * heads]`` int64 table rows.
+    """
+    tokens = input_ids.shape[0]
+    layers, orders, heads = primes.shape
+    if orders != 3 or multipliers.shape != (layers, 4):
+        raise ValueError("Engram hash expects three lookbacks per layer")
+    if previous_token_ids.shape != (tokens, 3) or token_mask.shape != (tokens,):
+        raise ValueError("Engram IDs, previous-three window and mask shapes disagree")
+    if offsets.shape != (layers, 3 * heads):
+        raise ValueError("Engram offsets must cover every layer's buckets")
+    if (
+        token_mask.dtype != torch.bool
+        or input_ids.dtype not in (torch.int32, torch.int64)
+        or previous_token_ids.dtype not in (torch.int32, torch.int64)
+    ):
+        raise TypeError("Engram expects int32/int64 IDs and a bool token mask")
+    constants = (token_map, multipliers, primes, offsets)
+    if any(t.dtype != torch.int64 for t in constants):
+        raise TypeError("Engram hash constants must be int64")
+    everything = (input_ids, previous_token_ids, token_mask, *constants)
+    if not all(t.is_cuda and t.is_contiguous() for t in everything):
+        raise ValueError("Engram hash requires contiguous GPU tensors")
+    kernel = select_kernel(
+        "embedding",
+        "engram_hash",
+        format_signature(indices=dense_tensor_format(torch.int64)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(
+        input_ids,
+        previous_token_ids,
+        token_mask,
+        token_map,
+        multipliers,
+        primes,
+        offsets,
+        pad_id,
+        dead_id,
+    )

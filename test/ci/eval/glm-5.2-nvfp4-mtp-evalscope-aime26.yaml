@@ -3,7 +3,6 @@ name: eval-glm-5.2-nvfp4-mtp-aime26
 type: eval
 workflow_stage: model-test
 triggers:
-  - per-commit
   - manual
 runner:
   labels:
@@ -23,7 +22,6 @@ server:
     --max-num-seqs 16
     --max-prefill-tokens 8192
     --chunked-prefill-size 8192
-    --gpu-memory-utilization 0.95
     --disable-cuda-graph-padding
     --trust-remote-code
     --moe-backend flashinfer_trtllm
@@ -34,9 +32,9 @@ server:
     --speculative-eagle-topk 1
     --speculative-num-draft-tokens 4
     --speculative-draft-model-quantization unquant
-    --enable-cache-report
     --host 127.0.0.1
     --port 8000
+    --grammar-backend xgrammar
   ready:
     url: http://127.0.0.1:8000/readiness
     timeout: 1800
@@ -47,6 +45,7 @@ eval:
   command: >-
     HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
+    --work-dir .ci-artifacts/published/evalscope-results
     --model nvidia/GLM-5.2-NVFP4
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN

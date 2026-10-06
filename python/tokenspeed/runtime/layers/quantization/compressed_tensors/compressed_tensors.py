@@ -470,24 +470,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
         self._check_scheme_supported(scheme.get_min_capability())
-        logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
+        logger.debug(f"Using scheme: {scheme.__class__.__name__!s} for {layer_name!s}")
         return scheme
-
-    def get_cache_scale(self, name: str) -> str | None:
-        """
-        Check whether the param name matches the format for k/v cache scales
-        in compressed-tensors. If this is the case, return its equivalent
-        param name expected by TokenSpeed
-
-        :param name: param name
-        :return: matching param name for KV cache scale in TokenSpeed
-        """
-        if name.endswith(".output_scale") and ".k_proj" in name:
-            return name.replace(".k_proj.output_scale", ".attn.k_scale")
-        if name.endswith(".output_scale") and ".v_proj" in name:
-            return name.replace(".v_proj.output_scale", ".attn.v_scale")
-        # If no matches, return None
-        return None
 
     @staticmethod
     def supports_cutlass_24(

@@ -26,8 +26,6 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.embedding import apply_k_rope as _apply_k_rope
-from tokenspeed_kernel.ops.kvcache.triton import fused_fp8_set_kv_buffer
-from tokenspeed_kernel.ops.layernorm.triton import fused_qk_rmsnorm_rope
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
@@ -50,6 +48,7 @@ from tokenspeed.runtime.layers.paged_attention import (
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -114,7 +113,6 @@ class DFlashAttention(nn.Module):
         eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.q_norm = RMSNorm(self.head_dim, eps=eps)
         self.k_norm = RMSNorm(self.head_dim, eps=eps)
-        self._qk_norm_eps = eps
         rope_parameters = getattr(config, "rope_parameters", None)
         if rope_parameters is not None:
             rope_theta = float(rope_parameters["rope_theta"])
@@ -138,16 +136,9 @@ class DFlashAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=sliding_window_size,
+            rotary_emb=self.rotary_emb,
+            qk_norm=(self.q_norm, self.k_norm),
         )
-
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        q = q.reshape(-1, self.head_dim)
-        k = k.reshape(-1, self.head_dim)
-        q = self.q_norm(q).view(-1, self.q_size)
-        k = self.k_norm(k).view(-1, self.kv_size)
-        return q, k
 
     def forward(
         self,
@@ -157,51 +148,7 @@ class DFlashAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = fused_qk_rmsnorm_rope(
-            q,
-            k,
-            self.q_norm.weight.data,
-            self.k_norm.weight.data,
-            self.rotary_emb.cos_sin_cache,
-            positions,
-            self._qk_norm_eps,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )
-        k_cache = k.view(-1, self.num_kv_heads, self.head_dim)
-        v_cache = v.view(-1, self.num_kv_heads, self.head_dim)
-        # Model-side pool write: slots come from the backend (the drafter
-        # publishes each step's window before the forward).
-        out_cache_loc = ctx.attn_backend.write_locations(self.attn, ctx.forward_mode)
-        if ctx.token_to_kv_pool.dtype == torch.float8_e4m3fn:
-            k_buf, v_buf = ctx.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
-            fused_fp8_set_kv_buffer(
-                k=k_cache,
-                v=v_cache,
-                k_cache=k_buf,
-                v_cache=v_buf,
-                cache_loc=out_cache_loc,
-                k_scale=self.attn.k_scale,
-                v_scale=self.attn.v_scale,
-                page_size=ctx.token_to_kv_pool.arena.kv_page_size,
-            )
-        else:
-            ctx.token_to_kv_pool.set_kv_buffer(
-                self.attn,
-                out_cache_loc,
-                k_cache,
-                v_cache,
-                self.attn.k_scale,
-                self.attn.v_scale,
-            )
-        attn_output = self.attn(
-            q,
-            None,
-            None,
-            ctx,
-            save_kv_cache=False,
-        )
+        attn_output = self.attn(q, k, v, positions, ctx)
         if len(attn_output.size()) == 3:
             attn_output = attn_output.reshape(attn_output.shape[0], -1)
         output, _ = self.o_proj(attn_output)
@@ -363,8 +310,50 @@ class DFlashDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class DFlashDraftModel(nn.Module):
+class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
     decoder_layer_cls = DFlashDecoderLayer
+
+    def _checkpoint_capture_field(self, name: str):
+        """A capture field from ``dflash_config``, else the top-level config."""
+        nested = getattr(self.config, "dflash_config", {}) or {}
+        return nested.get(name) or getattr(self.config, name, None)
+
+    @property
+    def target_layer_ids(self) -> tuple[int, ...]:
+        """Target layers whose hidden states this checkpoint was trained on."""
+        layer_ids = self._checkpoint_capture_field("target_layer_ids")
+        if not layer_ids:
+            raise ValueError(
+                "DFLASH draft config must define dflash_config.target_layer_ids."
+            )
+        return tuple(int(layer_id) for layer_id in layer_ids)
+
+    @property
+    def aux_hidden_stream(self) -> str:
+        """Which target residual stream the taps read; ``prefix`` by default."""
+        return str(
+            self._checkpoint_capture_field("aux_hidden_stream") or "prefix"
+        ).lower()
+
+    def configure_target(self, target_model, target_config) -> None:
+        """Install the capture inputs expected by this block-draft checkpoint."""
+        del target_config
+        layer_ids = self.target_layer_ids
+        stream = self.aux_hidden_stream
+        if not hasattr(target_model, "set_dflash_layers_to_capture"):
+            raise ValueError(
+                "DFLASH requires the target model to support set_dflash_layers_to_capture."
+            )
+        stream_setter = getattr(target_model, "set_dflash_aux_hidden_stream", None)
+        if stream_setter is None and stream != "prefix":
+            raise ValueError(
+                f"The draft asks for the {stream!r} target hidden stream but "
+                f"{type(target_model).__name__} does not implement "
+                "set_dflash_aux_hidden_stream, so it can only supply 'prefix'."
+            )
+        target_model.set_dflash_layers_to_capture(list(layer_ids))
+        if stream_setter is not None:
+            stream_setter(stream)
 
     def __init__(
         self,
@@ -439,14 +428,7 @@ class DFlashDraftModel(nn.Module):
             k = attn.apply_k_rope(positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            token_to_kv_pool.set_kv_buffer(
-                attn.attn,
-                cache_locs,
-                k,
-                v,
-                attn.attn.k_scale,
-                attn.attn.v_scale,
-            )
+            token_to_kv_pool.set_kv_buffer(attn.attn, cache_locs, k, v)
 
     def _zeroed_residual(self, template: torch.Tensor) -> torch.Tensor:
         """The residual stream the layers accumulate into, cleared in place.

@@ -133,9 +133,32 @@ def test_forward_batch_uses_per_group_block_tables_as_the_only_page_table():
     assert not hasattr(op, "sizes")
 
 
+def test_pages_to_zero_arrays_view_the_plan_without_python_ints():
+    import numpy as np
+
+    scheduler = ts.Scheduler(_make_config())
+    scheduler.submit_requests([_make_spec("r1", num_pages=2)])
+
+    plan = scheduler.next_execution_plan()
+    arrays = plan.pages_to_zero_arrays()
+    assert set(arrays) == set(plan.pages_to_zero) == {"full", "swa"}
+    for group_id, pages in plan.pages_to_zero.items():
+        array = arrays[group_id]
+        assert array.dtype == np.int32 and array.ndim == 1
+        assert array.tolist() == list(pages)
+    assert any(array.size for array in arrays.values())
+
+    # The views borrow the plan's storage; the plan must outlive them even
+    # when the caller drops its own reference.
+    full = arrays["full"]
+    expected = full.tolist()
+    del plan, arrays
+    assert full.tolist() == expected
+
+
 def test_k3_four_groups_share_one_global_id_namespace() -> None:
     scheduler = ts.Scheduler(_make_k3_config())
-    before = scheduler.available_kv_pages()
+    before = scheduler.available_lcm_blocks()
     assert before == 32
     scheduler.submit_requests([_make_spec("r1", num_pages=2)])
     plan = scheduler.next_execution_plan()
@@ -165,18 +188,26 @@ def test_k3_four_groups_share_one_global_id_namespace() -> None:
 
     _abort(scheduler, "r1")
     scheduler.next_execution_plan()
-    assert scheduler.available_kv_pages() == before
+    assert scheduler.available_lcm_blocks() == before
 
 
 def test_k3_finish_restores_all_usable_pages() -> None:
     scheduler = ts.Scheduler(_make_k3_config())
-    before = scheduler.available_kv_pages()
+    before = scheduler.available_lcm_blocks()
+    assert scheduler.empty_lcm_blocks() == before
+    assert scheduler.active_lcm_blocks() == 0
     scheduler.submit_requests([_make_spec("r1", num_pages=2)])
     assert _find_forward_op(scheduler.next_execution_plan()) is not None
+    assert scheduler.active_lcm_blocks() > 0
+    assert scheduler.empty_lcm_blocks() + scheduler.active_lcm_blocks() == before
     _advance_tokens(scheduler, "r1", [42])
     _finish(scheduler, "r1")
     scheduler.next_execution_plan()
-    assert scheduler.available_kv_pages() == before
+    assert scheduler.available_lcm_blocks() == before
+    # The finished request's pages stay resident as cache-only parents: they
+    # are evictable (available) but neither empty nor active.
+    assert scheduler.active_lcm_blocks() == 0
+    assert scheduler.empty_lcm_blocks() < before
 
 
 def _make_k3_128k_config(num_device_pages: int) -> ts.SchedulerConfig:
@@ -197,25 +228,25 @@ def _make_k3_128k_config(num_device_pages: int) -> ts.SchedulerConfig:
 
 
 def test_k3_reports_group_aware_single_request_capacity() -> None:
-    # Each sparse State group needs an input checkpoint, an aligned-body
-    # checkpoint, and its reserved tail. The three groups therefore leave 275
+    # Each sparse State group needs input, aligned checkpoint, final state,
+    # and banked growth. The three groups therefore leave 272
     # of the 284 usable parents for Full KV. K_full=12 and P=128 expose
-    # 275 * 12 * 128 tokens.
+    # 272 * 12 * 128 tokens.
     scheduler = ts.Scheduler(_make_k3_128k_config(285))
-    assert scheduler.max_single_request_tokens() == 422_400
+    assert scheduler.max_single_request_tokens() == 417_792
 
 
 def test_k3_128k_requires_group_aware_shared_pool_geometry() -> None:
     prompt = _spec("128k", list(range(131_072)))
 
-    # Nine State parents plus 86 Full parents admit 128K; one fewer Full parent
+    # Twelve State parents plus 86 Full parents admit 128K; one fewer Full parent
     # is 512 tokens short because each Full parent carries 12 * 128 tokens.
-    undersized = ts.Scheduler(_make_k3_128k_config(95))
+    undersized = ts.Scheduler(_make_k3_128k_config(98))
     assert undersized.max_single_request_tokens() < 131_072
 
-    corrected = ts.Scheduler(_make_k3_128k_config(96))
-    before = corrected.available_kv_pages()
-    assert before == 95
+    corrected = ts.Scheduler(_make_k3_128k_config(99))
+    before = corrected.available_lcm_blocks()
+    assert before == 98
     corrected.submit_requests([prompt])
     completed_tokens = 0
     for chunk in range(32):
@@ -229,7 +260,128 @@ def test_k3_128k_requires_group_aware_shared_pool_geometry() -> None:
     assert _find_forward_op(corrected.next_execution_plan()) is not None
     _finish(corrected, "128k")
     corrected.next_execution_plan()
-    assert corrected.available_kv_pages() == before
+    assert corrected.available_lcm_blocks() == before
+
+
+@pytest.mark.parametrize("block_granularity", [1, 2, 4])
+@pytest.mark.parametrize("chunk_tokens", [4, 8, 9])
+@pytest.mark.parametrize("decode_width", [1, 3])
+@pytest.mark.parametrize("overlap_depth", [0, 1])
+@pytest.mark.parametrize("prefix_cache_enabled", [False, True])
+def test_accepted_state_prompts_can_prefill_and_start_decode(
+    block_granularity: int,
+    chunk_tokens: int,
+    decode_width: int,
+    overlap_depth: int,
+    prefix_cache_enabled: bool,
+) -> None:
+    """An empty pool must serve every prompt below its advertised startup bound."""
+    for usable_blocks in range(2, 9):
+        cfg = ts.SchedulerConfig()
+        cfg.prefix_granularity = 4
+        cfg.num_device_pages = usable_blocks + 1
+        cfg.max_scheduled_tokens = chunk_tokens
+        cfg.max_batch_size = 1
+        cfg.disable_l2_cache = True
+        cfg.disable_prefix_cache = not prefix_cache_enabled
+        cfg.decode_input_tokens = decode_width
+        cfg.overlap_schedule_depth = overlap_depth
+        cfg.cache_groups = [
+            ts.CacheGroupConfig(
+                group_id="state",
+                block_granularity=block_granularity,
+                total_pages=usable_blocks + 1,
+                retention=ts.CacheRetention.FullHistory,
+                family=ts.CacheGroupFamily.State,
+            )
+        ]
+        capacity = ts.Scheduler(cfg).max_single_request_tokens()
+        for prompt_tokens in range(1, min(16, capacity - decode_width) + 1):
+            scheduler = ts.Scheduler(cfg)
+            spec = _spec("r", list(range(prompt_tokens)))
+            spec.max_new_tokens = min(decode_width + 1, capacity - prompt_tokens)
+            scheduler.submit_requests([spec])
+            computed = 0
+            while computed < prompt_tokens:
+                batch = _find_forward_op(scheduler.next_execution_plan())
+                assert batch is not None, (
+                    usable_blocks,
+                    prompt_tokens,
+                    computed,
+                    capacity,
+                )
+                assert list(batch.request_ids) == ["r"]
+                assert batch.input_lengths[0] > 0
+                computed += batch.input_lengths[0]
+                _advance_tokens(
+                    scheduler, "r", [101] if computed == prompt_tokens else []
+                )
+            # The completing admission must also secure the first decode step.
+            if spec.max_new_tokens > 1:
+                assert _find_forward_op(scheduler.next_execution_plan()) is not None
+
+
+@pytest.mark.parametrize("finish_after_first_decode", [False, True])
+@pytest.mark.parametrize("decode_width", [1, 3])
+@pytest.mark.parametrize("state_granularity", [1, 2, 4])
+@pytest.mark.parametrize("prompt_tokens", [3, 7, 8])
+@pytest.mark.parametrize("truncate_output", [False, True])
+def test_decode_reuses_only_prefill_state_boundary(
+    finish_after_first_decode: bool,
+    decode_width: int,
+    state_granularity: int,
+    prompt_tokens: int,
+    truncate_output: bool,
+) -> None:
+    cfg = ts.SchedulerConfig()
+    cfg.prefix_granularity = 4
+    cfg.num_device_pages = 33
+    cfg.num_host_pages = 0
+    cfg.max_scheduled_tokens = 32
+    cfg.max_batch_size = 2
+    cfg.disable_l2_cache = True
+    cfg.disable_prefix_cache = False
+    cfg.decode_input_tokens = decode_width
+    cfg.overlap_schedule_depth = 0
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id="state",
+            block_granularity=state_granularity,
+            total_pages=33,
+            retention=ts.CacheRetention.FullHistory,
+            family=ts.CacheGroupFamily.State,
+        )
+    ]
+    scheduler = ts.Scheduler(cfg)
+    request = _spec("r", list(range(1, prompt_tokens + 1)))
+    request.max_new_tokens = 30
+    scheduler.submit_requests([request])
+    assert _find_forward_op(scheduler.next_execution_plan()) is not None
+    _advance_tokens(scheduler, "r", [prompt_tokens + 1])
+    assert _find_forward_op(scheduler.next_execution_plan()) is not None
+    next_token = prompt_tokens + 2
+    visible_tokens = 1 if truncate_output else decode_width
+    _advance_tokens(
+        scheduler, "r", list(range(next_token, next_token + visible_tokens))
+    )
+    if not finish_after_first_decode:
+        assert _find_forward_op(scheduler.next_execution_plan()) is not None
+        _advance_tokens(
+            scheduler,
+            "r",
+            list(range(next_token + visible_tokens, next_token + 2 * visible_tokens)),
+        )
+    _finish(scheduler, "r")
+    scheduler.next_execution_plan()
+
+    # Decode cannot create a reusable checkpoint, even at an aligned accepted
+    # endpoint or when host-side stopping truncates the accepted output.
+    reuse = _spec("reuse", list(range(1, next_token + visible_tokens)) + [90, 91])
+    reuse.max_new_tokens = 4
+    scheduler.submit_requests([reuse])
+    batch = _find_forward_op(scheduler.next_execution_plan())
+    assert batch is not None
+    assert list(batch.extend_prefix_lens) == [prompt_tokens // 4 * 4]
 
 
 def _drive_k3_to_retract(scheduler) -> dict[str, dict[int, int]]:
@@ -261,10 +413,16 @@ def _drive_k3_to_retract(scheduler) -> dict[str, dict[int, int]]:
     retracted = False
     next_token = 2000
     for _ in range(32):
+        before_plan = (
+            scheduler.active_lcm_blocks(),
+            scheduler.empty_lcm_blocks(),
+            scheduler.available_lcm_blocks(),
+        )
         op = _find_forward_op(scheduler.next_execution_plan())
         scheduled = () if op is None else tuple(op.request_ids)
         if scheduler.waiting_size() == 1:
             assert not scheduled
+            assert before_plan == (29, 3, 3)
             retracted = True
             break
         if "a" in scheduled:
@@ -275,79 +433,231 @@ def _drive_k3_to_retract(scheduler) -> dict[str, dict[int, int]]:
             next_token += 1
 
     assert retracted
-    assert scheduler.available_kv_pages() == 11
+    # Decode retains only its working state. After a retracts, b/c/d each
+    # hold four History blocks and one working block per State group.
+    assert tuple(scheduler.request_token_size(r) for r in request_ids) == (
+        11,
+        9,
+        9,
+        9,
+    )
+    assert scheduler.active_lcm_blocks() == 21
+    assert scheduler.available_lcm_blocks() == 11
+    # Retracting a drops five History refs and three working State refs.
+    # Four published History blocks remain cache-only; the unpublished final
+    # History block and working State blocks return to the pool (3 + 4 empty).
+    assert scheduler.empty_lcm_blocks() == 7
     assert scheduler.waiting_size() == 1
     assert scheduler.decoding_size() == 3
-    assert scheduler.request_token_size("a") == 11
     return pre_retract_pages
 
 
-def test_k3_readmit_rebuilds_all_four_tables_and_restores_pages() -> None:
-    """Binding smoke for a split readmit and its reserved state tail."""
-    scheduler = ts.Scheduler(_make_k3_config())
-    before = scheduler.available_kv_pages()
+def test_k3_readmit_recomputes_missing_checkpoint_and_restores_pages() -> None:
+    """Without L2, rebuild consumed state before completing the recovery tail."""
+    cfg = _make_k3_config()
+    assert cfg.num_host_pages == 0
+    assert cfg.disable_l2_cache
+    scheduler = ts.Scheduler(cfg)
+    before = scheduler.available_lcm_blocks()
     pre_retract_pages = _drive_k3_to_retract(scheduler)
 
     for request_id in ("b", "c", "d"):
         _finish(scheduler, request_id)
+    assert scheduler.active_lcm_blocks() == 0
+    assert scheduler.available_lcm_blocks() == before
 
-    body = _find_forward_op(scheduler.next_execution_plan())
+    # The original prefill checkpoint was evicted under pressure. Decode
+    # created no replacement. History published through token 8 cannot resume
+    # alone, but supplies the promotion boundary ending the recovery body.
+    body_plan = scheduler.next_execution_plan()
+    body = _find_forward_op(body_plan)
     assert body is not None
     assert tuple(body.request_ids) == ("a",)
     assert tuple(body.prefill_lengths) == (11,)
-    assert tuple(body.extend_prefix_lens) == (8,)
-    assert tuple(body.input_lengths) == (2,)
-    tables = dict(body.block_tables)
-    assert tuple(tables) == K3_GROUP_IDS
-    prefix_granularity = _make_k3_config().prefix_granularity
-    assert body.extend_prefix_lens[0] % prefix_granularity == 0
-    prefix_slots = body.extend_prefix_lens[0] // prefix_granularity
+    assert tuple(body.extend_prefix_lens) == (0,)
+    assert tuple(body.input_lengths) == (8,)
+    body_tables = dict(body.block_tables)
+    assert tuple(body_tables) == K3_GROUP_IDS
+    prefix_granularity = cfg.prefix_granularity
+    prefix_slots = body.input_lengths[0] // prefix_granularity
     assert prefix_slots == 4
+    rebuilt_rows = {}
+    rebuilt_pages = []
+    body_zero = dict(body_plan.pages_to_zero)
+    assert set(body_zero) == set(K3_GROUP_IDS)
+    for group_id in K3_GROUP_IDS:
+        row = tuple(body_tables[group_id][0])
+        assert len(row) == prefix_slots
+        if group_id == K3_GROUP_IDS[0]:
+            assert all(page > 0 for page in row)
+        else:
+            assert row[:-1] == (0,) * (prefix_slots - 1)
+            assert row[-1] > 0
+        positive = _positive_pages(row)
+        assert set(body_zero[group_id]) == set(positive)
+        rebuilt_rows[group_id] = row
+        rebuilt_pages.extend(positive)
+    assert len(set(rebuilt_pages)) == len(rebuilt_pages)
+    assert len(rebuilt_pages) == 7
+    assert scheduler.active_lcm_blocks() == 7
+    assert scheduler.available_lcm_blocks() == before - 7
+
+    # An intermediate prefill acknowledges completion without producing a
+    # token. The next forward continues from the checkpoint just rebuilt.
+    _advance_tokens(scheduler, "a", [])
+    assert scheduler.request_token_size("a") == 11
+    tail_plan = scheduler.next_execution_plan()
+    tail = _find_forward_op(tail_plan)
+    assert tail is not None
+    assert tuple(tail.request_ids) == ("a",)
+    assert tuple(tail.prefill_lengths) == (11,)
+    assert tuple(tail.extend_prefix_lens) == (8,)
+    assert tuple(tail.input_lengths) == (3,)
+    tables = dict(tail.block_tables)
+    assert tuple(tables) == K3_GROUP_IDS
+    assert tail.extend_prefix_lens[0] % prefix_granularity == 0
     expected_slots = (
-        body.prefill_lengths[0] + prefix_granularity - 1
+        tail.prefill_lengths[0] + prefix_granularity - 1
     ) // prefix_granularity
     assert expected_slots == 6
 
     all_positive_entries = []
-    restored_pages = set()
     fresh_tail_entries = []
+    tail_zero = dict(tail_plan.pages_to_zero)
+    assert set(tail_zero) == set(K3_GROUP_IDS)
     for group_id in K3_GROUP_IDS:
         row = tuple(tables[group_id][0])
-        assert len(row) == expected_slots
+        # State groups include their decode growth block beyond the endpoint.
+        growth_slots = int(group_id != K3_GROUP_IDS[0])
+        assert len(row) == expected_slots + growth_slots
         group_positive = _positive_pages(row)
         assert group_positive
         all_positive_entries.extend(group_positive)
 
-        restored_in_group = []
-        for index, page in enumerate(row[:prefix_slots]):
-            if page > 0:
-                assert page == pre_retract_pages[group_id].get(index)
-                restored_in_group.append(page)
-        assert restored_in_group
-        restored_pages.update(restored_in_group)
-
-        tail = row[prefix_slots:]
-        assert len(tail) == 2
-        group_tail = _positive_pages(tail)
-        # The aligned body materializes its state checkpoint and atomically
-        # reserves the final prompt-tail slot, so every group owns both pages.
-        assert all(page > 0 for page in tail)
-        assert len(group_tail) == 2
+        if group_id == K3_GROUP_IDS[0]:
+            # Publication may replace recomputed History blocks with the
+            # still-resident canonical blocks for those same logical slots.
+            for slot, page in enumerate(row[:prefix_slots]):
+                assert page in (
+                    rebuilt_rows[group_id][slot],
+                    pre_retract_pages[group_id][slot],
+                )
+        else:
+            assert row[:prefix_slots] == rebuilt_rows[group_id]
+        suffix = row[prefix_slots:]
+        assert len(suffix) == 2 + growth_slots
+        group_tail = _positive_pages(suffix)
+        # One forward materializes the aligned checkpoint and endpoint;
+        # state groups also own the following growth block.
+        assert all(page > 0 for page in suffix)
+        assert len(group_tail) == 2 + growth_slots
+        assert set(tail_zero[group_id]) == set(group_tail)
         fresh_tail_entries.extend(group_tail)
 
     assert len(set(all_positive_entries)) == len(all_positive_entries)
     assert len(set(fresh_tail_entries)) == len(fresh_tail_entries)
-    assert set(fresh_tail_entries).isdisjoint(restored_pages)
-
-    tail = _find_forward_op(scheduler.next_execution_plan())
-    assert tail is not None
-    assert tuple(tail.request_ids) == ("a",)
-    assert tuple(tail.extend_prefix_lens) == (10,)
-    assert tuple(tail.input_lengths) == (1,)
+    assert set(fresh_tail_entries).isdisjoint(rebuilt_pages)
+    assert len(fresh_tail_entries) == 11
+    assert scheduler.active_lcm_blocks() == 18
+    assert scheduler.available_lcm_blocks() == before - 18
 
     _advance_tokens(scheduler, "a", [3000])
     scheduler.next_execution_plan()
     _advance_tokens(scheduler, "a", [3001])
     _finish(scheduler, "a")
     scheduler.next_execution_plan()
-    assert scheduler.available_kv_pages() == before
+    assert scheduler.available_lcm_blocks() == before
+    assert scheduler.active_lcm_blocks() == 0
+
+
+def _make_replay_config() -> ts.SchedulerConfig:
+    """full (closed) + swa regenerated by bounded replay; P=8, budget 64."""
+    cfg = ts.SchedulerConfig()
+    cfg.prefix_granularity = 8
+    cfg.num_device_pages = 256
+    cfg.num_host_pages = 256
+    cfg.max_scheduled_tokens = 64
+    cfg.max_batch_size = 8
+    cfg.enable_l3_storage = False
+    cfg.disable_l2_cache = True
+    cfg.disable_prefix_cache = False
+    full = ts.CacheGroupConfig(
+        group_id="full",
+        block_granularity=cfg.prefix_granularity,
+        total_pages=cfg.num_device_pages,
+        retention=ts.CacheRetention.FullHistory,
+        family=ts.CacheGroupFamily.History,
+    )
+    swa = ts.CacheGroupConfig(
+        group_id="swa",
+        block_granularity=4,
+        total_pages=cfg.num_device_pages,
+        retention=ts.CacheRetention.SlidingWindow,
+        sliding_window_tokens=16,
+        family=ts.CacheGroupFamily.History,
+        replayable=True,
+    )
+    cfg.cache_groups = [full, swa]
+    return cfg
+
+
+def test_cache_group_config_replayable_round_trips() -> None:
+    swa = _make_replay_config().cache_groups[1]
+    assert swa.replayable is True
+    swa.replayable = False
+    assert swa.replayable is False
+    swa.validate()
+    swa.replayable = True
+    swa.validate()
+    full = _make_replay_config().cache_groups[0]
+    assert full.replayable is False
+    full.replayable = True
+    with pytest.raises(ValueError, match="sliding History group"):
+        full.validate()
+
+
+def test_prefix_hit_replays_window_and_exposes_extend_replay_lens() -> None:
+    scheduler = ts.Scheduler(_make_replay_config())
+    tokens = list(range(1, 33))
+    scheduler.submit_requests([_spec("r1", tokens)])
+    op = _find_forward_op(scheduler.next_execution_plan())
+    assert op is not None
+    assert list(op.extend_prefix_lens) == [0]
+    assert list(op.extend_replay_lens) == [0]
+    _advance_tokens(scheduler, "r1", [9001])
+    scheduler.next_execution_plan()  # first decode publishes the prefix pages
+    _advance_tokens(scheduler, "r1", [9002])
+    _finish(scheduler, "r1")
+    scheduler.next_execution_plan()
+
+    # r2 shares r1's 32 tokens and adds 8: the closed group hits P=32 alone
+    # and the swa window [16, 32) is re-fed ahead of the new tokens.
+    scheduler.submit_requests([_spec("r2", tokens + list(range(901, 909)))])
+    op = _find_forward_op(scheduler.next_execution_plan())
+    assert op is not None
+    assert list(op.extend_prefix_lens) == [16]
+    assert list(op.extend_replay_lens) == [16]
+    assert list(op.input_lengths) == [24]
+    assert list(op.input_ids) == tokens[16:] + list(range(901, 909))
+    swa_row = list(dict(op.block_tables)["swa"][0])
+    assert swa_row[:4] == [0, 0, 0, 0], "no swa page below the replay window"
+    assert all(page > 0 for page in swa_row[4:11]), "private swa pages from s=16"
+    assert "extend_replay_lens=[16]" in repr(op)
+
+
+def test_final_chunk_is_never_shorter_than_the_replay_window() -> None:
+    scheduler = ts.Scheduler(_make_replay_config())
+    tokens = list(range(1, 71))
+    scheduler.submit_requests([_spec("r1", tokens)])
+    # 70 tokens under a 64-token budget would leave a 6-token final chunk; the
+    # first chunk is shortened so the final chunk holds the 16-token window.
+    chunk1 = _find_forward_op(scheduler.next_execution_plan())
+    assert chunk1 is not None
+    assert list(chunk1.input_lengths) == [54]
+    assert list(chunk1.extend_replay_lens) == [0]
+    chunk2 = _find_forward_op(scheduler.next_execution_plan())
+    assert chunk2 is not None
+    assert list(chunk2.extend_prefix_lens) == [54]
+    assert list(chunk2.extend_replay_lens) == [0]
+    assert list(chunk2.input_lengths) == [16]
+    assert list(chunk2.input_ids) == tokens[54:70]

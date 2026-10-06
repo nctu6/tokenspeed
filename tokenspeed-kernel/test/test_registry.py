@@ -52,7 +52,6 @@ class TestKernelSpec:
         assert spec.features == frozenset()
         assert spec.solution == ""
         assert spec.priority == 10
-        assert spec.tags == frozenset()
         assert spec.format_signatures == frozenset()
 
     def test_hashable_without_dict_traits(self):
@@ -288,14 +287,6 @@ class TestRegistryQueries:
         assert "reference_decode" in names
         assert "flashinfer_decode" not in names
 
-    def test_filter_by_tags(self, sample_specs):
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        latency = reg.get_for_operator("attention", "decode", tags={"latency"})
-        for s in latency:
-            assert "latency" in s.tags
-
     def test_filter_by_solution(self, sample_specs):
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)
@@ -434,7 +425,7 @@ class TestRegisterKernelDecorator:
         reg = KernelRegistry.get()
         assert reg.get_by_name("my_custom_kernel") is not None
 
-    def test_decorator_with_features_and_tags(self):
+    def test_decorator_with_features_and_capability(self):
         @register_kernel(
             "attention",
             "decode",
@@ -446,7 +437,6 @@ class TestRegisterKernelDecorator:
             signatures=format_signatures(
                 ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
             ),
-            tags={"determinism", "latency"},
         )
         def decorated_kernel():
             pass
@@ -455,7 +445,6 @@ class TestRegisterKernelDecorator:
         spec = reg.get_by_name("triton_attention_decode")
         assert spec is not None
         assert spec.features == frozenset({"paged", "rope"})
-        assert spec.tags == frozenset({"determinism", "latency"})
         assert spec.capability.min_arch_version == ArchVersion(8, 0)
 
     def test_decorator_returns_original_function(self):
@@ -519,3 +508,43 @@ class TestUnregister:
     def test_unregister_nonexistent_is_noop(self):
         reg = KernelRegistry.get()
         reg._unregister("does_not_exist")
+
+
+def test_vendor_min_arch_versions_apply_per_vendor(
+    h100_platform, b200_platform, mi350_platform
+) -> None:
+    from dataclasses import replace
+
+    capability = CapabilityRequirement(
+        vendors=frozenset({"nvidia", "amd"}),
+        vendor_min_arch_versions={
+            "nvidia": ArchVersion(10, 0),
+            "amd": ArchVersion(9, 5),
+        },
+    )
+
+    assert not capability.satisfied_by(h100_platform)
+    assert capability.satisfied_by(b200_platform)
+    assert capability.satisfied_by(mi350_platform)
+    gfx942 = replace(mi350_platform, arch_version=ArchVersion(9, 4))
+    assert not capability.satisfied_by(gfx942)
+
+
+def test_vendor_min_arch_versions_reject_ambiguous_requirements() -> None:
+    with pytest.raises(ValueError, match="not both"):
+        CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"amd"}),
+            vendor_min_arch_versions={"amd": ArchVersion(9, 5)},
+        )
+    with pytest.raises(ValueError, match="every vendor in vendors"):
+        CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            vendor_min_arch_versions={"amd": ArchVersion(9, 5)},
+        )
+    # A vendor without a floor would silently accept every arch of it.
+    with pytest.raises(ValueError, match="every vendor in vendors"):
+        CapabilityRequirement(
+            vendors=frozenset({"nvidia", "amd"}),
+            vendor_min_arch_versions={"nvidia": ArchVersion(10, 0)},
+        )

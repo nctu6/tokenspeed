@@ -77,6 +77,7 @@ class Qwen3MoeDecoderLayer(Qwen3DecoderLayer):
             )
         elif isinstance(self.mlp, Qwen3MLP):
             self.mlp = Qwen3_5MoeMLP(
+                parallelism="dense",
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -91,8 +92,10 @@ class Qwen3MoeDecoderLayer(Qwen3DecoderLayer):
             layer_id=layer_id,
             is_moe=is_moe,
             prev_is_moe=_is_moe_layer(layer_id - 1, config),
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def forward(

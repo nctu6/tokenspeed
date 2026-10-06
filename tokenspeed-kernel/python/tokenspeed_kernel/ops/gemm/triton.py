@@ -824,7 +824,6 @@ def triton_scaled_mm(
     signatures=_MXFP8_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PERFORMANT + 3,
-    tags={"portability"},
 )
 def triton_mm_fp8_blockscale(
     A: torch.Tensor,
@@ -954,7 +953,6 @@ def _w8a8_block_fp8_bmm(
         "out_inner_stride_one": frozenset({True}),
     },
     priority=Priority.PERFORMANT + 3,
-    tags={"portability"},
 )
 def triton_bmm_fp8_blockscale(
     A: torch.Tensor,
@@ -1074,7 +1072,6 @@ def _triton_dsv4_grouped_output_projection_weights(
     ),
     traits={},
     priority=Priority.PERFORMANT + 3,
-    tags={"portability"},
     weight_preprocessor=_triton_dsv4_grouped_output_projection_weights,
 )
 def triton_dsv4_grouped_output_projection(
@@ -1097,7 +1094,7 @@ def triton_dsv4_grouped_output_projection(
     del recipe
     if tma_aligned_scales:
         raise ValueError("the portable projection requires canonical scales")
-    from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+    from tokenspeed_kernel.ops.attention.dsv4.triton import (
         dsv4_fused_inv_rope_fp8_quant,
     )
 
@@ -1144,19 +1141,21 @@ def _mxfp4_mm_kernel(
     A_scales,
     B_scales,
     C,
-    M: tl.constexpr,
+    # Activation-side geometry follows the batch and stays runtime; the
+    # weight-side geometry is fixed for the process lifetime.
+    M,
     N: tl.constexpr,
     K: tl.constexpr,
-    stride_am: tl.constexpr,
-    stride_ak: tl.constexpr,
+    stride_am,
+    stride_ak,
     stride_bn: tl.constexpr,
     stride_bk: tl.constexpr,
-    stride_asm: tl.constexpr,
-    stride_asg: tl.constexpr,
+    stride_asm,
+    stride_asg,
     stride_bsn: tl.constexpr,
     stride_bsg: tl.constexpr,
-    stride_cm: tl.constexpr,
-    stride_cn: tl.constexpr,
+    stride_cm,
+    stride_cn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -1217,7 +1216,7 @@ def _mxfp4_mm_kernel(
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=_MXFP4_FORMAT_SIGNATURES,
-    traits={"quant": frozenset({"mxfp4"})},
+    traits={},
     priority=Priority.PORTABLE,
 )
 def triton_mm_mxfp4(
@@ -1281,15 +1280,17 @@ def triton_mm_mxfp4(
     name="triton_mm_fp8_scaled",
     solution="triton",
     capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
-        vendors=frozenset({"nvidia"}),
+        vendors=frozenset({"nvidia", "amd"}),
+        vendor_min_arch_versions={
+            "nvidia": ArchVersion(10, 0),
+            "amd": ArchVersion(9, 5),
+        },
     ),
     signatures=_FP8_SCALED_FORMAT_SIGNATURES,
     traits={
         "b_layout": frozenset({"KN"}),
     },
     priority=Priority.PERFORMANT + 2,
-    tags={"portability"},
 )
 def triton_mm_fp8_scaled(
     A: torch.Tensor,
@@ -1303,6 +1304,22 @@ def triton_mm_fp8_scaled(
     bias: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """FP8 E4M3 GEMM with per-token/per-tensor A and per-channel/per-tensor B scales.
+
+    Args:
+        A: ``[M, K]`` FP8 activations.
+        B: ``[K, N]`` FP8 weights (a transposed ``[N, K]`` view is accepted).
+        A_scales: FP32 ``[M, 1]`` per-token or ``[1, 1]`` per-tensor scales.
+        B_scales: FP32 ``[N, 1]`` per-channel or ``[1, 1]`` per-tensor scales.
+        out_dtype: Output dtype.
+        alpha: Unused; accepted for the ``gemm.mm`` calling convention.
+        block_size: Unused; accepted for the ``gemm.mm`` calling convention.
+        bias: Optional ``[N]`` bias added in the epilogue.
+        out: Optional ``[M, N]`` output buffer.
+
+    Returns:
+        ``[M, N]`` tensor ``(A * A_scales) @ (B * B_scales^T)`` in ``out_dtype``.
+    """
     return triton_scaled_mm(
         A,
         B,

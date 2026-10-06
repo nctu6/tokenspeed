@@ -114,6 +114,7 @@ def test_v9_timed_partition_replays_changed_inputs() -> None:
             NP2_STATELEN=4,
             BLOCK_M=8,
             BLOCK_N=256,
+            ENABLE_PDL=False,
             num_stages=2,
         )
 
@@ -135,3 +136,7 @@ def test_v9_timed_partition_replays_changed_inputs() -> None:
         atol=2e-2,
         rtol=2e-2,
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

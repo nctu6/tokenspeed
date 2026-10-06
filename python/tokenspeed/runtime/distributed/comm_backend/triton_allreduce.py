@@ -20,6 +20,8 @@
 
 """Triton all-reduce backend for latency-sensitive small AMD tensors."""
 
+import math
+
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.triton import (
@@ -29,6 +31,7 @@ from tokenspeed_kernel.ops.communication.triton import (
     all_reduce_symm_can_run,
     all_reduce_symmetric,
     create_state,
+    initialize_all_reduce_state,
     symm_outputs_can_run,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -69,12 +72,104 @@ class TritonAllReduceBackend(CommBackend):
         state = create_state(
             group=pg_manager.get_process_group("nccl", group),
             rank_in_group=group.index(dist.get_rank()),
+            attnres_max_numel=0,
+            attnres_max_rows=0,
+            enable_lamport=False,
+            moe_tail_max_rows=0,
+            max_tokens=0,
+            hidden_size=0,
             max_numel=self._max_numel,
             max_bytes=self._producer_direct_max_bytes,
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
         )
         self._instances[group] = state
         return state
+
+    def prepare_all_reduce_buffers(
+        self,
+        group: Group,
+        *,
+        staged_max_numel: int,
+        producer_direct_max_numel: int,
+        attnres_max_numel: int,
+        attnres_max_rows: int,
+        enable_lamport: bool,
+        moe_tail_max_rows: int,
+        dtype: torch.dtype,
+    ) -> bool:
+        """Allocate or reuse an Iris state with the requested path capacities.
+
+        Args:
+            group: Global ranks participating in the reductions.
+            staged_max_numel: Requested ordinary all-reduce payload in elements.
+            producer_direct_max_numel: Requested producer-direct payload in elements.
+            attnres_max_numel: Maximum fused AttnRes payload in elements.
+            attnres_max_rows: Maximum fused AttnRes payload in rows.
+            enable_lamport: Allow Lamport for eligible producer-direct payloads.
+            moe_tail_max_rows: Maximum rows in the reusable symmetric result buffer;
+                zero skips its allocation.
+            dtype: Element type shared by the prepared paths.
+
+        Returns:
+            Whether Iris prepared the requested buffers on this platform.
+        """
+
+        if len(group) <= 1 or not current_platform().is_amd:
+            return False
+        if dtype != torch.bfloat16:
+            return False
+        staged_max_numel = min(staged_max_numel, self._max_numel)
+        requested = (
+            staged_max_numel,
+            producer_direct_max_numel * dtype.itemsize,
+            attnres_max_numel,
+            attnres_max_rows,
+            moe_tail_max_rows,
+        )
+        if min(requested) < 0 or not any(requested):
+            raise ValueError(f"invalid all-reduce buffer capacities: {requested}")
+        if bool(attnres_max_numel) != bool(attnres_max_rows):
+            raise ValueError(
+                "AttnRes element and row capacities must both be zero or non-zero"
+            )
+
+        state = self._instances.get(group)
+        if state is not None:
+            if state.enable_lamport != enable_lamport:
+                raise RuntimeError(
+                    "all-reduce buffers were initialized with a different Lamport policy"
+                )
+            available = (
+                state.max_numel,
+                state.max_bytes,
+                state.attnres_max_numel,
+                state.max_token_num,
+                state.moe_tail_max_rows,
+            )
+            if any(have < need for have, need in zip(available, requested)):
+                raise RuntimeError(
+                    "all-reduce buffers were initialized below the requested "
+                    f"capacities: available={available}, requested={requested}"
+                )
+            initialize_all_reduce_state(state, dtype)
+            return True
+
+        state = create_state(
+            group=pg_manager.get_process_group("nccl", group),
+            rank_in_group=group.index(dist.get_rank()),
+            max_tokens=0,
+            hidden_size=0,
+            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+            max_numel=staged_max_numel,
+            max_bytes=producer_direct_max_numel * dtype.itemsize,
+            attnres_max_numel=attnres_max_numel,
+            attnres_max_rows=attnres_max_rows,
+            enable_lamport=enable_lamport,
+            moe_tail_max_rows=moe_tail_max_rows,
+        )
+        initialize_all_reduce_state(state, dtype)
+        self._instances[group] = state
+        return True
 
     def can_run(self, tensor: torch.Tensor, group: Group, op=None) -> bool:
         if len(group) <= 1 or not current_platform().is_amd:
@@ -132,7 +227,7 @@ class TritonAllReduceBackend(CommBackend):
         group: Group,
         op=None,
     ) -> bool:
-        """Iris returns symmetric outputs the reduction consumes in place."""
+        """Whether acquisition returns prepared symmetric producer storage."""
         return self.can_acquire_outputs(shapes, like, group, op=op)
 
     def can_acquire_outputs(
@@ -145,7 +240,15 @@ class TritonAllReduceBackend(CommBackend):
         """Check producer-direct eligibility without initializing Iris."""
         if not current_platform().is_cdna4 or not like.is_cuda:
             return False
-        state = self._get_or_create(group)
+        total_bytes = sum(math.prod(shape) for shape in shapes) * like.dtype.itemsize
+        state = self._instances.get(group)
+        max_bytes = (
+            state.max_bytes if state is not None else self._producer_direct_max_bytes
+        )
+        if total_bytes > max_bytes:
+            return False
+        if state is None:
+            state = self._get_or_create(group)
         return symm_outputs_can_run(state, shapes, like.dtype, op=op)
 
     def can_reduce_outputs(
@@ -163,18 +266,29 @@ class TritonAllReduceBackend(CommBackend):
     ) -> torch.Tensor:
         return self._fallback.all_gather(tensor, group, dim)
 
-    def all_gather_into_tensor(
+    def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
-        return self._fallback.all_gather_into_tensor(output, input, group)
+        return self._fallback.all_gather_single(output, input, group)
 
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
         return self._fallback.reduce_scatter(tensor, group)
 
     def all_to_all_single(
-        self, output: torch.Tensor, input: torch.Tensor, group: Group
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        group: Group,
+        output_split_sizes: list[int] | None = None,
+        input_split_sizes: list[int] | None = None,
     ) -> None:
-        return self._fallback.all_to_all_single(output, input, group)
+        return self._fallback.all_to_all_single(
+            output,
+            input,
+            group,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+        )
 
     def token_all_gather(
         self,

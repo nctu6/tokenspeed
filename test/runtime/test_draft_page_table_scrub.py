@@ -55,12 +55,16 @@ class _Leaf:
 
 
 def _draft_router(rows: int = 8) -> CacheGroupRouter:
-    router = CacheGroupRouter(None, is_draft=True, spec_num_tokens=4, device="cpu")
+    router = CacheGroupRouter(
+        None, is_draft=True, spec_num_tokens=4, device="cpu", consumed_group_ids=None
+    )
     router.bind(
         CacheGroupGeometry(
             granularities={FULL: 128},
             families={FULL: "history"},
             full_history_group_id=FULL,
+            row_geometry={FULL: (128, 1)},
+            retentions={FULL: ("full_history", None)},
         ),
         {FULL: _Leaf()},
     )
@@ -129,11 +133,12 @@ class IdleReplayScrubTest(unittest.TestCase):
                 # with placeholders before this call; snapshot what the
                 # drafter's recorded kernels would read.
                 captured["extend_kwargs"] = extend_kwargs
+                captured["attn_backend"] = ctx.attn_backend
                 _refresh(router, padded_bs, 0, None)
                 captured["rows"] = router.draft_history_view().table[:padded_bs].clone()
 
         ex = SimpleNamespace(
-            attn_backend=None,
+            attn_backend=object(),
             token_to_kv_pool=None,
             input_buffers=SimpleNamespace(
                 req_pool_indices_buf=torch.zeros(8, dtype=torch.int64),
@@ -141,6 +146,8 @@ class IdleReplayScrubTest(unittest.TestCase):
                 extend_prefix_lens_cpu=torch.zeros(8, dtype=torch.int32),
                 extend_seq_lens_buf=torch.zeros(8, dtype=torch.int32),
                 extend_seq_lens_cpu=torch.zeros(8, dtype=torch.int32),
+                extend_replay_lens_cpu=torch.zeros(8, dtype=torch.int32),
+                extend_prompt_lens_cpu=torch.zeros(8, dtype=torch.int32),
                 fill_dummy_decode_buffers=lambda batch_size, total_tokens: None,
             ),
             runtime_states=SimpleNamespace(
@@ -164,6 +171,7 @@ class IdleReplayScrubTest(unittest.TestCase):
             ),
         )
         self.assertTrue((captured["rows"] == 0).all(), captured["rows"])
+        self.assertIs(captured["attn_backend"], ex.attn_backend)
         # The idle replay hands the runner empty extend slices, never None.
         extend_kwargs = captured["extend_kwargs"]
         self.assertIs(extend_kwargs["extend_with_prefix"], False)
@@ -174,6 +182,8 @@ class IdleReplayScrubTest(unittest.TestCase):
             "extend_seq_lens_cpu",
         ):
             self.assertEqual(extend_kwargs[name].numel(), 0, name)
+        # And the runner's required host tables: no request, no groups.
+        self.assertEqual(extend_kwargs["block_tables_cpu"], {})
 
 
 if __name__ == "__main__":

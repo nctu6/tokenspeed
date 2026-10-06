@@ -666,11 +666,7 @@ class ProgramScheduler:
 
 
 @gluon.jit
-def process_single_attention_tile(
-    program: AttentionProgram,
-    k_smem: gl.shared_memory_descriptor,
-    v_smem: gl.shared_memory_descriptor,
-):
+def process_single_attention_tile(program: AttentionProgram):
     cfg = program.cfg
     q = program.load_q(other=0.0)
 
@@ -869,7 +865,7 @@ def process_sliding_attention_tile(
 
 
 @gluon.jit
-def _rel_mha_prefill_fp16(
+def gluon_rel_mha_prefill_gfx950(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -953,7 +949,7 @@ def _rel_mha_prefill_fp16(
         if active:
             if program.seq_len < cfg.BLOCK_N:
                 if program.q_start == 0:
-                    process_single_attention_tile(program, k_smem, v_smem)
+                    process_single_attention_tile(program)
             else:
                 process_attention_tile(
                     program, k_smem, v_smem, boundary_mask0, boundary_mask1
@@ -962,7 +958,7 @@ def _rel_mha_prefill_fp16(
 
 
 @gluon.jit
-def _rel_mha_prefill_sliding_fp16(
+def gluon_rel_mha_prefill_sliding_gfx950(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -1041,7 +1037,7 @@ def _rel_mha_prefill_sliding_fp16(
         if active:
             if program.seq_len < cfg.BLOCK_N:
                 if program.q_start == 0:
-                    process_single_attention_tile(program, k_smem, v_smem)
+                    process_single_attention_tile(program)
             else:
                 process_sliding_attention_tile(program, k_smem, v_smem)
         scheduler = scheduler.advance()
@@ -1100,7 +1096,7 @@ def get_config(
     )
 
 
-def gluon_rel_mha_prefill_gfx950(
+def launch_gluon_rel_mha_prefill_gfx950(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1133,9 +1129,9 @@ def gluon_rel_mha_prefill_gfx950(
     lse_arg = lse if lse is not None else q
 
     kernel = (
-        _rel_mha_prefill_sliding_fp16
+        gluon_rel_mha_prefill_sliding_gfx950
         if config.window_left >= 0
-        else _rel_mha_prefill_fp16
+        else gluon_rel_mha_prefill_gfx950
     )
     kernel[config.grid](
         q,

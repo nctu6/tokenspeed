@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import re
 from collections.abc import Iterable
 
@@ -37,10 +36,11 @@ from tokenspeed.runtime.configs.qwen4_exp_config import (
 from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
-    bind_qwen4_exp_side_state,
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    BreakableCapture,
+    current_forward_ctx,
 )
+from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import rmsnorm_fn
 from tokenspeed.runtime.layers.hyperconnection import (
     GatedResidualSimple,
@@ -57,12 +57,10 @@ from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfi
 from tokenspeed.runtime.layers.qwen4_exp_ple import (
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLELayer,
-    quantize_ple_embedding_rows,
 )
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
-    kv_cache_scales_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.qwen3_5 import (
@@ -78,9 +76,6 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeSparseMoeBlock,
 )
 from tokenspeed.runtime.models.utils import validate_attention_partition
-from tokenspeed.runtime.moe.distribution_recorder import (
-    get_global_expert_distribution_recorder,
-)
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import add_prefix
 
@@ -121,6 +116,7 @@ def _build_qwen4_exp_mlp(
         )
     else:
         mlp = Qwen3_5MoeMLP(
+            parallelism="dense",
             mapping=mapping,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -152,8 +148,10 @@ class _Qwen4ExpRMSNormGated(nn.Module):
                 self.weight,
                 z=z,
                 eps=self.eps,
+                group_size=None,
                 norm_before_gate=True,
                 sigmoid_gate=True,
+                weights_independent=True,
             )
         input_dtype = x.dtype
         value = x.float()
@@ -212,9 +210,19 @@ class _Qwen4ExpDecoderMixin:
     def _prepare_attention(
         self,
         hidden_states: torch.Tensor,
+        residuals,
         input_ids: torch.Tensor,
         ctx: ForwardContext,
     ):
+        if residuals is not None:
+            if self.ple is None and not self.comm_manager.needs_pre_attn_all_gather():
+                hidden_states, normalized = self.attn_hyper_connection.combine_norm(
+                    hidden_states, residuals
+                )
+                return self.attn_hyper_connection.mix(
+                    hidden_states, normalized=normalized
+                )
+            hidden_states = self.attn_hyper_connection.combine(hidden_states, residuals)
         expected = self.hc_count * self.hidden_size
         if hidden_states.shape[-1] == self.hidden_size:
             hidden_states = hidden_states.repeat(1, self.hc_count)
@@ -227,26 +235,27 @@ class _Qwen4ExpDecoderMixin:
         if self.ple is not None:
             # The PLE layer folds this residual add into its conv epilogue.
             hidden_states = self.ple(hidden_states, input_ids, ctx)
-        return self.attn_hyper_connection.mix(hidden_states)
+        return self.attn_hyper_connection.mix(hidden_states, normalized=None)
 
     def _finish_attention(
         self,
         attention_output: torch.Tensor,
         residuals,
         ctx: ForwardContext,
-    ) -> torch.Tensor:
-        if ctx.forward_mode.is_idle():
-            return self.attn_hyper_connection.combine(attention_output, residuals)
-        attention_output, residual = self.comm_manager.post_attn_comm(
-            attention_output, residuals[0], ctx
+    ):
+        if not ctx.forward_mode.is_idle():
+            attention_output, residual = self.comm_manager.post_attn_comm(
+                attention_output, residuals[0], ctx
+            )
+            residuals = self.attn_hyper_connection.norm_for(residual, residuals)
+        # The MLP consumes this updated residual immediately, so inject the
+        # attention output in the MLP's grouped norm before its mix projection.
+        combined, normalized = self.mlp_hyper_connection.combine_norm(
+            attention_output, residuals
         )
-        return self.attn_hyper_connection.combine(
-            attention_output,
-            self.attn_hyper_connection.norm_for(residual, residuals),
-        )
+        return self.mlp_hyper_connection.mix(combined, normalized=normalized)
 
-    def _run_mlp(self, hidden_states: torch.Tensor, ctx: ForwardContext):
-        mixed, residuals = self.mlp_hyper_connection.mix(hidden_states)
+    def _run_mlp(self, mixed: torch.Tensor, residuals, ctx: ForwardContext):
         num_global_tokens, max_tokens_per_gpu = self.comm_manager.get_num_tokens(ctx)
         if self.is_moe:
             deferred_reduce = (
@@ -262,7 +271,7 @@ class _Qwen4ExpDecoderMixin:
             mixed = self.comm_manager.pre_mlp_comm(mixed, ctx)
             output = self.mlp(mixed)
             output, _ = self.comm_manager.post_mlp_comm(output, residuals[0], ctx)
-        return self.mlp_hyper_connection.combine(output, residuals)
+        return output, residuals
 
 
 class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLayer):
@@ -299,6 +308,8 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
             layer_id=layer_id,
             is_moe=self.is_moe,
             prev_is_moe=self.is_moe,
+            dense_batch_invariant=False,
+            query_sharded=False,
         )
         if _qwen4_exp_uses_sigmoid_output_gate(config):
             self.linear_attn.norm = _Qwen4ExpRMSNormGated(
@@ -310,18 +321,20 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
+        residual: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         **kwargs,
     ):
-        del residual, kwargs
-        mixed, residuals = self._prepare_attention(hidden_states, input_ids, ctx)
+        del kwargs
+        mixed, residuals = self._prepare_attention(
+            hidden_states, residual, input_ids, ctx
+        )
         attention_output = (
             mixed if ctx.forward_mode.is_idle() else self.linear_attn(mixed, ctx)
         )
-        hidden_states = self._finish_attention(attention_output, residuals, ctx)
-        return self._run_mlp(hidden_states, ctx), None
+        mixed, residuals = self._finish_attention(attention_output, residuals, ctx)
+        return self._run_mlp(mixed, residuals, ctx)
 
 
 class Qwen4ExpAttentionDecoderLayer(
@@ -404,12 +417,16 @@ class Qwen4ExpAttentionDecoderLayer(
             tp_group=self.attn_tp_group,
             prefix=add_prefix("o_proj", prefix),
         )
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            rotary_emb=self.rotary_emb,
+            qk_norm=(self.q_norm, self.k_norm),
         )
         self.mlp, self.is_moe = _build_qwen4_exp_mlp(
             config,
@@ -421,13 +438,13 @@ class Qwen4ExpAttentionDecoderLayer(
         )
         self.input_layernorm = None
         self.post_attention_layernorm = None
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.comm_manager = CommManager(
             mapping=mapping,
             layer_id=layer_id,
             is_moe=self.is_moe,
             prev_is_moe=self.is_moe,
+            dense_batch_invariant=False,
+            query_sharded=False,
         )
         self.indexer = None
         if getattr(config, "indexer_n_heads", None) is not None:
@@ -448,50 +465,38 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
-        if self.indexer is not None:
-            selected_slots = self.indexer(hidden_states, positions, ctx)
-            attention_output = self._qsa_attention(
-                q=q,
-                k=k,
-                v=v,
-                gate=gate,
-                attention_layer=self.attn,
-                ctx=ctx,
-                # QSA writes the paged KV itself; slots come from the backend.
-                out_cache_loc=ctx.attn_backend.write_locations(
-                    self.attn, ctx.forward_mode
-                ),
-                selected_slots=selected_slots,
-            )
-        else:
-            attention_output = self._attn(q, k, v, gate, ctx)
+        q, k, v, gate = self._project_qkv(hidden_states)
+        selected_slots = (
+            self.indexer(hidden_states, positions, ctx)
+            if self.indexer is not None
+            else None
+        )
+        attention_output = self._attn(
+            positions, q, k, v, gate, ctx, topk_indices=selected_slots
+        )
         output, _ = self.o_proj(attention_output)
         return output
-
-    def _qsa_attention(self, **kwargs) -> torch.Tensor:
-        """Sparse-attention hook specialized by the MTP draft layer."""
-
-        return self.indexer.sparse_attention(**kwargs)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
+        residual: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         **kwargs,
     ):
-        del residual, kwargs
-        mixed, residuals = self._prepare_attention(hidden_states, input_ids, ctx)
+        del kwargs
+        mixed, residuals = self._prepare_attention(
+            hidden_states, residual, input_ids, ctx
+        )
         attention_output = (
             mixed
             if ctx.forward_mode.is_idle()
             else self.self_attention(positions, mixed, ctx)
         )
-        hidden_states = self._finish_attention(attention_output, residuals, ctx)
-        return self._run_mlp(hidden_states, ctx), None
+        mixed, residuals = self._finish_attention(attention_output, residuals, ctx)
+        return self._run_mlp(mixed, residuals, ctx)
 
 
 class Qwen4ExpModel(Qwen3_5ForCausalLM):
@@ -518,35 +523,20 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidualSimple(hc_config, use_combine=False)
-        self.ple_layers = tuple(
-            layer.ple
-            for layer in self.layers
-            if getattr(layer, "ple", None) is not None
-        )
         self.qsa_indexers = tuple(
             layer.indexer
             for layer in self.layers
             if getattr(layer, "indexer", None) is not None
         )
 
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        """Load per-tensor FP8 KV scales for full-attention layers."""
-
-        for layer_idx, scaling_factor in kv_cache_scales_loader(
-            quantization_param_path,
-            self.mapping.attn.tp_rank,
-            self.mapping.attn.tp_size,
-            self.config.num_hidden_layers,
-            self.config.model_type,
-        ):
-            paged_attention = getattr(self.layers[layer_idx], "attn", None)
-            if paged_attention is None:
-                continue
-            scale = float(scaling_factor)
-            paged_attention.k_scale = scale
-            paged_attention.v_scale = scale
-            paged_attention.k_scale_float = scale
-            paged_attention.v_scale_float = scale
+    def _start_ple_prefetch(
+        self, ple: Qwen4ExpPLELayer, input_ids: torch.Tensor, ctx: ForwardContext
+    ) -> None:
+        cap = BreakableCapture.current()
+        if cap is not None and cap._capturing:
+            cap.add_eager(lambda: ple.start_prefetch(input_ids, current_forward_ctx()))
+        else:
+            ple.start_prefetch(input_ids, ctx)
 
     @torch.no_grad()
     def forward(
@@ -559,42 +549,58 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         input_deepstack_embeds: torch.Tensor | None = None,
     ):
         del pp_proxy_tensors
-        bind_qwen4_exp_side_state(
-            ctx.attn_backend,
-            self.ple_layers,
-            self.qsa_indexers,
-        )
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
+        if self.layers and self.layers[0].ple is not None:
+            self._start_ple_prefetch(self.layers[0].ple, input_ids, ctx)
         residual = None
         for layer_id, layer in enumerate(self.layers):
-            with get_global_expert_distribution_recorder().with_current_layer(layer_id):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    ctx=ctx,
-                    input_ids=input_ids,
-                )
+            if layer_id + 1 < len(self.layers):
+                next_ple = self.layers[layer_id + 1].ple
+                if next_ple is not None:
+                    self._start_ple_prefetch(next_ple, input_ids, ctx)
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+                ctx=ctx,
+                input_ids=input_ids,
+            )
             if (
                 input_deepstack_embeds is not None
                 and input_deepstack_embeds.numel()
                 and layer_id < 3
             ):
+                if residual is not None:
+                    hidden_states = layer.mlp_hyper_connection.combine(
+                        hidden_states, residual
+                    )
+                    residual = None
                 start = self.hidden_size * layer_id
                 deepstack = input_deepstack_embeds[
                     :, start : start + self.hidden_size
                 ].repeat(1, self.config.hc_count)
                 hidden_states.add_(deepstack)
 
-        if self.layers:
+        if self.layers and self.layers[-1].comm_manager.needs_final_all_gather():
+            if residual is not None:
+                hidden_states = self.layers[-1].mlp_hyper_connection.combine(
+                    hidden_states, residual
+                )
+                residual = None
             hidden_states, _ = self.layers[-1].comm_manager.post_final_norm_comm(
                 hidden_states, hidden_states, ctx
             )
-        hc_hidden_states = hidden_states
-        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
-        return hidden_states, [hc_hidden_states]
+        normalized = None
+        if residual is not None:
+            hidden_states, normalized = self.hyper_connection_mixer.combine_norm(
+                hidden_states, residual
+            )
+        hidden_states, residuals = self.hyper_connection_mixer.mix(
+            hidden_states, normalized=normalized
+        )
+        return hidden_states, [residuals[0]]
 
 
 def _normalize_checkpoint_name(name: str) -> str:
@@ -622,42 +628,8 @@ def _copy_ple_shard(
     ple_embedding = ple_modules.get(module_name)
     if not isinstance(ple_embedding, Qwen4ExpNGramEmbedding):
         return None
-    embedding = ple_embedding.ngram_embedding
-    shard_index = int(match.group(1))
-    shard_size = (embedding.org_vocab_size + split_parts - 1) // split_parts
-    row_start = shard_index * shard_size
-    row_end = row_start + loaded_weight.shape[0]
-    tp_start = embedding.shard_indices.org_vocab_start_index
-    tp_end = embedding.shard_indices.org_vocab_end_index
-    overlap_start = max(row_start, tp_start)
-    overlap_end = min(row_end, tp_end)
-    if overlap_start < overlap_end:
-        destination = overlap_start - tp_start
-        source = overlap_start - row_start
-        rows = overlap_end - overlap_start
-        source_rows = loaded_weight[source : source + rows]
-        target_rows = embedding.weight.data[destination : destination + rows]
-        scale_buffer = getattr(ple_embedding, "ngram_embedding_scale", None)
-        source_is_fp8 = source_rows.dtype == torch.float8_e4m3fn
-        target_is_fp8 = target_rows.dtype == torch.float8_e4m3fn
-        # Matching formats are copied unchanged. In particular, FP8-to-FP8
-        # preserves the checkpoint payload; its global scale is loaded by
-        # _load_ple_weight_scale independently of checkpoint weight ordering.
-        if target_is_fp8 and not source_is_fp8:
-            if scale_buffer is None:
-                raise RuntimeError("FP8 PLE embedding is missing its scale buffer")
-            # Quantize compute-dtype checkpoint rows for FP8 storage and retain
-            # their independently derived dequant scales.
-            source_rows, scale = quantize_ple_embedding_rows(source_rows)
-            scale_buffer[destination : destination + rows].copy_(
-                scale.to(scale_buffer.device, scale_buffer.dtype)
-            )
-        elif source_is_fp8 and not target_is_fp8:
-            source_rows = (
-                source_rows.to(torch.float32) * ple_embedding._checkpoint_weight_scale
-            )
-        target_rows.copy_(source_rows.to(target_rows.device, target_rows.dtype))
-    return f"{module_name}.ngram_embedding.weight"
+    ple_embedding.lookup.load_shard(loaded_weight, int(match.group(1)), split_parts)
+    return f"{module_name}.lookup.ngram_embedding.weight"
 
 
 def _load_ple_weight_scale(
@@ -674,31 +646,8 @@ def _load_ple_weight_scale(
     ple_embedding = dict(module.named_modules()).get(module_name)
     if not isinstance(ple_embedding, Qwen4ExpNGramEmbedding):
         return None
-    if loaded_weight.numel() != 1:
-        raise ValueError(
-            f"Qwen4-Exp PLE weight scale must be scalar, got "
-            f"{tuple(loaded_weight.shape)} for {name}"
-        )
-    scale = float(loaded_weight.to(torch.float32).item())
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError(
-            f"Qwen4-Exp PLE weight scale must be finite and positive, got "
-            f"{scale} for {name}"
-        )
-
-    scale_buffer = getattr(ple_embedding, "ngram_embedding_scale", None)
-    if scale_buffer is not None:
-        # The checkpoint scale is shared by every pre-quantized row, so one
-        # fill handles both scale-before-shards and scale-after-shards order.
-        scale_buffer.fill_(scale)
-    else:
-        # Compute-dtype target: rescale any raw FP8 rows copied before the
-        # scale tensor. Future shard copies multiply by the new value.
-        ple_embedding.ngram_embedding.weight.data.mul_(
-            scale / ple_embedding._checkpoint_weight_scale
-        )
-    ple_embedding._checkpoint_weight_scale = scale
-    return f"{module_name}.ngram_embedding.weight"
+    ple_embedding.lookup.load_scale(loaded_weight)
+    return f"{module_name}.lookup.ngram_embedding.weight"
 
 
 def load_qwen4_exp_weights(
@@ -784,6 +733,10 @@ def load_qwen4_exp_weights(
                     f"got {tuple(loaded_weight.shape)}"
                 )
             buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
+            if buffer_name == "ngram_heads_vocab_sizes":
+                owner = dict(module.named_modules())[name.rpartition(".")[0]]
+                if isinstance(owner, Qwen4ExpNGramEmbedding):
+                    owner.refresh_ngram_reciprocals()
             loaded.add(name)
             continue
         scale_name = _load_ple_weight_scale(module, name, loaded_weight)
@@ -794,6 +747,13 @@ def load_qwen4_exp_weights(
         if shard_name is not None:
             loaded.add(shard_name)
             continue
+        if name.endswith(".ngram_embedding.weight"):
+            module_name = name[: -len(".ngram_embedding.weight")]
+            embedding = dict(module.named_modules()).get(module_name)
+            if isinstance(embedding, Qwen4ExpNGramEmbedding):
+                embedding.lookup.load_shard(loaded_weight, 0, 1)
+                loaded.add(f"{module_name}.lookup.ngram_embedding.weight")
+                continue
         for param_name, weight_name, shard_id in stacked:
             if weight_name not in name or "mlp.experts" in name or "visual" in name:
                 continue
@@ -813,7 +773,7 @@ def load_qwen4_exp_weights(
             if name.endswith(ignored_suffixes) and name not in params:
                 continue
             if name not in params:
-                logger.warning("Qwen4-Exp parameter %s was not found", name)
+                logger.warning(f"Qwen4-Exp parameter {name!s} was not found")
                 continue
             loader = getattr(params[name], "weight_loader", default_weight_loader)
             loader(params[name], loaded_weight)
@@ -840,9 +800,6 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
         return load_qwen4_exp_weights(
             self, self.config, self.mapping, weights, include_visual=False
         )
-
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        self.model.load_kv_cache_scales(quantization_param_path)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -887,10 +844,6 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             weights,
             include_visual=self.is_multimodal_active,
         )
-
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        if self.model is not None:
-            self.model.load_kv_cache_scales(quantization_param_path)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

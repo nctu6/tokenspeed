@@ -1,14 +1,13 @@
 # Copyright (c) 2026 LightSeek Foundation
 
-"""Biased sigmoid top-k routing entry point."""
+"""Biased sigmoid top-k routing implementations and internal dispatch."""
 
 from __future__ import annotations
 
+import tokenspeed_kernel.ops.moe.triton.kimi3_sigmoid_topk  # noqa: F401
 import torch
-from tokenspeed_kernel.ops.moe.triton.kimi3_sigmoid_topk import (
-    kimi3_sigmoid_bias_topk,
-)
-from tokenspeed_kernel.platform import CapabilityRequirement, Platform, pdl_enabled
+from tokenspeed_kernel.ops.moe.triton.minimax_topk import minimax_biased_grouped_topk
+from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
@@ -35,13 +34,7 @@ def _gluon_eligible(
     )
 
 
-#: GB200, cold L2: packed wins to 256 rows and ties the grouped kernel at 320.
-_K3_PACKED_TOPK_MAX_ROWS_NVIDIA = 256
-#: Unmeasured past one row on CDNA4, so it keeps what it was tuned at.
-_K3_PACKED_TOPK_MAX_ROWS_CDNA4 = 1
-
-
-def moe_sigmoid_bias_topk(
+def _moe_sigmoid_bias_topk(
     router_logits: torch.Tensor,
     correction_bias: torch.Tensor,
     topk: int,
@@ -50,6 +43,7 @@ def moe_sigmoid_bias_topk(
     normalize_topk_weights: bool = True,
     logical_to_physical_map: torch.Tensor | None = None,
     weights_dtype: torch.dtype = torch.float32,
+    override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select experts using ``sigmoid(logits) + correction_bias``.
@@ -65,7 +59,8 @@ def moe_sigmoid_bias_topk(
             the specialized decode kernel; a gather elsewhere).
         weights_dtype: Output dtype for the route weights (selection always
             runs in FP32).
-        solution: Optional implementation override.
+        override: Optional exact registered kernel name.
+        solution: Optional implementation solution.
 
     Returns:
         ``(topk_weights, topk_ids)`` with shapes ``[tokens, topk]``. Weights
@@ -97,55 +92,22 @@ def moe_sigmoid_bias_topk(
             torch.empty(shape, device=router_logits.device, dtype=weights_dtype),
             torch.empty(shape, device=router_logits.device, dtype=torch.int32),
         )
-    platform = Platform.get()
-    if platform.is_nvidia:
-        packed_max_rows = _K3_PACKED_TOPK_MAX_ROWS_NVIDIA
-    elif platform.is_cdna4:
-        packed_max_rows = _K3_PACKED_TOPK_MAX_ROWS_CDNA4
-    else:
-        packed_max_rows = 0
     if (
-        solution is None
-        and router_logits.shape[1] == 896
-        and 0 < tokens <= packed_max_rows
-        and router_logits.dtype == torch.float32
-        and correction_bias.dtype == torch.float32
-        and topk == 16
-        # The packed kernel raises on these layouts; the grouped one reads strides.
-        and router_logits.is_cuda
-        and router_logits.is_contiguous()
-        and correction_bias.is_contiguous()
+        override is None
+        and solution is None
+        and not _gluon_eligible(router_logits, correction_bias, topk)
     ):
-        # Selection matches the grouped kernel; the weights differ by an fp32 ulp.
-        topk_weights, topk_ids = kimi3_sigmoid_bias_topk(
-            router_logits,
-            correction_bias,
-            enable_pdl=pdl_enabled(),
-            routed_scaling_factor=routed_scaling_factor,
-            normalize_topk_weights=normalize_topk_weights,
-            logical_to_physical_map=(
-                logical_to_physical_map
-                if logical_to_physical_map is not None
-                and logical_to_physical_map.dtype == torch.int32
-                else None
-            ),
-            weights_dtype=weights_dtype,
-        )
-        if (
-            logical_to_physical_map is not None
-            and logical_to_physical_map.dtype == torch.int64
-        ):
-            topk_ids = logical_to_physical_map[topk_ids.long()].to(torch.int32)
-        return topk_weights, topk_ids
-    if solution is None and not _gluon_eligible(router_logits, correction_bias, topk):
         solution = "torch"
 
     signature = format_signature(router_logits=dense_tensor_format(router_logits.dtype))
     traits = {"tokens": tokens, "experts": experts, "topk": topk}
-    if (
-        logical_to_physical_map is not None
-        and logical_to_physical_map.dtype == torch.int32
-        and solution is None
+    if logical_to_physical_map is not None and (
+        (override is not None and override.endswith("_mapped"))
+        or (
+            logical_to_physical_map.dtype == torch.int32
+            and solution is None
+            and override is None
+        )
     ):
         try:
             mapped_kernel = select_kernel(
@@ -153,6 +115,7 @@ def moe_sigmoid_bias_topk(
                 "sigmoid_bias_topk_mapped",
                 signature,
                 traits=traits,
+                override=override,
             )
         except NoKernelFoundError:
             mapped_kernel = None
@@ -173,6 +136,7 @@ def moe_sigmoid_bias_topk(
         "sigmoid_bias_topk",
         signature,
         traits=traits,
+        override=override,
         solution=solution,
     )
     topk_weights, topk_ids = kernel(
@@ -198,7 +162,6 @@ def moe_sigmoid_bias_topk(
         "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
     ),
     priority=Priority.PERFORMANT,
-    tags={"nvidia", "cuda_graph"},
 )
 def triton_minimax_sigmoid_bias_topk(
     *,
@@ -216,8 +179,6 @@ def triton_minimax_sigmoid_bias_topk(
     (40us vs 13us at [1, 896] topk=16). ``hidden_states`` is only shape-
     validated by the kernel wrapper, so the logits stand in for it.
     """
-    from tokenspeed_kernel.thirdparty.triton import minimax_biased_grouped_topk
-
     # The kernel scales only when it renormalizes, so keep fp32 through mul_.
     topk_weights, topk_ids = minimax_biased_grouped_topk(
         router_logits,
@@ -246,7 +207,6 @@ def triton_minimax_sigmoid_bias_topk(
         "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
     ),
     priority=Priority.PORTABLE,
-    tags={"portability", "reference"},
 )
 def torch_sigmoid_bias_topk(
     *,
@@ -271,5 +231,3 @@ def torch_sigmoid_bias_topk(
 
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.triton.decode_sigmoid_topk  # noqa: E402,F401
-
-__all__ = ["moe_sigmoid_bias_topk"]

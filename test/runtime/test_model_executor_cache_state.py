@@ -21,9 +21,13 @@
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 
 
 class _RuntimeStates:
@@ -128,6 +132,8 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     )
     executor.grammar_runtime = None
     executor.drafter = _Drafter()
+    executor.tree_spec = None
+    executor.dspark_context_producer = None
     executor.config = SimpleNamespace(spec_algo="EAGLE3", pp_size=1, output_length=4)
     executor.runtime_states = SimpleNamespace(
         future_input_map=_FutureInputMap(),
@@ -138,7 +144,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         merge_oov=lambda *_args: None,
     )
     executor._run_target_forward = lambda *_args: SimpleNamespace(
-        next_token_logprobs=None
+        next_token_logprobs=None, input_token_logprobs=None
     )
     executor._run_sampling = lambda *_args: (
         torch.tensor([3], dtype=torch.int32),
@@ -147,7 +153,15 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     executor._draft_final_step_counter = SimpleNamespace(
         record_cache=lambda: events.append("draft-final")
     )
-    ctx = SimpleNamespace(bs=1, num_extends=1, input_num_tokens=1)
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=1,
+        num_extends=1,
+        output_layout=ForwardOutputLayout(1, 1, 0, 1),
+        input_num_tokens=1,
+        forward_mode=ForwardMode.EXTEND,
+    )
 
     executor._forward_step(bs=1, ctx=ctx, sampling_info=object())
 
@@ -214,6 +228,7 @@ def test_non_spec_decode_routes_through_verify():
 
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.drafter = None
+    executor.tree_spec = None
     executor.config = SimpleNamespace(output_length=1)
     executor.input_buffers = SimpleNamespace(
         input_ids_buf=torch.arange(8, dtype=torch.int32),
@@ -221,7 +236,7 @@ def test_non_spec_decode_routes_through_verify():
     )
     executor.sampling_backend = SimpleNamespace(
         sample=lambda *_a, **_k: calls.append("sample") or (None, None),
-        verify=lambda _lo, _si, cand: calls.append(("verify", tuple(cand.shape)))
+        verify=lambda _lo, _si, cand, tree: calls.append(("verify", tuple(cand.shape)))
         or (
             torch.zeros(cand.shape[0], dtype=torch.int32),
             torch.ones(cand.shape[0], dtype=torch.int32),
@@ -230,7 +245,11 @@ def test_non_spec_decode_routes_through_verify():
 
     # Pure decode, bs=3, N=1: candidates are the tail 3 ids as [3, 1].
     ctx = SimpleNamespace(
-        bs=3, num_extends=0, input_num_tokens=3, decode_input_ids=None
+        bs=3,
+        num_extends=0,
+        input_num_tokens=3,
+        decode_input_ids=None,
+        output_layout=ForwardOutputLayout(0, 0, 3, 1),
     )
     candidates = executor._decode_candidates(ctx)
     assert candidates.shape == (3, 1)
@@ -242,8 +261,61 @@ def test_non_spec_decode_routes_through_verify():
     # Pure prefill still samples.
     calls.clear()
     ctx2 = SimpleNamespace(
-        bs=2, num_extends=2, input_num_tokens=6, decode_input_ids=None
+        bs=2,
+        num_extends=2,
+        input_num_tokens=6,
+        decode_input_ids=None,
+        output_layout=ForwardOutputLayout(2, 2, 0, 1),
     )
     assert executor._decode_candidates(ctx2) is None
     executor._run_sampling(object(), object(), ctx2, None)
     assert calls == ["sample"]
+
+
+@pytest.mark.parametrize(
+    ("prefill_tokens", "dp_size", "width", "capacity"),
+    [(64, 1, 1, 160), (64, 1, 4, 640), (64, 4, 4, 160), (8192, 1, 4, 8192)],
+)
+def test_input_allocation_covers_decode(
+    monkeypatch, prefill_tokens, dp_size, width, capacity
+):
+    import tokenspeed.runtime.execution.model_executor as module
+
+    class AllocationChecked(Exception):
+        pass
+
+    def check_allocation(
+        max_bs, max_num_tokens, state_write_padding_pool_index, device
+    ):
+        assert max_bs == 160 // dp_size
+        assert max_num_tokens == capacity
+        raise AllocationChecked
+
+    monkeypatch.setattr(
+        module, "validate_scheduler_config", lambda attn_backend, kv_pool: None
+    )
+    # Check the real constructor's allocation arguments without model/GPU setup.
+    monkeypatch.setattr(module, "InputBuffers", check_allocation)
+    config = SimpleNamespace(
+        device="cpu",
+        max_num_seqs=160,
+        data_parallel_size=dp_size,
+        chunked_prefill_size=prefill_tokens,
+        output_length=width,
+        max_req_pool_size=161,
+        spec_algo="EAGLE" if width > 1 else None,
+        spec_num_tokens=width,
+    )
+    with pytest.raises(AllocationChecked):
+        ModelExecutor(
+            config=config,
+            model_runner=None,
+            attn_backend=None,
+            token_to_kv_pool=SimpleNamespace(
+                arena=SimpleNamespace(runtime_contract=None)
+            ),
+            sampling_backend=None,
+            draft_model_runner=None,
+            draft_attn_backend=None,
+            draft_token_to_kv_pool=None,
+        )

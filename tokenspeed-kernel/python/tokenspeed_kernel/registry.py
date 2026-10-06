@@ -177,9 +177,6 @@ class KernelSpec:
     # places unannotated kernels in PERFORMANT so they win against PORTABLE but
     # lose to SPECIALIZED. Selection scoring clamps out-of-range values.
     priority: int = int(Priority.PERFORMANT) + 2
-    tags: frozenset[str] = (
-        frozenset()
-    )  # Standard tags: "throughput", "latency", "determinism", "portability"
     weight_preprocessor: Callable | None = None
 
     def __post_init__(self) -> None:
@@ -311,7 +308,6 @@ class KernelRegistry:
         features: frozenset[str] | None = None,
         platform: PlatformInfo | None = None,
         format_signature: FormatSignature | None = None,
-        tags: set[str] | None = None,
         solution: str | None = None,
     ) -> list[KernelSpec]:
         """Get all kernels for an operator, optionally filtered."""
@@ -323,8 +319,6 @@ class KernelRegistry:
             specs = [s for s in specs if s.capability.satisfied_by(platform)]
         if format_signature:
             specs = [s for s in specs if s.supports_format_signature(format_signature)]
-        if tags:
-            specs = [s for s in specs if tags.issubset(s.tags)]
         if solution:
             specs = [s for s in specs if s.solution == solution]
 
@@ -383,10 +377,12 @@ def register_kernel(
     signatures: set[FormatSignature] | frozenset[FormatSignature],
     traits: dict[str, frozenset[Any]] | None = None,
     priority: Priority | int = Priority.PERFORMANT + 2,
-    tags: set[str] | None = None,
     weight_preprocessor: Callable | None = None,
 ) -> Callable:
-    """Decorator to register a kernel function.
+    """Decorator to register a kernel function or stateful kernel class.
+
+    ``name`` is the registry key that ``override=`` strings, ``describe_kernel``
+    and profiler scopes show.
 
     ``priority`` accepts a :class:`Priority` band (recommended) or a raw ``int``
     in ``[0, 20)``. Within a band, add a small offset for relative preference,
@@ -399,6 +395,7 @@ def register_kernel(
 
         @register_kernel(
             "attention", "decode",
+            name="triton_attention_decode",
             features={"paged"},
             solution="triton",
             capability=CapabilityRequirement(
@@ -410,15 +407,14 @@ def register_kernel(
             ),
             # Narrowly gated on SM100 + tcgen05 → SPECIALIZED band.
             priority=Priority.SPECIALIZED + 1,
-            tags={"latency", "determinism"},
         )
-        def triton_decode_attention(query, key_cache, value_cache, ...):
+        def triton_attention_decode(query, key_cache, value_cache, ...):
             ...
     """
     priority_int = _validate_priority(priority)
     normalized_weight_preprocessor = _validate_weight_preprocessor(weight_preprocessor)
 
-    def decorator(fn: Callable) -> Callable:
+    def decorator(impl: Callable) -> Callable:
         kernel_name = name or f"{solution}_{family}_{mode}"
 
         spec = KernelSpec(
@@ -431,12 +427,11 @@ def register_kernel(
             capability=capability or CapabilityRequirement(),
             traits=traits or {},
             priority=priority_int,
-            tags=frozenset(tags or set()),
             weight_preprocessor=normalized_weight_preprocessor,
         )
 
-        KernelRegistry.get().register(spec, fn)
-        return fn
+        KernelRegistry.get().register(spec, impl)
+        return impl
 
     return decorator
 
@@ -459,7 +454,6 @@ def describe_kernel(name: str) -> str:
         "  Format signatures: "
         + ("; ".join(str(p) for p in spec.format_signatures) or "none"),
         f"  Platform: {spec.capability}",
-        f"  Tags: {', '.join(spec.tags) or 'none'}",
     ]
     if spec.weight_preprocessor is None:
         lines.append("  Weight preprocessor: none")
@@ -480,11 +474,25 @@ def load_builtin_kernels() -> None:
                 "tokenspeed_kernel.numerics.reference."
             ):
                 del sys.modules[key]
-    import tokenspeed_kernel.ops.attn_res  # noqa: F401
+    import tokenspeed_kernel.ops.attention  # noqa: F401
+    import tokenspeed_kernel.ops.attention.dsa  # noqa: F401
+    import tokenspeed_kernel.ops.attention.dsv4  # noqa: F401
+    import tokenspeed_kernel.ops.attention.dsv41  # noqa: F401
+    import tokenspeed_kernel.ops.attention.gdn  # noqa: F401
+    import tokenspeed_kernel.ops.attention.kda  # noqa: F401
+    import tokenspeed_kernel.ops.attention.kpool  # noqa: F401
+    import tokenspeed_kernel.ops.attention.mamba2  # noqa: F401
+    import tokenspeed_kernel.ops.attention.mha  # noqa: F401
+    import tokenspeed_kernel.ops.attention.mla  # noqa: F401
+    import tokenspeed_kernel.ops.attention.msa  # noqa: F401
+    import tokenspeed_kernel.ops.attention.prologue  # noqa: F401
+    import tokenspeed_kernel.ops.attention.qsa  # noqa: F401
+    import tokenspeed_kernel.ops.attention.rmha  # noqa: F401
     import tokenspeed_kernel.ops.embedding  # noqa: F401
     import tokenspeed_kernel.ops.gemm  # noqa: F401
     import tokenspeed_kernel.ops.moe  # noqa: F401
     import tokenspeed_kernel.ops.quantization  # noqa: F401
+    import tokenspeed_kernel.ops.residual  # noqa: F401
     import tokenspeed_kernel.ops.sampling  # noqa: F401
     import tokenspeed_kernel.ops.transform  # noqa: F401
 

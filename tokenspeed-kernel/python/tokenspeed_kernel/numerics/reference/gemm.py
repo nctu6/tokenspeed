@@ -25,7 +25,12 @@ import math
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import ScaleFormat, format_signatures
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 fp8_dtype = torch.float8_e4m3fn
 _FP8_BLOCK_SCALE = ScaleFormat(
@@ -114,7 +119,6 @@ def _reference_mxfp8_quantize(
     signatures=_MXFP8_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE + 2,
-    tags={"portability"},
 )
 def torch_mm_fp8_blockscale(
     A: torch.Tensor,
@@ -178,7 +182,6 @@ def torch_mm_fp8_blockscale(
         "b_layout": frozenset({"NK"}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def torch_mm_fp8_scaled_mnk(
     A: torch.Tensor,
@@ -195,8 +198,8 @@ def torch_mm_fp8_scaled_mnk(
     assert (
         A_scales is not None and B_scales is not None
     ), "A_scales and B_scales are required for fp8 scaled reference"
-    assert A_scales.shape == (1,), "A_scales must have shape (1,)"
-    assert B_scales.shape == (1,), "B_scales must have shape (1,)"
+    assert A_scales.numel() == 1, "A_scales must be a single per-tensor scale"
+    assert B_scales.numel() == 1, "B_scales must be a single per-tensor scale"
 
     assert (
         A.shape[1] == B.shape[1]
@@ -227,7 +230,6 @@ def torch_mm_fp8_scaled_mnk(
         "b_layout": frozenset({"KN"}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def torch_mm_fp8_scaled_nkm(
     A: torch.Tensor,
@@ -244,8 +246,8 @@ def torch_mm_fp8_scaled_nkm(
     assert (
         A_scales is not None and B_scales is not None
     ), "A_scales and B_scales are required for fp8 scaled reference"
-    assert A_scales.shape == (1,), "A_scales must have shape (1,)"
-    assert B_scales.shape == (1,), "B_scales must have shape (1,)"
+    assert A_scales.numel() == 1, "A_scales must be a single per-tensor scale"
+    assert B_scales.numel() == 1, "B_scales must be a single per-tensor scale"
 
     assert (
         A.shape[1] == B.shape[0]
@@ -272,7 +274,6 @@ def torch_mm_fp8_scaled_nkm(
     signatures=_DENSE_GEMM_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE + 3,
-    tags={"determinism", "portability"},
 )
 def torch_mm(
     A: torch.Tensor,
@@ -319,7 +320,6 @@ def torch_mm(
     signatures=_MXFP8_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE + 2,
-    tags={"portability"},
 )
 def torch_bmm_fp8_blockscale(
     A: torch.Tensor,
@@ -400,7 +400,6 @@ def _bmm_scaled_fp8_scale(
     signatures=_FP8_SCALED_BMM_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def torch_bmm_fp8_scaled(
     A: torch.Tensor,
@@ -443,7 +442,6 @@ def torch_bmm_fp8_scaled(
     solution="reference",
     signatures=_DENSE_GEMM_FORMAT_SIGNATURES,
     priority=Priority.PORTABLE + 3,
-    tags={"determinism", "portability"},
 )
 def torch_bmm(
     A: torch.Tensor,
@@ -523,3 +521,30 @@ def torch_bmm(
         # represented as a reference cast after the native epilogue.
         output = output.to(out_dtype)
     return output
+
+
+@register_kernel(
+    "gemm",
+    "grouped_bf16_projection",
+    name="grouped_bf16_projection_torch",
+    solution="torch",
+    signatures=frozenset(
+        {
+            format_signature(
+                x=dense_tensor_format(torch.bfloat16),
+                weight=dense_tensor_format(torch.bfloat16),
+            )
+        }
+    ),
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def grouped_bf16_projection_torch(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
+) -> torch.Tensor:
+    """Preserve the original batched projection and its BF16 rounding."""
+    result = torch.einsum("tgd,grd->tgr", x, weight)
+    if out is None:
+        return result
+    out.copy_(result)
+    return out

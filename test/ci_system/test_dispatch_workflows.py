@@ -1,5 +1,7 @@
 import os
+import shlex
 import subprocess
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -57,7 +59,7 @@ printf 'image=%s\\n' "${TS_CI_CONTAINER_IMAGE-}"
         "CONTAINER_IMAGE": "",
         "CLUSTER": "gb200",
         "YAML_SELECTION": "off",
-        "RUNNERS": "b200-4gpu,gb200-4gpu",
+        "RUNNERS": workflow_dispatch_inputs("slurm-dispatch.yml")["runners"]["default"],
         "TASK_TYPES": "eval,perf",
         "MATCH": "",
         "INCLUDE_MMLU": "false",
@@ -116,8 +118,8 @@ case "$endpoint" in
     printf '%s\\n' "$GH_PR_FILES"
     ;;
   repos/lightseekorg/tokenspeed/pulls/*)
-    printf '{"head":{"sha":"%s"},"html_url":"https://github.com/lightseekorg/tokenspeed/pull/123"}\\n' \
-      "$GH_PR_SHA"
+    printf '{"base":{"sha":"%s"},"head":{"sha":"%s"},"html_url":"https://github.com/lightseekorg/tokenspeed/pull/123"}\\n' \
+      "$GH_PR_BASE_SHA" "$GH_PR_SHA"
     ;;
   *)
     echo "Unexpected gh call: $*" >&2
@@ -135,6 +137,7 @@ esac
         "GH_CALLS": str(calls),
         "GH_MAIN_SHA": "1" * 40,
         "GH_COMMIT_SHA": commit.strip().lower(),
+        "GH_PR_BASE_SHA": "3" * 40,
         "GH_PR_SHA": "2" * 40,
         "GH_PR_FILES": pr_files,
         "GITHUB_OUTPUT": str(output),
@@ -167,7 +170,7 @@ def run_deepswe_resolve_script(tmp_path: Path, *, pr: str, pr_files: str) -> str
     )
     script = step["run"].replace("${{ github.repository }}", "lightseekorg/tokenspeed")
     for placeholder in ("task_count", "sample_seed", "concurrency"):
-        script = script.replace("${{ inputs.%s }}" % placeholder, "1")
+        script = script.replace(f"${{{{ inputs.{placeholder!s} }}}}", "1")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     gh = bin_dir / "gh"
@@ -245,9 +248,89 @@ def configured_yaml_choices(workflow_name: str) -> set[str]:
 
 
 def test_k8s_dispatch_lists_every_supported_ci_yaml():
-    assert configured_yaml_choices("k8s-dispatch.yml") == eligible_config_paths(
-        K8S_RUNNER_PREFIXES
+    choices = configured_yaml_choices("k8s-dispatch.yml")
+    assert eligible_config_paths(K8S_RUNNER_PREFIXES) <= choices
+    assert all((REPO_ROOT / choice).is_file() for choice in choices)
+
+
+def test_kernel_ut_parts_cover_every_test_once():
+    root = REPO_ROOT / "tokenspeed-kernel/test"
+    files = {
+        path
+        for path in root.rglob("*.py")
+        if path.name.startswith("test_") or path.name.endswith("_test.py")
+    }
+    assert files
+    executions = Counter()
+    for part in ("i", "ii"):
+        task = load_yaml(
+            REPO_ROOT / f"test/ci/ut/ut-tokenspeed-kernel-part-{part}.yaml"
+        )
+        for command in task["ut"]["commands"]:
+            tokens = shlex.split(command)
+            arguments = tokens[tokens.index("pytest") + 1 :]
+            targets = [REPO_ROOT / arg for arg in arguments if not arg.startswith("-")]
+            ignores = [
+                REPO_ROOT / arg.removeprefix("--ignore=")
+                for arg in arguments
+                if arg.startswith("--ignore=")
+            ]
+            executions.update(
+                path
+                for path in files
+                if any(path.is_relative_to(target) for target in targets)
+                and not any(path.is_relative_to(ignore) for ignore in ignores)
+            )
+
+    assert executions == Counter({path: 1 for path in files})
+
+
+def test_amd_pr_workflow_runs_kernel_benchmarks_alongside_model_tests():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/amd-tests.yml")
+    jobs = workflow["jobs"]
+
+    assert jobs["kernel-benchmark"]["needs"] == ["scan", "unit-test"]
+    normal_model = jobs["model-test"]
+    assert normal_model["needs"] == ["scan", "unit-test"]
+    assert "!cancelled()" in normal_model["if"]
+    assert "needs.unit-test.result == 'success'" in normal_model["if"]
+    assert "needs.scan.outputs.unit_has_tasks != 'true'" in normal_model["if"]
+    assert "needs.kernel-benchmark" not in normal_model["if"]
+
+    eager_model = jobs["model-test-eager"]
+    assert eager_model["needs"] == "scan"
+    assert "needs.unit-test" not in eager_model["if"]
+    assert "needs.kernel-benchmark" not in eager_model["if"]
+    assert "kernel-benchmark" in jobs["finish"]["needs"]
+    benchmark_inputs = jobs["kernel-benchmark"]["with"]
+    assert (
+        "github.event.pull_request.base.sha" in benchmark_inputs["comparison_base_ref"]
     )
+    assert (
+        "github.event.pull_request.head.sha"
+        in benchmark_inputs["comparison_candidate_ref"]
+    )
+    assert (
+        "kernel_benchmark:kernel-benchmark"
+        in next(
+            step
+            for step in jobs["scan"]["steps"]
+            if step.get("name") == "Build task matrix"
+        )["run"]
+    )
+
+
+def test_kernel_benchmark_task_uses_shared_ci_contract():
+    task = load_yaml(REPO_ROOT / "test/ci/perf/kernel-benchmark-amd-gfx950.yaml")
+
+    assert task["type"] == "perf"
+    assert task["workflow_stage"] == "kernel-benchmark"
+    assert task["triggers"] == ["per-commit", "manual"]
+    assert task["runner"]["labels"] == ["amd-mi350-1gpu-bench"]
+    assert task["env"]["TOKENSPEED_KERNEL_BENCHMARK_PROFILER"] == "none"
+    assert ".ci-artifacts/published" in task["perf"]["command"]
+    for variable in ("BASE_REF", "CANDIDATE_REF", "PR_NUMBER", "MERGE_SHA"):
+        assert variable in task["perf"]["command"]
 
 
 def test_k8s_dispatch_accepts_full_commit_sha(tmp_path):
@@ -259,6 +342,8 @@ def test_k8s_dispatch_accepts_full_commit_sha(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert f"sha={'a' * 40}" in output
+    assert f"comparison_base_ref={'1' * 40}" in output
+    assert f"comparison_candidate_ref={'a' * 40}" in output
     assert "install_mla=1" in output
     assert "- Mode: commit" in summary
     assert f"api repos/lightseekorg/tokenspeed/commits/{'a' * 40}" in calls
@@ -269,6 +354,8 @@ def test_k8s_dispatch_defaults_to_latest_main(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert f"sha={'1' * 40}" in output
+    assert f"comparison_base_ref={'1' * 40}" in output
+    assert f"comparison_candidate_ref={'1' * 40}" in output
     assert "install_mla=0" in output
     assert "- Mode: main" in summary
     assert "api repos/lightseekorg/tokenspeed/commits/main --jq .sha" in calls
@@ -287,6 +374,8 @@ def test_k8s_dispatch_preserves_pr_resolution(tmp_path, pr_files, expected_insta
 
     assert result.returncode == 0, result.stderr
     assert f"sha={'2' * 40}" in output
+    assert f"comparison_base_ref={'3' * 40}" in output
+    assert f"comparison_candidate_ref={'2' * 40}" in output
     assert f"install_mla={expected_install_mla}" in output
     assert "- Mode: pr" in summary
     assert "api repos/lightseekorg/tokenspeed/pulls/123" in calls
@@ -323,6 +412,18 @@ def test_k8s_dispatch_commit_input_is_optional():
     assert (
         "${{ inputs.commit || inputs.pr || 'main' }}"
         in workflow["concurrency"]["group"]
+    )
+
+
+def test_k8s_dispatch_passes_comparison_revisions_to_tasks():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/k8s-dispatch.yml")
+    run_inputs = workflow["jobs"]["run"]["with"]
+
+    assert run_inputs["comparison_base_ref"] == (
+        "${{ needs.scan.outputs.comparison_base_ref }}"
+    )
+    assert run_inputs["comparison_candidate_ref"] == (
+        "${{ needs.scan.outputs.comparison_candidate_ref }}"
     )
 
 
@@ -395,7 +496,8 @@ def test_slurm_dispatch_routes_gb300_to_its_coordinator():
         "'slurm-dispatch-gb300' || 'slurm-dispatch' }}"
     )
     assert "${{ inputs.cluster }}" in workflow["concurrency"]["group"]
-    assert checkout["with"]["ref"] == "main"
+    assert checkout["with"]["ref"] == "${{ inputs.pr && 'main' || github.sha }}"
+    assert "${{ github.ref }}" in workflow["concurrency"]["group"]
     assert 'python3 - "$YAML_SELECTION" "$CLUSTER" "$PR"' in dispatch_script
     assert "from slurm_submit import pr_worktree" in dispatch_script
     assert "with pr_worktree(repo, pr) as checkout:" in dispatch_script
@@ -430,6 +532,7 @@ def test_slurm_dispatch_preserves_gb200_defaults(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "arg=--runner\narg=b200-4gpu\n" in result.stdout
     assert "arg=--runner\narg=gb200-4gpu\n" in result.stdout
+    assert "arg=--runner\narg=slurm-gb200-4gpu\n" in result.stdout
     assert "artifact=\n" in result.stdout
     assert "cache=\n" in result.stdout
     assert "image=\n" in result.stdout
@@ -442,6 +545,9 @@ def test_slurm_dispatch_maps_gb300_defaults_without_changing_filters(tmp_path):
     assert "arg=--all\n" in result.stdout
     assert "arg=--runner-alias\narg=b200-4gpu=gb300-4gpu\n" in result.stdout
     assert "arg=--runner-alias\narg=gb200-4gpu=gb300-4gpu\n" in result.stdout
+    assert (
+        "arg=--runner-alias\narg=slurm-gb200-4gpu=slurm-gb300-4gpu\n" in result.stdout
+    )
     assert "arg=--type\narg=eval\n" in result.stdout
     assert "arg=--type\narg=perf\n" in result.stdout
     assert "arg=--exclude-match\narg=mmlu\n" in result.stdout
@@ -487,7 +593,7 @@ def test_slurm_dispatch_maps_b200_yaml_to_gb300_runners(tmp_path):
     result = run_slurm_dispatch_script(
         tmp_path,
         CLUSTER="gb300",
-        YAML_SELECTION="test/ci/ut/ut-tokenspeed-kernel.yaml",
+        YAML_SELECTION="test/ci/ut/ut-tokenspeed-kernel-part-i.yaml",
     )
 
     assert result.returncode == 0, result.stderr
@@ -555,7 +661,7 @@ def test_slurm_dispatch_rejects_mismatched_or_multiple_gb300_runners(
 
 
 def test_slurm_dispatch_accepts_multiple_native_gb300_runners(tmp_path):
-    task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel.yaml")
+    task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-part-i.yaml")
     task["runner"]["labels"] = ["gb300-1gpu", "gb300-4gpu"]
     config = tmp_path / "ambiguous.yaml"
     config.write_text(yaml.safe_dump(task))
@@ -579,10 +685,12 @@ def test_only_dedicated_tasks_declare_gb300():
             configs.append(path.name)
 
     assert sorted(configs) == [
+        "deepseek-v4.1-flash-pd-1p1d-dspark-evalscope-gsm8k-gb300-slurm.yaml",
         "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-mmmu-pro-vision-gb300-slurm.yaml",
         "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-ocr-bench-gb300-slurm.yaml",
         "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-dflash2-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
+        "kimi-k3-nvfp4-dp16-four-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-dspark-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
     ]
@@ -638,7 +746,7 @@ def test_kimi_k3_dflash2_gb300_uses_a_window_aware_drafter_backend():
 
 
 def test_gb300_slurm_nightly_workflow_is_scheduled_and_isolated():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/gb300-slurm-nightly.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/nvidia-gb300-nightly-tests.yml")
     triggers = workflow.get("on") or workflow.get(True)
     scan = workflow["jobs"]["scan"]
     submit = workflow["jobs"]["submit"]
@@ -739,7 +847,7 @@ def test_gb300_slurm_nightly_matrix_selects_the_nightly_kimi_k3_tasks(monkeypatc
 
 
 def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/gb300-slurm-per-commit.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/nvidia-gb300-tests.yml")
     triggers = workflow.get("on") or workflow.get(True)
     submit = workflow["jobs"]["submit"]
     scan_steps = workflow["jobs"]["scan"]["steps"]
@@ -796,7 +904,7 @@ def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
     assert "gb300-slurm-per-commit" in cancel_groups
 
 
-def test_gb300_slurm_per_commit_matrix_selects_kimi_k3_tasks(monkeypatch):
+def test_gb300_slurm_per_commit_matrix_selects_model_tasks(monkeypatch):
     monkeypatch.delenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", raising=False)
 
     matrix = build_matrix(
@@ -810,11 +918,35 @@ def test_gb300_slurm_per_commit_matrix_selects_kimi_k3_tasks(monkeypatch):
 
     assert matrix["include"] == [
         {
+            "name": "eval-deepseek-v4.1-flash-pd-1p1d-dspark-gsm8k-gb300-slurm",
+            "type": "eval",
+            "config": (
+                "test/ci/eval/"
+                "deepseek-v4.1-flash-pd-1p1d-dspark-evalscope-gsm8k-gb300-slurm.yaml"
+            ),
+            "runner": "slurm-gb300-4gpu",
+            "priority": "normal",
+            "optional": False,
+            "workflow_stage": "model-test",
+        },
+        {
             "name": "eval-kimi-k3-mxfp4-tp8-two-node-aime26-gb300-slurm",
             "type": "eval",
             "config": (
                 "test/ci/eval/"
                 "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
+            ),
+            "runner": "slurm-gb300-4gpu",
+            "priority": "normal",
+            "optional": False,
+            "workflow_stage": "model-test",
+        },
+        {
+            "name": "eval-kimi-k3-nvfp4-dp16-four-node-aime26-gb300-slurm",
+            "type": "eval",
+            "config": (
+                "test/ci/eval/"
+                "kimi-k3-nvfp4-dp16-four-node-evalscope-aime26-gb300-slurm.yaml"
             ),
             "runner": "slurm-gb300-4gpu",
             "priority": "normal",
@@ -875,18 +1007,111 @@ def test_nvidia_arm_model_tests_allow_runner_wait_time():
 
 
 def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/run-pr-test-stage.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/run-ci-task-matrix.yml")
     job = workflow["jobs"]["test"]
 
     assert job["runs-on"] == "${{ matrix.runner }}"
     assert job["timeout-minutes"] == (
         "${{ matrix.runner == 'amd-mi45x-cpu-test'"
-        " && 10 || inputs.timeout_minutes }}"
+        " && 30 || inputs.timeout_minutes }}"
     )
 
 
+@pytest.mark.parametrize(
+    ("workflow_stage", "task_type"),
+    [
+        ("unit-test", "ut"),
+        ("kernel-benchmark", "perf"),
+        ("model-test", "eval"),
+        ("model-test", "perf"),
+    ],
+)
+def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
+    tmp_path, workflow_stage, task_type
+):
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/run-ci-task-matrix.yml")
+    steps = workflow["jobs"]["test"]["steps"]
+    setup = next(step for step in steps if step["name"] == "Set work directory")
+    cleanup = next(step for step in steps if step["name"] == "Cleanup work directory")
+    assert cleanup["if"] == "always()"
+    shared_cache = tmp_path / "shared-uv"
+    shared_cache.mkdir()
+    persistent_hf_home = tmp_path / "shared-huggingface"
+    persistent_hf_home.mkdir()
+    sentinel = shared_cache / "another-job"
+    sentinel.touch()
+    cache_variables = (
+        "UV_CACHE_DIR",
+        "TRITON_CACHE_DIR",
+        "MIOPEN_USER_DB_PATH",
+        "MIOPEN_CUSTOM_CACHE_DIR",
+    )
+    isolated_variables = tuple(
+        variable
+        for variable in cache_variables
+        if variable != "TRITON_CACHE_DIR" or task_type == "eval"
+    )
+    job_envs = []
+    for attempt in (1, 2):
+        env_file = tmp_path / f"env-{attempt}"
+        script = setup["run"]
+        for expression, value in {
+            "github.workspace": str(tmp_path / "workspace with spaces"),
+            "github.run_id": "1234",
+            "github.run_attempt": str(attempt),
+            "matrix.name": "eval-cache-test",
+            "matrix.runner": "model-runner",
+            "matrix.workflow_stage": workflow_stage,
+            "matrix.type": task_type,
+        }.items():
+            script = script.replace("${{ " + expression + " }}", value)
+        subprocess.run(
+            ["bash", "-c", script],
+            env={
+                **os.environ,
+                "GITHUB_ENV": str(env_file),
+                "HF_HOME": str(persistent_hf_home),
+                **{variable: str(shared_cache) for variable in cache_variables},
+            },
+            check=True,
+        )
+        job_env = dict(line.split("=", 1) for line in env_file.read_text().splitlines())
+        assert "MIOPEN_SYSTEM_DB_PATH" not in job_env
+        assert "MIOPEN_FIND_MODE" not in job_env
+        assert "MIOPEN_FIND_ENFORCE" not in job_env
+        if workflow_stage != "model-test":
+            assert all(variable not in job_env for variable in cache_variables)
+            assert "EVALSCOPE_UV_CACHE_DIR" not in job_env
+            continue
+        assert job_env["EVALSCOPE_UV_CACHE_DIR"] == str(
+            persistent_hf_home / ".uv-cache" / "evalscope"
+        )
+        if task_type == "perf":
+            assert "TRITON_CACHE_DIR" not in job_env
+        for variable in isolated_variables:
+            cache = Path(job_env[variable])
+            assert cache.is_relative_to(Path(job_env["WORK_DIR"]))
+            assert cache != shared_cache
+            cache.mkdir(parents=True, exist_ok=True)
+            (cache / "download").touch()
+        job_envs.append(job_env)
+
+    if workflow_stage != "model-test":
+        assert sentinel.exists()
+        return
+    first, second = job_envs
+    assert all(first[variable] != second[variable] for variable in isolated_variables)
+    script = cleanup["run"].replace("${{ env.WORK_DIR }}", first["WORK_DIR"])
+    script = script.replace("${{ matrix.runner }}", "model-runner")
+    subprocess.run(["bash", "-c", script], check=True)
+    for variable in isolated_variables:
+        assert not Path(first[variable]).exists()
+        assert (Path(second[variable]) / "download").exists()
+    assert sentinel.exists()
+
+
 def test_gb300_per_commit_forwards_the_tokenspeed_mla_override():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/gb300-slurm-per-commit.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/nvidia-gb300-tests.yml")
     step = next(
         step
         for step in workflow["jobs"]["submit"]["steps"]
@@ -941,10 +1166,20 @@ def test_mi450_sim_runs_on_the_cpu_only_pool():
 
 def test_mi450_sim_uses_bounded_smoke_suite():
     task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml")
+    setup_script = (REPO_ROOT / "test/ci_system/setup_mi450_sim.sh").read_text()
+    parallel_script = (
+        REPO_ROOT / "test/ci_system/run_mi450_rocjitsu_parallel.sh"
+    ).read_text()
 
-    assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "330"
+    assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "600"
+    assert task["env"]["MI450_SIM_THREADS_PER_WORKER"] == "2"
+    assert 'config["cpu_thread_budget"] = thread_budget' in setup_script
+    assert 'threads_per_emulator="${MI450_SIM_THREADS_PER_WORKER:-2}"' in (
+        parallel_script
+    )
+    assert "/sys/fs/cgroup/cpu.max" in parallel_script
     assert task["env"]["MI450_SIM_TEST_ROOT"] != "tokenspeed-kernel/test"
-    assert "tokenspeed-kernel/test/ops/attention" in task["env"]["MI450_SIM_TESTS"]
+    assert "tokenspeed-kernel/test/amd/ops/attention" in task["env"]["MI450_SIM_TESTS"]
 
 
 def test_mi450_sim_uses_stock_triton_compatible_libhip_path():

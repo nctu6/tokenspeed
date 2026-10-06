@@ -27,8 +27,8 @@ from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import select_kv_splits
 
 __all__ = [
-    "gluon_dsa_decode_gfx950",
-    "gluon_dsa_prefill_gfx950",
+    "launch_gluon_dsa_decode_gfx950",
+    "launch_gluon_dsa_prefill_gfx950",
 ]
 
 _REGISTERED_TOPK_WIDTHS = (512, 1024, 2048, 2049, 2050, 2051)
@@ -464,7 +464,6 @@ def _dsa_dense_mfma_kv_kernel(
                 other=0.0,
             ).to(smem_dtype)
             smem_krope.index(0).store(k_rope)
-        gl.barrier()
     else:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             dest=smem_klora.index(0),
@@ -554,7 +553,6 @@ def _dsa_dense_mfma_kv_kernel(
                     other=0.0,
                 ).to(smem_dtype)
                 smem_krope.index(next_buf).store(k_rope_next)
-            gl.barrier()
         else:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 dest=smem_klora.index(next_buf),
@@ -611,8 +609,6 @@ def _dsa_dense_mfma_kv_kernel(
         l_i = l_new
         cur_buf = next_buf
         valid_mma = valid_mma_next
-        if FP8_INPUTS:
-            gl.barrier()
 
     if not FP8_INPUTS:
         gl.amd.cdna4.async_copy.wait_group(0)
@@ -1029,6 +1025,7 @@ def _select_num_kv_splits(
     is_fp8: bool,
     native_fp8: bool = False,
     qk_rope_head_dim: int = 64,
+    is_prefill: bool = False,
 ) -> int:
     work_tiles = max(1, (min(int(topk_width), int(max_seqlen_k)) + 31) // 32)
     if work_tiles <= 8:
@@ -1057,7 +1054,12 @@ def _select_num_kv_splits(
         and work_tiles == 64
     ):
         return _GLM52_SINGLE_ROW_DECODE_SPLITS
+    base_ctas = max(1, int(num_tokens) * triton.cdiv(int(num_heads), 16))
     if native_fp8 and int(num_heads) == 16:
+        # Large prefill grids already fill the two-wave occupancy target. Splitting
+        # them would only multiply the full-rank reduction workspace.
+        if is_prefill and base_ctas >= _GFX950_COMPUTE_UNITS * 2:
+            return 1
         # Native FP8 DSA CTAs carry enough work that the generic two-wave
         # occupancy target oversplits medium/large graph batches. These
         # thresholds are expressed only in kernel shape terms and keep short
@@ -1069,7 +1071,6 @@ def _select_num_kv_splits(
                 return 8
         elif work_tiles >= 32 and (int(num_tokens) == 1 or int(num_tokens) >= 8):
             return 4
-    base_ctas = max(1, int(num_tokens) * triton.cdiv(int(num_heads), 16))
     return select_kv_splits(
         base_ctas=base_ctas,
         num_pages=work_tiles,
@@ -1103,6 +1104,7 @@ def _run_dense_kv(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     max_seqlen_k: int,
+    is_prefill: bool,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if out is None:
@@ -1119,6 +1121,7 @@ def _run_dense_kv(
         is_fp8=q.dtype in _FP8_DTYPES,
         native_fp8=q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES,
         qk_rope_head_dim=qk_rope_head_dim,
+        is_prefill=is_prefill,
     )
     if num_kv_splits == 1:
         stage_out = out
@@ -1189,6 +1192,14 @@ def _run_dense_kv(
         BLOCK_H=16,
         TILE_K=64 if qk_rope_head_dim == 0 else 32,
         num_warps=4,
+        # iterative-ilp overlaps the KV loads with the MFMAs better than the
+        # default scheduler for BF16 inputs. It slows BF16 q with FP8 KV, and
+        # native FP8 is unmeasured, so FP8 keeps the default.
+        llvm_fn_attrs=(
+            (("amdgpu-sched-strategy", "iterative-ilp"),)
+            if q.dtype == torch.bfloat16 and kv_cache.dtype == torch.bfloat16
+            else ()
+        ),
     )
     if num_kv_splits > 1:
         _dsa_dense_mfma_reduce_kernel[(q.shape[0], q.shape[1])](
@@ -1299,6 +1310,7 @@ def _run_dsa(
     k_scale: float,
     out: torch.Tensor | None,
     max_seqlen_k: int,
+    is_prefill: bool,
 ) -> torch.Tensor:
     _check_inputs(
         q,
@@ -1362,6 +1374,7 @@ def _run_dsa(
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 max_seqlen_k=max_seqlen_k,
+                is_prefill=is_prefill,
                 out=out_view,
             )
         else:
@@ -1383,7 +1396,7 @@ def _run_dsa(
     return out
 
 
-def gluon_dsa_decode_gfx950(
+def launch_gluon_dsa_decode_gfx950(
     q: torch.Tensor,
     kv_cache: torch.Tensor | None,
     sparse_kv_cache: torch.Tensor | None,
@@ -1418,10 +1431,11 @@ def gluon_dsa_decode_gfx950(
         k_scale=k_scale,
         out=out,
         max_seqlen_k=max_seqlen_k,
+        is_prefill=False,
     )
 
 
-def gluon_dsa_prefill_gfx950(
+def launch_gluon_dsa_prefill_gfx950(
     q: torch.Tensor,
     kv_cache: torch.Tensor | None,
     sparse_kv_cache: torch.Tensor | None,
@@ -1456,4 +1470,5 @@ def gluon_dsa_prefill_gfx950(
         k_scale=k_scale,
         out=out,
         max_seqlen_k=max_seqlen_k,
+        is_prefill=True,
     )

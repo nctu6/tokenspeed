@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.communication.triton import (
     all_gather_inner,
     create_state,
     reduce_scatter,
+    rsag_all_reduce,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -40,6 +41,15 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.utils import ceil_div
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+# The multimem kernels move 16 bytes per thread: a row must hold a whole
+# number of such chunks (``nvidia_rsag_get_launch_config``).
+_MULTIMEM_ROW_ALIGNMENT = 8
+# Rank in the group that issues the in-switch loads of the batch-invariant
+# all-reduce. Fixed for the deployment: the in-switch association order
+# depends on the issuer (``nvidia_rsag_all_reduce``), so moving it would move
+# the bits.
+MULTIMEM_ALL_REDUCE_ISSUER = 0
 
 
 class TritonRSAGBackend:
@@ -55,6 +65,56 @@ class TritonRSAGBackend:
         # (group_tuple, hidden_size) -> Triton RS/AG state
         self._instances = {}
 
+    # ---- The batch-invariant all-reduce (no fallback) ----
+
+    @staticmethod
+    def serves_multimem_all_reduce(tensor: torch.Tensor) -> bool:
+        """Whether ``multimem_all_reduce`` can take ``tensor`` at all.
+
+        Static properties of the call site only -- platform, rank, dtype,
+        row width -- never the row count: the route a site takes must not
+        change with the batch, so capacity is checked (and refused, not
+        rerouted) inside ``multimem_all_reduce``.
+        """
+        return (
+            current_platform().is_nvidia
+            and tensor.dim() == 2
+            and tensor.dtype == torch.bfloat16
+            and tensor.size(-1) % _MULTIMEM_ROW_ALIGNMENT == 0
+        )
+
+    def multimem_all_reduce(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
+        """In-place all-reduce through the group's fixed issuer's in-switch load.
+
+        ``rsag_all_reduce`` with ``MULTIMEM_ALL_REDUCE_ISSUER``: one function
+        of the inputs for the deployment's lifetime (see the kernel's note on
+        issuer dependence). No fallback -- a payload past the RS/AG state's
+        capacity is a sizing bug and raises, because the ordered fold would
+        return different bits for that batch alone.
+        """
+        if not self.serves_multimem_all_reduce(tensor):
+            raise ValueError(
+                "the multimem all-reduce takes 2-D bf16 rows whose width is a "
+                f"multiple of {_MULTIMEM_ROW_ALIGNMENT} on NVIDIA; got "
+                f"{tuple(tensor.shape)} {tensor.dtype}"
+            )
+        state = self._get_or_create(group, tensor.size(-1))
+        if tensor.size(0) > state.max_token_num:
+            raise RuntimeError(
+                f"the multimem all-reduce over group {group} was handed "
+                f"{tensor.size(0)} rows, past the {state.max_token_num} its "
+                "communication buffer was sized for from the launch; the "
+                "batch-invariant contract forbids rerouting this batch to the fold"
+            )
+        reduced = rsag_all_reduce(
+            state,
+            tensor.contiguous(),
+            issuer=MULTIMEM_ALL_REDUCE_ISSUER,
+            safe=False,
+        )
+        tensor.copy_(reduced)
+        return tensor
+
     def _get_or_create(self, group: Group, hidden_size: int):
         key = (group, hidden_size)
         if key in self._instances:
@@ -62,10 +122,17 @@ class TritonRSAGBackend:
 
         max_num_tokens = self._get_max_num_gathered_tokens()
         state = create_state(
+            enable_lamport=False,
+            moe_tail_max_rows=0,
             group=pg_manager.get_process_group("nccl", group),
             rank_in_group=group.index(dist.get_rank()),
+            attnres_max_numel=0,
+            attnres_max_rows=0,
             max_tokens=max_num_tokens,
             hidden_size=hidden_size,
+            device=None,
+            max_numel=0,
+            max_bytes=0,
         )
         self._instances[key] = state
         return state
@@ -93,6 +160,9 @@ class TritonRSAGBackend:
         ):
             hidden_size = tensor.size(-1) * len(group)
             state = self._get_or_create(group, hidden_size)
+            if tensor.size(0) > state.max_token_num:
+                # Rows past the prefill-sized buffer would trip the kernel's capacity assert.
+                return self._fallback.all_gather(tensor, group=group, dim=dim)
             return all_gather_inner(
                 state,
                 tensor,
@@ -110,6 +180,10 @@ class TritonRSAGBackend:
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
         state = self._get_or_create(group, tensor.size(-1))
+        # Cached history can exceed the scheduled-token budget used to size
+        # this workspace. Keep captured pointers stable and use NCCL instead.
+        if sum(scattered_num_tokens) > state.max_token_num:
+            return self._fallback.token_all_gather(tensor, group, scattered_num_tokens)
         return all_gather(state, tensor, token_list_in_group=scattered_num_tokens)
 
     def token_reduce_scatter(
@@ -119,10 +193,14 @@ class TritonRSAGBackend:
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
         state = self._get_or_create(group, tensor.size(-1))
+        if sum(scattered_num_tokens) > state.max_token_num:
+            return self._fallback.token_reduce_scatter(
+                tensor, group, scattered_num_tokens
+            )
         return reduce_scatter(state, tensor, token_list_in_group=scattered_num_tokens)
 
     def _get_max_num_gathered_tokens(self):
-        """Compute max buffer size for TritonRSAG.
+        """Cover prefill and rank-local decode/verify batches for TritonRSAG.
 
         global_server_args_dict read is intentional — this is one-time RSAG buffer
         init infrastructure. Passing mapping through all signatures would be too invasive.
@@ -135,6 +213,19 @@ class TritonRSAGBackend:
             max_attn_tp_num_tokens = chunked_prefill_size
         else:
             max_attn_tp_num_tokens = max_prefill_tokens + max_model_len
+        max_decode_bs = (
+            global_server_args_dict["max_num_seqs"] or 0
+        ) // mapping.attn.dp_size
+        decode_tokens_per_req = (
+            global_server_args_dict["speculative_num_draft_tokens"]
+            if global_server_args_dict.get("speculative_algorithm") is not None
+            else 1
+        )
+        # Graph buckets are capped by this same rank-local request limit.
+        # Verify expands each request even when the prefill chunk is smaller.
+        max_attn_tp_num_tokens = max(
+            max_attn_tp_num_tokens, max_decode_bs * decode_tokens_per_req
+        )
         max_scattered_num_tokens = ceil_div(
             max_attn_tp_num_tokens, mapping.attn.tp_size
         )

@@ -24,10 +24,13 @@
 # SOFTWARE.
 
 
-import numpy as np
 import torch
-import triton
-import triton.language as tl
+from tokenspeed_kernel.ops.attention.gdn.triton import (
+    CausalConv1dPrefillMetadata,
+)
+from tokenspeed_kernel.platform import pdl_enabled
+
+from tokenspeed.runtime.utils.triton import tl, triton
 
 PAD_SLOT_ID = -1
 
@@ -74,7 +77,12 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
     stride_conv_state_seq = stride_istate_seq
@@ -406,7 +414,8 @@ def causal_conv1d_fn(
     activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
-    **kwargs,
+    *,
+    prefill_metadata: CausalConv1dPrefillMetadata,
 ):
     """support varlen + continuous batching when x is 2D tensor
 
@@ -447,26 +456,23 @@ def causal_conv1d_fn(
         for example: cache_indices = [pad_slot_id, 1, 20, pad_slot_id]
         in this case, the kernel will not process entries at
         indices 0 and 3
+    prefill_metadata: CausalConv1dPrefillMetadata
+        Read-only program mapping built once with this forward's sequence
+        boundaries and shared by all recurrent-attention layers.
 
     out: same shape as `x`
     """
+    enable_pdl = pdl_enabled()
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
     out = torch.empty_like(x)
-    seq_lens_cpu = kwargs.get("seq_lens_cpu")
-    if seq_lens_cpu is not None:
-        seqlens = np.asarray(seq_lens_cpu)
-    else:
-        seqlens = np.diff(query_start_loc.to("cpu"))
-    MAX_NUM_PROGRAMS = 1024
-
-    batch_ptr = torch.full(
-        (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
-    )  # tracking which seq-idx the Triton program is handling
-    token_chunk_offset_ptr = torch.full(
-        (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
-    )  # tracking BLOCK_M-based index in the sequence the Triton program is handling
+    batch_ptr = prefill_metadata.batch_indices
+    token_chunk_offset_ptr = prefill_metadata.chunk_offsets
+    if batch_ptr.device != x.device or token_chunk_offset_ptr.device != x.device:
+        raise ValueError("convolution metadata must be on the input device")
+    if batch_ptr.numel() == 0:
+        return out
 
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
@@ -527,43 +533,7 @@ def causal_conv1d_fn(
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
 
-    def num_program(META, seqlens):
-        nums = -(-seqlens // META["BLOCK_M"])  # ceil-div, numpy array
-        tot = int(nums.sum())
-
-        mlist = np.repeat(np.arange(len(nums)), nums)
-        # offsetlist[i] = local chunk index within its sequence
-        offsetlist = np.arange(tot) - np.repeat(np.cumsum(nums) - nums, nums)
-        mlist_len = mlist.shape[0]
-
-        if META["batch_ptr"].nelement() < mlist_len:
-            newlen = mlist_len + 1
-            META["batch_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
-            META["token_chunk_offset_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
-
-        combined_np = np.stack([mlist, offsetlist]).astype(np.int32, copy=False)
-        combined_cpu = torch.from_numpy(combined_np).pin_memory()
-        META["batch_ptr"][:mlist_len].copy_(combined_cpu[0], non_blocking=True)
-        META["token_chunk_offset_ptr"][:mlist_len].copy_(
-            combined_cpu[1], non_blocking=True
-        )
-
-        META["batch_ptr"] = META["batch_ptr"].to(META["x_ptr"].device)
-        META["token_chunk_offset_ptr"] = META["token_chunk_offset_ptr"].to(
-            META["x_ptr"].device
-        )
-        return tot
-
-    def grid(META):
-        return (
-            num_program(META, seqlens),
-            triton.cdiv(dim, META["BLOCK_N"]),
-        )
-
-    if batch_ptr.device != x.device:
-        batch_ptr = batch_ptr.to(x.device)
-        token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
-
+    grid = (batch_ptr.numel(), triton.cdiv(dim, 256))
     _causal_conv1d_fwd_kernel[grid](
         # Pointers to matrices
         x,
@@ -603,9 +573,11 @@ def causal_conv1d_fn(
         IS_CONTINUOUS_BATCHING=cache_indices is not None,
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
-        BLOCK_M=8,
+        BLOCK_M=prefill_metadata.block_m,
         BLOCK_N=256,
         num_stages=2,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return out
 
@@ -661,8 +633,13 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_OUTPUT_STATE_INDICES: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     # ruff: noqa: E501
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return
@@ -899,6 +876,155 @@ def _causal_conv1d_update_kernel(
                     tl.store(output_base + 2 * stride_conv_state_tok, col2, mask=mask_w)
 
 
+@triton.jit()
+def _causal_conv1d_tree_update_kernel(
+    x_ptr,  # (batch, dim, seqlen)
+    w_ptr,  # (dim, width)
+    bias_ptr,
+    conv_state_ptr,
+    conv_state_indices_ptr,  # (batch,) initial window rows
+    output_state_indices_ptr,  # (batch, seqlen) per-token window rows
+    parent_indices_ptr,  # (batch, seqlen)
+    o_ptr,  # (batch, dim, seqlen), not aliasing x
+    dim: tl.constexpr,
+    seqlen: tl.constexpr,
+    stride_x_seq: tl.constexpr,
+    stride_x_dim: tl.constexpr,
+    stride_x_token: tl.constexpr,
+    stride_w_dim: tl.constexpr,
+    stride_w_width: tl.constexpr,
+    stride_conv_state_seq: tl.constexpr,
+    stride_conv_state_dim: tl.constexpr,
+    stride_conv_state_tok: tl.constexpr,
+    stride_out_rows_seq: tl.constexpr,
+    stride_out_rows_step: tl.constexpr,
+    stride_parent_seq: tl.constexpr,
+    stride_parent_step: tl.constexpr,
+    stride_o_seq: tl.constexpr,
+    stride_o_dim: tl.constexpr,
+    stride_o_token: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+    PAD_SLOT: tl.constexpr,
+):
+    """One (request x token, feature block) per program: a width-W causal conv
+    needs only the token's last W - 1 ancestors (or the initial window when
+    the path is shallower), so tree tokens run in parallel."""
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    idx_seq = tl.program_id(0) // seqlen
+    token = tl.program_id(0) % seqlen
+    feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = feats < dim
+
+    init_row = tl.load(conv_state_indices_ptr + idx_seq).to(tl.int64)
+    if init_row == PAD_SLOT:
+        # not processing as this is not the actual sequence
+        return
+    init = (
+        conv_state_ptr
+        + init_row * stride_conv_state_seq
+        + feats * stride_conv_state_dim
+    )
+    x_row = x_ptr + idx_seq * stride_x_seq + feats * stride_x_dim
+    parents = parent_indices_ptr + idx_seq * stride_parent_seq
+
+    if HAS_BIAS:
+        acc = tl.load(bias_ptr + feats, mask=mask, other=0.0).to(tl.float32)
+    else:
+        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    # Column c is the (W - 1 - c)-th ancestor, else the initial window's column.
+    out_rows = output_state_indices_ptr + idx_seq * stride_out_rows_seq
+    out_row = tl.load(out_rows + token * stride_out_rows_step).to(tl.int64)
+    out_base = (
+        conv_state_ptr + out_row * stride_conv_state_seq + feats * stride_conv_state_dim
+    )
+    for c in tl.static_range(KERNEL_WIDTH):
+        # Ancestor distance for this column, and how far past the root it lands.
+        node = token
+        past_root = 0
+        for j in tl.static_range(KERNEL_WIDTH - 1):
+            if j + c < KERNEL_WIDTH - 1:
+                parent = tl.load(parents + tl.maximum(node, 0) * stride_parent_step)
+                past_root += (node < 0).to(tl.int32) + ((node >= 0) & (parent < 0)).to(
+                    tl.int32
+                )
+                node = tl.where(node >= 0, parent, node)
+        from_x = tl.load(
+            x_row + tl.maximum(node, 0) * stride_x_token,
+            mask=mask & (node >= 0),
+            other=0.0,
+        )
+        init_col = KERNEL_WIDTH - 1 - past_root
+        from_init = tl.load(
+            init + tl.maximum(init_col, 0) * stride_conv_state_tok,
+            mask=mask & (node < 0),
+            other=0.0,
+        )
+        value = tl.where(node >= 0, from_x, from_init)
+        acc += value * tl.load(
+            w_ptr + feats * stride_w_dim + c * stride_w_width, mask=mask, other=0.0
+        )
+        if c > 0:
+            if out_row >= 0:
+                tl.store(out_base + (c - 1) * stride_conv_state_tok, value, mask=mask)
+    if SILU_ACTIVATION:
+        acc = acc / (1 + tl.exp(-acc))
+    tl.store(
+        o_ptr + idx_seq * stride_o_seq + token * stride_o_token + feats * stride_o_dim,
+        acc,
+        mask=mask,
+    )
+
+
+def _causal_conv1d_tree_update(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: bool | str | None,
+    conv_state_indices: torch.Tensor,
+    output_state_indices: torch.Tensor,
+    parent_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Draft-tree causal_conv1d_update: every token in parallel, output out of place."""
+    enable_pdl = pdl_enabled()
+    batch, dim, seqlen = x.shape
+    width = weight.shape[1]
+    out = torch.empty_like(x)
+    block_n = 256
+    _causal_conv1d_tree_update_kernel[(batch * seqlen, triton.cdiv(dim, block_n))](
+        x,
+        weight,
+        bias,
+        conv_state,
+        conv_state_indices,
+        output_state_indices,
+        parent_indices,
+        out,
+        dim,
+        seqlen,
+        *x.stride(),
+        *weight.stride(),
+        *conv_state.stride(),
+        *output_state_indices.stride(),
+        *parent_indices.stride(),
+        *out.stride(),
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=activation in ("silu", "swish"),
+        BLOCK_N=block_n,
+        ENABLE_PDL=enable_pdl,
+        PAD_SLOT=PAD_SLOT_ID,
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+    return out
+
+
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -912,6 +1038,8 @@ def causal_conv1d_update(
     output_state_indices: torch.Tensor | None = None,
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
+    *,
+    parent_indices: torch.Tensor | None,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)
@@ -935,8 +1063,39 @@ def causal_conv1d_update(
             for example: cache_indices = [pad_slot_id, 1 ,20 ,pad_slot_id]
             in this case, the kernel will not process entries at
             indices 0 and 3
+    parent_indices: (batch, seqlen), dtype int32; requires
+        conv_state_indices and int32 output_state_indices. Draft trees: token t's
+        window ends at token parent_indices[b, t] (the initial window when
+        negative) instead of token t - 1.
     out: (batch, dim) or (batch, dim, seqlen)
     """
+    enable_pdl = pdl_enabled()
+    if parent_indices is not None:
+        tree_tables_ok = (
+            conv_state_indices is not None
+            and output_state_indices is not None
+            and parent_indices.shape == output_state_indices.shape
+            and conv_state_indices.shape == parent_indices.shape[:1]
+            and {
+                parent_indices.dtype,
+                output_state_indices.dtype,
+                conv_state_indices.dtype,
+            }
+            == {torch.int32}
+        )
+        chain_only_options = (
+            num_accepted_tokens is not None
+            or cache_seqlens is not None
+            or intermediate_conv_window is not None
+            or pad_slot_id != PAD_SLOT_ID
+            or validate_data
+        )
+        if not tree_tables_ok or chain_only_options:
+            raise ValueError(
+                "parent_indices needs int32 conv_state_indices (batch,) and "
+                "output_state_indices of its shape, and none of num_accepted_tokens, "
+                "cache_seqlens, intermediate_conv_window, pad_slot_id, validate_data"
+            )
     if validate_data:
         assert cache_seqlens is None
         assert pad_slot_id is not None
@@ -945,6 +1104,17 @@ def causal_conv1d_update(
         activation = "silu" if activation is True else None
     elif activation is not None:
         assert activation in ["silu", "swish"]
+    if parent_indices is not None:
+        return _causal_conv1d_tree_update(
+            x,
+            conv_state,
+            weight,
+            bias,
+            activation,
+            conv_state_indices,
+            output_state_indices,
+            parent_indices,
+        )
     unsqueeze = x.dim() == 2
     if unsqueeze:
         # make it (batch, dim, seqlen) with seqlen == 1
@@ -1061,6 +1231,8 @@ def causal_conv1d_update(
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     if unsqueeze:
         out = out.squeeze(-1)

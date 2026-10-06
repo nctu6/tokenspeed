@@ -30,6 +30,7 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2,
     _LN2,
     InputStrides,
+    _mfma_unscaled_fp8,
     attention_layouts,
     max,
     maximum,
@@ -57,7 +58,6 @@ class AttentionConfig:
     BLOCK_M: gl.constexpr
     BLOCK_N: gl.constexpr
     NUM_WARPS: gl.constexpr
-    BATCH_SIZE: gl.constexpr
     NUM_XCDS: gl.constexpr
     NUM_BLOCKS: gl.constexpr
     IS_FP8: gl.constexpr
@@ -94,7 +94,6 @@ class AttentionConfig:
         BLOCK_M,
         BLOCK_N,
         NUM_WARPS,
-        BATCH_SIZE,
         IS_FP8,
         KV_DTYPE,
         q_strides,
@@ -105,9 +104,9 @@ class AttentionConfig:
     ):
         assert HEAD_DIM == 128
         assert ROPE_DIM == 64
-        assert NUM_WARPS == 4
+        assert NUM_WARPS in (4, 8)
 
-        # Prefill uses a [32, 32, 16] MFMA with NUM_WARPS warp tiling.
+        # FP8 uses the wider gfx950 MFMA K dimension; 16-bit inputs retain K=16.
         (
             qk_layout,
             pv_layout,
@@ -125,8 +124,12 @@ class AttentionConfig:
             IS_FP8,
             KV_DTYPE,
             num_warps=NUM_WARPS,
-            instr_shape=[32, 32, 16],
+            instr_shape=[32, 32, 64] if IS_FP8 else [32, 32, 16],
         )
+        if IS_FP8:
+            # Keep each MFMA wave's 32 rows during output narrowing. Only the
+            # lane-32 partner exchanges columns to form eight-element stores.
+            store_layout = gl.BlockedLayout([1, 8], [32, 2], [NUM_WARPS, 1], [0, 1])
         # RoPE uses the same 128-bit load width as the content path.
         load_vec = 16 if IS_FP8 else 8
         load_pe_threads = ROPE_DIM // load_vec
@@ -152,7 +155,6 @@ class AttentionConfig:
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
-        self.BATCH_SIZE = gl.constexpr(BATCH_SIZE)
         self.NUM_XCDS = gl.constexpr(8)
         self.NUM_BLOCKS = gl.constexpr(512)
         self.IS_FP8 = gl.constexpr(IS_FP8)
@@ -334,18 +336,24 @@ class AttentionProgram:
         return v_smem.load(cfg.v_layout)
 
     @gluon.jit
+    def dot(self, a, b, acc):
+        if self.cfg.IS_FP8:
+            return _mfma_unscaled_fp8(a, b, acc)
+        return cdna4.mfma(a, b, acc)
+
+    @gluon.jit
     def compute_qk(self, q, k, q_pe, k_pe):
         cfg = self.cfg
         qk = gl.zeros(
             [cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.qk_layout
         )
-        qk = cdna4.mfma(q, k, qk)
-        qk = cdna4.mfma(q_pe, k_pe, qk)
+        qk = self.dot(q, k, qk)
+        qk = self.dot(q_pe, k_pe, qk)
         return qk
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
-        return cdna4.mfma(p, v, acc)
+        return self.dot(p, v, acc)
 
     @gluon.jit
     def scale_logits(self, qk):
@@ -390,10 +398,11 @@ class AttentionProgram:
     @gluon.jit
     def store_output(self, output):
         cfg = self.cfg
+        layout: gl.constexpr = output.type.layout
         offs_m = self.q_start + gl.arange(
-            0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout)
+            0, cfg.BLOCK_M, layout=gl.SliceLayout(1, layout)
         )
-        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
+        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, layout))
         offsets = cfg.o_strides.offsets(
             self.seq_base_q + offs_m[:, None], self.q_head, offs_d[None, :]
         )
@@ -443,14 +452,20 @@ def issue_tile_loads(
     if MASKED:
         # Each load uses its own blocked layout, so the tail mask must be built
         # from that load's own row index (offs_n) to keep layouts consistent.
+        # FP8 buffer loads zero-fill masked lanes directly into LDS; an explicit
+        # zero operand would instead add divergent stores beside the DMA.
+        other: gl.constexpr = None if program.cfg.IS_FP8 else 0.0
         program.issue_load(
-            k_offsets, k_smem, mask=offs_n[:, None] < program.kv_len, other=0.0
+            k_offsets, k_smem, mask=offs_n[:, None] < program.kv_len, other=other
         )
         program.issue_load(
-            k_pe_offsets, k_pe_smem, mask=offs_n_pe[:, None] < program.kv_len, other=0.0
+            k_pe_offsets,
+            k_pe_smem,
+            mask=offs_n_pe[:, None] < program.kv_len,
+            other=other,
         )
         program.issue_load_v(
-            v_offsets, v_smem, mask=offs_n_v[:, None] < program.kv_len, other=0.0
+            v_offsets, v_smem, mask=offs_n_v[:, None] < program.kv_len, other=other
         )
     else:
         program.issue_load(k_offsets, k_smem)
@@ -502,6 +517,320 @@ def compute_tile(
         v = gl.where((v_n < program.kv_len)[:, None], v, 0.0)
     acc = program.compute_pv(p, v, acc)
     return m_i, l_i, acc
+
+
+@gluon.jit
+def finish_query_block(program, m_i, l_i, acc):
+    cfg = program.cfg
+    program.store_lse(l_i, m_i)
+    denom = gl.where(l_i > 0.0, l_i, 1.0)
+    output = acc * (1.0 / denom)[:, None]
+    narrow_output: gl.constexpr = (
+        program.output_ptr.dtype.element_ty.primitive_bitwidth < 32
+    )
+    if cfg.IS_FP8 and narrow_output:
+        # Narrow before exchanging columns within each wave so each lane can
+        # form eight-element stores; 16-bit inputs retain their store order.
+        output = output.to(program.output_ptr.dtype.element_ty)
+    # Wider outputs retain their direct accumulator-layout stores.
+    if not cfg.IS_FP8 or narrow_output:
+        output = gl.convert_layout(output, cfg.store_layout)
+    program.store_output(output)
+
+
+@gluon.jit
+def _fp8_join_columns(a, b, layout: gl.constexpr):
+    values = gl.join(a, b).permute([0, 2, 1]).reshape([a.shape[0], 2 * a.shape[1]])
+    return gl.convert_layout(values, layout)
+
+
+@gluon.jit
+def _fp8_score_half(program, q, q_pe, k_smem, k_pe_smem, HALF: gl.constexpr):
+    cfg = program.cfg
+    k = k_smem.slice(HALF * 32, 32, 0).permute([1, 0]).load(cfg.k_layout)
+    k_pe = k_pe_smem.slice(HALF * 32, 32, 0).permute([1, 0]).load(cfg.k_pe_layout)
+    scores = gl.zeros([cfg.BLOCK_M, 32], gl.float32, cfg.qk_layout)
+    scores = program.dot(q, k, scores)
+    return program.dot(q_pe, k_pe, scores)
+
+
+@gluon.jit
+def _fp8_shift(program, scores, m, kv_start, main_end, causal_row):
+    cfg = program.cfg
+    e = program.scale_logits(scores)
+    if kv_start >= main_end * cfg.BLOCK_N:
+        cols = kv_start + gl.arange(0, cfg.BLOCK_N, gl.SliceLayout(0, cfg.qk_layout))
+        if cfg.IS_CAUSAL:
+            valid = cols[None, :] <= causal_row[:, None]
+        else:
+            valid = cols[None, :] < program.kv_len
+        e = gl.where(valid, e, -float("inf"))
+    row_max = max(e, 1)
+    row_max = gl.where(row_max == -float("inf"), -1.0e20, row_max)
+    m_new = maximum(m, row_max)
+    # Keep P <= 1 before FP8 conversion, including when a later tile raises m.
+    return e - m_new[:, None], m_new
+
+
+@gluon.jit
+def _fp8_rescale_row(l, m, m_new, unchanged):
+    alpha = gl.cast(1.0, gl.float32)
+    if unchanged == 0:
+        alpha = gl.exp2(m - m_new)
+        l = l * alpha
+    return l, alpha
+
+
+@gluon.jit
+def _fp8_rescale_output_pack(*args):
+    # Each half contributes 32 output registers for one row. The final packs
+    # contain that row's alpha and a wave-uniform unchanged-maximum vote.
+    values = args[:64]
+    if args[96] == 0:
+        updated = ()
+        for i in gl.static_range(64):
+            value = gl.inline_asm_elementwise(
+                asm="v_mul_f32_e32 $0, $0, $2",
+                constraints="=v,0,v",
+                args=[values[i], args[64]],
+                dtype=gl.float32,
+                is_pure=True,
+                pack=1,
+            )
+            updated += (value,)
+        values = updated
+    return values
+
+
+@gluon.jit
+def _fp8_overlap_qk_and_previous_pv(
+    program,
+    q,
+    q_pe,
+    k_smem,
+    k_pe_smem,
+    v_smem,
+    shifted,
+    m,
+    l,
+    acc0,
+    acc1,
+    t,
+    count,
+    main_end,
+    causal_row,
+    CUR: gl.constexpr,
+):
+    cfg = program.cfg
+    # Overlap this tile's QK with the previous tile's softmax and PV.
+    # V(t) is the most recent commit group; this phase consumes K(t) and V(t-1).
+    # Leave V(t) in flight until the next phase, which waits for all older groups.
+    async_copy.wait_group(1)
+    if t + 1 < count:
+        # The previous K buffer is dead, while its V buffer still feeds PV.
+        offsets, rows = program.make_k_offsets((t + 1) * cfg.BLOCK_N)
+        offsets_pe, rows_pe = program.make_k_pe_offsets((t + 1) * cfg.BLOCK_N)
+        program.issue_load(
+            offsets,
+            k_smem.index(1 - CUR),
+            mask=rows[:, None] < program.kv_len,
+            other=None,
+        )
+        program.issue_load(
+            offsets_pe,
+            k_pe_smem.index(1 - CUR),
+            mask=rows_pe[:, None] < program.kv_len,
+            other=None,
+        )
+        # The four-slot V ring reuses V(t-3), read in phase t-2. The entry
+        # barrier therefore separates every prior read from this overwrite.
+        offsets_v, rows_v = program.make_v_offsets((t + 1) * cfg.BLOCK_N)
+        program.issue_load_v(
+            offsets_v,
+            v_smem.index((t + 1) % 4),
+            mask=rows_v[:, None] < program.kv_len,
+            other=None,
+        )
+
+    previous0, previous1 = gl.split(
+        shifted.reshape([cfg.BLOCK_M, 2, 32]).permute([0, 2, 1])
+    )
+    with gl.amd.warp_pipeline_stage("qk0_previous_exp0", priority=0):
+        s0 = _fp8_score_half(
+            program, q, q_pe, k_smem.index(CUR), k_pe_smem.index(CUR), 0
+        )
+        p0 = gl.exp2(previous0)
+    with gl.amd.warp_pipeline_stage("qk1_previous_exp1", priority=0):
+        s1 = _fp8_score_half(
+            program, q, q_pe, k_smem.index(CUR), k_pe_smem.index(CUR), 1
+        )
+        p1 = gl.exp2(previous1)
+    p32 = _fp8_join_columns(p0, p1, cfg.qk_layout)
+    l = l + gl.sum(p32, axis=1)
+    p = gl.convert_layout(p32.to(program.q_ptr.dtype.element_ty), cfg.p_layout)
+    scores = _fp8_join_columns(s0, s1, cfg.qk_layout)
+    # A successor QK tile exists, so every row in this previous V tile is valid.
+    # Keep FP8 values packed instead of introducing per-element tail masks.
+    previous_v = (t - 1) % 4
+    v0 = v_smem.index(previous_v).slice(0, 64, 1).load(cfg.v_layout)
+    with gl.amd.warp_pipeline_stage("previous_pv0_current_max", priority=0):
+        acc0 = program.dot(p, v0, acc0)
+        shifted, m_new = _fp8_shift(
+            program, scores, m, t * cfg.BLOCK_N, main_end, causal_row
+        )
+    v1 = v_smem.index(previous_v).slice(64, 64, 1).load(cfg.v_layout)
+    with gl.amd.warp_pipeline_stage("previous_pv1_current_rescale", priority=0):
+        acc1 = program.dot(p, v1, acc1)
+        # A wave owns 32 query rows. Skip only if all their maxima are unchanged;
+        # no deferred maximum or enlarged FP8 probability range is introduced.
+        unchanged = gl.inline_asm_elementwise(
+            asm="v_cmp_eq_f32_e64 vcc, $1, $2\n"
+            "s_cmp_eq_u64 vcc, exec\n"
+            "s_cselect_b32 $0, 1, 0",
+            constraints="=s,v,v,~{vcc},~{scc}",
+            args=[m, m_new],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
+        l, alpha = gl.map_elementwise(_fp8_rescale_row, l, m, m_new, unchanged)
+        acc0, acc1 = gl.map_elementwise(
+            _fp8_rescale_output_pack,
+            acc0,
+            acc1,
+            alpha[:, None],
+            unchanged[:, None],
+            pack=32,
+        )
+    return shifted, m_new, l, acc0, acc1
+
+
+@gluon.jit
+def process_query_block_fp8(program, k_smem, k_pe_smem, v_smem):
+    cfg = program.cfg
+    q = program.load_q_nope()
+    q_pe = program.load_q_pe()
+    m, l, _ = program.init_state()
+    acc0 = gl.zeros([cfg.BLOCK_M, 64], gl.float32, cfg.pv_layout)
+    acc1 = gl.zeros([cfg.BLOCK_M, 64], gl.float32, cfg.pv_layout)
+    causal_row = (
+        program.q_causal_start
+        + program.q_start
+        + gl.arange(0, cfg.BLOCK_M, gl.SliceLayout(1, cfg.qk_layout))
+    )
+    if cfg.IS_CAUSAL:
+        # Combine both bounds once per row instead of comparing each score
+        # against KV length as well. This also covers queries longer than KV.
+        causal_row = gl.minimum(causal_row, program.kv_len - 1)
+        main_end = gl.minimum(
+            (program.q_causal_start + program.q_start) // cfg.BLOCK_N,
+            program.kv_len // cfg.BLOCK_N,
+        )
+        visible = gl.minimum(
+            program.q_causal_start + program.q_start + cfg.BLOCK_M, program.kv_len
+        )
+        count = gl.cdiv(visible, cfg.BLOCK_N)
+    else:
+        main_end = program.kv_len // cfg.BLOCK_N
+        count = gl.cdiv(program.kv_len, cfg.BLOCK_N)
+    if count > 0:
+        issue_tile_loads(
+            program, k_smem.index(0), k_pe_smem.index(0), v_smem.index(0), 0, True
+        )
+        async_copy.wait_group(0)
+        if count > 1:
+            issue_tile_loads(
+                program,
+                k_smem.index(1),
+                k_pe_smem.index(1),
+                v_smem.index(1),
+                cfg.BLOCK_N,
+                True,
+            )
+        s0 = _fp8_score_half(program, q, q_pe, k_smem.index(0), k_pe_smem.index(0), 0)
+        s1 = _fp8_score_half(program, q, q_pe, k_smem.index(0), k_pe_smem.index(0), 1)
+        shifted, m = _fp8_shift(
+            program,
+            _fp8_join_columns(s0, s1, cfg.qk_layout),
+            m,
+            0,
+            main_end,
+            causal_row,
+        )
+
+        # Static key-buffer indices remove their ping/pong address calculations.
+        t = 1
+        while t + 1 < count:
+            shifted, m, l, acc0, acc1 = _fp8_overlap_qk_and_previous_pv(
+                program,
+                q,
+                q_pe,
+                k_smem,
+                k_pe_smem,
+                v_smem,
+                shifted,
+                m,
+                l,
+                acc0,
+                acc1,
+                t,
+                count,
+                main_end,
+                causal_row,
+                1,
+            )
+            shifted, m, l, acc0, acc1 = _fp8_overlap_qk_and_previous_pv(
+                program,
+                q,
+                q_pe,
+                k_smem,
+                k_pe_smem,
+                v_smem,
+                shifted,
+                m,
+                l,
+                acc0,
+                acc1,
+                t + 1,
+                count,
+                main_end,
+                causal_row,
+                0,
+            )
+            t += 2
+        if t < count:
+            shifted, m, l, acc0, acc1 = _fp8_overlap_qk_and_previous_pv(
+                program,
+                q,
+                q_pe,
+                k_smem,
+                k_pe_smem,
+                v_smem,
+                shifted,
+                m,
+                l,
+                acc0,
+                acc1,
+                t,
+                count,
+                main_end,
+                causal_row,
+                1,
+            )
+        # The last score tile has no successor QK with which to overlap its PV.
+        # Its V transfer was left outstanding by the final pipeline phase.
+        async_copy.wait_group(0)
+        p32 = gl.exp2(shifted)
+        l = l + gl.sum(p32, axis=1)
+        p = gl.convert_layout(p32.to(program.q_ptr.dtype.element_ty), cfg.p_layout)
+        last = (count - 1) % 4
+        # Masked DMA already zero-filled the partial tile, so V remains packed
+        # through its final matrix loads as well as the full interior tiles.
+        v0 = v_smem.index(last).slice(0, 64, 1).load(cfg.v_layout)
+        acc0 = program.dot(p, v0, acc0)
+        v1 = v_smem.index(last).slice(64, 64, 1).load(cfg.v_layout)
+        acc1 = program.dot(p, v1, acc1)
+    finish_query_block(program, m, l, _fp8_join_columns(acc0, acc1, cfg.pv_layout))
 
 
 @gluon.jit
@@ -598,11 +927,7 @@ def process_query_block(
         )
         kv_start = kv_start + cfg.BLOCK_N
 
-    program.store_lse(l_i, m_i)
-    denom = gl.where(l_i > 0.0, l_i, 1.0)
-    output = acc * (1.0 / denom)[:, None]
-    output = gl.convert_layout(output, cfg.store_layout)
-    program.store_output(output)
+    finish_query_block(program, m_i, l_i, acc)
 
 
 # ===-----------------------------------------------------------------------===#
@@ -625,8 +950,9 @@ class ProgramScheduler:
     q_head: gl.tensor
     q_slot: gl.tensor
     q_cycles_per_batch_group: gl.tensor
-    batch_slots: gl.constexpr
-    q_slots: gl.constexpr
+    batch_size: gl.tensor
+    batch_slots: gl.tensor
+    q_slots: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -641,6 +967,7 @@ class ProgramScheduler:
         q_head,
         q_slot,
         q_cycles_per_batch_group,
+        batch_size,
         batch_slots,
         q_slots,
     ):
@@ -654,13 +981,13 @@ class ProgramScheduler:
         self.q_head = q_head
         self.q_slot = q_slot
         self.q_cycles_per_batch_group = q_cycles_per_batch_group
-        self.batch_slots = gl.constexpr(batch_slots)
-        self.q_slots = gl.constexpr(q_slots)
+        self.batch_size = batch_size
+        self.batch_slots = batch_slots
+        self.q_slots = q_slots
 
     @gluon.jit
     def create(cfg, batch_size, max_seqlen_q, swizzled_order: gl.constexpr):
         num_q_blocks = (max_seqlen_q + cfg.BLOCK_M - 1) // cfg.BLOCK_M
-
         start_pid = gl.program_id(axis=0)
         pids_per_xcd: gl.constexpr = cfg.NUM_BLOCKS // cfg.NUM_XCDS
         xcd = start_pid % cfg.NUM_XCDS
@@ -669,23 +996,35 @@ class ProgramScheduler:
 
         if swizzled_order:
             max_batch_slots: gl.constexpr = cfg.NUM_BLOCKS // cfg.N_HEADS
-            if cfg.BATCH_SIZE < max_batch_slots:
-                batch_slots: gl.constexpr = cfg.BATCH_SIZE
-            else:
-                batch_slots: gl.constexpr = max_batch_slots
-            q_slots: gl.constexpr = cfg.NUM_BLOCKS // (batch_slots * cfg.N_HEADS)
+            batch_slots = gl.minimum(batch_size, max_batch_slots)
+            q_slots = cfg.NUM_BLOCKS // (batch_slots * cfg.N_HEADS)
 
             q_cycles_per_batch_group = (num_q_blocks + q_slots - 1) // q_slots
-            num_batch_groups: gl.constexpr = (
-                cfg.BATCH_SIZE + batch_slots - 1
-            ) // batch_slots
+            num_batch_groups = (batch_size + batch_slots - 1) // batch_slots
             total_work = num_batch_groups * q_cycles_per_batch_group
 
-            active_slots: gl.constexpr = batch_slots * cfg.N_HEADS * q_slots
+            active_slots = batch_slots * cfg.N_HEADS * q_slots
             slot_valid = logical_pid < active_slots
             safe_pid = gl.where(slot_valid, logical_pid, 0)
             q_slot = safe_pid % q_slots
             head_batch_slot = safe_pid // q_slots
+            if cfg.IS_FP8:
+                # Underfilled launches put all useful slots at low physical
+                # block IDs. Larger workloads retain the causal/XCD ordering.
+                compact = num_q_blocks < q_slots
+                q_slot = gl.where(
+                    compact, start_pid // (batch_slots * cfg.N_HEADS), q_slot
+                )
+                head_batch_slot = gl.where(
+                    compact,
+                    start_pid % (batch_slots * cfg.N_HEADS),
+                    head_batch_slot,
+                )
+                slot_valid = gl.where(
+                    compact,
+                    start_pid < batch_slots * cfg.N_HEADS * num_q_blocks,
+                    slot_valid,
+                )
             q_head = head_batch_slot % cfg.N_HEADS
             batch_slot = head_batch_slot // cfg.N_HEADS
             zero = logical_pid - logical_pid
@@ -693,14 +1032,16 @@ class ProgramScheduler:
         else:
             total_work = batch_size * cfg.N_HEADS * num_q_blocks
             zero = logical_pid - logical_pid
-            batch_slots: gl.constexpr = 1
-            q_slots: gl.constexpr = 1
+            batch_slots = zero + 1
+            q_slots = zero + 1
             slot_valid = logical_pid >= 0
             batch_slot = zero
             q_head = zero
             q_slot = zero
             q_cycles_per_batch_group = num_q_blocks
             work = logical_pid
+            if cfg.IS_FP8:
+                work = gl.where(total_work < cfg.NUM_BLOCKS, start_pid, work)
 
         return ProgramScheduler(
             gl.constexpr(cfg),
@@ -713,12 +1054,16 @@ class ProgramScheduler:
             q_head,
             q_slot,
             q_cycles_per_batch_group,
+            batch_size,
             batch_slots,
             q_slots,
         )
 
     @gluon.jit
     def has_work(self):
+        if self.cfg.IS_FP8:
+            # Unused blocks exit before any request-metadata or operand loads.
+            return self.slot_valid & (self.work < self.total_work)
         return self.work < self.total_work
 
     @gluon.jit
@@ -739,6 +1084,7 @@ class ProgramScheduler:
             self.q_head,
             self.q_slot,
             self.q_cycles_per_batch_group,
+            self.batch_size,
             self.batch_slots,
             self.q_slots,
         )
@@ -766,7 +1112,12 @@ class ProgramScheduler:
             query_block_dec = q_cycle * self.q_slots + (self.q_slots - 1 - self.q_slot)
             query_block = gl.where(q_cycle % 2 == 0, query_block_inc, query_block_dec)
             batch = batch_group * self.batch_slots + self.batch_slot
-            valid = self.slot_valid & (query_block < self.num_q_blocks)
+            # The final batch group may not fill every persistent batch slot.
+            valid = (
+                self.slot_valid
+                & (batch < self.batch_size)
+                & (query_block < self.num_q_blocks)
+            )
             safe_batch = gl.where(valid, batch, 0)
             q_head = self.q_head
         else:
@@ -809,8 +1160,41 @@ class ProgramScheduler:
 # ===-----------------------------------------------------------------------===#
 
 
-@gluon.jit
-def _mla_prefill_kernel(
+def prefill_launch_metadata(grid, kernel, args):
+    """Report attention work without reading device-resident lengths.
+
+    Sequence lengths live in cu_seqlens on the device, so FLOPs assume every
+    sequence has the average query and key length of the batch. Causal masks
+    align the last query with the last key. Bytes count each tensor once.
+    """
+    total_q, heads, qk_dim = args["q_ptr"].shape
+    total_kv = args["k_ptr"].shape[0]
+    v_dim = args["v_ptr"].shape[-1]
+    batch = args["batch_size"]
+    q_len, kv_len = total_q / batch, total_kv / batch
+    if args["IS_CAUSAL"]:
+        # Query row i sees min(max(kv_len - q_len, 0) + i + 1, kv_len) keys,
+        # so the mask hides a triangle of size min(q_len, kv_len) - 1.
+        rows = min(q_len, kv_len)
+        pairs = q_len * kv_len - rows * (rows - 1 if rows > 1 else 0) / 2
+    else:
+        pairs = q_len * kv_len
+    flops = round(2 * batch * pairs * heads * (qk_dim + v_dim))
+    tensors = [args[name] for name in ("q_ptr", "k_ptr", "v_ptr", "output_ptr")]
+    if args["HAS_LSE"]:
+        tensors.append(args["lse_ptr"])
+    return {
+        "name": kernel.name,
+        "flops8" if args["IS_FP8"] else "flops16": flops,
+        "bytes": sum(t.numel() * t.element_size() for t in tensors),
+    }
+
+
+@gluon.jit(
+    launch_metadata=prefill_launch_metadata,
+    do_not_specialize=("batch_size", "max_seqlen_q"),
+)
+def gluon_mla_prefill_gfx950(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -838,7 +1222,7 @@ def _mla_prefill_kernel(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    BATCH_SIZE: gl.constexpr,
+    batch_size,
     max_seqlen_q,
     IS_FP8: gl.constexpr,
 ):
@@ -853,7 +1237,6 @@ def _mla_prefill_kernel(
         BLOCK_M,
         BLOCK_N,
         NUM_WARPS,
-        BATCH_SIZE,
         IS_FP8,
         k_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, 1),
@@ -869,12 +1252,14 @@ def _mla_prefill_kernel(
         k_ptr.dtype.element_ty, [2, cfg.BLOCK_N, cfg.ROPE_DIM], cfg.k_pe_smem_layout
     )
     v_smem = gl.allocate_shared_memory(
-        v_ptr.dtype.element_ty, [2, cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
+        v_ptr.dtype.element_ty,
+        [4 if cfg.IS_FP8 else 2, cfg.BLOCK_N, cfg.HEAD_DIM],
+        cfg.v_smem_layout,
     )
 
     # Swizzle only helps the triangular causal workload; non-causal tiles are
     # uniform cost, so use the simpler round-robin order there.
-    scheduler = ProgramScheduler.create(cfg, BATCH_SIZE, max_seqlen_q, IS_CAUSAL)
+    scheduler = ProgramScheduler.create(cfg, batch_size, max_seqlen_q, IS_CAUSAL)
     while scheduler.has_work():
         program, active = scheduler.get_program(
             q_ptr,
@@ -886,7 +1271,10 @@ def _mla_prefill_kernel(
             cu_seqlens_kv_ptr,
         )
         if active:
-            process_query_block(program, k_smem, k_pe_smem, v_smem)
+            if cfg.IS_FP8:
+                process_query_block_fp8(program, k_smem, k_pe_smem, v_smem)
+            else:
+                process_query_block(program, k_smem, k_pe_smem, v_smem)
         scheduler = scheduler.advance()
 
 
@@ -911,10 +1299,10 @@ def get_config(*, q: torch.Tensor, k: torch.Tensor) -> LaunchConfig:
     n_kv_heads = k.shape[1]
     head_dim = 128
     rope_dim = 64
-    block_m = 128
+    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    block_m = 256 if is_fp8 else 128
     block_n = 64
-    num_warps = 4
-    grid = (512,)
+    num_warps = 8 if is_fp8 else 4
     return LaunchConfig(
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
@@ -923,11 +1311,11 @@ def get_config(*, q: torch.Tensor, k: torch.Tensor) -> LaunchConfig:
         block_m=block_m,
         block_n=block_n,
         num_warps=num_warps,
-        grid=grid,
+        grid=(512,),
     )
 
 
-def gluon_mla_prefill_gfx950(
+def launch_gluon_mla_prefill_gfx950(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -937,18 +1325,50 @@ def gluon_mla_prefill_gfx950(
     max_seqlen_kv: int,
     softmax_scale: float,
     *,
-    is_causal: bool = True,
-    logit_cap: float = 0.0,
-    return_lse: bool = False,
+    is_causal: bool,
+    logit_cap: float,
+    return_lse: bool,
     out: torch.Tensor | None = None,
     seq_lens_kv: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Dense non-absorbed MLA prefill on AMD gfx950.
 
-    ``q``/``k`` are ``[total_tokens, num_heads, 192]`` (128 NoPE + 64 RoPE),
-    ``v`` is ``[total_tokens, num_kv_heads, 128]``. Output is
-    ``[total_tokens, num_heads, 128]``.
+    Args:
+        q: Queries shaped ``[total_q, num_heads, 192]`` (128 NoPE + 64 RoPE),
+            FP16, BF16, FP8 E4M3 or FP8 E5M2 with a contiguous last dimension.
+        k: Keys shaped ``[total_kv, num_kv_heads, 192]`` with ``q``'s dtype and
+            a contiguous last dimension. ``num_heads`` must be a multiple of
+            ``num_kv_heads``.
+        v: Values shaped ``[total_kv, num_kv_heads, 128]`` with ``q``'s dtype
+            and a contiguous last dimension.
+        cu_seqlens_q: Int32 query offsets shaped ``[batch_size + 1]``; must
+            hold at least one sequence.
+        cu_seqlens_kv: Int32 key/value offsets shaped ``[batch_size + 1]``.
+            These define the KV lengths.
+        max_seqlen_q: Longest query sequence in the batch. It is a runtime
+            argument, so varying lengths reuse one compiled kernel.
+        max_seqlen_kv: Longest KV sequence in the batch. A redundant hint that
+            must agree with ``cu_seqlens_kv``; the kernel does not read it.
+        softmax_scale: Scale applied to QK logits before the softmax.
+        is_causal: Whether to apply a causal mask aligning each sequence's
+            last query with its last key.
+        logit_cap: Soft cap on attention logits. Must be ``0.0``; capping is
+            unsupported.
+        return_lse: Whether to also return the log-sum-exp values.
+        out: Optional destination shaped ``[total_q, num_heads, 128]`` of any
+            floating dtype with a contiguous last dimension. Allocated as BF16
+            when omitted.
+        seq_lens_kv: Optional KV lengths shaped ``[batch_size]``. A redundant
+            hint that must agree with ``cu_seqlens_kv``; the kernel does not
+            read it.
+
+    Returns:
+        The output tensor, or ``(output, lse)`` when ``return_lse`` is true,
+        where ``lse`` is FP32 shaped ``[total_q, num_heads]`` in natural-log
+        units.
     """
+    if cu_seqlens_q.numel() < 2:
+        raise ValueError("MLA prefill requires at least one sequence")
     if logit_cap != 0.0:
         raise NotImplementedError("gluon MLA prefill gfx950 does not support logit_cap")
     if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
@@ -999,10 +1419,14 @@ def gluon_mla_prefill_gfx950(
     )
     lse_arg = lse if lse is not None else out
 
-    config = get_config(q=q, k=k)
     batch_size = cu_seqlens_q.numel() - 1
+    config = get_config(q=q, k=k)
+    if is_fp8:
+        # No request can exceed the query buffer's token capacity. Keep this a
+        # runtime bound so varying prompt lengths do not each compile a kernel.
+        max_seqlen_q = min(max_seqlen_q, total_tokens)
 
-    _mla_prefill_kernel[config.grid](
+    gluon_mla_prefill_gfx950[config.grid](
         q,
         k,
         v,
@@ -1030,11 +1454,13 @@ def gluon_mla_prefill_gfx950(
         BLOCK_M=config.block_m,
         BLOCK_N=config.block_n,
         NUM_WARPS=config.num_warps,
-        BATCH_SIZE=batch_size,
+        batch_size=batch_size,
         max_seqlen_q=max_seqlen_q,
         IS_FP8=is_fp8,
         num_warps=config.num_warps,
         num_stages=1,
+        # Keep the overlapping FP8 matrix and softmax state in one register class.
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),) if is_fp8 else (),
     )
 
     if return_lse:
