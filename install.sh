@@ -274,13 +274,293 @@ install_system_deps() {
             return 0
         fi
     fi
+    # ADDON (hardening): if every required package is already installed, skip
+    # apt entirely. On hosts with an unrelated broken dpkg/DKMS state (e.g. a
+    # half-configured nvidia-dkms for a kernel that was purged) any apt-get
+    # install can abort under `set -e` even though nothing here needs
+    # installing. FORCE_SYSTEM_DEPS=1 keeps the old always-run-apt behaviour.
+    local _sys_pkgs=(libssl-dev libopenmpi-dev libnuma1 pkg-config)
+    _sys_deps_present() {
+        local p st
+        for p in "${_sys_pkgs[@]}"; do
+            st="$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null || true)"
+            [[ "$st" == "install ok installed" || "$st" == "hold ok installed" ]] || return 1
+        done
+        return 0
+    }
+    if [[ "${FORCE_SYSTEM_DEPS:-0}" != "1" ]] && command -v dpkg-query >/dev/null 2>&1 && _sys_deps_present; then
+        skip "System dependencies already installed (${_sys_pkgs[*]}); skipping apt (FORCE_SYSTEM_DEPS=1 to run apt anyway)"
+        return 0
+    fi
     log "Installing system dependencies (libssl-dev libopenmpi-dev libnuma1 pkg-config)"
-    $SUDO apt-get update
-    $SUDO apt-get install -y --no-install-recommends \
+    # ADDON: tolerate apt failures caused by unrelated packages, as long as the
+    # packages WE need end up installed. The apt path itself is unchanged.
+    if ! { $SUDO apt-get update && $SUDO apt-get install -y --no-install-recommends \
         libssl-dev \
         libopenmpi-dev \
         libnuma1 \
-        pkg-config
+        pkg-config; }; then
+        if command -v dpkg-query >/dev/null 2>&1 && _sys_deps_present; then
+            err "apt-get reported an error (likely an unrelated broken dpkg/DKMS package), but ${_sys_pkgs[*]} are installed; continuing."
+            err "Inspect with: sudo dpkg --audit; sudo apt-get check"
+        else
+            err "apt-get failed and required system packages are missing: ${_sys_pkgs[*]}"
+            return 1
+        fi
+    fi
+}
+
+# --- CUDA toolkit / nvcc discovery + optional apt install (ADDON) ------------
+# tokenspeed-kernel/python/setup.py uses CUDA_HOME (default /usr/local/cuda) and
+# FLASHINFER_NVCC (default $CUDA_HOME/bin/nvcc). Hosts without /usr/local/cuda
+# used to fail deep in the wheel build with "nvcc was not found:
+# /usr/local/cuda/bin/nvcc". Resolve a toolkit up front and export CUDA_HOME.
+# An explicit CUDA_HOME that contains bin/nvcc always wins, and a host with
+# /usr/local/cuda behaves exactly as before.
+#
+# Previously we ONLY resolved an existing nvcc and printed apt hints on failure.
+# We did not auto-apt-install the toolkit because that needs sudo and can
+# surprise multi-tenant hosts (driver/DKMS/kernel pulls). The user now wants
+# detection + a guarded userspace-only install when nvcc is missing.
+#
+# Discovery order (resolve_cuda_home):
+#   1. $CUDA_HOME/bin/nvcc   2. $FLASHINFER_NVCC   3. /usr/local/cuda
+#   4. `nvcc` on PATH        5. /usr/local/cuda-* (torch's CUDA major first,
+#      then newest)  6. /opt/cuda   7. pip wheels in the venv (nvidia/cu*/bin/nvcc,
+#      only if nvcc's cicc, cuda_runtime.h and libcudart are all present)
+#
+# Target version for apt install (prefer torch's CUDA, e.g. 13.0 / cu130):
+#   1. nvcc --version from an already-resolved toolkit
+#   2. else torch.version.cuda in the venv
+#   3. else nvidia-smi "CUDA Version" as a hint (driver max supported, NOT toolkit)
+_cuda_home_ok() { [[ -n "${1:-}" && -x "$1/bin/nvcc" ]]; }
+
+# Normalize "13.0" / "13.0.88" / "cuda_13.0" -> "13.0" (major.minor).
+_cuda_xy() {
+    local v="${1:-}"
+    v="${v#cuda_}"
+    v="${v#CUDA }"
+    [[ "$v" =~ ^([0-9]+)\.([0-9]+) ]] && { echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"; return 0; }
+    [[ "$v" =~ ^([0-9]+)$ ]] && { echo "${BASH_REMATCH[1]}.0"; return 0; }
+    return 1
+}
+
+detect_target_cuda_version() {
+    local v=""
+    # 1) Existing toolkit / nvcc
+    if _cuda_home_ok "${CUDA_HOME:-}"; then
+        v="$("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1 || true)"
+    elif [[ -n "${FLASHINFER_NVCC:-}" && -x "${FLASHINFER_NVCC}" ]]; then
+        v="$("$FLASHINFER_NVCC" --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1 || true)"
+    elif command -v nvcc >/dev/null 2>&1; then
+        v="$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1 || true)"
+    fi
+    v="$(_cuda_xy "$v" 2>/dev/null || true)"
+    if [[ -n "$v" ]]; then
+        echo "$v"
+        return 0
+    fi
+    # 2) Prefer torch's CUDA (build must match the venv's torch)
+    v="$("$PY" -c 'import torch; print(torch.version.cuda or "")' 2>/dev/null || true)"
+    v="$(_cuda_xy "$v" 2>/dev/null || true)"
+    if [[ -n "$v" ]]; then
+        echo "$v"
+        return 0
+    fi
+    # 3) nvidia-smi hint only (driver max; may be newer than any installed toolkit)
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        v="$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: \([0-9.]*\).*/\1/p' | head -1 || true)"
+        v="$(_cuda_xy "$v" 2>/dev/null || true)"
+        if [[ -n "$v" ]]; then
+            echo "$v"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# True if apt-get -s output would touch kernel/DKMS/nvidia-driver packages.
+# cuda-driver-dev-* is userspace stubs and is allowed.
+_apt_cuda_pulls_forbidden() {
+    local dry="$1" pkg
+    while read -r pkg; do
+        [[ -z "$pkg" ]] && continue
+        case "$pkg" in
+            linux-image|linux-image-*|linux-headers|linux-headers-*|dkms|*-dkms|\
+            nvidia-driver|nvidia-driver-*|nvidia-dkms|nvidia-dkms-*|\
+            nvidia-kernel|nvidia-kernel-*|nvidia-kernel-common|nvidia-kernel-common-*)
+                err "Refusing CUDA toolkit apt install: dry-run would touch '$pkg' (kernel/DKMS/driver)."
+                return 0
+                ;;
+        esac
+    done < <(printf '%s\n' "$dry" | awk '/^(Inst|Conf|Remv) / { print $2 }')
+    return 1
+}
+
+# ADDON: when nvcc is missing, install a matching userspace CUDA toolkit via apt.
+# Prefer the minimal set (compiler + libraries-dev + nvml-dev); fall back to
+# cuda-toolkit-X-Y. Always dry-run first and refuse kernel/DKMS/driver pulls.
+# SKIP_CUDA_TOOLKIT_INSTALL=1 disables this. FORCE_SYSTEM_DEPS remains for the
+# separate libssl/openmpi/numa apt path only.
+install_cuda_toolkit_apt() {
+    if [[ "${SKIP_CUDA_TOOLKIT_INSTALL:-0}" == "1" ]]; then
+        skip "SKIP_CUDA_TOOLKIT_INSTALL=1; not attempting CUDA toolkit apt install"
+        return 1
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        err "apt-get not found; cannot auto-install CUDA toolkit."
+        return 1
+    fi
+
+    local target="" ver_dash=""
+    target="$(detect_target_cuda_version || true)"
+    if [[ -z "$target" ]]; then
+        err "Could not detect a target CUDA version (no nvcc, torch.version.cuda, or nvidia-smi hint)."
+        return 1
+    fi
+    ver_dash="${target/./-}"
+    log "Target CUDA toolkit version: $target (prefer matching torch; nvidia-smi is driver-max hint only)"
+
+    local SUDO=""
+    if [[ "$(id -u)" -ne 0 ]]; then
+        # Non-interactive only: never hang on a sudo password prompt.
+        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            SUDO="sudo"
+        else
+            err "CUDA toolkit install needs root (sudo -n unavailable). Install manually, then re-run ./install.sh:"
+            err "  sudo apt-get update"
+            err "  sudo apt-get install -y --no-install-recommends cuda-compiler-${ver_dash} cuda-libraries-dev-${ver_dash} cuda-nvml-dev-${ver_dash}"
+            err "  # or: sudo apt-get install -y --no-install-recommends cuda-toolkit-${ver_dash}"
+            err "  # Dry-run first: sudo apt-get -s install --no-install-recommends ...  (must NOT pull linux-image/DKMS/nvidia-driver)"
+            return 1
+        fi
+    fi
+
+    # Refresh package lists so cuda-*-X-Y from the NVIDIA CUDA repo is visible.
+    log "Refreshing apt package lists (for CUDA toolkit ${target})"
+    if ! $SUDO apt-get update; then
+        err "apt-get update failed; cannot install CUDA toolkit ${target}."
+        return 1
+    fi
+
+    local -a minimal=( "cuda-compiler-${ver_dash}" "cuda-libraries-dev-${ver_dash}" "cuda-nvml-dev-${ver_dash}" )
+    local -a full=( "cuda-toolkit-${ver_dash}" )
+    local -a try_sets=("minimal" "full")
+    local set_name pkg_list dry missing p
+
+    for set_name in "${try_sets[@]}"; do
+        if [[ "$set_name" == "minimal" ]]; then
+            pkg_list=( "${minimal[@]}" )
+        else
+            pkg_list=( "${full[@]}" )
+        fi
+
+        missing=0
+        for p in "${pkg_list[@]}"; do
+            if ! apt-cache show "$p" >/dev/null 2>&1; then
+                err "CUDA apt package '$p' not found in apt cache (need NVIDIA CUDA apt repo for ${target})."
+                missing=1
+                break
+            fi
+        done
+        [[ "$missing" -eq 1 ]] && continue
+
+        log "Dry-running apt install of ${pkg_list[*]} (refuse kernel/DKMS/driver pulls)"
+        dry="$($SUDO apt-get -s install --no-install-recommends "${pkg_list[@]}" 2>&1 || true)"
+        if _apt_cuda_pulls_forbidden "$dry"; then
+            err "Skipping ${set_name} set for CUDA ${target} due to forbidden packages in dry-run."
+            continue
+        fi
+        if ! printf '%s\n' "$dry" | grep -qE '^(Inst|Conf) '; then
+            # Already installed or nothing to do -- treat as success if nvcc appears later.
+            log "apt dry-run for ${pkg_list[*]} reported no packages to install"
+        fi
+
+        log "Installing CUDA userspace toolkit ${target} via apt (${set_name}: ${pkg_list[*]})"
+        if $SUDO apt-get install -y --no-install-recommends "${pkg_list[@]}"; then
+            log "CUDA toolkit apt install (${set_name}) finished"
+            return 0
+        fi
+        err "apt-get install failed for ${pkg_list[*]}; trying next candidate set if any."
+    done
+
+    err "Could not install a safe CUDA ${target} userspace toolkit via apt."
+    return 1
+}
+
+resolve_cuda_home() {
+    local cand torch_cuda="" torch_major="" nvcc_path
+    torch_cuda="$("$PY" -c 'import torch; print(torch.version.cuda or "")' 2>/dev/null || true)"
+    torch_major="${torch_cuda%%.*}"
+
+    if _cuda_home_ok "${CUDA_HOME:-}"; then
+        :
+    elif [[ -n "${FLASHINFER_NVCC:-}" && -x "${FLASHINFER_NVCC}" ]]; then
+        CUDA_HOME="$(cd -- "$(dirname -- "$FLASHINFER_NVCC")/.." && pwd)"
+    elif _cuda_home_ok /usr/local/cuda; then
+        CUDA_HOME=/usr/local/cuda
+    elif nvcc_path="$(command -v nvcc 2>/dev/null)" && [[ -n "$nvcc_path" ]]; then
+        nvcc_path="$(readlink -f "$nvcc_path" 2>/dev/null || echo "$nvcc_path")"
+        CUDA_HOME="$(cd -- "$(dirname -- "$nvcc_path")/.." && pwd)"
+    else
+        CUDA_HOME=""
+        local -a cands=()
+        [[ -n "$torch_major" ]] && cands+=( $(ls -d /usr/local/cuda-"$torch_major".* 2>/dev/null | sort -rV || true) )
+        cands+=( $(ls -d /usr/local/cuda-* 2>/dev/null | sort -rV || true) /opt/cuda )
+        for cand in "${cands[@]}"; do
+            if _cuda_home_ok "$cand"; then CUDA_HOME="$cand"; break; fi
+        done
+        if [[ -z "$CUDA_HOME" ]]; then
+            local sp
+            sp="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null || true)"
+            for cand in $(ls -d "$sp"/nvidia/cu"${torch_major}" "$sp"/nvidia/cu* 2>/dev/null); do
+                if _cuda_home_ok "$cand" && [[ -x "$cand/nvvm/bin/cicc" && -f "$cand/include/cuda_runtime.h" ]] \
+                    && ls "$cand"/lib/libcudart.so* >/dev/null 2>&1; then
+                    CUDA_HOME="$cand"
+                    err "Using pip-wheel CUDA toolkit at $CUDA_HOME (experimental; a full system toolkit is preferred)."
+                    break
+                fi
+            done
+        fi
+    fi
+
+    if _cuda_home_ok "${CUDA_HOME:-}"; then
+        export CUDA_HOME
+        export PATH="$CUDA_HOME/bin:$PATH"
+        log "CUDA toolkit: CUDA_HOME=$CUDA_HOME ($("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p')); torch CUDA ${torch_cuda:-unknown}"
+        return 0
+    fi
+    unset CUDA_HOME
+    err "No CUDA toolkit (nvcc) found. Checked: \$CUDA_HOME, \$FLASHINFER_NVCC, /usr/local/cuda, PATH, /usr/local/cuda-*, /opt/cuda, venv nvidia/cu*/bin."
+    err "torch in this venv was built for CUDA ${torch_cuda:-unknown}. The kernel build needs a matching toolkit."
+    err "  or point at an existing toolkit: CUDA_HOME=/path/to/cuda ./install.sh"
+    return 1
+}
+
+# Resolve existing nvcc first; if missing, optionally apt-install a matching
+# userspace toolkit (dry-run guarded), then re-resolve CUDA_HOME.
+ensure_cuda_home() {
+    if resolve_cuda_home; then
+        return 0
+    fi
+    log "nvcc not found; attempting guarded CUDA toolkit apt install (userspace only, no kernel/DKMS/driver)"
+    if install_cuda_toolkit_apt; then
+        # Clear a stale empty CUDA_HOME so re-resolve can pick /usr/local/cuda-X.Y.
+        unset CUDA_HOME
+        if resolve_cuda_home; then
+            return 0
+        fi
+        err "CUDA toolkit apt install reported success, but nvcc still not found under /usr/local/cuda*."
+        return 1
+    fi
+    local hint=""
+    hint="$(detect_target_cuda_version 2>/dev/null || true)"
+    if [[ -n "$hint" ]]; then
+        err "  Manual install (after dry-run confirms no linux-image/DKMS/nvidia-driver):"
+        err "    sudo apt-get install -y --no-install-recommends cuda-compiler-${hint/./-} cuda-libraries-dev-${hint/./-} cuda-nvml-dev-${hint/./-}"
+        err "    # or: sudo apt-get install -y --no-install-recommends cuda-toolkit-${hint/./-}"
+    fi
+    return 1
 }
 
 # --- smg gateway build (Rust) ------------------------------------------------
@@ -505,6 +785,14 @@ if [[ "$FRESH" == "1" || "$KERNEL_WORK" == "1" || "$SMG_WORK" == "1" || "$FA2_WO
     # System build deps and the pip build front-ends are only needed when we
     # actually compile. Skipping them on a no-op run keeps it fast and offline.
     install_system_deps
+    # ADDON: resolve CUDA_HOME/nvcc (and optionally apt-install userspace toolkit)
+    # before any source build. Fatal only when the CUDA kernel is going to be
+    # compiled; smg/FA2-only runs just warn.
+    if ! ensure_cuda_home; then
+        if [[ "$FRESH" == "1" || "$KERNEL_WORK" == "1" ]]; then
+            exit 1
+        fi
+    fi
     # setuptools + wheel are REQUIRED here because the kernel and engine are
     # built with --no-build-isolation: pip runs the build backend
     # (setuptools.build_meta) from THIS venv. A fresh `python -m venv` ships pip

@@ -53,6 +53,11 @@ logger = get_colorful_logger(__name__)
 
 ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
 
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 # Spec-decode overshoot spans the physical KV extent must absorb past the
 # logical context_len. The overlap scheduler steps a finished request at most
 # ONE extra iteration (the depth-1 event loop commits the previous step every
@@ -759,6 +764,19 @@ class ServerArgs:
             )
 
     def resolve_communication(self):
+        # VLLM_BATCH_INVARIANT=1: opt-in deterministic comm preset (NCCL RS/AG
+        # instead of symm-mem Triton collectives, NCCL NVLS off). Only turns
+        # flags on; explicit --force-deterministic-rsag / --disable-nccl-nvls
+        # keep working and nothing changes when the env var is unset.
+        if _env_truthy("VLLM_BATCH_INVARIANT"):
+            if not self.force_deterministic_rsag or not self.disable_nccl_nvls:
+                logger.info(
+                    "VLLM_BATCH_INVARIANT set: enabling force_deterministic_rsag "
+                    "and disable_nccl_nvls"
+                )
+            self.force_deterministic_rsag = True
+            self.disable_nccl_nvls = True
+
         # Auto-enable allreduce fusion on supported single-node TP configurations.
         platform = current_platform()
         if (

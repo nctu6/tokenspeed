@@ -1145,6 +1145,12 @@ elif platform.is_nvidia and platform.is_hopper:
         get_scheduler_metadata,
     )
 
+    # FA3 on Hopper supports head_dim at most 256 (flash_attn_3 fwd guard).
+    # Gemma-4 full-attention layers use global_head_dim=512; without this trait
+    # the registry selects fa3 for those layers and crashes at kernel launch.
+    # Keep the set aligned with FA4's dense MHA dims up through 256.
+    _FA3_HOPPER_HEAD_DIMS = frozenset(range(8, 257, 8))
+
     @register_kernel(
         "attention",
         "mha_prefill",
@@ -1162,6 +1168,7 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "head_dim": _FA3_HOPPER_HEAD_DIMS,
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
@@ -1218,6 +1225,7 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "head_dim": _FA3_HOPPER_HEAD_DIMS,
             "is_causal": frozenset({False, True}),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
@@ -1281,6 +1289,7 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "head_dim": _FA3_HOPPER_HEAD_DIMS,
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
