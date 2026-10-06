@@ -1309,6 +1309,23 @@ class ServerArgs:
             self.force_deterministic_rsag = True
             self.disable_nccl_nvls = True
 
+        # Hosts where Fabric Manager advertises a zero ClusterUUID while the
+        # driver still claims multicast support: NCCL NVLS hard-fails at
+        # init_process_group with cuMulticastBindMem ILLEGAL_STATE. Auto-set
+        # --disable-nccl-nvls so VLLM_BATCH_INVARIANT=0 (perf path) can start;
+        # force_deterministic_rsag stays off so Triton/IPC fusion remains.
+        if not self.disable_nccl_nvls:
+            from tokenspeed.runtime.distributed.nvls_multicast import (
+                should_auto_disable_nccl_nvls,
+            )
+
+            if should_auto_disable_nccl_nvls():
+                logger.warning(
+                    "Auto-enabling disable_nccl_nvls: NVLS multicast mapping "
+                    "unavailable on this host"
+                )
+                self.disable_nccl_nvls = True
+
         # Auto-enable allreduce fusion on supported single-node TP configurations.
         platform = current_platform()
         if (

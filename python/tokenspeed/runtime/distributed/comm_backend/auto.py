@@ -235,9 +235,20 @@ class AutoBackend(CommBackend):
 
         The world fabric map is gathered during distributed initialization, so
         the group verdict is a local lookup with no dispatch-time collective.
+
+        Intra-node is not unconditionally safe either: some NVSwitch hosts
+        advertise multicast while ``cuMulticastBindMem`` returns ILLEGAL_STATE
+        (null multicast_ptr after rendezvous). Those hosts must not take the
+        Triton RSAG multimem path or they illegal-memory-access; see
+        ``nvls_multicast_mapping_usable``.
         """
+        from tokenspeed.runtime.distributed.nvls_multicast import (
+            nvls_multicast_mapping_usable,
+        )
         from tokenspeed_kernel.ops.communication.fabric import group_has_fabric
 
+        if nvls_multicast_mapping_usable() is False:
+            return False
         if not AutoBackend._group_spans_nodes(group):
             return True
         return group_has_fabric(group)
