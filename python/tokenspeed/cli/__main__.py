@@ -24,8 +24,48 @@ import argparse
 import sys
 
 
+def _split_host_port(raw_argv: list[str]) -> tuple[list[str], str, int]:
+    """Engine args plus the gateway-side --host/--port this server binds."""
+    from tokenspeed.cli._argsplit import split_argv
+
+    split = split_argv(raw_argv)
+    host, port = "127.0.0.1", 8000
+    gateway = list(split.gateway)
+    if "--host" in gateway:
+        host = gateway[gateway.index("--host") + 1]
+    if "--port" in gateway:
+        port = int(gateway[gateway.index("--port") + 1])
+    return split.engine, host, port
+
+
+def _serve_asr(raw_argv: list[str]) -> None:
+    """``ts serve`` for Whisper: audio in, transcript out via asr_http.
+
+    SMG's gRPC transcription adapter currently supports Qwen3-ASR only; Whisper
+    needs log-mel features beside the decoder prompt, so this path owns the
+    OpenAI-compatible /v1/audio/transcriptions HTTP surface in-process.
+    """
+    from tokenspeed.runtime.entrypoints.asr_http import serve
+
+    engine_args, host, port = _split_host_port(raw_argv)
+    print(f"[ts serve] asr server on http://{host}:{port}")
+    serve(engine_args, host=host, port=port)
+
+
 def _serve(args: argparse.Namespace, raw_argv: list[str]) -> None:
     from tokenspeed.cli.serve_smg import run_smg_from_args
+
+    if not getattr(args, "headless", False):
+        # Resolve from the first positional model path in raw argv (same shape
+        # as ``tokenspeed serve <model> ...``).
+        from tokenspeed.runtime_select import describe_runtime, resolve_serving_runtime
+
+        model = next((a for a in raw_argv if a and not a.startswith("-")), "")
+        runtime = resolve_serving_runtime(model) if model else "generate"
+        print(f"[ts serve] runtime: {runtime} -- {describe_runtime(runtime)}")
+        if runtime == "asr":
+            _serve_asr(raw_argv)
+            return
 
     run_smg_from_args(args, raw_argv)
 

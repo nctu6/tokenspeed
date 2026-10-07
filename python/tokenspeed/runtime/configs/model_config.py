@@ -535,6 +535,10 @@ def _derive_num_attention_layers(
         return num_hidden_layers * model_profile.attention_instances_per_layer
     architectures = getattr(hf_config, "architectures", None) or []
     num_attention_layers = num_hidden_layers
+    if "WhisperForConditionalGeneration" in architectures:
+        # Encoder keeps no paged KV; cross-KV lives outside the arena.
+        # Size the pool for decoder self-attention only.
+        return int(getattr(hf_config, "decoder_layers", num_hidden_layers))
     if is_deepseek_v4_nextn(hf_config):
         num_attention_layers = int(getattr(hf_config, "num_nextn_predict_layers", 1))
     if any(arch in _DOUBLE_ATTENTION_LAYER_ARCHITECTURES for arch in architectures):
@@ -801,6 +805,13 @@ class ModelConfig:
         else:
             self.context_len = derived_context_len
 
+        self._clamp_prefill_budget_to_context(server_args)
+
+        if getattr(self.hf_config, "is_encoder_decoder", False):
+            # Cross-attention KV is a per-slot buffer outside the paged arena.
+            # +1 mirrors the scheduler's padding slot.
+            self.hf_config.cross_attn_slots = int(server_args.max_num_seqs) + 1
+
         if self.pooling_config is not None:
             # Deferred to here, not to where pooling_config is resolved: the
             # prefill-chunk guard below is stated against context_len, which
@@ -933,6 +944,34 @@ class ModelConfig:
             self.model_profile is not None and self.model_profile.request_token_history
         )
 
+
+
+    def _clamp_prefill_budget_to_context(self, server_args: ServerArgs) -> None:
+        """Cap the per-step prefill budget at what the request pool can hold.
+
+        Whisper's decoder holds 448 positions, so the default 8192-token budget
+        implies more concurrent requests than max_num_seqs allows, and the
+        autotuner's dummy batch indexes past the pool. Clamped rather than
+        refused: operators took a default that predates short-context models.
+        """
+        if server_args is None:
+            return
+        reachable = int(self.context_len) * max(1, int(server_args.max_num_seqs))
+        for field in ("chunked_prefill_size", "max_prefill_tokens"):
+            current = getattr(server_args, field, None)
+            if current is None or current <= 0 or current <= reachable:
+                continue
+            logger.info(
+                "%s=%s exceeds what the request pool can hold (context_len %s "
+                "x max_num_seqs %s = %s); clamping to %s.",
+                field,
+                current,
+                self.context_len,
+                server_args.max_num_seqs,
+                reachable,
+                reachable,
+            )
+            setattr(server_args, field, reachable)
 
     def _resolve_embedding_server_args(self, server_args: ServerArgs) -> None:
         """Force off the features a pooling forward cannot express.
@@ -1321,6 +1360,9 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Glm53FlashForConditionalGeneration",
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
+        # Audio in, tokens out: same multimodal request shape as an image,
+        # even though Whisper is encoder-decoder rather than audio-prefix.
+        "WhisperForConditionalGeneration",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
 
@@ -1335,6 +1377,7 @@ def is_image_gen_model(model_architectures: list[str]):
 
 def is_audio_model(model_architectures: list[str] | None):
     audio_architectures = {
+        "WhisperForConditionalGeneration",
         "InklingForConditionalGeneration",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",

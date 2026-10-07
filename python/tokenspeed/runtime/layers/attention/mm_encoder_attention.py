@@ -54,6 +54,9 @@ from tokenspeed.runtime.utils import add_prefix, round_up
 
 logger = logging.getLogger(__name__)
 
+# One-shot guard for the cross-attention dtype normalization diagnostic.
+_cross_attn_warned_dtype = False
+
 _platform = current_platform()
 _is_nvidia = _platform.is_nvidia
 _is_amd = _platform.is_amd
@@ -212,6 +215,63 @@ def vision_attn_fa4(
     # FA4 CUTE returns (output, lse) in newer builds and bare output in older
     # ones; downstream callers only consume the tensor.
     return result[0] if isinstance(result, tuple) else result
+
+
+def cross_attn_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float | None = None,
+) -> torch.Tensor:
+    """Encoder-decoder cross-attention: q and kv have different lengths.
+
+    The three ``vision_attn_*`` backends above are self-attention shaped --
+    they pass one ``cu_seqlens`` for both sides because q_len == kv_len. A
+    Whisper decoder step has one query row per request against a fixed
+    encoder output, so the two sides differ and need separate cumulative
+    lengths. ``flash_attn_varlen_func`` already takes both.
+
+    ``k``/``v`` must be contiguous and in batch order. On sm_120 there is no
+    alternative: every indexed KV read this kernel offers is closed there --
+    ``page_table`` is refused outright ("Paged KV not supported on SM 12.0"),
+    ``gather_kv_indices`` needs ``qv``, and ``flash_attn_with_kvcache`` is an
+    unregistered placeholder. Measured 2026-08-21; re-probe before assuming
+    the caller still has to materialise the gather.
+    """
+    # ``flash_attn_varlen_func`` requires q/k/v in one dtype. Whisper can land
+    # fp16 decoder queries against bf16 encoder keys; normalize to the query
+    # dtype rather than aborting.
+    if q.dtype != k.dtype or k.dtype != v.dtype:
+        global _cross_attn_warned_dtype
+        target = q.dtype if q.dtype in (torch.float16, torch.bfloat16) else k.dtype
+        if not _cross_attn_warned_dtype:
+            _cross_attn_warned_dtype = True
+            logger.info(
+                "cross_attn_varlen normalized q=%s k=%s v=%s -> %s",
+                q.dtype,
+                k.dtype,
+                v.dtype,
+                target,
+            )
+        q, k, v = (t.to(target) for t in (q, k, v))
+    result = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=False,
+    )
+    return result[0] if isinstance(result, tuple) else result
+
 
 
 def vision_attn_flashinfer_cudnn(

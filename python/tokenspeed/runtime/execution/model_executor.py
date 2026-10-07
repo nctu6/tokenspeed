@@ -408,7 +408,13 @@ class ModelExecutorConfig:
         # User intent only; backend-imposed graph restrictions are declared on
         # the backend classes (cuda_graph_support) and resolved in
         # ModelExecutor.__init__ once the backend instances exist.
-        disable_prefill_graph = bool(server_args.disable_prefill_graph)
+        # Encoder-decoder (Whisper) keeps cross-attention KV outside the paged
+        # arena, addressed by pool slot; a captured prefill graph would freeze
+        # the first batch's slots.
+        is_encoder_decoder = bool(
+            getattr(model_config.hf_config, "is_encoder_decoder", False)
+        )
+        disable_prefill_graph = bool(server_args.disable_prefill_graph) or is_encoder_decoder
 
         return ModelExecutorConfig(
             max_req_pool_size=max_req_pool_size,
@@ -1274,6 +1280,9 @@ class ModelExecutor:
             name: view[rows]
             for name, view in self.input_buffers.ngram_model_kwargs(num_tokens).items()
         }
+        # Encoder-decoder cross-attention addresses its KV by pool slot.
+        ib = self.input_buffers
+        kwargs["req_pool_indices"] = ib.req_pool_indices_buf[:bs]
         if self.runtime_states.has_request_token_history:
             ib = self.input_buffers
             kwargs["request_token_history"] = (

@@ -64,6 +64,14 @@ class MHAConfig(SoftmaxAttnConfig):
         )
         if draft_block_decode and server_args.drafter_attention_backend != "trtllm":
             kv_cache_dtype = "bfloat16"
+        # "auto" means the model's own dtype (--kv-cache-dtype help). Whisper
+        # fp16 checkpoints need a matching pool; bf16-hardcoded auto matched
+        # no paged kernel when query was fp16.
+        resolved_kv_cache_dtype = (
+            model_config.dtype
+            if kv_cache_dtype == "auto"
+            else resolve_dtype(kv_cache_dtype)
+        )
 
         hf_config = model_config.hf_config
         cache_layer_types = resolve_cache_layer_types(
@@ -110,7 +118,7 @@ class MHAConfig(SoftmaxAttnConfig):
                 server_args,
                 model_config,
                 is_draft,
-                kv_cache_dtype=resolve_dtype(kv_cache_dtype),
+                kv_cache_dtype=resolved_kv_cache_dtype,
                 kv_cache_mxfp8=kv_cache_dtype == "mxfp8",
                 draft_block_decode=draft_block_decode,
             ),
