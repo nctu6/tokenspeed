@@ -36,6 +36,7 @@ from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
 )
+from tokenspeed.runtime.layers.pooler import PoolingType
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.plugins import ensure_loaded
 from tokenspeed.runtime.plugins.registry import resolve_model_profile
@@ -690,8 +691,22 @@ class ModelConfig:
             if hasattr(self.hf_config, "text_config"):
                 self.hf_config.text_config = self.hf_text_config
 
-        # Check model type
-        self.is_generation = is_generation_model(self.hf_config.architectures)
+        # Check model type.
+        # A pooling checkpoint is served as an embedding model: one prefill,
+        # one vector, no decode. Draft/auxiliary checkpoints are never pooled.
+        self.pooling_config = (
+            None if is_draft_worker else resolve_pooling_config(model_path, server_args)
+        )
+        self.is_generation = self.pooling_config is None and is_generation_model(
+            self.hf_config.architectures
+        )
+        if self.pooling_config is not None:
+            # Model-facing gate, same idiom as ``hf_config.encoder_only``: the
+            # model class is constructed from the HF config alone, so the
+            # decision has to travel on it.
+            self.hf_config.pooling_config = self.pooling_config
+            if hasattr(self.hf_config, "text_config"):
+                self.hf_config.text_config.pooling_config = self.pooling_config
         self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
         self.is_multimodal_gen = is_multimodal_gen_model(self.hf_config.architectures)
         self.is_image_gen = is_image_gen_model(self.hf_config.architectures)
@@ -785,6 +800,12 @@ class ModelConfig:
                 self.context_len = context_length
         else:
             self.context_len = derived_context_len
+
+        if self.pooling_config is not None:
+            # Deferred to here, not to where pooling_config is resolved: the
+            # prefill-chunk guard below is stated against context_len, which
+            # only settles above.
+            self._resolve_embedding_server_args(server_args)
 
         # Unify the config keys for hf_text_config
         self.head_dim = getattr(
@@ -911,6 +932,61 @@ class ModelConfig:
         return (
             self.model_profile is not None and self.model_profile.request_token_history
         )
+
+
+    def _resolve_embedding_server_args(self, server_args: ServerArgs) -> None:
+        """Force off the features a pooling forward cannot express.
+
+        All four reference engines disable the same two things for pooling
+        models: chunked prefill (a pooled vector reduces over the whole prompt)
+        and prefix caching (a pooling request never reads back its own KV).
+        Both are forced rather than validated.
+        """
+        if server_args.enable_prefix_caching:
+            logger.info(
+                "Embedding model: disabling prefix caching. A pooling request "
+                "computes one forward and never reads its own KV back."
+            )
+            server_args.enable_prefix_caching = False
+        # Pooling reduces over the whole prompt; a partial chunk would produce
+        # a well-formed vector over the wrong tokens. Open both the admission
+        # budget and the chunk size to the context length rather than refusing
+        # a default --max-prefill-tokens the operator never set.
+        budget = max(int(server_args.max_prefill_tokens), int(self.context_len))
+        if int(server_args.max_prefill_tokens) < self.context_len:
+            logger.info(
+                "Embedding model: raising --max-prefill-tokens from %s to %s "
+                "so a pooled prompt fits in one prefill.",
+                server_args.max_prefill_tokens,
+                budget,
+            )
+            server_args.max_prefill_tokens = budget
+        if server_args.chunked_prefill_size != budget:
+            logger.info(
+                "Embedding model: opening the prefill chunk budget from %s to "
+                "%s so a pooled prompt is never split across chunks.",
+                server_args.chunked_prefill_size,
+                budget,
+            )
+            server_args.chunked_prefill_size = budget
+        if server_args.speculative_algorithm:
+            raise ValueError(
+                "Speculative decoding is meaningless for an embedding model: "
+                "there are no tokens to draft. Drop --speculative-algorithm."
+            )
+        if not server_args.disable_overlap_schedule:
+            logger.info(
+                "Embedding model: disabling the overlap schedule. A pooling "
+                "request finishes on its first forward, and overlap would "
+                "schedule a decode step against it before that lands."
+            )
+            server_args.disable_overlap_schedule = True
+
+        # Settle the tri-state: after this, `server_args.is_embedding` is the
+        # resolved answer, not the request.
+        server_args.is_embedding = True
+        server_args.pooling_type = self.pooling_config.pooling_type.value
+        server_args.pooling_normalize = self.pooling_config.normalize
 
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
@@ -1119,6 +1195,113 @@ def _get_and_verify_dtype(
             logger.warning(f"Casting {config_dtype!s} to {torch_dtype!s}.")
 
     return torch_dtype
+
+
+
+@dataclass(frozen=True)
+class PoolingConfig:
+    """How an embedding checkpoint reduces hidden states to one vector."""
+
+    pooling_type: PoolingType
+    normalize: bool
+
+
+# sentence-transformers spells its pooling choice as a set of mutually
+# exclusive booleans. Only the three we implement are listed; a checkpoint
+# selecting any other mode is rejected rather than silently pooled the wrong
+# way -- a wrong reduction returns a well-formed vector nothing downstream
+# can catch.
+_ST_POOLING_MODES = {
+    "pooling_mode_lasttoken": PoolingType.LAST,
+    "pooling_mode_cls_token": PoolingType.CLS,
+    "pooling_mode_mean_tokens": PoolingType.MEAN,
+}
+
+
+def read_sentence_transformers_pooling(model_path: str) -> PoolingConfig | None:
+    """Read ``1_Pooling/config.json`` + ``modules.json`` from a checkpoint.
+
+    Returns None when the checkpoint ships no sentence-transformers pooling
+    config, which is how a plain generative checkpoint looks.
+    """
+    pooling_file = os.path.join(model_path, "1_Pooling", "config.json")
+    if not os.path.isfile(pooling_file):
+        return None
+    with open(pooling_file) as handle:
+        raw = json.load(handle)
+
+    selected = [
+        pooling_type for key, pooling_type in _ST_POOLING_MODES.items() if raw.get(key)
+    ]
+    enabled_unsupported = [
+        key
+        for key, value in raw.items()
+        if key.startswith("pooling_mode_") and value and key not in _ST_POOLING_MODES
+    ]
+    if enabled_unsupported:
+        raise ValueError(
+            f"{pooling_file} selects unsupported pooling mode(s) "
+            f"{sorted(enabled_unsupported)}; supported: "
+            f"{sorted(_ST_POOLING_MODES)}. Pass --pooling-type to override."
+        )
+    if len(selected) != 1:
+        raise ValueError(
+            f"{pooling_file} selects {len(selected)} pooling modes; expected "
+            "exactly one. Pass --pooling-type to override."
+        )
+
+    # Normalization is a separate sentence-transformers module, not a field of
+    # the pooling config: read it off modules.json rather than assuming it.
+    normalize = False
+    modules_file = os.path.join(model_path, "modules.json")
+    if os.path.isfile(modules_file):
+        with open(modules_file) as handle:
+            modules = json.load(handle)
+        normalize = any(
+            str(module.get("type", "")).endswith("Normalize") for module in modules
+        )
+
+    return PoolingConfig(pooling_type=selected[0], normalize=normalize)
+
+
+def resolve_pooling_config(
+    model_path: str, server_args: ServerArgs | None
+) -> PoolingConfig | None:
+    """Decide whether this server pools, and how.
+
+    Returns None for a generative server. Raises when the operator asked for
+    embedding mode on a checkpoint that declares no pooling and gave no
+    override -- an embedding server that guessed its reduction would answer
+    every request with a plausible wrong vector.
+    """
+    declared = read_sentence_transformers_pooling(model_path)
+    requested = getattr(server_args, "is_embedding", None)
+    if requested is False:
+        return None
+    if requested is None and declared is None:
+        return None
+
+    override_type = getattr(server_args, "pooling_type", None)
+    override_normalize = getattr(server_args, "pooling_normalize", None)
+
+    if declared is None and override_type is None:
+        raise ValueError(
+            f"--is-embedding was requested but {model_path} ships no "
+            "1_Pooling/config.json to say how to pool. Pass --pooling-type "
+            "(last|cls|mean), and --pooling-normalize if the checkpoint "
+            "expects L2-normalized output."
+        )
+
+    pooling_type = (
+        PoolingType(override_type)
+        if override_type is not None
+        else declared.pooling_type
+    )
+    if override_normalize is not None:
+        normalize = override_normalize
+    else:
+        normalize = declared.normalize if declared is not None else False
+    return PoolingConfig(pooling_type=pooling_type, normalize=normalize)
 
 
 def is_generation_model(model_architectures: list[str]):

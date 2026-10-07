@@ -178,6 +178,18 @@ class PlannedForward:
 
 
 @dataclass
+class PoolerForwardResult:
+    """What a pooling forward returns in place of (tokens, lengths, logprobs).
+
+    Kept as its own type rather than reusing the token tuple: an embedding
+    tensor smuggled through ``output_tokens`` would be silently clamped to the
+    vocab range and packed as int32 by the generative D2H path.
+    """
+
+    embeddings: torch.Tensor
+
+
+@dataclass
 class ModelExecutionResult:
     """
     Result of model execution returned to scheduler.
@@ -205,6 +217,10 @@ class ModelExecutionResult:
     # Optional verify-input snapshot used by speculative diagnostics. Layout is
     # [batch, verify_width]: anchor followed by draft candidate token ids.
     spec_candidate_tokens: torch.Tensor | None = None
+    # Embedding serving only: one pooled vector per request, [bs, hidden].
+    # Mutually exclusive with output_tokens -- a pooling forward samples
+    # nothing, so output_tokens is empty when this is set.
+    output_embeddings: torch.Tensor | None = None
     # Prompt (input) logprobs of the rows ``input_logprob_plan`` named, flat
     # fp32 in plan order; None when the forward gathered none (no plan, or a
     # pipeline stage without logits). The plan rides along so the commit path

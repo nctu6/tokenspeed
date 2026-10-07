@@ -69,6 +69,7 @@ from tokenspeed.runtime.engine.io_struct import (
     ResumeSchedulerReqInput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
+    TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
@@ -380,7 +381,14 @@ class RequestHandler:
         new_req_specs, req_states, bootstrap_infos, abort_rids = [], [], [], []
         pending_flush_outputs = 0
         for recv_req in recv_reqs:
-            if isinstance(recv_req, TokenizedGenerateReqInput):
+            if isinstance(recv_req, TokenizedEmbeddingReqInput):
+                req_spec, req_state, bootstrap_info = self.handle_embedding_request(
+                    recv_req
+                )
+                new_req_specs.append(req_spec)
+                req_states.append(req_state)
+                bootstrap_infos.append(bootstrap_info)
+            elif isinstance(recv_req, TokenizedGenerateReqInput):
                 req_spec, req_state, bootstrap_info = self.handle_generate_request(
                     recv_req
                 )
@@ -772,6 +780,40 @@ class RequestHandler:
         self.server_args.weight_version = str(version)
         self._device.set_l3_weight_version(str(version))
         return True, msg
+
+    def handle_embedding_request(
+        self,
+        recv_req: TokenizedEmbeddingReqInput,
+    ):
+        """Admit a pooling request: one prefill, one vector, then finished.
+
+        Built directly rather than via ``from_recv_req``: an embedding request
+        does not carry generate-only fields (return_logprob, multimodal, ...).
+        Prefix-cache claim is forced to 0 — pooling needs every prompt
+        position's hidden state, and embedding servers disable prefix caching.
+        """
+        req_spec = make_spec(
+            rid=recv_req.rid,
+            tokens=recv_req.input_ids,
+            max_cached_prefix_tokens=0,
+            max_new_tokens=0,
+        )
+        req_state = RequestState(
+            prompt_input_ids=recv_req.input_ids,
+            sampling_params=recv_req.sampling_params,
+            stream=False,
+            tokenizer=self.tokenizer,
+            computes_prompt_logprobs=False,
+            eos_token_ids=self.hf_eos_token_id,
+            created_time=recv_req.created_time,
+        )
+        req_state.embedding = None
+        if getattr(recv_req, "validation_error", None):
+            req_state.finished_reason = FINISH_ABORT(
+                f"Invalid request: {recv_req.validation_error}"
+            )
+        req_state.sampling_params.max_new_tokens = 0
+        return req_spec, req_state, BootstrapInfo(None, None, None)
 
     def handle_generate_request(
         self,

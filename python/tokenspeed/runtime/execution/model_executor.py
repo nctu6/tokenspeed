@@ -69,6 +69,7 @@ from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
 from tokenspeed.runtime.execution.types import (
+    PoolerForwardResult,
     DpForwardMetadata,
     InputLogprobPlan,
     ModelExecutionResult,
@@ -275,6 +276,8 @@ class ModelExecutorConfig:
     max_req_pool_size: int
     output_length: int
     enforce_eager: bool
+    # Embedding (pooling) serving: forward produces one vector per request.
+    is_embedding: bool
     prefix_granularity: int
     max_num_seqs: int
     chunked_prefill_size: int
@@ -411,6 +414,7 @@ class ModelExecutorConfig:
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
             enforce_eager=server_args.enforce_eager,
+            is_embedding=not model_config.is_generation,
             prefix_granularity=prefix_granularity,
             max_num_seqs=server_args.max_num_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,
@@ -608,19 +612,23 @@ class ModelExecutor:
         # DP rank resolves the same answer.
         graph_support = resolve_cuda_graph_support(attn_backend, draft_attn_backend)
 
-        self.dp_sampling_runtime_config = setup_dp_sampling(
-            model=self.model_runner.model,
-            sampling_backend=self.sampling_backend,
-            requested=self.config.dp_sampling,
-            drafter_available=self.drafter is not None,
-            limits=DpSamplingRuntimeLimits(
-                runtime_vocab_size=self.config.vocab_size,
-                max_num_seqs=config.max_num_seqs,
-                data_parallel_size=config.data_parallel_size,
-                num_tokens_per_req=spec_num_tokens,
-                configured_min_bs=self.config.dp_sampling_min_bs,
-                device=self.device,
-            ),
+        self.dp_sampling_runtime_config = (
+            None
+            if config.is_embedding
+            else setup_dp_sampling(
+                model=self.model_runner.model,
+                sampling_backend=self.sampling_backend,
+                requested=self.config.dp_sampling,
+                drafter_available=self.drafter is not None,
+                limits=DpSamplingRuntimeLimits(
+                    runtime_vocab_size=self.config.vocab_size,
+                    max_num_seqs=config.max_num_seqs,
+                    data_parallel_size=config.data_parallel_size,
+                    num_tokens_per_req=spec_num_tokens,
+                    configured_min_bs=self.config.dp_sampling_min_bs,
+                    device=self.device,
+                ),
+            )
         )
         self._last_dp_sampling_route_log: (
             tuple[str, int, bool, int, int, bool, int] | None
@@ -1424,6 +1432,9 @@ class ModelExecutor:
         runtime = self.dp_sampling_runtime_config
         if (
             self.config.global_rank != 0
+            # Embedding servers skip logits/sampling setup, so there is no
+            # DP-sampling topology to log.
+            or runtime is None
             or not runtime.enabled
             or runtime.min_bs is None
             or runtime.topology is None
@@ -1484,6 +1495,10 @@ class ModelExecutor:
             self.drafter.prepare_target_forward(ctx)
 
         logits_output = self._run_target_forward(ctx)
+
+        if self.config.is_embedding:
+            # Pooling forward: model returned PoolerOutput, not logits.
+            return PoolerForwardResult(embeddings=logits_output.embeddings)
 
         if self.config.pp_size > 1 and not self._pp_is_last_stage:
             # Mid-pipeline stage: the model returned the boundary bundle, not
@@ -2080,34 +2095,39 @@ class ModelExecutor:
                     ctx.global_bs = dp_metadata.global_batch_size
                     ctx.all_decode_or_idle = dp_metadata.all_decode_or_idle
                     ctx.all_extend = dp_metadata.all_extend
-                with nvtx_range("sampling_prep", color="yellow"):
-                    sampling_start = time.perf_counter() if timing_enabled else 0.0
-                    sampling_info = self._build_sampling_info(bs)
-                    grammar_completion = setup_grammar_step(
-                        sampling_info=sampling_info,
-                        bs=bs,
-                        is_spec_decode=self.drafter is not None and num_extends < bs,
-                        spec_num_tokens=self.config.spec_num_tokens or 1,
-                        grammar_inputs=grammar_inputs,
-                        grammar_runtime=self.grammar_runtime,
-                        input_ids_buf=self.input_buffers.input_ids_buf[:total_tokens],
-                        grammar_backend=self.config.grammar_backend,
-                        output_layout=output_layout,
-                    )
-                    extend_with_prefix = num_extends > 0 and any(
-                        forward_op.extend_prefix_lens
-                    )
-                    # Flip detection + per-slot scalar scatter + backend-owned
-                    # RNG state refill. Runs OUTSIDE the CUDA graph. Generators
-                    # are now backend-internal (pool-indexed, seeded on flip
-                    # from sp.seed), so the event loop no longer threads them
-                    # through.
-                    self.sampling_backend.prepare_step(
-                        request_ids=forward_op.request_ids,
-                        request_pool_indices=forward_op.request_pool_indices,
-                        sampling_params_list=sampling_params_list,
-                        num_tokens_per_req=self.config.output_length,
-                    )
+                if self.config.is_embedding:
+                    sampling_info = None
+                    grammar_completion = None
+                    extend_with_prefix = False
+                else:
+                    with nvtx_range("sampling_prep", color="yellow"):
+                        sampling_start = time.perf_counter() if timing_enabled else 0.0
+                        sampling_info = self._build_sampling_info(bs)
+                        grammar_completion = setup_grammar_step(
+                            sampling_info=sampling_info,
+                            bs=bs,
+                            is_spec_decode=self.drafter is not None and num_extends < bs,
+                            spec_num_tokens=self.config.spec_num_tokens or 1,
+                            grammar_inputs=grammar_inputs,
+                            grammar_runtime=self.grammar_runtime,
+                            input_ids_buf=self.input_buffers.input_ids_buf[:total_tokens],
+                            grammar_backend=self.config.grammar_backend,
+                            output_layout=output_layout,
+                        )
+                        extend_with_prefix = num_extends > 0 and any(
+                            forward_op.extend_prefix_lens
+                        )
+                        # Flip detection + per-slot scalar scatter + backend-owned
+                        # RNG state refill. Runs OUTSIDE the CUDA graph. Generators
+                        # are now backend-internal (pool-indexed, seeded on flip
+                        # from sp.seed), so the event loop no longer threads them
+                        # through.
+                        self.sampling_backend.prepare_step(
+                            request_ids=forward_op.request_ids,
+                            request_pool_indices=forward_op.request_pool_indices,
+                            sampling_params_list=sampling_params_list,
+                            num_tokens_per_req=self.config.output_length,
+                        )
                     if timing_enabled:
                         sampling_prep_ms = (
                             time.perf_counter() - sampling_start
@@ -2127,12 +2147,7 @@ class ModelExecutor:
                             else bs
                         )
                         forward_step_start = time.perf_counter()
-                    (
-                        output_tokens,
-                        output_lengths,
-                        output_logprobs,
-                        input_token_logprobs,
-                    ) = self.forward_step(
+                    step_result = self.forward_step(
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
@@ -2163,17 +2178,34 @@ class ModelExecutor:
                             time.perf_counter() - forward_step_start
                         ) * 1000.0
 
+                if isinstance(step_result, PoolerForwardResult):
+                    output_embeddings = step_result.embeddings
+                    output_tokens = None
+                    output_lengths = None
+                    output_logprobs = None
+                    input_token_logprobs = None
+                else:
+                    output_embeddings = None
+                    (
+                        output_tokens,
+                        output_lengths,
+                        output_logprobs,
+                        input_token_logprobs,
+                    ) = step_result
+
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
-                self._update_runtime_state(
-                    req_pool_indices=self.input_buffers.state_write_req_pool_indices_buf[
-                        :bs
-                    ],
-                    output_tokens=output_tokens,
-                    accept_lengths=output_lengths,
-                    input_lengths=self.input_buffers.input_lengths_buf[:bs],
-                    num_extends=num_extends,
-                    output_layout=ctx.output_layout,
-                )
+                if output_embeddings is None:
+                    self._update_runtime_state(
+                        req_pool_indices=self.input_buffers.state_write_req_pool_indices_buf[
+                            :bs
+                        ],
+                        output_tokens=output_tokens,
+                        accept_lengths=output_lengths,
+                        input_lengths=self.input_buffers.input_lengths_buf[:bs],
+                        num_extends=num_extends,
+                        output_layout=ctx.output_layout,
+                    )
+
             with nvtx_range("output_d2h", color="green"):
                 output_d2h_start = time.perf_counter() if timing_enabled else 0.0
                 next_input_ids = None
@@ -2212,27 +2244,34 @@ class ModelExecutor:
                 # inference mode, so re-enter it (maybe_inference_mode mirrors the
                 # forward and reduces to no_grad when inference mode is disabled,
                 # where output_tokens isn't an inference tensor anyway).
-                vocab_size = self.runtime_states.vocab_size
-                with maybe_inference_mode():
-                    output_tokens.clamp_(0, vocab_size - 1)
-
-                packed = self.sampling_backend.get_packed_output_d2h(
-                    output_tokens, output_lengths
-                )
-                if packed is not None:
-                    output_tokens, output_lengths = packed
+                if output_embeddings is not None:
+                    # Pooled vectors, not token ids: no vocab clamp.
+                    output_embeddings = output_embeddings.to("cpu", non_blocking=True)
+                    output_tokens = torch.empty(0, dtype=torch.int32)
+                    output_lengths = torch.zeros(bs, dtype=torch.int32)
+                    output_nan_flags = None
                 else:
-                    output_tokens = output_tokens.to("cpu", non_blocking=True)
-                    output_lengths = output_lengths.to("cpu", non_blocking=True)
+                    vocab_size = self.runtime_states.vocab_size
+                    with maybe_inference_mode():
+                        output_tokens.clamp_(0, vocab_size - 1)
 
-                if output_logprobs is not None:
-                    output_logprobs = output_logprobs.to("cpu", non_blocking=True)
-                if input_token_logprobs is not None:
-                    input_token_logprobs = input_token_logprobs.to(
-                        "cpu", non_blocking=True
+                    packed = self.sampling_backend.get_packed_output_d2h(
+                        output_tokens, output_lengths
                     )
+                    if packed is not None:
+                        output_tokens, output_lengths = packed
+                    else:
+                        output_tokens = output_tokens.to("cpu", non_blocking=True)
+                        output_lengths = output_lengths.to("cpu", non_blocking=True)
 
-                output_nan_flags = self.nan_guard.flags_cpu
+                    if output_logprobs is not None:
+                        output_logprobs = output_logprobs.to("cpu", non_blocking=True)
+                    if input_token_logprobs is not None:
+                        input_token_logprobs = input_token_logprobs.to(
+                            "cpu", non_blocking=True
+                        )
+
+                    output_nan_flags = self.nan_guard.flags_cpu
 
                 copy_event = self.device_module.Event()
                 copy_event.record()
@@ -2263,6 +2302,7 @@ class ModelExecutor:
             output_tokens=output_tokens,
             output_lengths=output_lengths,
             output_logprobs=output_logprobs,
+            output_embeddings=output_embeddings,
             copy_event=copy_event,
             grammar_completion=grammar_completion,
             next_input_ids=next_input_ids,

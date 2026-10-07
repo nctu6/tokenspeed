@@ -23,7 +23,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
-from tokenspeed.runtime.engine.io_struct import BatchTokenIDOut
+from tokenspeed.runtime.engine.io_struct import BatchEmbeddingOut, BatchTokenIDOut
 from tokenspeed.runtime.engine.request_stats import (
     NOOP_STATS,
     RequestStats,
@@ -112,6 +112,7 @@ class RequestState:
 
         # --- generation state (updated with forward step) ---
         self.output_ids: list[int] = []
+        self.embedding = None  # set by pooling forward
         self.finished_reason: BaseFinishReason | None = None
         self.cached_tokens: int = 0
         self.prefix_len: int = 0
@@ -221,7 +222,7 @@ class RequestState:
         return cls(
             prompt_input_ids=recv_req.input_ids,
             sampling_params=recv_req.sampling_params,
-            stream=recv_req.stream,
+            stream=getattr(recv_req, "stream", False),
             tokenizer=tokenizer,
             computes_prompt_logprobs=computes_prompt_logprobs,
             eos_token_ids=eos_token_ids,
@@ -738,12 +739,75 @@ class OutputProcesser:
             if rs := self.rid_to_state.get(rid):
                 rs.cached_tokens += max(0, prefix_len + replay_len - rs.computed_length)
 
+    def post_process_embedding_forward_op(self, forward_op, results):
+        """Commit a pooling forward: one vector per request, then finished.
+
+        ``results`` is already synced by ``PendingExecution.result()`` (nctu6
+        exactly-once sync gate); do not call ``results.sync()`` again.
+        """
+        self.add_cached_tokens(
+            forward_op.request_ids,
+            forward_op.extend_prefix_lens,
+            forward_op.extend_replay_lens,
+        )
+        self.add_computed_length(
+            forward_op.request_ids,
+            forward_op.input_lengths,
+            forward_op.extend_prefix_lens,
+        )
+
+        request_changes = []
+        stream_out_rids = []
+        stream_out_states = []
+        embeddings = results.output_embeddings
+        for i, rid in enumerate(forward_op.request_ids):
+            request_state: RequestState = self.rid_to_state.get(rid)
+            if request_state is None:
+                continue
+            if not request_state.prefill_finished:
+                raise RuntimeError(
+                    f"pooling request {rid} was scheduled as a partial prefill; "
+                    "embedding models require whole-prompt prefill"
+                )
+
+            request_state.embedding = embeddings[i].tolist()
+            request_state.finished_reason = FINISH_LENGTH(length=0)
+            request_changes.append(make_extend_result_event(rid))
+            request_changes.append(make_finish_event(rid))
+            stream_out_rids.append(rid)
+            stream_out_states.append(request_state)
+            self.rid_to_state.pop(rid)
+
+        self.stream_embedding_output(stream_out_rids, stream_out_states)
+        return request_changes
+
+    def stream_embedding_output(
+        self, rids: list[str], states: list[RequestState]
+    ) -> None:
+        """Ship pooled vectors to AsyncLLM over the same socket as tokens."""
+        if not states:
+            return
+        batch_out = BatchEmbeddingOut(
+            rids=rids,
+            finished_reasons=[
+                state.finished_reason.to_json() if state.finished_reason else None
+                for state in states
+            ],
+            embeddings=[state.embedding for state in states],
+            prompt_tokens=[state.input_length for state in states],
+        )
+        self.send_to_tokenizer.send_pyobj(batch_out)
+
     def post_process_forward_op(
         self,
         forward_op,
         model_execution_results: ModelExecutionResult,
         is_prefill_instance: bool,
     ):
+        if model_execution_results.output_embeddings is not None:
+            return self.post_process_embedding_forward_op(
+                forward_op, model_execution_results
+            )
         self.add_cached_tokens(
             forward_op.request_ids,
             forward_op.extend_prefix_lens,

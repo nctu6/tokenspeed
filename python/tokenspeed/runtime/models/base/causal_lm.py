@@ -35,6 +35,11 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from tokenspeed.runtime.layers.pooler import (
+    Pooler,
+    PoolerOutput,
+    seq_lens_from_gather_ids,
+)
 from tokenspeed.runtime.layers.quantization import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.model_loader.weight_utils import (
@@ -188,6 +193,8 @@ class BaseCausalLM(nn.Module):
         self._weight_update_derive_pending = False
         self._weight_update_non_unit_kv_scales = None
 
+        self.pooler = self.resolve_pooler(config)
+
         self.encoder_only = encoder_only
         if encoder_only:
             # Vision-only role (EPD encode): never allocate the LM / lm_head /
@@ -199,7 +206,12 @@ class BaseCausalLM(nn.Module):
             self.logits_processor = None
         else:
             self.model = self.resolve_model(config, mapping, quant_config, prefix)
-            if mapping.is_last_pp_rank:
+            if self.pooler is not None:
+                # A pooling checkpoint has no lm_head (Qwen3-Embedding ships
+                # embed_tokens + layers.* only); pooling never uses logits.
+                self.lm_head = None
+                self.logits_processor = None
+            elif mapping.is_last_pp_rank:
                 self.lm_head = self.resolve_lm_head(config, quant_config, prefix)
                 self.logits_processor = self.resolve_logits_processor(config)
             else:
@@ -207,6 +219,15 @@ class BaseCausalLM(nn.Module):
                 self.lm_head = None
                 self.logits_processor = None
         self.post_init()
+
+    def resolve_pooler(self, config: PretrainedConfig) -> Pooler | None:
+        pooling_config = getattr(config, "pooling_config", None)
+        if pooling_config is None:
+            return None
+        return Pooler(
+            pooling_type=pooling_config.pooling_type,
+            normalize=pooling_config.normalize,
+        )
 
     def resolve_model(
         self,
@@ -330,7 +351,29 @@ class BaseCausalLM(nn.Module):
             # Mid-pipeline stage: the executor sends this boundary state to
             # the next stage; there are no logits here.
             return hidden_states
+        if kwargs.get("get_embedding"):
+            return self.pool(ctx, hidden_states)
         return self.exit_logits(input_ids, hidden_states, aux_hidden_states, ctx)
+
+    def pool(self, ctx: ForwardContext, hidden_states: torch.Tensor) -> PoolerOutput:
+        """Reduce this prefill's hidden states to one vector per request."""
+        if self.pooler is None:
+            raise RuntimeError(
+                "get_embedding was requested but this model has no pooler; "
+                "start the server with --is-embedding on a pooling checkpoint."
+            )
+        if ctx.gather_ids is None:
+            raise RuntimeError(
+                "pooling requires ForwardContext.gather_ids, which only an "
+                "extend forward carries. Got forward_mode="
+                f"{ctx.forward_mode} bs={ctx.bs} num_extends={ctx.num_extends} "
+                f"input_num_tokens={ctx.input_num_tokens}"
+            )
+        return self.pooler(
+            hidden_states,
+            gather_ids=ctx.gather_ids,
+            extend_seq_lens=seq_lens_from_gather_ids(ctx.gather_ids),
+        )
 
     def exit_logits(
         self,
