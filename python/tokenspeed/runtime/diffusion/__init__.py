@@ -19,7 +19,7 @@
 
 Small parallel surface to the generative engine: no paged KV, no autoregressive
 decode. The first vertical slice wraps released ``diffusers`` ModularPipeline
-for MiniMax-H3. Diffusers deps ship via ``tokenspeed[diffusion]``; ``./scripts/install.sh`` installs them by default.
+for MiniMax-H3 and MiniMax-Music3. Diffusers deps ship via ``tokenspeed[diffusion]``; ``./scripts/install.sh`` installs them by default.
 
 Heavy imports (pipeline / job) are lazy so ``config`` stays CPU-importable.
 """
@@ -31,7 +31,10 @@ from typing import TYPE_CHECKING
 __all__ = [
     "H3Config",
     "H3Pipeline",
+    "Music3Config",
+    "Music3Pipeline",
     "VideoJobQueue",
+    "detect_diffusion_family",
     "resolve_diffusion_checkpoint",
     "AUDIO_SIGMA_SHIFT",
     "VIDEO_SIGMA_SHIFT",
@@ -54,6 +57,18 @@ def __getattr__(name: str):
         from tokenspeed.runtime.diffusion.pipeline import H3Pipeline
 
         return H3Pipeline
+    if name == "Music3Pipeline":
+        from tokenspeed.runtime.diffusion.music3_pipeline import Music3Pipeline
+
+        return Music3Pipeline
+    if name == "Music3Config":
+        from tokenspeed.runtime.diffusion.music3_config import Music3Config
+
+        return Music3Config
+    if name == "detect_diffusion_family":
+        from tokenspeed.runtime.diffusion.family import detect_diffusion_family
+
+        return detect_diffusion_family
     if name == "VideoJobQueue":
         from tokenspeed.runtime.diffusion.job import VideoJobQueue
 

@@ -53,10 +53,10 @@ def _serve_asr(raw_argv: list[str]) -> None:
 
 
 def _serve_diffusion(raw_argv: list[str]) -> None:
-    """``ts serve`` for diffusers pipelines (MiniMax-H3, ...).
+    """``ts serve`` for diffusers pipelines (MiniMax-H3, MiniMax-Music3, ...).
 
-    SMG has no video RPC. ``entrypoints/diffusion_http`` owns ModularPipeline
-    residency and serves OpenAI-shaped ``/v1/videos`` (+ ``/v1/videos/sync``).
+    SMG has no video/music RPC. ``entrypoints/diffusion_http`` dispatches:
+    H3 → ``/v1/videos`` (+ sync); Music3 → ``music3_http`` ``/v1/audio/speech``.
     Flags keep vLLM-familiar names (``--tensor-parallel-size``, ``--task-type``)
     at the CLI boundary; the implementation is TokenSpeed-native.
     """

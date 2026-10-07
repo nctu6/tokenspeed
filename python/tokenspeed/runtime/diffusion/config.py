@@ -138,16 +138,9 @@ class H3Config:
 
 
 def _is_modular_root(path: str) -> bool:
-    index = os.path.join(path, "model_index.json")
-    if not os.path.isfile(index):
-        return False
-    try:
-        with open(index) as handle:
-            meta = json.load(handle)
-    except (OSError, ValueError):
-        return False
-    name = str(meta.get("_class_name") or "")
-    return "Modular" in name or meta.get("_blocks_class_name") is not None
+    from tokenspeed.runtime.diffusion.family import is_modular_checkpoint
+
+    return is_modular_checkpoint(path)
 
 
 def resolve_diffusion_checkpoint(model_path: str) -> str:
@@ -169,13 +162,14 @@ def resolve_diffusion_checkpoint(model_path: str) -> str:
     if base in {"FL2VA", "Ref2VA"} and _is_modular_root(parent):
         return parent
 
-    # Partition-only tree without a modular sibling: still require model_index
-    # so runtime_select keeps classifying it as diffusion, but warn callers.
-    if os.path.isfile(os.path.join(path, "model_index.json")):
+    # Partition-only / index-only tree: accept either modular index name.
+    if os.path.isfile(os.path.join(path, "model_index.json")) or os.path.isfile(
+        os.path.join(path, "modular_model_index.json")
+    ):
         return path
 
     raise FileNotFoundError(
-        f"{path} has no model_index.json (need MiniMax-H3 repo root or FL2VA/)"
+        f"{path} has no model_index.json (need MiniMax-H3 / MiniMax-Music3 repo root or H3 FL2VA/)"
     )
 
 

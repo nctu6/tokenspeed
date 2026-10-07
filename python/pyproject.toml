@@ -98,13 +98,14 @@ ts = "tokenspeed.cli:main"
 [project.optional-dependencies]
 # Capped: 0.1.9 clones internally, so a release that stops would alias silently.
 instanttensor = ["instanttensor>=0.1.9,<0.2"]
-# MiniMax-H3 / ModularPipeline video+audio generation. Grouped as an extra for
-# lean pip-only installs; ./scripts/install.sh installs these by DEFAULT
-# (same as other implemented-model deps; additive, no kernel upgrade).
+# MiniMax-H3 (video) + MiniMax-Music3 (WAV) ModularPipeline. Grouped as an
+# extra for lean pip-only installs; ./scripts/install.sh installs these by
+# DEFAULT (same as other implemented-model deps; additive, no kernel upgrade).
 diffusion = [
     "diffusers>=0.40.0",
     "av",
     "imageio-ffmpeg",
+    "soundfile",
 ]
 
 [tool.setuptools]

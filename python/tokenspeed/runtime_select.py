@@ -96,11 +96,25 @@ def resolve_serving_runtime(model_path: str) -> str:
     if not model_path or not os.path.isdir(model_path):
         return "generate"
 
-    # A diffusers pipeline is a *directory of components* -- text encoder,
-    # transformer, VAE -- described by model_index.json. Nothing else in this
-    # tree ships that file, and its top level has no architectures of its own.
-    if os.path.isfile(os.path.join(model_path, "model_index.json")):
+    # A diffusers ModularPipeline is a *directory of components* described by
+    # modular_model_index.json (MiniMax-Music3) and/or model_index.json
+    # (MiniMax-H3). Nothing else in this tree ships those files at the root.
+    if os.path.isfile(os.path.join(model_path, "modular_model_index.json")) or os.path.isfile(
+        os.path.join(model_path, "model_index.json")
+    ):
         return "diffusion"
+    # Music3 also declares model_type on a root config.json even when indexes
+    # are present; keep this as a belt-and-suspenders signal for incomplete trees.
+    try:
+        with open(os.path.join(model_path, "config.json")) as handle:
+            cfg = json.load(handle)
+        if str(cfg.get("model_type") or "").lower() == "minimax_music3":
+            return "diffusion"
+        arch = cfg.get("architectures") or []
+        if any("Music3" in str(a) for a in arch):
+            return "diffusion"
+    except (OSError, ValueError):
+        pass
 
     architectures = _architectures(model_path)
 
@@ -131,5 +145,5 @@ def describe_runtime(runtime: str) -> str:
         "embed": "embedding (one pooled vector per request, no decode)",
         "rerank": "cross-encoder reranker (one score per query/document pair)",
         "asr": "speech recognition (encoder-decoder)",
-        "diffusion": "image/video diffusion pipeline",
+        "diffusion": "image/video/audio diffusion pipeline (MiniMax-H3 / Music3)",
     }.get(runtime, runtime)

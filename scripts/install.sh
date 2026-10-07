@@ -115,9 +115,9 @@ REINSTALL_SMG="${REINSTALL_SMG:-0}"
 # `flash_attn.cute` namespace the kernel needs. Both are equivalent triggers.
 REINSTALL_FA2="${REINSTALL_FA2:-0}"
 BUILD_FA2="${BUILD_FA2:-0}"
-# REINSTALL_DIFFUSION force-reinstalls MiniMax-H3 diffusion deps
-# (diffusers>=0.40, PyAV, imageio-ffmpeg). They install by DEFAULT so
-# install.sh covers every implemented model path (additive; no kernel/CUDA).
+# REINSTALL_DIFFUSION force-reinstalls MiniMax-H3 / Music3 diffusion deps
+# (diffusers>=0.40, PyAV, imageio-ffmpeg, soundfile). They install by DEFAULT
+# so install.sh covers every implemented model path (additive; no kernel/CUDA).
 REINSTALL_DIFFUSION="${REINSTALL_DIFFUSION:-0}"
 for arg in "$@"; do
     case "$arg" in
@@ -838,8 +838,8 @@ if [[ "$FRESH" == "1" ]]; then
     # Diffusion deps (MiniMax-H3 /v1/videos): same class as torchao -- required
     # for an implemented model path. Pure Python / wheels; no kernel rebuild.
     # Also pulled via python[diffusion] above; reaffirm here for clarity.
-    log "Installing diffusion deps (MiniMax-H3: diffusers, av, imageio-ffmpeg)"
-    "$PY" -m pip install "diffusers>=0.40.0" av imageio-ffmpeg
+    log "Installing diffusion deps (H3/Music3: diffusers, av, imageio-ffmpeg, soundfile)"
+    "$PY" -m pip install "diffusers>=0.40.0" av imageio-ffmpeg soundfile
     # NOTE: vllm_flash_attn (FA2) is intentionally NOT built here. It is an
     # optional prefill speedup and its package can shadow the kernel's FA4
     # namespace, so it is opt-in via --with-fa2 (handled by the FA2 block below).
@@ -874,25 +874,25 @@ else
     skip "Skipping FA2 (vllm_flash_attn). It is optional; prefill uses the Triton fallback. Build it with: ./scripts/install.sh --with-fa2"
 fi
 
-# --- diffusion deps (MiniMax-H3 / ModularPipeline) -- DEFAULT -----------------
+# --- diffusion deps (MiniMax-H3 / Music3 ModularPipeline) -- DEFAULT ----------
 # Additive: does not touch the kernel or upgrade CUDA. Always ensured so a
 # plain ./scripts/install.sh covers every implemented model (incl. /v1/videos).
 # Idempotent: skip when already importable unless --force-diffusion.
-if [[ "$REINSTALL_DIFFUSION" == "1" ]] || ! have_module diffusers || ! have_module av; then
-    log "Installing diffusion deps for MiniMax-H3 (diffusers>=0.40, av, imageio-ffmpeg)"
+if [[ "$REINSTALL_DIFFUSION" == "1" ]] || ! have_module diffusers || ! have_module av || ! have_module soundfile; then
+    log "Installing diffusion deps for MiniMax-H3/Music3 (diffusers>=0.40, av, imageio-ffmpeg, soundfile)"
     if [[ "$REINSTALL_DIFFUSION" == "1" ]]; then
-        "$PY" -m pip install --upgrade --force-reinstall "diffusers>=0.40.0" av imageio-ffmpeg
+        "$PY" -m pip install --upgrade --force-reinstall "diffusers>=0.40.0" av imageio-ffmpeg soundfile
     else
-        "$PY" -m pip install "diffusers>=0.40.0" av imageio-ffmpeg
+        "$PY" -m pip install "diffusers>=0.40.0" av imageio-ffmpeg soundfile
     fi
-    if ! "$PY" -c "import diffusers; import av" >/dev/null 2>&1; then
-        err "diffusion deps installed but import failed; MiniMax-H3 serve will refuse to start"
+    if ! "$PY" -c "import diffusers; import av; import soundfile" >/dev/null 2>&1; then
+        err "diffusion deps installed but import failed; H3/Music3 serve will refuse to start"
     else
         ver="$("$PY" -c 'import diffusers; print(diffusers.__version__)')"
-        log "diffusers $ver import OK (MiniMax-H3 ModularPipeline path)"
+        log "diffusers $ver + soundfile import OK (H3/Music3 ModularPipeline path)"
     fi
 else
-    skip "diffusion deps already present (MiniMax-H3). Force-reinstall with: ./scripts/install.sh --force-diffusion"
+    skip "diffusion deps already present (H3/Music3). Force-reinstall with: ./scripts/install.sh --force-diffusion"
 fi
 
 # --- Verify WITHOUT importing the kernel (mirrors the Dockerfile check) -------

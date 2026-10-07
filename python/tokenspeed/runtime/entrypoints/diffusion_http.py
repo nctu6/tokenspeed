@@ -15,11 +15,12 @@
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
-"""``/v1/videos`` (async job) and ``/v1/videos/sync`` for diffusion checkpoints.
+"""``/v1/videos`` (async job) and ``/v1/videos/sync`` for MiniMax-H3.
 
-Sibling of :mod:`asr_http`: the smg gateway speaks a text-in/text-out proto, so
-a DiT video model cannot be reached through it. This process owns the
-``H3Pipeline`` and exposes the OpenAI-shaped video surface.
+Sibling of :mod:`asr_http` and :mod:`music3_http`. The smg gateway speaks a
+text-in/text-out proto, so a DiT video model cannot be reached through it.
+``serve()`` also dispatches MiniMax-Music3 to :mod:`music3_http`
+(``/v1/audio/speech``) when the checkpoint family is ``music3``.
 
 Flags intentionally mirror familiar vLLM / vLLM-Omni names where the meaning
 matches (``--tensor-parallel-size``, ``--served-model-name``, ``--host``,
@@ -389,6 +390,7 @@ def serve(argv: list[str], *, host: str | None = None, port: int | None = None) 
 
     import uvicorn
 
+    from tokenspeed.runtime.diffusion.family import detect_diffusion_family
     from tokenspeed.runtime.diffusion.ulysses import (
         CMD_SHUTDOWN,
         barrier,
@@ -398,6 +400,23 @@ def serve(argv: list[str], *, host: str | None = None, port: int | None = None) 
         usp_world_size,
         worker_loop,
     )
+
+    # Peek model path before full H3 parse so Music3 does not inherit video defaults.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("model", nargs="?", default=None)
+    pre.add_argument("--model", dest="model_flag", default=None)
+    pre_args, _ = pre.parse_known_args(argv)
+    model_path = pre_args.model_flag or pre_args.model
+    if model_path:
+        try:
+            family = detect_diffusion_family(model_path)
+        except ValueError:
+            family = "h3"
+        if family == "music3":
+            from tokenspeed.runtime.entrypoints.music3_http import serve as music3_serve
+
+            music3_serve(argv, host=host, port=port)
+            return
 
     args = parse_diffusion_argv(argv)
     host = host or args.host
