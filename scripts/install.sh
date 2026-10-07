@@ -115,6 +115,10 @@ REINSTALL_SMG="${REINSTALL_SMG:-0}"
 # `flash_attn.cute` namespace the kernel needs. Both are equivalent triggers.
 REINSTALL_FA2="${REINSTALL_FA2:-0}"
 BUILD_FA2="${BUILD_FA2:-0}"
+# REINSTALL_DIFFUSION force-reinstalls MiniMax-H3 diffusion deps
+# (diffusers>=0.40, PyAV, imageio-ffmpeg). They install by DEFAULT so
+# install.sh covers every implemented model path (additive; no kernel/CUDA).
+REINSTALL_DIFFUSION="${REINSTALL_DIFFUSION:-0}"
 for arg in "$@"; do
     case "$arg" in
         --force) REINSTALL=1 ;;
@@ -122,6 +126,7 @@ for arg in "$@"; do
         --force-smg) REINSTALL_SMG=1 ;;
         --force-fa2) REINSTALL_FA2=1 ;;
         --with-fa2) BUILD_FA2=1 ;;
+        --force-diffusion) REINSTALL_DIFFUSION=1 ;;
     esac
 done
 
@@ -813,8 +818,8 @@ if [[ "$FRESH" == "1" ]]; then
     log "[2/5] Installing tokenspeed-scheduler (editable)"
     "$PY" -m pip install -e tokenspeed-scheduler/
 
-    log "[3/5] Installing the engine (python/, editable) -- pulls third-party deps"
-    "$PY" -m pip install -e ./python --no-build-isolation
+    log "[3/5] Installing the engine (python/, editable) -- pulls third-party deps (+diffusion)"
+    "$PY" -m pip install -e "./python[diffusion]" --no-build-isolation
 
     log "[4/5] Reinstalling tokenspeed-kernel from source (non-editable, force, no-deps) so it wins"
     "$PY" -m pip install tokenspeed-kernel/python/ \
@@ -830,6 +835,11 @@ if [[ "$FRESH" == "1" ]]; then
     # Pure Python, so a synced engine edit still needs no reinstall.
     log "Installing torchao (runtime dep for torchao-quantized checkpoints)"
     "$PY" -m pip install "torchao>=0.10.0"
+    # Diffusion deps (MiniMax-H3 /v1/videos): same class as torchao -- required
+    # for an implemented model path. Pure Python / wheels; no kernel rebuild.
+    # Also pulled via python[diffusion] above; reaffirm here for clarity.
+    log "Installing diffusion deps (MiniMax-H3: diffusers, av, imageio-ffmpeg)"
+    "$PY" -m pip install "diffusers>=0.40.0" av imageio-ffmpeg
     # NOTE: vllm_flash_attn (FA2) is intentionally NOT built here. It is an
     # optional prefill speedup and its package can shadow the kernel's FA4
     # namespace, so it is opt-in via --with-fa2 (handled by the FA2 block below).
@@ -862,6 +872,27 @@ if [[ "$FA2_WORK" == "1" ]]; then
         err "continuing without vllm_flash_attn; FA2 prefill falls back to Triton (engine unaffected)."
 else
     skip "Skipping FA2 (vllm_flash_attn). It is optional; prefill uses the Triton fallback. Build it with: ./scripts/install.sh --with-fa2"
+fi
+
+# --- diffusion deps (MiniMax-H3 / ModularPipeline) -- DEFAULT -----------------
+# Additive: does not touch the kernel or upgrade CUDA. Always ensured so a
+# plain ./scripts/install.sh covers every implemented model (incl. /v1/videos).
+# Idempotent: skip when already importable unless --force-diffusion.
+if [[ "$REINSTALL_DIFFUSION" == "1" ]] || ! have_module diffusers || ! have_module av; then
+    log "Installing diffusion deps for MiniMax-H3 (diffusers>=0.40, av, imageio-ffmpeg)"
+    if [[ "$REINSTALL_DIFFUSION" == "1" ]]; then
+        "$PY" -m pip install --upgrade --force-reinstall "diffusers>=0.40.0" av imageio-ffmpeg
+    else
+        "$PY" -m pip install "diffusers>=0.40.0" av imageio-ffmpeg
+    fi
+    if ! "$PY" -c "import diffusers; import av" >/dev/null 2>&1; then
+        err "diffusion deps installed but import failed; MiniMax-H3 serve will refuse to start"
+    else
+        ver="$("$PY" -c 'import diffusers; print(diffusers.__version__)')"
+        log "diffusers $ver import OK (MiniMax-H3 ModularPipeline path)"
+    fi
+else
+    skip "diffusion deps already present (MiniMax-H3). Force-reinstall with: ./scripts/install.sh --force-diffusion"
 fi
 
 # --- Verify WITHOUT importing the kernel (mirrors the Dockerfile check) -------

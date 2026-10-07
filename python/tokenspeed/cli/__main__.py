@@ -52,6 +52,21 @@ def _serve_asr(raw_argv: list[str]) -> None:
     serve(engine_args, host=host, port=port)
 
 
+def _serve_diffusion(raw_argv: list[str]) -> None:
+    """``ts serve`` for diffusers pipelines (MiniMax-H3, ...).
+
+    SMG has no video RPC. ``entrypoints/diffusion_http`` owns ModularPipeline
+    residency and serves OpenAI-shaped ``/v1/videos`` (+ ``/v1/videos/sync``).
+    Flags keep vLLM-familiar names (``--tensor-parallel-size``, ``--task-type``)
+    at the CLI boundary; the implementation is TokenSpeed-native.
+    """
+    from tokenspeed.runtime.entrypoints.diffusion_http import serve
+
+    _, host, port = _split_host_port(raw_argv)
+    print(f"[ts serve] diffusion server on http://{host}:{port}")
+    serve(raw_argv, host=host, port=port)
+
+
 def _serve(args: argparse.Namespace, raw_argv: list[str]) -> None:
     from tokenspeed.cli.serve_smg import run_smg_from_args
 
@@ -61,10 +76,18 @@ def _serve(args: argparse.Namespace, raw_argv: list[str]) -> None:
         from tokenspeed.runtime_select import describe_runtime, resolve_serving_runtime
 
         model = next((a for a in raw_argv if a and not a.startswith("-")), "")
+        # Also accept ``--model <path>`` (vLLM-shaped) when no positional.
+        if not model and "--model" in raw_argv:
+            idx = raw_argv.index("--model")
+            if idx + 1 < len(raw_argv):
+                model = raw_argv[idx + 1]
         runtime = resolve_serving_runtime(model) if model else "generate"
         print(f"[ts serve] runtime: {runtime} -- {describe_runtime(runtime)}")
         if runtime == "asr":
             _serve_asr(raw_argv)
+            return
+        if runtime == "diffusion":
+            _serve_diffusion(raw_argv)
             return
 
     run_smg_from_args(args, raw_argv)
