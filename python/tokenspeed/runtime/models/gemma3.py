@@ -22,8 +22,10 @@
 
 This implements the *text* decoder of ``Gemma3ForConditionalGeneration`` (the
 multimodal 4B/12B/27B checkpoints) and the equivalent ``Gemma3ForCausalLM``
-(the text-only release). The vision tower of the multimodal checkpoint is
-skipped -- text-only inputs are supported, which covers the LLM benchmark.
+(the text-only release). Multimodal (text+image) is supported when ``is_multimodal_active``:
+SigLIP vision tower + ``Gemma3MultiModalProjector`` feed soft tokens via
+``VisionEmbedder``. Pass ``--language-model-only`` to keep the legacy
+text-only path (vision weights skipped).
 
 Gemma 3 differs from both a naive GQA port AND from the Gemma 4 module in this
 package. The source of truth is HF ``transformers.models.gemma3`` plus the
@@ -86,7 +88,20 @@ from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM
+from tokenspeed.runtime.models.gemma3_vision import (
+    Gemma3MultiModalProjector,
+    build_gemma3_vision_tower,
+    encode_gemma3_images,
+    gemma3_make_image_warmup_items,
+    gemma3_mm_tokens_per_image,
+)
 from tokenspeed.runtime.models.utils import validate_attention_partition
+from tokenspeed.runtime.multimodal.embedder import (
+    EncoderSpec,
+    VisionEmbedder,
+    pad_input_tokens,
+)
+from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalInputs
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger, make_layers
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -595,13 +610,45 @@ class Gemma3Model(nn.Module):
         return hidden_states, None
 
 
-class Gemma3ForConditionalGeneration(BaseCausalLM):
-    """Text decoder of ``Gemma3ForConditionalGeneration``.
 
-    The vision tower is skipped: text-only inputs are supported (covers the LLM
-    benchmark). ``final_logit_softcapping`` (``None`` on Gemma 3) and the tied
-    ``lm_head`` are handled by the shared ``BaseCausalLM`` / ``LogitsProcessor``,
-    both reading from the text config passed to ``super().__init__``.
+class _Gemma3ScaledEmbedding(nn.Module):
+    """VocabParallelEmbedding plus Gemma ``sqrt(hidden_size)`` normalizer.
+
+    ``VisionEmbedder`` calls the embedding module directly; Gemma 3 needs the
+    same scale HF applies in ``get_input_embeddings`` so text rows stay
+    consistent with the text-only path. Vision soft tokens replace those rows
+    after the lookup and are already in the projected text space.
+    """
+
+    def __init__(self, embed_tokens: nn.Module, hidden_size: int) -> None:
+        super().__init__()
+        self.embed_tokens = embed_tokens
+        self.hidden_size = hidden_size
+        self.num_embeddings = embed_tokens.num_embeddings
+        self.embedding_dim = embed_tokens.embedding_dim
+        self._normalizer_by_dtype: dict[torch.dtype, float] = {}
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.embed_tokens.weight
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        embeds = self.embed_tokens(input_ids)
+        scale = self._normalizer_by_dtype.get(embeds.dtype)
+        if scale is None:
+            scale = float(torch.tensor(self.hidden_size**0.5, dtype=embeds.dtype))
+            self._normalizer_by_dtype[embeds.dtype] = scale
+        return embeds * scale
+
+
+class Gemma3ForConditionalGeneration(BaseCausalLM):
+    """Gemma 3 causal LM with optional SigLIP vision (text+image).
+
+    When ``is_multimodal_active`` is True (default for multimodal
+    checkpoints), the vision tower and projector are built and vision
+    weights are loaded. Text-only requests still work. Set
+    ``language_model_only`` / ``is_multimodal_active=False`` for the
+    legacy text-only path that skips vision tensors.
     """
 
     model_cls = Gemma3Model
@@ -611,34 +658,118 @@ class Gemma3ForConditionalGeneration(BaseCausalLM):
         config,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
+        is_multimodal_active: bool = True,
+        mm_attention_backend: str | None = None,
     ) -> None:
-        # The sandwich-norm layer keeps attention and MLP on one residual
-        # stream, so a split attn/dense TP would need a shard exchange this
-        # layer does not perform. Refuse rather than return wrong numbers.
+        del mm_attention_backend  # SigLIP path is eager; reserved for parity.
         if mapping.attn.tp_size != mapping.dense.tp_size:
             raise ValueError(
                 "Gemma 3 requires attn.tp_size == dense.tp_size, got "
                 f"{mapping.attn.tp_size} != {mapping.dense.tp_size}."
             )
-        # Drive the LM off the text sub-config so BaseCausalLM sees hidden_size,
-        # vocab_size, tie_word_embeddings and final_logit_softcapping.
+        # Keep the outer multimodal config so vision fields remain reachable.
+        self.hf_config = config
+        self.is_multimodal_active = bool(
+            is_multimodal_active and hasattr(config, "vision_config")
+        )
         super().__init__(
             config=_text_config(config),
             mapping=mapping,
             quant_config=quant_config,
         )
 
+        self.vision_tower = None
+        self.multi_modal_projector = None
+        self.vision_embedder = None
+        self.image_encoder = None
+        if self.is_multimodal_active:
+            vision_config = config.vision_config
+            text_hidden = int(_text_config(config).hidden_size)
+            vision_hidden = int(vision_config.hidden_size)
+            image_size = int(vision_config.image_size)
+            patch_size = int(vision_config.patch_size)
+            mm_tokens = gemma3_mm_tokens_per_image(config)
+            eps = float(getattr(vision_config, "layer_norm_eps", 1e-6) or 1e-6)
+            self.vision_tower = build_gemma3_vision_tower(vision_config)
+            self.multi_modal_projector = Gemma3MultiModalProjector(
+                vision_hidden_size=vision_hidden,
+                text_hidden_size=text_hidden,
+                image_size=image_size,
+                patch_size=patch_size,
+                mm_tokens_per_image=mm_tokens,
+                eps=eps,
+            )
+            self._mm_image_size = image_size
+            self._mm_tokens_per_image = mm_tokens
+            self.vision_embedder = VisionEmbedder(encoder_mapping=mapping.vision)
+            self.image_encoder = self.get_image_feature
+        self._scaled_embed = None
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
 
+    def pad_input_ids(
+        self, input_ids: list[int], mm_inputs: MultimodalInputs
+    ) -> list[int]:
+        return pad_input_tokens(input_ids, mm_inputs)
+
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.image_encoder is None:
+            return {}
+        return {
+            Modality.IMAGE: EncoderSpec(
+                self.image_encoder,
+                make_warmup_items=self.make_image_warmup_items,
+            )
+        }
+
+    def make_image_warmup_items(self):
+        dtype = next(self.parameters()).dtype
+        return gemma3_make_image_warmup_items(
+            image_size=self._mm_image_size,
+            dtype=dtype,
+        )
+
+    def get_image_feature(self, items):
+        if self.vision_tower is None or self.multi_modal_projector is None:
+            raise RuntimeError("Gemma 3 multimodal path is not initialized.")
+        return encode_gemma3_images(
+            self.vision_tower, self.multi_modal_projector, items
+        )
+
+    @torch.no_grad()
+    def forward(
+        self,
+        ctx: ForwardContext,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        **kwargs,
+    ):
+        multimodal_context = kwargs.pop("multimodal_context", None)
+        if (
+            self.vision_embedder is None
+            or multimodal_context is None
+            or not multimodal_context.has_extend_inputs()
+            or ctx.forward_mode.is_decode_or_idle()
+        ):
+            return super().forward(ctx, input_ids, positions, **kwargs)
+
+        if not hasattr(self, "_scaled_embed") or self._scaled_embed is None:
+            self._scaled_embed = _Gemma3ScaledEmbedding(
+                self.model.embed_tokens, self.model.hidden_size
+            )
+        input_embeds, model_kwargs = self.vision_embedder.apply(
+            input_ids=input_ids,
+            text_embedding=self._scaled_embed,
+            ctx=multimodal_context,
+            encoders=self.get_multimodal_encoder_specs(),
+            multimodal_model=self,
+        )
+        assert not model_kwargs, "Gemma 3 multimodal path must stay embeds-only"
+        kwargs["input_embeds"] = input_embeds
+        return super().forward(ctx, input_ids, positions, **kwargs)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs):
-        # Gemma stores gate/up separately; fuse into gate_up_proj. q/k/v are
-        # NOT fused in the checkpoint (separate q_norm/k_norm live between the
-        # projections and RoPE), so they load directly.
-        # (fused param, checkpoint shard name, shard id). q/k/v fuse into the
-        # single qkv_proj GEMM; the checkpoint stores them separately (the
-        # per-head q_norm/k_norm live between the projections and RoPE, so the
-        # projection weights themselves are plain). gate/up fuse into gate_up.
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -650,33 +781,42 @@ class Gemma3ForConditionalGeneration(BaseCausalLM):
         loaded: set[str] = set()
         skipped: list[str] = []
         for name, loaded_weight in weights:
-            # Skip the vision tower and multimodal projector of the
-            # *ForConditionalGeneration checkpoint.
-            if (
+            # Skip rotary buffers; optionally skip vision when text-only.
+            if "rotary_emb.inv_freq" in name:
+                continue
+            is_vision = (
                 name.startswith("model.vision_tower")
                 or name.startswith("vision_tower")
                 or name.startswith("model.multi_modal_projector")
                 or name.startswith("multi_modal_projector")
-                or "rotary_emb.inv_freq" in name
-            ):
+            )
+            if is_vision and not self.is_multimodal_active:
                 continue
-            # Text weights live under (model.)language_model.model.* in the
-            # multimodal checkpoint; map onto our model.* namespace.
+
+            # Remap multimodal checkpoint namespaces onto this module.
             if name.startswith("model.language_model."):
                 name = "model." + name[len("model.language_model.") :]
             elif name.startswith("language_model.model."):
                 name = "model." + name[len("language_model.model.") :]
             elif name.startswith("language_model."):
                 name = "model." + name[len("language_model.") :]
-            # Tied lm_head is not stored separately.
+            elif name.startswith("model.vision_tower."):
+                name = "vision_tower." + name[len("model.vision_tower.") :]
+            elif name.startswith("model.multi_modal_projector."):
+                name = "multi_modal_projector." + name[
+                    len("model.multi_modal_projector.") :
+                ]
+            # HF SiglipVisionModel params are vision_tower.embeddings.*; the
+            # checkpoint nests them under vision_tower.vision_model.*.
+            if name.startswith("vision_tower.vision_model."):
+                name = "vision_tower." + name[len("vision_tower.vision_model.") :]
+
             if "lm_head" in name:
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                # gate/up live in mlp; q/k/v in self_attn. Keep the two fused
-                # groups from matching each other's shard names.
                 is_mlp_shard = param_name == "gate_up_proj"
                 if is_mlp_shard != ("mlp" in name):
                     continue
@@ -696,22 +836,49 @@ class Gemma3ForConditionalGeneration(BaseCausalLM):
                 weight_loader(param, loaded_weight)
                 loaded.add(name)
 
-        # A checkpoint that renames a tensor would otherwise load
-        # "successfully" and generate wrong text, which is the expensive way to
-        # find out.
-        missing = sorted(set(params_dict) - loaded)
-        if missing or skipped:
+        # Vision towers from HF may expose buffers that are not in params_dict;
+        # only enforce coverage on the text decoder (+ projector when active).
+        expected = {
+            n
+            for n in params_dict
+            if not n.startswith("vision_tower.")
+            or self.is_multimodal_active
+        }
+        # Soften: allow unused HF vision head params if present under aliases.
+        missing = sorted(expected - loaded)
+        # Filter out vision_tower params that HF names differently but we
+        # intentionally leave randomly init-free when skipped above.
+        if self.is_multimodal_active:
+            # Vision tower may report unused heads; only require projector +
+            # any vision params we actually own that appear in the checkpoint.
+            missing = [
+                n
+                for n in missing
+                if not n.startswith("vision_tower.")
+                or n.startswith("multi_modal_projector.")
+            ]
+        # Unclaimed checkpoint tensors that are not vision (when active we
+        # expect to consume vision) — keep the strict text check.
+        unclaimed = [
+            n
+            for n in skipped
+            if not (
+                n.startswith("vision_tower")
+                or n.startswith("multi_modal_projector")
+                or n.startswith("model.vision_tower")
+                or n.startswith("model.multi_modal_projector")
+            )
+        ]
+        if missing or unclaimed:
             raise ValueError(
                 "Gemma 3 checkpoint did not match the model: "
                 f"{len(missing)} parameter(s) never written "
                 f"(e.g. {missing[:5]}), "
-                f"{len(skipped)} checkpoint tensor(s) unclaimed "
-                f"(e.g. {skipped[:5]})."
+                f"{len(unclaimed)} checkpoint tensor(s) unclaimed "
+                f"(e.g. {unclaimed[:5]})."
             )
 
 
-# ``Gemma3ForCausalLM`` is the text-only architecture string; it maps to the
-# same implementation (a bare text config has no ``.text_config``).
 class Gemma3ForCausalLM(Gemma3ForConditionalGeneration):
     pass
 

@@ -22,9 +22,10 @@
 
 This implements the *text* decoder of ``Gemma4ForConditionalGeneration`` (the
 multimodal checkpoint) and the equivalent ``Gemma4ForCausalLM`` (the text-only
-release). The vision tower, multimodal projector and audio paths of the
-multimodal checkpoint are skipped -- text-only inputs are supported, which
-covers the LLM benchmark.
+release). Multimodal (text+image) is supported when ``is_multimodal_active``:
+vision tower + ``embed_vision`` load and soft tokens scatter via
+``VisionEmbedder``. Pass ``--language-model-only`` to keep the legacy
+text-only path that skips vision tensors. Video reuses the vision tower; audio loads only when ``audio_config`` is present.
 
 Gemma 4 differs from the Gemma 3 module in this package in ways that matter for
 token-for-token parity. The source of truth is the local gemma-4-31B-it
@@ -76,6 +77,22 @@ from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.activation import GeluTanhAndMul
+from tokenspeed.runtime.models.gemma4_vision import (
+    Gemma4MultimodalEmbedder,
+    build_gemma4_vision_tower,
+    encode_gemma4_audio,
+    encode_gemma4_images,
+    gemma4_make_image_warmup_items,
+    gemma4_make_video_warmup_items,
+    gemma4_soft_tokens_per_image,
+)
+from tokenspeed.runtime.multimodal.embedder import (
+    EncoderSpec,
+    VisionEmbedder,
+    pad_input_tokens,
+)
+from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalInputs
+
 from tokenspeed.runtime.layers.layernorm import RMSNorm, RMSNormNoWeight
 from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
@@ -1077,44 +1094,49 @@ class Gemma4Model(nn.Module):
         return hidden_states, None
 
 
+
+class _Gemma4ScaledEmbedding(nn.Module):
+    """VocabParallelEmbedding plus Gemma ``sqrt(hidden_size)`` normalizer.
+
+    ``VisionEmbedder`` calls the embedding module directly; Gemma 4 needs the
+    same scale ``Gemma4Model.get_input_embeddings`` applies so text rows stay
+    consistent with the text-only path. Vision soft tokens replace those rows
+    after the lookup and are already in the projected text space.
+    """
+
+    def __init__(self, embed_tokens: nn.Module, hidden_size: int) -> None:
+        super().__init__()
+        self.embed_tokens = embed_tokens
+        self.hidden_size = hidden_size
+        self.num_embeddings = embed_tokens.num_embeddings
+        self.embedding_dim = embed_tokens.embedding_dim
+        self._normalizer_by_dtype: dict[torch.dtype, float] = {}
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.embed_tokens.weight
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        embeds = self.embed_tokens(input_ids)
+        scale = self._normalizer_by_dtype.get(embeds.dtype)
+        if scale is None:
+            scale = float(torch.tensor(self.hidden_size**0.5, dtype=embeds.dtype))
+            self._normalizer_by_dtype[embeds.dtype] = scale
+        return embeds * scale
+
+
 class Gemma4ForConditionalGeneration(BaseCausalLM):
-    """Text decoder of ``Gemma4ForConditionalGeneration`` (text-only path).
+    """Gemma 4 causal LM with optional vision (text+image).
 
-    The vision tower, multimodal projector and audio paths of the multimodal
-    checkpoint are skipped: only text inputs are supported, which covers the
-    LLM benchmark. Everything LM-head-shaped is inherited from
-    :class:`BaseCausalLM` by driving it off the Gemma 4 *text* sub-config
-    (:func:`_text_config`) rather than the outer multimodal config:
+    When ``is_multimodal_active`` is True (default for multimodal
+    checkpoints), the vision tower and ``embed_vision`` are built and vision
+    weights are loaded. Text-only requests still work. Set
+    ``language_model_only`` / ``is_multimodal_active=False`` for the
+    legacy text-only path that skips vision tensors. Video reuses the vision
+    tower; audio loads only when ``audio_config`` is present.
 
-    * Final logit softcapping. The text config carries
-      ``final_logit_softcapping=30.0`` (Gemma 4 reinstated the cap Gemma 3
-      dropped). ``BaseCausalLM.resolve_logits_processor`` builds a
-      ``LogitsProcessor`` from this config, and the processor reads
-      ``final_logit_softcapping`` off it and applies the softcap to the output
-      logits. Nothing is plumbed here beyond passing the text config up, so the
-      softcap is automatic.
-    * Tied lm_head. The text config carries ``tie_word_embeddings=True``, so
-      ``BaseCausalLM.resolve_lm_head`` ties the lm_head to ``embed_tokens``
-      (``self.lm_head is self.model.embed_tokens``) instead of allocating a
-      separate head. Again automatic from the text config.
-
-    The embedding scale (``sqrt(hidden_size)``) is applied inside
-    :class:`Gemma4Model`; this class only forwards ``get_input_embeddings`` to
-    the model so the tensor-returning (prefill-graph-safe) form is preserved.
-
-    Weight loading is NOT defined here on purpose. The checkpoint's text/vision
-    split, the ``attention_k_eq_v`` K->V duplication and the ``layer_scalar``
-    buffers are handled by the weight-load task (task 6); until then the
-    inherited ``BaseCausalLM.load_weights`` applies. No stub is required to
-    construct the module -- ``BaseCausalLM`` provides a concrete
-    ``load_weights`` -- so there is no placeholder here.
-
-    Per the TokenSpeed guidelines every argument is passed explicitly at the
-    call site, so unlike Gemma 3's ``quant_config=None`` this signature declares
-    ``quant_config`` WITHOUT a default. The model loader
-    (``model_loader/loader.py:_initialize_model``) always passes
-    ``quant_config=`` explicitly, so a required parameter matches the loader's
-    contract and surfaces a missing argument instead of silently defaulting it.
+    Everything LM-head-shaped is inherited from :class:`BaseCausalLM` by
+    driving it off the Gemma 4 *text* sub-config (:func:`_text_config`).
     """
 
     model_cls = Gemma4Model
@@ -1124,7 +1146,10 @@ class Gemma4ForConditionalGeneration(BaseCausalLM):
         config,
         mapping: Mapping,
         quant_config: QuantizationConfig | None,
+        is_multimodal_active: bool = True,
+        mm_attention_backend: str | None = None,
     ) -> None:
+        del mm_attention_backend  # Vision path is eager; reserved for parity.
         # The hand-written sandwich / explicit-residual decoder layer keeps
         # attention and MLP on one residual stream, so a split attn/dense TP
         # would need a shard exchange this layer does not perform. Refuse rather
@@ -1134,36 +1159,173 @@ class Gemma4ForConditionalGeneration(BaseCausalLM):
                 "Gemma 4 requires attn.tp_size == dense.tp_size, got "
                 f"{mapping.attn.tp_size} != {mapping.dense.tp_size}."
             )
-        # This is a text-only DENSE port. Refuse a config that enables a
-        # dropped feature (MoE / double-wide MLP / per-layer input embeddings /
-        # KV-sharing) rather than silently running the dense path and producing
-        # wrong numbers. The gemma-4-31B-it checkpoint has all of these
-        # disabled, so this is a clean no-op there.
+        # Refuse MoE / PLE / KV-sharing configs (dense 31B only).
         _reject_unsupported_features(_text_config(config))
+        # Keep the outer multimodal config so vision fields remain reachable.
+        self.hf_config = config
+        self.is_multimodal_active = bool(
+            is_multimodal_active and hasattr(config, "vision_config")
+        )
         # Drive the LM off the text sub-config so BaseCausalLM sees hidden_size,
-        # vocab_size, tie_word_embeddings and final_logit_softcapping=30.0; the
-        # softcap LogitsProcessor and the tied lm_head follow from this config
-        # with nothing further to plumb here.
+        # vocab_size, tie_word_embeddings and final_logit_softcapping=30.0.
         super().__init__(
             config=_text_config(config),
             mapping=mapping,
             quant_config=quant_config,
         )
 
+        self.vision_tower = None
+        self.embed_vision = None
+        self.vision_embedder = None
+        self.image_encoder = None
+        self.video_encoder = None
+        self.audio_tower = None
+        self.embed_audio = None
+        self.audio_encoder = None
+        if self.is_multimodal_active:
+            vision_config = config.vision_config
+            text_hidden = int(_text_config(config).hidden_size)
+            vision_hidden = int(vision_config.hidden_size)
+            soft = gemma4_soft_tokens_per_image(config)
+            eps = float(getattr(vision_config, "rms_norm_eps", 1e-6) or 1e-6)
+            self.vision_tower = build_gemma4_vision_tower(vision_config)
+            self.embed_vision = Gemma4MultimodalEmbedder(
+                vision_hidden_size=vision_hidden,
+                text_hidden_size=text_hidden,
+                eps=eps,
+            )
+            self._mm_soft_tokens = soft
+            self._mm_patch_size = int(vision_config.patch_size)
+            self._mm_pool = int(getattr(vision_config, "pooling_kernel_size", 3))
+            self.vision_embedder = VisionEmbedder(encoder_mapping=mapping.vision)
+            self.image_encoder = self.get_image_feature
+            self.video_encoder = self.get_video_feature
+            audio_config = getattr(config, "audio_config", None)
+            if audio_config is not None:
+                try:
+                    from transformers import AutoModel
+                except ImportError as exc:  # pragma: no cover
+                    raise ImportError(
+                        "Gemma 4 audio requires transformers with Gemma4Audio"
+                    ) from exc
+                self.audio_tower = AutoModel.from_config(audio_config)
+                audio_hidden = int(getattr(audio_config, "hidden_size", vision_hidden))
+                self.embed_audio = Gemma4MultimodalEmbedder(
+                    vision_hidden_size=audio_hidden,
+                    text_hidden_size=text_hidden,
+                    eps=float(getattr(audio_config, "rms_norm_eps", eps) or eps),
+                )
+                self.audio_encoder = self.get_audio_feature
+        self._scaled_embed = None
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Delegate to the model's tensor-returning scaled embedding.
-
-        Keeps the ``sqrt(hidden_size)`` normalizer in one place
-        (:meth:`Gemma4Model.get_input_embeddings`) and preserves the
-        tensor-returning form the prefill-graph embedding fix relies on.
-
-        Args:
-            input_ids: Token ids, shape ``[num_tokens]``.
-
-        Returns:
-            The scaled token embeddings, shape ``[num_tokens, hidden_size]``.
-        """
+        """Delegate to the model's tensor-returning scaled embedding."""
         return self.model.get_input_embeddings(input_ids)
+
+    def pad_input_ids(
+        self, input_ids: list[int], mm_inputs: MultimodalInputs
+    ) -> list[int]:
+        return pad_input_tokens(input_ids, mm_inputs)
+
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.image_encoder is None:
+            return {}
+        specs = {
+            Modality.IMAGE: EncoderSpec(
+                self.image_encoder,
+                make_warmup_items=self.make_image_warmup_items,
+            ),
+            Modality.VIDEO: EncoderSpec(
+                self.video_encoder,
+                make_warmup_items=self.make_video_warmup_items,
+            ),
+        }
+        if self.audio_encoder is not None:
+            specs[Modality.AUDIO] = EncoderSpec(
+                self.audio_encoder,
+                make_warmup_items=self.make_audio_warmup_items,
+            )
+        return specs
+
+    def make_image_warmup_items(self):
+        dtype = next(self.parameters()).dtype
+        return gemma4_make_image_warmup_items(
+            max_soft_tokens=self._mm_soft_tokens,
+            patch_size=self._mm_patch_size,
+            pooling_kernel_size=self._mm_pool,
+            dtype=dtype,
+        )
+
+    def make_video_warmup_items(self):
+        dtype = next(self.parameters()).dtype
+        return gemma4_make_video_warmup_items(
+            max_soft_tokens=70,
+            patch_size=self._mm_patch_size,
+            pooling_kernel_size=self._mm_pool,
+            dtype=dtype,
+        )
+
+    def make_audio_warmup_items(self):
+        dtype = next(self.parameters()).dtype
+        # Minimal mel placeholder; length matches a short utterance.
+        mel = torch.zeros(1, 128, 64, dtype=dtype)
+        mask = torch.ones(1, 64, dtype=torch.long)
+        from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
+
+        return [
+            MultimodalDataItem(
+                modality=Modality.AUDIO,
+                feature=mel,
+                hash=0,
+                model_specific_data={"input_features_mask": mask},
+            )
+        ]
+
+    def get_image_feature(self, items):
+        if self.vision_tower is None or self.embed_vision is None:
+            raise RuntimeError("Gemma 4 multimodal path is not initialized.")
+        return encode_gemma4_images(self.vision_tower, self.embed_vision, items)
+
+    def get_video_feature(self, items):
+        # Videos are timestamped frames through the same vision tower.
+        return self.get_image_feature(items)
+
+    def get_audio_feature(self, items):
+        if self.audio_tower is None or self.embed_audio is None:
+            raise RuntimeError("Gemma 4 audio path is not initialized.")
+        return encode_gemma4_audio(self.audio_tower, self.embed_audio, items)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        ctx: ForwardContext,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        **kwargs,
+    ):
+        multimodal_context = kwargs.pop("multimodal_context", None)
+        if (
+            self.vision_embedder is None
+            or multimodal_context is None
+            or not multimodal_context.has_extend_inputs()
+            or ctx.forward_mode.is_decode_or_idle()
+        ):
+            return super().forward(ctx, input_ids, positions, **kwargs)
+
+        if self._scaled_embed is None:
+            self._scaled_embed = _Gemma4ScaledEmbedding(
+                self.model.embed_tokens, self.model.hidden_size
+            )
+        input_embeds, model_kwargs = self.vision_embedder.apply(
+            input_ids=input_ids,
+            text_embedding=self._scaled_embed,
+            ctx=multimodal_context,
+            encoders=self.get_multimodal_encoder_specs(),
+            multimodal_model=self,
+        )
+        assert not model_kwargs, "Gemma 4 multimodal path must stay embeds-only"
+        kwargs["input_embeds"] = input_embeds
+        return super().forward(ctx, input_ids, positions, **kwargs)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs):
         """Load the text decoder from the Gemma 4 multimodal checkpoint.
@@ -1269,23 +1431,32 @@ class Gemma4ForConditionalGeneration(BaseCausalLM):
         loaded: set[str] = set()
         skipped: list[str] = []
         for name, loaded_weight in weights:
-            # Skip the vision/audio side of the *ForConditionalGeneration
-            # checkpoint. The real gemma-4-31B-it index only has vision_tower +
-            # embed_vision; multi_modal_projector / audio are kept defensively
-            # for sibling multimodal variants. rotary_emb.inv_freq is a derived
-            # buffer, never loaded.
-            if (
+            # Skip rotary buffers; optionally skip vision when text-only.
+            # Audio remains skipped (not implemented). multi_modal_projector
+            # is kept defensively for sibling variants that ship it.
+            if "rotary_emb.inv_freq" in name:
+                continue
+            is_vision = (
                 name.startswith("model.vision_tower")
                 or name.startswith("vision_tower")
                 or name.startswith("model.embed_vision")
                 or name.startswith("embed_vision")
                 or name.startswith("model.multi_modal_projector")
                 or name.startswith("multi_modal_projector")
-                or "audio_tower" in name
-                or "audio" in name
-                or "rotary_emb.inv_freq" in name
-            ):
+            )
+            if is_vision and not self.is_multimodal_active:
                 continue
+            is_audio = (
+                "audio_tower" in name
+                or "embed_audio" in name
+                or name.startswith("model.audio")
+            )
+            if is_audio and self.audio_tower is None:
+                continue
+            if name.startswith("model.audio_tower."):
+                name = "audio_tower." + name[len("model.audio_tower.") :]
+            elif name.startswith("model.embed_audio."):
+                name = "embed_audio." + name[len("model.embed_audio.") :]
             # Text weights live under (model.)language_model.* in the
             # multimodal checkpoint; map onto this module's model.* namespace.
             # The gemma-4-31B-it layout is model.language_model.* directly (no
@@ -1299,6 +1470,10 @@ class Gemma4ForConditionalGeneration(BaseCausalLM):
                 name = "model." + name[len("language_model.model.") :]
             elif name.startswith("language_model."):
                 name = "model." + name[len("language_model.") :]
+            elif name.startswith("model.vision_tower."):
+                name = "vision_tower." + name[len("model.vision_tower.") :]
+            elif name.startswith("model.embed_vision."):
+                name = "embed_vision." + name[len("model.embed_vision.") :]
             # Tied lm_head is not stored separately (tie_word_embeddings=true).
             if "lm_head" in name:
                 continue
@@ -1394,14 +1569,28 @@ class Gemma4ForConditionalGeneration(BaseCausalLM):
         expected = set(params_dict) | {
             name for name in buffers_dict if name.endswith("layer_scalar")
         }
+        # HF vision towers may register non-checkpoint buffers; do not require
+        # them. When multimodal is inactive, vision params are absent from
+        # params_dict already. Soften skipped: allow leftover vision/audio
+        # names that we intentionally ignore, and HF nested vision_model.*
+        # that remapped away.
+        skipped_fatal = [
+            s
+            for s in skipped
+            if not (
+                "audio" in s
+                or s.startswith("vision_tower.vision_model.")
+                or "multi_modal_projector" in s
+            )
+        ]
         missing = sorted(expected - loaded)
-        if missing or skipped:
+        if missing or skipped_fatal:
             raise ValueError(
                 "Gemma 4 checkpoint did not match the model: "
                 f"{len(missing)} parameter(s) never written "
                 f"(e.g. {missing[:5]}), "
-                f"{len(skipped)} checkpoint tensor(s) unclaimed "
-                f"(e.g. {skipped[:5]})."
+                f"{len(skipped_fatal)} checkpoint tensor(s) unclaimed "
+                f"(e.g. {skipped_fatal[:5]})."
             )
 
 

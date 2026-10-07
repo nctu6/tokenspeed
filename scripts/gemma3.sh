@@ -6,22 +6,34 @@
 # Matched baseline knobs (override via env):
 #   MODEL_PATH           default: /models/google/gemma-3-27b-it
 #   SERVED_MODEL_NAME    default: test
-#   HOST_PORT            default: 8977
-#   CUDA_DEVICES         default: 1
+#   HOST_PORT            default: 8778
+#   CUDA_DEVICES         default: 6
 #   MAX_NUM_SEQS         default: 452
 #   MAX_MODEL_LEN        default: 131072
 #   DTYPE                default: bfloat16
-#   KV_CACHE_DTYPE       default: auto (unset/empty = omit flag)
+#   KV_CACHE_DTYPE       default: empty (omit flag)
 #   ATTENTION_BACKEND    default: empty (engine auto). Set e.g. triton to force.
 #   VENV_DIR             default: ./.venv
 #   TOKENSPEED_TRITON_PREFILL_SKIP_OOR   default: 1 (F1; kernel default on)
 #   TOKENSPEED_TRITON_DECODE_KV_SPLITS   default: legacy (F2; not auto)
 #   TOKENSPEED_FLASHINFER_FA2_EXTEND    default: off (F3; not 512/all)
+#   VLLM_BATCH_INVARIANT default: empty. Truthy = --force-deterministic-rsag +
+#                        --disable-nccl-nvls (for TP>1 on hosts with broken
+#                        NVLS multicast, e.g. sm90). Single-GPU default is fine
+#                        without it.
+#   FORCE_DETERMINISTIC_RSAG / DISABLE_NCCL_NVLS
+#                        legacy per-knob switches (non-empty = on); still work.
+#
+# Multi-model (SMG IGW): override SERVED_MODEL_NAME to a unique id when
+# registering beside other models; pair with gemma4.sh on another port/GPUs
+# and enable IGW on the gateway. See multi-model-gemma.md.
 #
 # Usage:
 #   ./scripts/gemma3.sh
-#   CUDA_DEVICES=0 HOST_PORT=8977 ./scripts/gemma3.sh
+#   CUDA_DEVICES=0 HOST_PORT=8778 ./scripts/gemma3.sh
 #   ATTENTION_BACKEND=triton ./scripts/gemma3.sh
+#   # multi-model: override served name when needed
+#   SERVED_MODEL_NAME=gemma-3-27b-it ./scripts/gemma3.sh
 
 set -euo pipefail
 
@@ -39,6 +51,14 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 DTYPE="${DTYPE:-bfloat16}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"
+FORCE_DETERMINISTIC_RSAG="${FORCE_DETERMINISTIC_RSAG:-}"
+DISABLE_NCCL_NVLS="${DISABLE_NCCL_NVLS:-}"
+case "${VLLM_BATCH_INVARIANT:-}" in
+    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn])
+        FORCE_DETERMINISTIC_RSAG="${FORCE_DETERMINISTIC_RSAG:-1}"
+        DISABLE_NCCL_NVLS="${DISABLE_NCCL_NVLS:-1}"
+        ;;
+esac
 VENV_DIR="${VENV_DIR:-$REPO_ROOT/.venv}"
 
 export CUDA_VISIBLE_DEVICES="$CUDA_DEVICES"
@@ -75,6 +95,13 @@ if [[ -n "$KV_CACHE_DTYPE" ]]; then
 fi
 if [[ -n "$ATTENTION_BACKEND" ]]; then
     cmd+=(--attention-backend "$ATTENTION_BACKEND")
+fi
+if [[ -n "$FORCE_DETERMINISTIC_RSAG" ]]; then
+    cmd+=(--force-deterministic-rsag)
+fi
+if [[ -n "$DISABLE_NCCL_NVLS" ]]; then
+    cmd+=(--disable-nccl-nvls)
+    export NCCL_NVLS_ENABLE=0
 fi
 
 exec "${cmd[@]}"

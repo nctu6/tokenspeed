@@ -123,7 +123,9 @@ def resolve_mm_pad_substitute_ids(config: Any) -> dict[Modality, int]:
     shared = first_configured("media_placeholder_token_id")
     candidates = {
         Modality.IMAGE: first_configured(
-            "image_token_id", "image_placeholder_token_id"
+            "image_token_id",
+            "image_token_index",
+            "image_placeholder_token_id",
         ),
         Modality.VIDEO: first_configured(
             "video_token_id", "video_placeholder_token_id"

@@ -290,7 +290,9 @@ class ServerArgs:
     quantization_param_path: nullable_str = None
     max_model_len: int | None = None
     device: str = "cuda"
-    served_model_name: str | None = None
+    # vLLM parity: one or more API ids for the same weights/process.
+    # CLI ``nargs="+"``; first name is canonical for metrics / gRPC.
+    served_model_name: str | list[str] | None = None
     revision: str | None = None
     language_model_only: bool = False
 
@@ -680,10 +682,45 @@ class ServerArgs:
             self.tokenizer = self.model
 
         if self.served_model_name is None:
-            self.served_model_name = self.model
+            self.served_model_name = [self.model]
+        elif isinstance(self.served_model_name, str):
+            self.served_model_name = [self.served_model_name]
+        elif isinstance(self.served_model_name, list):
+            if not self.served_model_name:
+                self.served_model_name = [self.model]
+            else:
+                # Drop empties; keep order; dedupe while preserving first wins.
+                seen: set[str] = set()
+                names: list[str] = []
+                for name in self.served_model_name:
+                    if not name or name in seen:
+                        continue
+                    seen.add(name)
+                    names.append(name)
+                self.served_model_name = names or [self.model]
+        else:
+            raise TypeError(
+                "served_model_name must be str | list[str] | None, "
+                f"got {type(self.served_model_name).__name__}"
+            )
 
         if self.seed is None:
             self.seed = random.randint(0, 1 << 30)
+
+    @property
+    def served_model_names(self) -> list[str]:
+        """All served API ids (vLLM-style multi ``--served-model-name``)."""
+        names = self.served_model_name
+        if names is None:
+            return [self.model]
+        if isinstance(names, str):
+            return [names]
+        return list(names)
+
+    @property
+    def canonical_served_model_name(self) -> str:
+        """First served name — metrics / gRPC GetModelInfo canonical id."""
+        return self.served_model_names[0]
 
     def resolve_config_aliases(self):
         # Whether the block-drafter widths were given rather than defaulted.
@@ -2114,8 +2151,15 @@ class ServerArgs:
         parser.add_argument(
             "--served-model-name",
             type=str,
+            nargs="+",
             default=ServerArgs.served_model_name,
-            help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
+            help=(
+                "API model id(s) for this engine (vLLM parity). One process / one "
+                "weight set; accept any of the names on chat/completions. "
+                "First name is canonical for metrics and gRPC GetModelInfo; "
+                "all names are advertised on /v1/models. "
+                "Example: --served-model-name gemma-3-27b-it gemma3"
+            ),
         )
         parser.add_argument(
             "--revision",

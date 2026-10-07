@@ -1733,7 +1733,7 @@ def _build_kv_transfer(
             dist_init_addr=server_args.dist_init_addr,
             topology=topology,
             enable_metrics=False,
-            served_model_name=server_args.served_model_name,
+            served_model_name=server_args.canonical_served_model_name,
             app_key=server_args.app_key,
             metrics_reporters=server_args.metrics_reporters,
             enable_dp_attention=mapping.has_attn_dp,

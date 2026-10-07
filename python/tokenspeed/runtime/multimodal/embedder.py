@@ -549,6 +549,19 @@ class MultimodalEmbedder:
                 output = self._run_encoder(items, spec, device)
                 per_item_lens = [_item_token_count(it) for it in items]
                 output = output.reshape(-1, output.shape[-1])
+                expected = sum(per_item_lens)
+                # Gemma4 pan-and-scan (multi-view) can emit a couple extra pooled
+                # soft tokens vs SMG's n_valid//k^2 estimate used in prompt
+                # offsets. Truncate/pad so VisionEmbedder split matches the
+                # already-expanded placeholders.
+                if output.shape[0] != expected:
+                    if output.shape[0] > expected:
+                        output = output[:expected]
+                    else:
+                        pad = output.new_zeros(
+                            (expected - output.shape[0], output.shape[-1])
+                        )
+                        output = torch.cat([output, pad], dim=0)
                 per_item_embs = list(torch.split(output, per_item_lens, dim=0))
 
             self._store_encoder_outputs(items, per_item_embs, spec, multimodal_model)

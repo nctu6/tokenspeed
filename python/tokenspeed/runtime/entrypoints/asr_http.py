@@ -141,10 +141,16 @@ def _transcribe(
     return engine.llm.generate(request)["text"]
 
 
-def create_app(engine, processor, served_model_name: str) -> FastAPI:
+def create_app(
+    engine, processor, served_model_name: str | list[str]
+) -> FastAPI:
     app = FastAPI(title="TokenSpeed ASR server")
     app.state.engine = engine
     app.state.processor = processor
+    if isinstance(served_model_name, str):
+        served_names = [served_model_name]
+    else:
+        served_names = list(served_model_name)
 
     @app.get("/health")
     def health():
@@ -152,15 +158,17 @@ def create_app(engine, processor, served_model_name: str) -> FastAPI:
 
     @app.get("/v1/models")
     def models():
+        now = int(time.time())
         return {
             "object": "list",
             "data": [
                 {
-                    "id": served_model_name,
+                    "id": name,
                     "object": "model",
-                    "created": int(time.time()),
+                    "created": now,
                     "owned_by": "tokenspeed",
                 }
+                for name in served_names
             ],
         }
 
@@ -230,7 +238,7 @@ def serve(argv: list[str], *, host: str, port: int) -> None:
     server_args = prepare_server_args(argv)
     processor = AutoProcessor.from_pretrained(server_args.model)
     engine = Engine(server_args=server_args)
-    served = server_args.served_model_name or server_args.model
+    served = server_args.served_model_names
     if isinstance(served, (list, tuple)):
         served = served[0]
     logger.info("asr server: model=%s", served)

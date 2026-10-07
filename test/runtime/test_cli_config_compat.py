@@ -848,7 +848,7 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertEqual(sa.model, "deepseek-ai/DeepSeek-V3.1")
         self.assertEqual(sa.attn_tp_size, 8)
         self.assertTrue(sa.enable_expert_parallel)
-        self.assertEqual(sa.served_model_name, "ds31")
+        self.assertEqual(sa.served_model_name, ["ds31"])
 
     def test_data_parallel_size_arg(self):
         args = self._parse_args(["--model", "test/model", "--data-parallel-size", "2"])

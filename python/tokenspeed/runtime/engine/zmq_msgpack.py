@@ -381,7 +381,7 @@ def connect_msgpack_engine_for_loop(
         # chunked_prefill_size=-1 means "disabled"; the wire field is a
         # non-negative integer for the frontend, so clamp to 0 (= no cap).
         max_num_batched_tokens=max(0, server_args.chunked_prefill_size),
-        instance_id=server_args.served_model_name or server_args.model,
+        instance_id=server_args.canonical_served_model_name,
         kv_cache_size_tokens=loop.max_total_num_tokens,
     )
     return connect_msgpack_engine(

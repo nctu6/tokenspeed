@@ -507,6 +507,10 @@ def get_config(
         "Qwen3ASRForConditionalGeneration",
         "Qwen3ASRConfig",
         "MiniMaxM3SparseForConditionalGeneration",
+        "Gemma3ForConditionalGeneration",
+        "Gemma3Config",
+        "Gemma4ForConditionalGeneration",
+        "Gemma4Config",
     ]:
         if config is text_config:
             return config

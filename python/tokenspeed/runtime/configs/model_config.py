@@ -711,10 +711,15 @@ class ModelConfig:
             self.hf_config.pooling_config = self.pooling_config
             if hasattr(self.hf_config, "text_config"):
                 self.hf_config.text_config.pooling_config = self.pooling_config
-        self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
-        self.is_multimodal_gen = is_multimodal_gen_model(self.hf_config.architectures)
-        self.is_image_gen = is_image_gen_model(self.hf_config.architectures)
-        self.is_audio_model = is_audio_model(self.hf_config.architectures)
+        # Prefer the combined architecture list: multimodal wrappers can
+        # lose ``hf_config.architectures`` to None after text_config attach
+        # (gemma3/gemma4), while ``resolve_architecture`` / text_config still
+        # carry ``*ForConditionalGeneration``.
+        _mm_archs = _model_architectures(self.hf_config, self.hf_text_config)
+        self.is_multimodal = is_multimodal_model(_mm_archs)
+        self.is_multimodal_gen = is_multimodal_gen_model(_mm_archs)
+        self.is_image_gen = is_image_gen_model(_mm_archs)
+        self.is_audio_model = is_audio_model(_mm_archs)
 
         language_model_only = bool(getattr(server_args, "language_model_only", False))
         # Target-only flag; never apply to draft / auxiliary checkpoints.
@@ -926,6 +931,9 @@ class ModelConfig:
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
         self.image_token_id = getattr(self.hf_config, "image_token_id", None)
+        if self.image_token_id is None:
+            # Gemma 3 uses image_token_index; Gemma 4 uses image_token_id.
+            self.image_token_id = getattr(self.hf_config, "image_token_index", None)
 
         if server_args is not None and server_args.load_format == "extensible":
             override_model_config(self, server_args.ext_yaml)
@@ -1363,6 +1371,10 @@ def is_multimodal_model(model_architectures: list[str] | None):
         # Audio in, tokens out: same multimodal request shape as an image,
         # even though Whisper is encoder-decoder rather than audio-prefix.
         "WhisperForConditionalGeneration",
+        # Gemma 3/4 multimodal (text+image). Vision tower is optional at
+        # runtime via language_model_only / is_multimodal_active.
+        "Gemma3ForConditionalGeneration",
+        "Gemma4ForConditionalGeneration",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
 

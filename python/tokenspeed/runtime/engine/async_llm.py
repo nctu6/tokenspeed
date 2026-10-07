@@ -139,7 +139,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
         # Read model args
         self.model_path = server_args.model
-        self.served_model_name = server_args.served_model_name
+        self.served_model_name = server_args.canonical_served_model_name
         self.model_config = ModelConfig(
             server_args.model,
             trust_remote_code=server_args.trust_remote_code,
@@ -210,7 +210,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
         self.metrics = RequestMetrics(
             labels={
-                "model_name": self.server_args.served_model_name,
+                "model_name": self.server_args.canonical_served_model_name,
                 "app_key": self.server_args.app_key,
             },
             enabled=(

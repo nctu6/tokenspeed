@@ -298,6 +298,52 @@ def _free_port_avoiding_ephemeral_range() -> int:
     return port
 
 
+
+def _gateway_args_with_served_model_aliases(
+    gateway_args: list[str], engine_args: list[str]
+) -> list[str]:
+    """Map extra ``--served-model-name`` values to SMG ``--model-alias``.
+
+    Engine canonical = first name (GetModelInfo). Extras become
+    ``--model-alias extra=canonical`` so chat routes before/without a
+    create_worker rebuild that lists them as first-class ModelCards.
+    Existing explicit ``--model-alias`` entries are left alone.
+    """
+    names: list[str] = []
+    i = 0
+    while i < len(engine_args):
+        tok = engine_args[i]
+        if tok == "--served-model-name":
+            i += 1
+            while i < len(engine_args) and not engine_args[i].startswith("--"):
+                names.append(engine_args[i])
+                i += 1
+            continue
+        if tok.startswith("--served-model-name="):
+            names.append(tok.split("=", 1)[1])
+        i += 1
+    if len(names) < 2:
+        return gateway_args
+    canonical = names[0]
+    result = list(gateway_args)
+    for alias in names[1:]:
+        if alias == canonical:
+            continue
+        entry = f"{alias}={canonical}"
+        # Skip if already present as --model-alias entry
+        skip = False
+        for j, tok in enumerate(result):
+            if tok == "--model-alias" and j + 1 < len(result) and result[j + 1] == entry:
+                skip = True
+                break
+            if tok == f"--model-alias={entry}":
+                skip = True
+                break
+        if not skip:
+            result.extend(["--model-alias", entry])
+    return result
+
+
 def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[str]:
     """Bind the smg Prometheus exporter to a freshly allocated free port.
 
@@ -702,6 +748,9 @@ async def run_smg(
 
         # Allocate the metrics port only now — see
         # _gateway_args_with_default_prometheus_port for why earlier is racy.
+        gateway_args = _gateway_args_with_served_model_aliases(
+            gateway_args, engine_args
+        )
         gateway_args = _gateway_args_with_default_prometheus_port(gateway_args)
         gateway = await spawn_gateway(
             gateway_args, engine_host="127.0.0.1", engine_port=engine_port

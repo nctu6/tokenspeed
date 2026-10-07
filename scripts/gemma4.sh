@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 #
-# gemma3.sh -- serve gemma-3-27b-it (bf16) from a local venv (see install.sh)
+# gemma4.sh -- serve gemma-4-31B-it (bf16, TP=2) from a local venv (see install.sh)
 # =====================================================================
 #
 # Matched baseline knobs (override via env):
-#   MODEL_PATH           default: /models/google/gemma-3-27b-it
+#   MODEL_PATH           default: /models/google/gemma-4-31B-it
 #   SERVED_MODEL_NAME    default: test
-#   HOST_PORT            default: 8977
-#   CUDA_DEVICES         default: 1
+#   HOST_PORT            default: 8779
+#   CUDA_DEVICES         default: 6,7
+#   TENSOR_PARALLEL_SIZE default: 2 (must match CUDA_DEVICES count)
 #   MAX_NUM_SEQS         default: 452
 #   MAX_MODEL_LEN        default: 131072
 #   DTYPE                default: bfloat16
-#   KV_CACHE_DTYPE       default: auto (unset/empty = omit flag)
+#   KV_CACHE_DTYPE       default: empty (omit flag)
 #   ATTENTION_BACKEND    default: empty (engine auto). Set e.g. triton to force.
 #   VENV_DIR             default: ./.venv
 #   TOKENSPEED_TRITON_PREFILL_SKIP_OOR   default: 1 (F1; kernel default on)
@@ -20,18 +21,24 @@
 #   VLLM_BATCH_INVARIANT default: empty. Truthy (1/true/yes/on) = deterministic
 #                        comm preset: --force-deterministic-rsag +
 #                        --disable-nccl-nvls (NCCL_NVLS_ENABLE=0). Needed on
-#                        hosts with broken NVLS multicast (e.g. mewtwo). The
+#                        hosts with broken NVLS multicast (e.g. sm90). The
 #                        engine also honors it directly from the environment.
 #   FORCE_DETERMINISTIC_RSAG / DISABLE_NCCL_NVLS
 #                        legacy per-knob switches (non-empty = on); still work.
 #
-# Recommended mewtwo invoke:
+# Recommended sm90 (H200) invoke:
 #   CUDA_DEVICES=6,7 VLLM_BATCH_INVARIANT=1 ./scripts/gemma4.sh
 #
+# Multi-model (SMG IGW): override SERVED_MODEL_NAME to a unique id when
+# registering beside other models; HOST_PORT already differs from gemma3.sh.
+# See multi-model-gemma.md.
+#
 # Usage:
-#   ./scripts/gemma3.sh
-#   CUDA_DEVICES=0 HOST_PORT=8977 ./scripts/gemma3.sh
-#   ATTENTION_BACKEND=triton ./scripts/gemma3.sh
+#   ./scripts/gemma4.sh
+#   CUDA_DEVICES=6,7 HOST_PORT=8779 ./scripts/gemma4.sh
+#   ATTENTION_BACKEND=triton ./scripts/gemma4.sh
+#   # multi-model: override served name when needed
+#   SERVED_MODEL_NAME=gemma-4-31B-it ./scripts/gemma4.sh
 
 set -euo pipefail
 
@@ -42,8 +49,9 @@ cd "$REPO_ROOT"
 
 MODEL_PATH="${MODEL_PATH:-/models/google/gemma-4-31B-it}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-test}"
-HOST_PORT="${HOST_PORT:-8778}"
+HOST_PORT="${HOST_PORT:-8779}"
 CUDA_DEVICES="${CUDA_DEVICES:-6,7}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-2}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-452}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 DTYPE="${DTYPE:-bfloat16}"
@@ -84,7 +92,7 @@ cmd=(
     --host 0.0.0.0
     --port "$HOST_PORT"
     --trust-remote-code
-    --tensor-parallel-size 2
+    --tensor-parallel-size "$TENSOR_PARALLEL_SIZE"
     --dtype "$DTYPE"
     --max-num-seqs "$MAX_NUM_SEQS"
     --enable-prefix-caching

@@ -480,7 +480,7 @@ class EventLoop:
 
         self.metrics = EngineMetrics(
             labels={
-                "model_name": server_args.served_model_name,
+                "model_name": server_args.canonical_served_model_name,
                 "app_key": server_args.app_key or "",
                 "dp_rank": str(dp_rank),
             },
