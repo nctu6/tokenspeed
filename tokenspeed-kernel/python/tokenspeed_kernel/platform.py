@@ -423,6 +423,39 @@ def _detect_npu_platform() -> PlatformInfo:
     )
 
 
+# Device-property names torch exposes for the per-block shared-memory ceiling,
+# most useful first. `max_shared_memory_per_block` is NOT one of them (reading
+# it always yielded 0). The opt-in ceiling is what a kernel can raise itself to
+# via cudaFuncAttributeMaxDynamicSharedMemorySize (101,376 B on sm_120, 232,448 B
+# on sm_90) and is the limit Triton checks a launch against; the plain
+# per-block value is the 48 KB default, used only if opt-in is missing.
+_CUDA_SHARED_MEMORY_PROPS = ("shared_memory_per_block_optin", "shared_memory_per_block")
+
+
+def _cuda_shared_memory_budget(props) -> int:
+    """Per-block shared-memory budget (bytes) for CUDA kernel tile selection.
+
+    Args:
+        props: ``torch.cuda.get_device_properties(...)`` (or any object with the
+            same attributes).
+
+    Returns:
+        The first positive value among ``_CUDA_SHARED_MEMORY_PROPS``, or ``0``
+        when none is available. ``0`` means "unknown" to consumers such as the
+        Triton MHA prefill tile choice, which then keeps its datacenter tiles.
+    """
+    for name in _CUDA_SHARED_MEMORY_PROPS:
+        value = getattr(props, name, None)
+        if value:
+            return int(value)
+    logger.warning(
+        "CUDA device properties expose no shared-memory limit (%s); "
+        "max_shared_memory_per_sm=0 (unknown)",
+        ", ".join(_CUDA_SHARED_MEMORY_PROPS),
+    )
+    return 0
+
+
 def _detect_cuda_platform() -> PlatformInfo:
     """Detect NVIDIA CUDA platform."""
     import torch
@@ -443,18 +476,7 @@ def _detect_cuda_platform() -> PlatformInfo:
         memory_bandwidth=_estimate_bandwidth(props),
         sm_count=props.multi_processor_count,
         max_threads_per_sm=getattr(props, "max_threads_per_multi_processor", 0),
-        # `max_shared_memory_per_block` is not an attribute torch exposes, so
-        # this always fell through to 0 on every CUDA device. The real names are
-        # `shared_memory_per_block_optin` (the ceiling a kernel can raise itself
-        # to with cudaFuncAttributeMaxDynamicSharedMemorySize -- 101,376 on
-        # sm_120, 232,448 on sm_90) and `shared_memory_per_block` (the 48 KB
-        # default). The opt-in ceiling is the one a tile has to fit under, and
-        # is what Triton reports as the hardware limit when a launch fails.
-        max_shared_memory_per_sm=getattr(
-            props,
-            "shared_memory_per_block_optin",
-            getattr(props, "shared_memory_per_block", 0),
-        ),
+        max_shared_memory_per_sm=_cuda_shared_memory_budget(props),
         sm_features=sm_features,
         runtime_features=runtime_features,
         interconnect=interconnect,

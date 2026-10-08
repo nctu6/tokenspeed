@@ -541,6 +541,14 @@ elif platform.is_nvidia and platform.is_hopper:
     # Keep the set aligned with FA4's dense MHA dims up through 256.
     _FA3_HOPPER_HEAD_DIMS = frozenset(range(8, 257, 8))
 
+    def _fa3_sinks(sinks: torch.Tensor | None) -> torch.Tensor | None:
+        # The FA3 Hopper API requires bf16 sinks regardless of the q/kv dtype
+        # (fp16, bf16 or fp8). Sinks are per-head softmax logits, so bf16
+        # precision is sufficient; cast instead of failing at kernel launch.
+        if sinks is None or sinks.dtype == torch.bfloat16:
+            return sinks
+        return sinks.to(torch.bfloat16).contiguous()
+
     @register_kernel(
         "attention",
         "mha_prefill",
@@ -596,7 +604,7 @@ elif platform.is_nvidia and platform.is_hopper:
             causal=True,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
-            sinks=sinks,
+            sinks=_fa3_sinks(sinks),
         )
 
     @register_kernel(
@@ -660,7 +668,7 @@ elif platform.is_nvidia and platform.is_hopper:
             causal=is_causal,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
-            sinks=sinks,
+            sinks=_fa3_sinks(sinks),
         )
 
     @register_kernel(
@@ -718,6 +726,6 @@ elif platform.is_nvidia and platform.is_hopper:
             causal=max_seqlen_q > 1,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
-            sinks=sinks,
+            sinks=_fa3_sinks(sinks),
         )
         return out.view_as(q)

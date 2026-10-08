@@ -375,6 +375,37 @@ def _has_large_shared_memory(platform) -> bool:
     return budget == 0 or budget >= _LARGE_SHARED_MEMORY_BYTES
 
 
+def _select_prefill_tiles(platform, Lq: int) -> tuple[int, int]:
+    """``(BLOCK_M, BLOCK_N)`` for the NVIDIA prefill/extend kernel.
+
+    Classifies the device by its measured shared-memory budget rather than by
+    arch-version ordering alone: sm_120 is ``is_hopper_plus`` by version but has
+    the ~100 KB budget of sm_86/sm_89, so it takes the small-memory Ampere tiles.
+    sm_86/sm_89 are additionally matched by compute-capability minor so they
+    keep small tiles even when the budget is unknown (``0`` is treated as large
+    by ``_has_large_shared_memory``).
+
+    Args:
+        platform: ``PlatformInfo`` of a non-AMD device.
+        Lq: query/key head dim (``q_extend.shape[-1]``).
+    """
+    small_smem = not _has_large_shared_memory(platform)
+
+    if platform.is_hopper_plus and not small_smem:
+        return (128, 64) if Lq <= 256 else (32, 64)
+
+    if platform.is_ampere_plus:
+        if small_smem or platform.arch_version.minor in (6, 9):
+            if Lq <= 128:
+                return (64, 128)
+            return (64, 64) if Lq <= 256 else (32, 32)
+        if Lq <= 128:
+            return (128, 128)
+        return (64, 64) if Lq <= 256 else (32, 64)
+
+    return (64, 64) if Lq <= 128 else (32, 32)
+
+
 def prefill_attention_fwd(
     q_extend,
     k_extend,
@@ -430,41 +461,7 @@ def prefill_attention_fwd(
         num_warps = 4
 
     else:
-        # Classify by measured shared-memory budget, not arch-version ordering:
-        # sm_120 is `is_hopper_plus` by version but carries only ~100 KB, so the
-        # datacenter tiles below overflow and the launch aborts. Treat it like
-        # the small-shared-memory Ampere parts (sm_86/sm_89) instead.
-        small_smem = not _has_large_shared_memory(platform)
-
-        if platform.is_hopper_plus and not small_smem:
-            if Lq <= 256:
-                BLOCK_M, BLOCK_N = (128, 64)
-            else:
-                BLOCK_M, BLOCK_N = (32, 64)
-        elif platform.is_ampere_plus:
-            # sm86/sm89 has a much smaller shared memory size (100K) than sm80
-            # (160K); sm_120 lands here for the same reason via `small_smem`.
-            if (
-                small_smem
-                or platform.arch_version.minor == 9
-                or platform.arch_version.minor == 6
-            ):
-                if Lq <= 128:
-                    BLOCK_M, BLOCK_N = (64, 128)
-                elif Lq <= 256:
-                    BLOCK_M, BLOCK_N = (64, 64)
-                else:
-                    BLOCK_M, BLOCK_N = (32, 32)
-            else:
-                if Lq <= 128:
-                    BLOCK_M, BLOCK_N = (128, 128)
-                elif Lq <= 256:
-                    BLOCK_M, BLOCK_N = (64, 64)
-                else:
-                    BLOCK_M, BLOCK_N = (32, 64)
-        else:
-            BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
-
+        BLOCK_M, BLOCK_N = _select_prefill_tiles(platform, Lq)
         num_warps = 4 if Lk <= 64 else 8
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)

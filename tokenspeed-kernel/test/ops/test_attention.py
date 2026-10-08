@@ -86,7 +86,12 @@ def test_mha_prefill(
     q = _randn((total_tokens, num_q_heads, head_dim), device=device, dtype=dtype)
     k = _randn((total_tokens, num_kv_heads, head_dim), device=device, dtype=dtype)
     v = _randn((total_tokens, num_kv_heads, head_dim), device=device, dtype=dtype)
-    sinks = _randn((num_q_heads,), device=device, dtype=q.dtype) if has_sink else None
+    # Sinks are per-head softmax logits, not quantized activations: keep them
+    # in bf16 for fp8 inputs and in the activation dtype otherwise.
+    sink_dtype = torch.bfloat16 if dtype in _FP8_DTYPES else dtype
+    sinks = (
+        _randn((num_q_heads,), device=device, dtype=sink_dtype) if has_sink else None
+    )
     window_left = 127 if is_sliding else -1
 
     out = mha_prefill(
@@ -103,6 +108,49 @@ def test_mha_prefill(
 
     assert out.shape == q.shape
     assert not torch.isnan(out).any()
+
+
+@pytest.mark.parametrize(
+    "sink_dtype", [torch.float16, torch.float32], ids=["fp16", "fp32"]
+)
+def test_mha_prefill_fa3_casts_sinks_to_bf16(
+    device: str,
+    sink_dtype: torch.dtype,
+    require,
+) -> None:
+    """FA3 only accepts bf16 sinks; the wrapper must cast other dtypes."""
+    dtype = torch.float16
+    require("attention", "mha_prefill", "fa3", dtype, "q")
+
+    seqlens_list = [97, 130]
+    cu_seqlens_cpu = [0, 97, 227]
+    cu_seqlens = torch.tensor(cu_seqlens_cpu, device=device, dtype=torch.int32)
+    total_tokens, num_q_heads, num_kv_heads, head_dim = 227, 8, 2, 64
+
+    q = _randn((total_tokens, num_q_heads, head_dim), device=device, dtype=dtype)
+    k = _randn((total_tokens, num_kv_heads, head_dim), device=device, dtype=dtype)
+    v = _randn((total_tokens, num_kv_heads, head_dim), device=device, dtype=dtype)
+    sinks = _randn((num_q_heads,), device=device, dtype=sink_dtype)
+
+    def _run(s: torch.Tensor) -> torch.Tensor:
+        return mha_prefill(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            max_seqlen=max(seqlens_list),
+            window_left=-1,
+            sinks=s,
+            solution="fa3",
+        )
+
+    out = _run(sinks)
+    ref = _run(sinks.to(torch.bfloat16))
+
+    assert out.shape == q.shape
+    assert not torch.isnan(out).any()
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
