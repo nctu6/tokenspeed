@@ -14,9 +14,10 @@
 #
 # What differs from Dockerfile.nvidia, and why:
 #   1. CUDA_ARCH_LIST adds 12.0a (sm_120) to the datacenter 9.0a/10.0a, so one
-#      image serves both tiers. Datacenter-only tcgen05 groups still build for
-#      sm_90/sm_100 and are auto-skipped for sm_120 by setup.py's arch gate --
-#      no ptxas "tcgen05 not supported on sm_120a" failure.
+#      image serves both tiers. Every kernel group builds for every listed
+#      arch; attn_res's tcgen05 body is compiled only for sm_10x by a
+#      __CUDA_ARCH__ guard in the source (stub on sm_90/sm_120), so ptxas never
+#      sees tcgen05 for sm_120a.
 #   2. Engine install uses the `diffusion` extra (./python[diffusion]) and an
 #      explicit post-torchao reaffirm of diffusers/av/imageio-ffmpeg/soundfile,
 #      mirroring scripts/install.sh so MiniMax-H3 (/v1/videos) and Music3
@@ -43,9 +44,10 @@ USER root
 
 ARG MAX_JOBS=16
 # Fat binary spanning the datacenter tier (sm_90 Hopper, sm_100 Blackwell) and
-# the workstation tier (sm_120, RTX PRO 6000 / 5090). The tcgen05 groups
-# (attn_res) build for sm_90/sm_100 and are auto-skipped for sm_120 by
-# tokenspeed-kernel/python/setup.py, so this list compiles cleanly.
+# the workstation tier (sm_120, RTX PRO 6000 / 5090). Arch-only code is gated
+# in the CUDA sources (attn_res tcgen05: sm_10x only), and setup.py keeps
+# sm_12x arch-specific ("a"), which the NVFP4 kernels need, so this list
+# compiles cleanly.
 ARG CUDA_ARCH_LIST="9.0a 10.0a 12.0a"
 # FlashAttention-2 from vLLM's fork: OPT-IN (WITH_FA2=1), default off -- same
 # as scripts/install.sh (--with-fa2). Nothing in the engine or kernel imports

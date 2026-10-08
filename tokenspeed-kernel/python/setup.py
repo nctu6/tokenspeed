@@ -57,6 +57,7 @@ import ctypes
 import importlib
 import json
 import os
+import re
 import shlex
 import shutil
 import site
@@ -79,6 +80,9 @@ BASE_VERSION = "0.1.4"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
+# CUDA arch spellings accepted from FLASHINFER_CUDA_ARCH_LIST /
+# TOKENSPEED_CUDA_ARCH: "12.0", "12.0a", "120", "120a", "120f", ...
+_CUDA_ARCH_RE = re.compile(r"^(?:(\d+)\.(\d)|(\d{1,2})(\d))([af]?)$")
 
 # CUDA kernels source and output directories
 CUDA_CSRC_DIR = THIRDPARTY_DIR / "cuda" / "csrc"
@@ -532,17 +536,27 @@ class CudaKernelBuilder:
     # Target GPU architectures: detect from the CUDA driver or use env var override.
     # FLASHINFER_CUDA_ARCH_LIST is accepted for compatibility, but TokenSpeed
     # docs prefer TOKENSPEED_CUDA_ARCH=100 on GB200.
-    def _normalize_cuda_arch(self, arch):
-        has_suffix = arch.endswith("a")
-        arch_clean = arch.rstrip("a")
-        if "." in arch_clean:
-            major_s, minor_s = arch_clean.split(".", 1)
-            major = int(major_s)
-            minor = int(minor_s)
-        else:
-            major = int(arch_clean[:-1])
-            minor = int(arch_clean[-1])
-        suffix = "a" if has_suffix or major >= 9 else ""
+    #
+    # An explicit arch-specific ("a") or family-specific ("f", CUDA >= 12.9)
+    # suffix is kept as given. A bare sm_90+ target is promoted to "a" and is
+    # never emitted as a generic target: in-tree kernels issue arch-specific
+    # PTX behind plain __CUDA_ARCH__ guards (tcgen05 for sm_100, NVFP4
+    # cvt.rn.satfinite.e2m1x2 for __CUDA_ARCH__ >= 1000), and ptxas rejects
+    # those for generic targets such as sm_120 / sm_121, while sm_120a and
+    # sm_120f compile. So "12.0" must stay "120a", not "120".
+    @staticmethod
+    def _normalize_cuda_arch(arch):
+        match = _CUDA_ARCH_RE.fullmatch(arch.strip().lower())
+        if match is None:
+            raise ValueError(
+                f"Unrecognized CUDA arch {arch!r}; expected forms like "
+                "'9.0a', '12.0', '120a' or '120f'."
+            )
+        dotted_major, dotted_minor, major_s, minor_s, suffix = match.groups()
+        major = int(dotted_major or major_s)
+        minor = int(dotted_minor or minor_s)
+        if not suffix and major >= 9:
+            suffix = "a"
         return f"{major}{minor}{suffix}"
 
     def _detect_cuda_archs(self):

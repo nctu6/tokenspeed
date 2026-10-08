@@ -328,3 +328,63 @@ def test_cuda_compile_command_preserves_optional_launcher(
             "source.o",
         ]
     ]
+
+
+def _cuda_kernel_builder(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    setup_namespace = runpy.run_path(str(SETUP_PY))
+    return setup_namespace["CudaKernelBuilder"]([], verbose=False)
+
+
+@pytest.mark.parametrize(
+    ("arch", "expected"),
+    [
+        # Pre-Hopper targets stay generic.
+        ("8.0", "80"),
+        ("8.9", "89"),
+        ("86", "86"),
+        # Bare sm_90+ targets are promoted to arch-specific, including the
+        # sm_12x workstation parts: in-tree NVFP4 kernels emit
+        # cvt.rn.satfinite.e2m1x2, which ptxas rejects for generic sm_120.
+        ("9.0", "90a"),
+        ("10.0", "100a"),
+        ("10.3", "103a"),
+        ("12.0", "120a"),
+        ("120", "120a"),
+        ("12.1", "121a"),
+        # Explicit suffixes are preserved.
+        ("9.0a", "90a"),
+        ("12.0a", "120a"),
+        ("120a", "120a"),
+        ("8.6a", "86a"),
+        ("120f", "120f"),
+        ("10.0f", "100f"),
+        (" 12.0A ", "120a"),
+    ],
+)
+def test_normalize_cuda_arch(arch, expected, monkeypatch) -> None:
+    builder = _cuda_kernel_builder(monkeypatch)
+
+    assert builder._normalize_cuda_arch(arch) == expected
+
+
+@pytest.mark.parametrize("arch", ["", "sm_120", "12.0+PTX", "120x", "12.0.1", "a"])
+def test_normalize_cuda_arch_rejects_malformed(arch, monkeypatch) -> None:
+    builder = _cuda_kernel_builder(monkeypatch)
+
+    with pytest.raises(ValueError, match="Unrecognized CUDA arch"):
+        builder._normalize_cuda_arch(arch)
+
+
+def test_detect_cuda_archs_from_arch_list(monkeypatch) -> None:
+    builder = _cuda_kernel_builder(monkeypatch)
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "9.0a 10.0a 12.0a 12.0")
+    monkeypatch.setenv("TOKENSPEED_CUDA_ARCH", "8.0")
+
+    # The arch list wins over TOKENSPEED_CUDA_ARCH; duplicates collapse.
+    assert builder._detect_cuda_archs() == {"90a", "100a", "120a"}
+
+    monkeypatch.delenv("FLASHINFER_CUDA_ARCH_LIST")
+    monkeypatch.setenv("TOKENSPEED_CUDA_ARCH", "12.0")
+    assert builder._detect_cuda_archs() == {"120a"}

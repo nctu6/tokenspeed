@@ -11,8 +11,11 @@
 #
 #   1. CUDA_ARCH_LIST = "9.0a 10.0a 12.0a" -- one fat binary spanning the
 #      datacenter tier (sm_90 Hopper, sm_100 Blackwell) and the workstation tier
-#      (sm_120). tcgen05 groups build for sm_90/sm_100 and are auto-skipped for
-#      sm_120 by the kernel's setup.py arch gate, so this list compiles cleanly.
+#      (sm_120). setup.py builds every kernel group for every listed arch and
+#      keeps bare sm_90+ entries arch-specific ("a"). Arch-only code is gated in
+#      the CUDA sources: attn_res's tcgen05 body compiles only for sm_10x
+#      (__CUDA_ARCH__ guard, stub elsewhere), and the NVFP4 cvt.e2m1x2 paths
+#      need sm_120a, not generic sm_120. So this list compiles cleanly.
 #
 #   2. THE KERNEL IS (RE)INSTALLED FROM SOURCE LAST. The engine (python/)
 #      declares `tokenspeed-kernel>=0.1.3.dev0`, so `pip install ./python`
