@@ -64,6 +64,13 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_RULES,
 )
 
+# Paged-MHA architectures that run mixed prefill+decode rounds by default,
+# paired with a 4096-token prefill chunk (lower TTFT at equal throughput).
+MIXED_BATCH_DEFAULT_ARCHITECTURES = frozenset(
+    {"Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"}
+)
+MIXED_BATCH_DEFAULT_CHUNK = 4096
+
 logger = get_colorful_logger(__name__)
 
 # Sampling backends whose verify runs the draft-prob chain kernel
@@ -330,7 +337,9 @@ class ServerArgs:
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
-    enable_mixed_batch: bool = False
+    # None = auto: on for validated paged-MHA architectures (see
+    # MIXED_BATCH_DEFAULT_ARCHITECTURES), off otherwise.
+    enable_mixed_batch: bool | None = None
     # Scheduler cache-reuse identity granularity in tokens.
     prefix_granularity: int = 64
     # special kv cache
@@ -830,6 +839,33 @@ class ServerArgs:
         if self.speculative_num_draft_tokens is None:
             self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
+    def _mixed_batch_by_default(self) -> bool:
+        """Whether mixed prefill+decode batches are on when not set explicitly.
+
+        Only architectures whose attention runs on the paged MHA backend (which
+        splits a MIXED round into extend rows and decode rows) and that were
+        validated end to end opt in. Features that reject mixed rounds
+        (PD disaggregation, prefill context parallel, speculative decoding)
+        keep the old default.
+        """
+        if self.disaggregation_mode != "null" or self.speculative_algorithm:
+            return False
+        attn = getattr(self.mapping, "attn", None)
+        if getattr(attn, "qcp_size", 1) > 1:
+            return False
+        try:
+            from tokenspeed.runtime.utils.hf_transformers_utils import get_config
+
+            config = get_config(
+                self.model,
+                trust_remote_code=self.trust_remote_code,
+                revision=self.revision,
+            )
+        except Exception:
+            return False
+        archs = getattr(config, "architectures", None) or []
+        return any(a in MIXED_BATCH_DEFAULT_ARCHITECTURES for a in archs)
+
     def resolve_memory_and_scheduling(self):
         if current_platform().is_amd:
             gpu_mem = get_amdgpu_memory_capacity()
@@ -842,6 +878,12 @@ class ServerArgs:
         # Set GPU memory utilization.
         if self.gpu_memory_utilization is None:
             self.gpu_memory_utilization = 0.95
+
+        # Mixed prefill+decode default (auto) and the chunk size it pairs with.
+        if self.enable_mixed_batch is None:
+            self.enable_mixed_batch = self._mixed_batch_by_default()
+            if self.enable_mixed_batch and self.chunked_prefill_size is None:
+                self.chunked_prefill_size = MIXED_BATCH_DEFAULT_CHUNK
 
         # Set the chunked prefill token budget.
         if self.chunked_prefill_size is None:
@@ -2408,7 +2450,15 @@ class ServerArgs:
             action="store_true",
             dest="enable_mixed_batch",
             default=ServerArgs.enable_mixed_batch,
-            help="Allow the scheduler to issue prefill and decode requests in the same iteration.",
+            help="Allow the scheduler to issue prefill and decode requests in the same "
+            "iteration. Default: on (with --chunked-prefill-size 4096 unless set) for "
+            "validated paged-MHA architectures such as Gemma 3, off otherwise.",
+        )
+        parser.add_argument(
+            "--disable-mixed-batch",
+            action="store_false",
+            dest="enable_mixed_batch",
+            help="Never mix prefill and decode requests in one iteration.",
         )
         parser.add_argument(
             "--prefix-granularity",

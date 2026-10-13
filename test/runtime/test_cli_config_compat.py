@@ -285,7 +285,7 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model"])
         self.assertEqual(args.max_prefill_tokens, 8192)
         self.assertIsNone(args.chunked_prefill_size)
-        self.assertFalse(args.enable_mixed_batch)
+        self.assertIsNone(args.enable_mixed_batch)
 
         sa = self._from_cli_args_no_init(args)
         sa.mapping = SimpleNamespace(world_size=1)
@@ -303,6 +303,47 @@ class TestCLIConfigCompat(unittest.TestCase):
     def test_mixed_batch_can_be_enabled(self):
         args = self._parse_args(["--model", "test/model", "--enable-mixed-batch"])
         self.assertTrue(args.enable_mixed_batch)
+
+    def test_mixed_batch_can_be_disabled(self):
+        args = self._parse_args(["--model", "test/model", "--disable-mixed-batch"])
+        self.assertFalse(args.enable_mixed_batch)
+
+    def _resolve_scheduling_for_arch(self, arch, extra=()):
+        args = self._parse_args(["--model", "test/model", *extra])
+        sa = self._from_cli_args_no_init(args)
+        sa.mapping = SimpleNamespace(world_size=1)
+        platform = SimpleNamespace(is_amd=False, is_nvidia=False)
+        with patch(
+            "tokenspeed.runtime.utils.server_args.current_platform",
+            return_value=platform,
+        ), patch(
+            "tokenspeed.runtime.utils.hf_transformers_utils.get_config",
+            return_value=SimpleNamespace(architectures=[arch]),
+        ):
+            sa.resolve_memory_and_scheduling()
+        return sa
+
+    def test_mixed_batch_and_4k_chunk_default_on_for_gemma3(self):
+        sa = self._resolve_scheduling_for_arch("Gemma3ForConditionalGeneration")
+        self.assertTrue(sa.enable_mixed_batch)
+        self.assertEqual(sa.chunked_prefill_size, 4096)
+
+    def test_mixed_batch_default_respects_explicit_flags(self):
+        sa = self._resolve_scheduling_for_arch(
+            "Gemma3ForConditionalGeneration", ["--disable-mixed-batch"]
+        )
+        self.assertFalse(sa.enable_mixed_batch)
+        self.assertEqual(sa.chunked_prefill_size, 8192)
+        sa = self._resolve_scheduling_for_arch(
+            "Gemma3ForConditionalGeneration", ["--chunked-prefill-size", "8192"]
+        )
+        self.assertTrue(sa.enable_mixed_batch)
+        self.assertEqual(sa.chunked_prefill_size, 8192)
+
+    def test_mixed_batch_default_off_for_other_architectures(self):
+        sa = self._resolve_scheduling_for_arch("DeepseekV3ForCausalLM")
+        self.assertFalse(sa.enable_mixed_batch)
+        self.assertEqual(sa.chunked_prefill_size, 8192)
 
     def test_distributed_timeout_seconds_arg(self):
         args = self._parse_args(
