@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import inspect
 import os
 import sys
@@ -670,7 +671,58 @@ class GroupAwareWireTest(unittest.TestCase):
             layer_slices=((0, 2), (2, 1)),
             num_field_rows=3,
         )
+        executor._paced_writes = collections.deque()
+        executor._paced_inflight = None
+        executor._paced_slice_blocks = 0
         return executor, device
+
+    def test_large_pinned_writeback_is_paced_one_slice_at_a_time(self):
+        executor_module = self._executor_module()
+        executor, _ = self._make_write_executor(executor_module)
+        executor._paced_slice_blocks = 2
+        executor._ready_load_acks = []
+        executor._prefetch_acks = []
+        executor._backup_futures = []
+        executor.l3_store = None
+        launched = []
+        events = []
+
+        def start_d2h(transfers, **launch):
+            launched.append((list(transfers), launch["prerequisite_stream"]))
+            event = Mock(name=f"slice{len(events)}")
+            event.query.return_value = False
+            events.append(event)
+            return event
+
+        executor._pinned_write_lane = SimpleNamespace(start_d2h=start_d2h)
+        prerequisite = Mock(name="forward_stream")
+        ready = Mock(name="ready")
+        transfers = [(0, i, 10 + i) for i in range(5)]
+        with patch.object(executor_module.device_module, "Event", return_value=ready):
+            executor._queue_pinned_writes(
+                [7], transfers, [], prerequisite_stream=prerequisite
+            )
+        # Only the first slice is in flight, ordered behind an event recorded
+        # at submit time rather than the forward stream at launch time.
+        ready.record.assert_called_once_with(prerequisite)
+        self.assertEqual(launched, [(transfers[0:2], None)])
+        executor.write_stream.wait_event.assert_called_with(ready)
+        self.assertTrue(executor.has_paced_writes())
+        executor.pump_paced_writes()
+        self.assertEqual(executor.poll_results(), [])
+        self.assertEqual(len(launched), 1)
+        # Each poll launches the next slice once the previous one is done.
+        events[0].query.return_value = True
+        executor.pump_paced_writes()
+        self.assertEqual(launched[1][0], transfers[2:4])
+        events[1].query.return_value = True
+        executor.pump_paced_writes()
+        self.assertEqual(launched[2][0], transfers[4:5])
+        self.assertFalse(executor.has_paced_writes())
+        # The ACK rides the last slice only.
+        events[2].query.return_value = True
+        acks = executor.poll_results()
+        self.assertEqual([ack.op_id for ack in acks], [7])
 
     def test_writeback_rides_the_write_stream_ordered_after_the_caller(self):
         executor_module = self._executor_module()

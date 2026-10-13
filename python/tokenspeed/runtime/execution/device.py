@@ -324,6 +324,7 @@ class DeviceHandle:
         # in flight forever and the cache-gated requests hang silently.
         # Appended and drained on the control-plane thread only.
         self._l2_submissions: deque = deque()
+        self._paced_pump = None
         # The transfer peer's submissions, settled at the next round's
         # execute (see ``_settle``).
         self._transfer_submissions: deque = deque()
@@ -553,6 +554,14 @@ class DeviceHandle:
             "L2 cache-plan submission failed on the data plane; its ops have "
             "no completion events and would hang their cache-gated requests",
         )
+        if l2.has_paced_writes():
+            # A paced write-back advances one slice per data-plane turn, also
+            # on idle rounds; at most one pump is queued at a time.
+            pump = self._paced_pump
+            if pump is None or pump.done():
+                pump = self._thread.submit(l2.pump_paced_writes)
+                self._paced_pump = pump
+                self._l2_submissions.append(pump)
         return l2.poll_results()
 
     def consume_l3_backup_poll_failure(self) -> bool:

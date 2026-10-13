@@ -365,6 +365,7 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
             ),
             submit_prefetches=lambda ops: None,
             poll_results=lambda: ["done"],
+            has_paced_writes=lambda: False,
         ),
     )
     handle._executor.zero_cache_pages = lambda pages: trace.append(
@@ -522,6 +523,7 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll(wire_ops):
             submit_load_backs=lambda ops, *, prerequisite_stream: None,
             submit_prefetches=lambda ops: None,
             poll_results=lambda: [],
+            has_paced_writes=lambda: False,
         ),
     )
 

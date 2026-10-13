@@ -53,6 +53,8 @@ so under KVP each rank copies exactly the blocks it owns.
 
 from __future__ import annotations
 
+import collections
+import os
 import threading
 import time
 from collections.abc import Iterable, Sequence
@@ -103,6 +105,24 @@ logger = get_colorful_logger(__name__)
 device_module = get_device_module()
 
 _HOST_MEM_HEADROOM_BYTES = 10 * (1024**3)
+
+
+def _writeback_slice_blocks() -> int:
+    """Blocks per paced pinned write-back slice; 0 submits each batch whole."""
+    return max(int(os.environ.get("TOKENSPEED_L2_WRITEBACK_SLICE_BLOCKS", "64")), 0)
+
+
+class _PacedWrite:
+    """A pinned write-back batch still being fed to the write stream in slices."""
+
+    __slots__ = ("op_ids", "transfers", "pages", "ready", "cursor")
+
+    def __init__(self, op_ids, transfers, pages, ready) -> None:
+        self.op_ids = op_ids
+        self.transfers = transfers
+        self.pages = pages
+        self.ready = ready
+        self.cursor = 0
 
 
 def _ordered_unique(values: Iterable[int]) -> list[int]:
@@ -172,6 +192,12 @@ def allocate_blob_arena(rows: int, nbytes: int) -> torch.Tensor:
 
 class HostCacheExecutor:
     """Execute group-aware D2H/H2D operations against the two compact Host tiers."""
+
+    # Pacing state; ``__init__`` replaces these. The class defaults leave
+    # pacing off for an executor built without it.
+    _paced_writes: collections.deque | tuple = ()
+    _paced_inflight = None
+    _paced_slice_blocks = 0
 
     def __init__(
         self,
@@ -404,6 +430,12 @@ class HostCacheExecutor:
         # released from ``_ready_load_acks``; the lock covers it and the L3
         # backup futures.
         self._completions = CompletionQueue()
+        # Pinned write-backs are paced: one slice in flight on the write
+        # stream at a time, so the copy engine never holds seconds of queued
+        # D2H in front of the forward's own small result copies.
+        self._paced_writes: collections.deque[_PacedWrite] = collections.deque()
+        self._paced_inflight = None
+        self._paced_slice_blocks = _writeback_slice_blocks()
         self._ack_lock = threading.Lock()
         self._load_poisoned = False
         self._ready_load_acks: list[int] = []
@@ -603,13 +635,104 @@ class HostCacheExecutor:
             raise
         if fence is not None:
             fence_stream.wait_event(fence)
-        self._start_writing(
+        self._queue_pinned_writes(
             pinned_op_ids,
             pinned_transfers,
             pinned_pages,
-            lane=self._pinned_write_lane,
             prerequisite_stream=prerequisite_stream,
         )
+
+    def _queue_pinned_writes(
+        self,
+        op_ids: Sequence[int],
+        transfers: Sequence[tuple[int, int, int]],
+        pages: Sequence[StoragePage],
+        *,
+        prerequisite_stream,
+    ) -> None:
+        """Submit a pinned write-back, sliced and paced when it is large.
+
+        A pinned op's sources stay unevictable until its ACK, so deferring the
+        tail of its copy is safe; the ACK rides the last slice's event. The
+        slices wait on an event recorded now on ``prerequisite_stream`` rather
+        than on that stream at launch time, so a later slice does not couple
+        to forwards queued after the ones that wrote its pages.
+        """
+        if not op_ids:
+            return
+        limit = self._paced_slice_blocks
+        if limit <= 0 or (
+            len(transfers) <= limit
+            and not self._paced_writes
+            and self._paced_inflight is None
+        ):
+            self._start_writing(
+                op_ids,
+                transfers,
+                pages,
+                lane=self._pinned_write_lane,
+                prerequisite_stream=prerequisite_stream,
+            )
+            return
+        ready = None
+        if prerequisite_stream is not None:
+            ready = device_module.Event()
+            ready.record(prerequisite_stream)
+        self._paced_writes.append(
+            _PacedWrite(_ordered_unique(op_ids), list(transfers), list(pages), ready)
+        )
+        if self.attn_tp_rank == 0:
+            logger.info(
+                f"[L2] writeback queued: operations={len(op_ids):d} "
+                f"blocks={len(transfers):d} slice={limit:d}"
+            )
+        self._pump_paced_writes()
+
+    def has_paced_writes(self) -> bool:
+        """Whether a paced write-back still has slices to launch."""
+        return bool(self._paced_writes)
+
+    def pump_paced_writes(self) -> None:
+        """Launch the next paced slice if the previous one is done; data plane only."""
+        self._pump_paced_writes()
+
+    def _pump_paced_writes(self, *, drain: bool = False) -> None:
+        """Launch the next slice once the previous one has left the stream.
+
+        Runs on the data-plane thread: a slice launch allocates and enqueues
+        device work.
+        """
+        while self._paced_writes:
+            inflight = self._paced_inflight
+            if inflight is not None and not drain and not inflight.query():
+                return
+            entry = self._paced_writes[0]
+            limit = self._paced_slice_blocks
+            end = len(entry.transfers) if drain else entry.cursor + limit
+            chunk = entry.transfers[entry.cursor : end]
+            entry.cursor += len(chunk)
+            if entry.ready is not None:
+                self.write_stream.wait_event(entry.ready)
+            finish = self._pinned_write_lane.start_d2h(
+                chunk,
+                device_buffers=self.layout.buffers,
+                host_buffer=self.host_storage.host_buffer,
+                geometry=self._transfer_geometry,
+                stream=self.write_stream,
+                prerequisite_stream=None,
+                backend=self.transfer_backend,
+            )
+            self._paced_inflight = finish
+            if entry.cursor >= len(entry.transfers):
+                self._paced_writes.popleft()
+                self._completions.push(
+                    finish,
+                    _Ack(
+                        kind=_AckKind.WRITE_BACK,
+                        op_ids=entry.op_ids,
+                        backup_pages=entry.pages,
+                    ),
+                )
 
     def submit_load_backs(self, cache_ops: Sequence, *, prerequisite_stream) -> None:
         """Launch the plan's H2D loads; runs after the plan's page zeroing.
@@ -1605,6 +1728,7 @@ class HostCacheExecutor:
     def shutdown(self) -> None:
         # The fences and start events live on streams the callers named per
         # submission; the whole device covers them and the transfer streams.
+        self._pump_paced_writes(drain=True)
         device_module.synchronize()
         pending = self._completions.drop_all()
         with self._ack_lock:
