@@ -245,6 +245,11 @@ class EventLoop:
             disaggregation_mode=server_args.disaggregation_mode,
         )
         self.overlap_schedule_depth = int(self.use_overlap_schedule)
+        # TOKENSPEED_COMMIT_DISPATCHED_EXTEND=1 restores committing an extend
+        # forward in the same round it was dispatched (blocks on the prefill).
+        self._commit_dispatched_extend_now = (
+            os.environ.get("TOKENSPEED_COMMIT_DISPATCHED_EXTEND", "0") == "1"
+        )
         # In-flight depth of the unified event loop: how many dispatched
         # forwards may await commit at once. 0 = commit in the same iteration
         # (classic non-overlap); 1 = the overlap schedule (CPU post-processes
@@ -1097,6 +1102,21 @@ class EventLoop:
         """
         return grammar_inputs is not None and self._uses_eager_grammar
 
+    def _should_commit_head(self, in_flight, effective_depth, forward_op) -> bool:
+        """Whether the oldest in-flight forward commits this round: past the
+        depth, or an extend head (it carries first tokens) dispatched in an
+        EARLIER round. The forward dispatched this round is never committed
+        early: that would block on the whole prefill and leave the GPU idle
+        while the next round is planned."""
+        if not in_flight:
+            return False
+        if len(in_flight) > effective_depth:
+            return True
+        head = in_flight[0][0]
+        return head.num_extends() > 0 and (
+            head is not forward_op or self._commit_dispatched_extend_now
+        )
+
     def event_loop(self):
         """The one scheduler loop, parameterized by in-flight depth.
 
@@ -1293,9 +1313,13 @@ class EventLoop:
                     # one-step overlap only for decode->decode. This is a commit
                     # ordered earlier, never later, so the depth stays a perf
                     # knob (event-loop.md Principle 4): correctness is unchanged.
-                    while in_flight and (
-                        len(in_flight) > effective_depth
-                        or in_flight[0][0].num_extends() > 0
+                    # Only an extend head dispatched in an EARLIER round is
+                    # committed early: committing the forward dispatched just
+                    # now would block this thread for the whole prefill and
+                    # leave the GPU idle while the next round is planned. A
+                    # round that dispatches nothing drains fully anyway.
+                    while self._should_commit_head(
+                        in_flight, effective_depth, forward_op
                     ):
                         fo, res = in_flight.popleft()
                         request_changes.extend(self._commit_forward_results(fo, res))

@@ -258,3 +258,30 @@ def test_pp_broadcast_precedes_commit_post_processing() -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def _commit_rule_loop(commit_dispatched_extend_now=False):
+    loop = object.__new__(EventLoop)
+    loop._commit_dispatched_extend_now = commit_dispatched_extend_now
+    return loop
+
+
+def test_extend_dispatched_this_round_is_not_committed_early() -> None:
+    loop = _commit_rule_loop()
+    extend = SimpleNamespace(num_extends=lambda: 1)
+    decode = SimpleNamespace(num_extends=lambda: 0)
+    # Just dispatched: committing would block on the whole prefill.
+    assert not loop._should_commit_head([(extend, None)], 1, extend)
+    # Dispatched last round: commit it now (first tokens), even within depth.
+    assert loop._should_commit_head([(extend, None), (decode, None)], 2, decode)
+    # Past the depth: commit regardless of kind.
+    assert loop._should_commit_head([(decode, None), (extend, None)], 1, extend)
+    # A round that dispatched nothing drains fully (depth 0).
+    assert loop._should_commit_head([(extend, None)], 0, None)
+    assert not loop._should_commit_head([], 0, None)
+
+
+def test_commit_dispatched_extend_knob_restores_same_round_commit() -> None:
+    loop = _commit_rule_loop(commit_dispatched_extend_now=True)
+    extend = SimpleNamespace(num_extends=lambda: 1)
+    assert loop._should_commit_head([(extend, None)], 1, extend)
