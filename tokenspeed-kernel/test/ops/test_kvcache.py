@@ -1074,3 +1074,41 @@ def test_index_k_scatter_mask_preserves_dummy_page(device):
     scale[1, [1, 3]] = scales[[1, 3]]
     assert torch.equal(cache, expected)
     assert torch.equal(cache[:64], before[:64])
+
+
+def test_merge_contiguous_ranges_coalesces_runs_on_both_sides():
+    from tokenspeed_kernel.ops.kvcache.host_transfer import merge_contiguous_ranges
+
+    ranges = [
+        (0, 200, 1200, 100),  # out of order: sorted before merging
+        (0, 0, 1000, 100),
+        (0, 100, 1100, 100),  # device and host contiguous -> merged
+        (0, 300, 5000, 100),  # device contiguous, host jumps -> new range
+        (1, 400, 5100, 100),  # other device buffer -> new range
+        (0, 500, 9000, 0),  # empty -> dropped
+    ]
+    assert merge_contiguous_ranges(ranges) == [
+        (0, 0, 1000, 300),
+        (0, 300, 5000, 100),
+        (1, 400, 5100, 100),
+    ]
+
+
+def test_dma_transfer_matches_per_range_copy_after_merging():
+    from tokenspeed_kernel.ops.kvcache.host_transfer import _transfer_dma
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    dev = torch.arange(4096, dtype=torch.int32, device="cuda").view(torch.uint8)
+    host = torch.zeros(dev.numel() * 2, dtype=torch.uint8, pin_memory=True)
+    ranges = [(0, i * 512, 1024 + i * 512, 512) for i in (3, 0, 1, 2, 5)]
+    _transfer_dma("d2h", (dev,), host, ranges)
+    torch.cuda.synchronize()
+    ref = dev.cpu()
+    for _, d, h, n in ranges:
+        assert torch.equal(host[h : h + n], ref[d : d + n])
+    back = torch.zeros_like(dev)
+    _transfer_dma("h2d", (back,), host, ranges)
+    torch.cuda.synchronize()
+    for _, d, h, n in ranges:
+        assert torch.equal(back[d : d + n].cpu(), ref[d : d + n])

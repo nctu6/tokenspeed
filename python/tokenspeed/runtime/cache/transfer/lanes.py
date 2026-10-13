@@ -185,6 +185,23 @@ def build_transfer_geometry(
     return geometry
 
 
+# Transfers of at least this many block rows skip the mapped-Host SM copy
+# kernel and use copy-engine DMA. The SM kernel moves Host memory through
+# PCIe loads and stores from 64 CTAs. A bulk write-back after a prefill wave
+# (thousands of blocks) keeps it busy for seconds at a few GB/s and takes SMs
+# from the forwards. The copy engine moves the same bytes at link speed
+# without SMs. Small transfers stay on the kernel, whose single launch is
+# cheaper than many DMA submissions.
+_DMA_MIN_BLOCKS = int(os.environ.get("TOKENSPEED_HOST_TRANSFER_DMA_MIN_BLOCKS", "64"))
+
+
+def _copy_backend_for(backend: str, num_transfers: int) -> str:
+    """The transport for one submission: DMA for bulk ``auto`` transfers."""
+    if backend == "auto" and _DMA_MIN_BLOCKS > 0 and num_transfers >= _DMA_MIN_BLOCKS:
+        return "dma"
+    return backend
+
+
 class _LaneSlot:
     """One staging workspace plus the event after the last payload that read it."""
 
@@ -329,6 +346,7 @@ class HostTransferLane:
             # read, or land on, their final bytes.
             stream.wait_stream(prerequisite_stream)
         if transfers:
+            backend = _copy_backend_for(backend, len(transfers))
             slot = self._acquire()
             # Mark the slot busy before staging: if staging raises midway, a
             # partially submitted upload is still ordered behind this event.

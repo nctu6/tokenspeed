@@ -940,6 +940,40 @@ def _validate_ranges(
             raise IndexError("cache transfer range lies outside Host buffer")
 
 
+def merge_contiguous_ranges(
+    ranges: Sequence[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int]]:
+    """Coalesce ranges that are contiguous on both the Device and the Host side.
+
+    The ranges of one transfer never overlap, so their order is free. Sorting
+    by (device buffer, device offset) puts neighbouring blocks of one field
+    next to each other. When the Host slots are consecutive too, as they are
+    for blocks allocated together, a run of blocks becomes one copy-engine
+    transfer instead of one small copy per block.
+
+    Args:
+        ranges: ``(device_buffer_index, device_offset, host_offset, num_bytes)``.
+
+    Returns:
+        The merged ranges, covering exactly the same bytes.
+    """
+    merged: list[list[int]] = []
+    for buf, dev, host, size in sorted(ranges):
+        if size <= 0:
+            continue
+        if merged:
+            last = merged[-1]
+            if (
+                last[0] == buf
+                and last[1] + last[3] == dev
+                and last[2] + last[3] == host
+            ):
+                last[3] += size
+                continue
+        merged.append([buf, dev, host, size])
+    return [tuple(r) for r in merged]
+
+
 def _transfer_dma(
     direction: Literal["d2h", "h2d"],
     device_buffers: Sequence[torch.Tensor],
@@ -949,7 +983,9 @@ def _transfer_dma(
     byte_buffers = tuple(
         buffer.view(torch.uint8).reshape(-1) for buffer in device_buffers
     )
-    for device_buffer_index, device_offset, host_offset, num_bytes in ranges:
+    for device_buffer_index, device_offset, host_offset, num_bytes in (
+        merge_contiguous_ranges(ranges)
+    ):
         device_slice = byte_buffers[device_buffer_index][
             device_offset : device_offset + num_bytes
         ]

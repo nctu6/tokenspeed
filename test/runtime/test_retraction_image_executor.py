@@ -1198,3 +1198,13 @@ def _round_trip_two_ranks(io_backend, executors):
         assert bool(slot_states[rank].flag[3]) and not bool(slot_states[rank].flag[1])
         assert slot_states[rank].table[0].tolist() == [200 + rank] * 5
         assert not bool(slot_states[rank].flag[0])
+
+
+def test_bulk_auto_transfers_route_to_copy_engine_dma():
+    """Large ``auto`` submissions use DMA; small ones keep the SM copy kernel."""
+    threshold = lanes_module._DMA_MIN_BLOCKS
+    assert lanes_module._copy_backend_for("auto", threshold) == "dma"
+    assert lanes_module._copy_backend_for("auto", threshold - 1) == "auto"
+    # An explicit transport is never rewritten.
+    assert lanes_module._copy_backend_for("dma", 1) == "dma"
+    assert lanes_module._copy_backend_for("triton", threshold * 10) == "triton"
