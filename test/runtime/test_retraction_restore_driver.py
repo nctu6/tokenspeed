@@ -59,6 +59,14 @@ from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
 )
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _eager_host_writes(monkeypatch):
+    # These op-sequence checks assume every published page is stored as it
+    # completes; the deferred (reuse) write policy adds stores at retraction.
+    monkeypatch.setenv("TOKENSPEED_KVSTORE_WRITE_POLICY", "eager")
+
+
 PAGE = 16
 PROMPT = list(range(40))  # 2 hash-complete pages and a 8-token tail
 POOL_LCM_BLOCKS = 8

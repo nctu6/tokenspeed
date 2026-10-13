@@ -18,6 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include <cstdlib>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -5167,4 +5168,98 @@ TEST(RetractionImageTest, HostAllocationFollowsTheSourceBucket) {
 }
 
 }  // namespace
+
+namespace {
+
+std::vector<CacheGroupSpec> WritePolicySpecs() {
+    return {
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 4,
+                       .cache_blocks_per_lcm_block = 1,
+                       .block_granularity = 2},
+    };
+}
+
+}  // namespace
+
+TEST(CacheCoordinatorHostWritePolicy, OnReuseHoldsStoresUntilADeviceHit) {
+    BlockPool pool(/*num_lcm_blocks=*/16, {1, 1});
+    BlockPool host_pool(4, {1, 1});
+    CacheCoordinator coordinator = MakeCoordinator(WritePolicySpecs(), 2, pool, /*enable_l3_storage=*/false,
+                                                   &host_pool, /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true);
+    coordinator.SetHostWritePolicy(CacheCoordinator::HostWritePolicy::kOnReuse);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+    std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
+
+    CacheFullBlocksForTest(coordinator, tables, hashes, /*first_slot=*/0);
+    // First access: nothing is copied yet, the candidates wait.
+    EXPECT_TRUE(coordinator.TakePendingStores().empty());
+    EXPECT_EQ(coordinator.NumDeferredStores(), 2u);
+
+    // Second access: the Device hit promotes the hit pages to real stores.
+    auto match = MatchPrefixForTest(coordinator, hashes);
+    std::vector<CacheCoordinator::StoreCandidate> pending = coordinator.TakePendingStores();
+    ASSERT_FALSE(pending.empty());
+    for (const auto& candidate : pending) {
+        EXPECT_EQ(candidate.key.group_id, 1u);
+    }
+    EXPECT_EQ(coordinator.NumDeferredStores(), 2u - pending.size());
+    // A promoted key is stored once; a repeated hit queues nothing new.
+    auto again = MatchPrefixForTest(coordinator, hashes);
+    for (const auto& candidate : coordinator.TakePendingStores()) {
+        for (const auto& first : pending) {
+            EXPECT_NE(candidate.key, first.key);
+        }
+    }
+}
+
+TEST(CacheCoordinatorHostWritePolicy, EagerQueuesEveryPublishedPageImmediately) {
+    BlockPool pool(16, {1, 1});
+    BlockPool host_pool(4, {1, 1});
+    CacheCoordinator coordinator = MakeCoordinator(WritePolicySpecs(), 2, pool, false, &host_pool, nullptr, true);
+    EXPECT_EQ(coordinator.GetHostWritePolicy(), CacheCoordinator::HostWritePolicy::kEager);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, 4));
+    CacheFullBlocksForTest(coordinator, tables, ContentHashes({{1, 2}, {3, 4}}), 0);
+    EXPECT_EQ(coordinator.TakePendingStores().size(), 2u);
+    EXPECT_EQ(coordinator.NumDeferredStores(), 0u);
+}
+
+TEST(CacheCoordinatorHostWritePolicy, PressurePromotesDeferredPagesWhenThePoolRunsDry) {
+    for (const auto policy :
+         {CacheCoordinator::HostWritePolicy::kOnReuse, CacheCoordinator::HostWritePolicy::kOnReuseOrPressure}) {
+        // Four blocks, all owned by the admitted request: no empty block left.
+        BlockPool pool(4, {1, 1});
+        BlockPool host_pool(4, {1, 1});
+        CacheCoordinator coordinator = MakeCoordinator(WritePolicySpecs(), 2, pool, false, &host_pool, nullptr, true);
+        coordinator.SetHostWritePolicy(policy);
+        std::vector<BlockTable> tables(coordinator.NumGroups());
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, 4));
+        ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
+        CacheFullBlocksForTest(coordinator, tables, ContentHashes({{1, 2}, {3, 4}}), 0);
+        const std::size_t pending = coordinator.TakePendingStores().size();
+        if (policy == CacheCoordinator::HostWritePolicy::kOnReuse) {
+            EXPECT_EQ(pending, 0u) << "reuse-only never copies on pressure";
+            EXPECT_EQ(coordinator.NumDeferredStores(), 2u);
+        } else {
+            EXPECT_EQ(pending, 2u) << "pages about to be evicted are copied out first";
+            EXPECT_EQ(coordinator.NumDeferredStores(), 0u);
+        }
+    }
+}
+
 }  // namespace tokenspeed::test
+
+namespace {
+// The Scheduler-level suites pin exact store/op sequences written for eager
+// Host writes; run them under eager unless the caller chose a policy. The
+// HostWritePolicy tests set their policy on the coordinator directly.
+const bool kEagerWritePolicyForSuites = [] {
+    setenv("TOKENSPEED_KVSTORE_WRITE_POLICY", "eager", /*overwrite=*/0);
+    return true;
+}();
+}  // namespace

@@ -149,6 +149,8 @@ bool CacheCoordinator::ClearDeviceCache() {
     }
 
     pending_stores_.clear();
+    deferred_store_order_.clear();
+    deferred_store_keys_.clear();
     storage_keys_.clear();
     storage_key_order_.clear();
     for (const auto& [group_id, location] : cached_locations) {
@@ -522,6 +524,19 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(
 }
 
 CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch) {
+    if (!deferred_store_keys_.empty()) {
+        // A Device hit is the second access the deferred write policy waits
+        // for: the hit pages are now worth a Host copy.
+        for (std::size_t i = 0; i < probe.device.per_group.size() && i < probe.group_keys.size(); ++i) {
+            const std::vector<std::uint8_t>& hits = probe.device.per_group[i].hits;
+            const std::vector<CacheKey>& keys = probe.group_keys[i];
+            for (std::size_t k = 0; k < hits.size() && k < keys.size(); ++k) {
+                if (hits[k] != 0) {
+                    promoteDeferredStore(keys[k]);
+                }
+            }
+        }
+    }
     AcquiredPrefix out;
     out.device = acquireTierWithKeys<CacheTier::kDevice>(probe.group_keys, /*floor_tokens=*/0, std::move(probe.device),
                                                          access_epoch);
@@ -657,8 +672,16 @@ void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> pr
             continue;
         }
         for (CacheKey& key : keysForGroup(prefix_hashes, group.Id())) {
-            if (group.Index().Contains(pool_, key)) {
+            if (!group.Index().Contains(pool_, key)) {
+                continue;
+            }
+            // A finished request's pages follow the write policy too: under a
+            // deferred policy they wait for a reuse hit (or pressure) instead of
+            // being copied the moment the request ends.
+            if (host_write_policy_ == HostWritePolicy::kEager) {
                 pending_stores_.push_back(StoreCandidate{.key = std::move(key)});
+            } else {
+                deferStore(std::move(key));
             }
         }
     }
@@ -735,10 +758,81 @@ void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTab
         if (!automatically_streams_to_host) {
             continue;
         }
-        pending_stores_.push_back(StoreCandidate{
-            .key = std::move(key),
-        });
+        if (host_write_policy_ == HostWritePolicy::kEager) {
+            pending_stores_.push_back(StoreCandidate{
+                .key = std::move(key),
+            });
+        } else {
+            deferStore(std::move(key));
+        }
     }
+}
+
+void CacheCoordinator::deferStore(CacheKey key) {
+    if (!deferred_store_keys_.insert(key).second) {
+        return;
+    }
+    deferred_store_order_.push_back(std::move(key));
+    // Bounded: a candidate older than a few Device pools' worth of pages has
+    // long been evicted (StartPendingStores would skip it anyway).
+    const std::size_t limit = static_cast<std::size_t>(std::max(pool_.NumLcmBlocks(), 1)) * 8;
+    while (deferred_store_keys_.size() > limit && !deferred_store_order_.empty()) {
+        deferred_store_keys_.erase(deferred_store_order_.front());
+        deferred_store_order_.pop_front();
+    }
+    compactDeferredStores();
+}
+
+void CacheCoordinator::promoteDeferredStore(const CacheKey& key) {
+    if (deferred_store_keys_.erase(key) > 0) {
+        pending_stores_.push_back(StoreCandidate{.key = key});
+    }
+}
+
+void CacheCoordinator::compactDeferredStores() {
+    // Promoted keys leave stale deque slots behind; rebuild once they dominate.
+    if (deferred_store_order_.size() <= 2 * deferred_store_keys_.size() + 1024) {
+        return;
+    }
+    std::deque<CacheKey> live;
+    std::unordered_set<CacheKey, CacheKeyHash> seen;
+    for (CacheKey& key : deferred_store_order_) {
+        if (deferred_store_keys_.contains(key) && seen.insert(key).second) {
+            live.push_back(std::move(key));
+        }
+    }
+    deferred_store_order_ = std::move(live);
+}
+
+void CacheCoordinator::promoteDeferredUnderPressure() {
+    if (host_write_policy_ != HostWritePolicy::kOnReuseOrPressure || deferred_store_keys_.empty()) {
+        return;
+    }
+    const std::int32_t total = pool_.NumLcmBlocks();
+    // Low watermark: under 1/16 of the Device pool empty means the next
+    // admissions evict, oldest entries first -- copy those out first.
+    if (pool_.NumEmptyLcmBlocks() * 16 >= total) {
+        return;
+    }
+    constexpr std::size_t kPerRound = 256;
+    std::size_t promoted = 0;
+    while (promoted < kPerRound && !deferred_store_order_.empty()) {
+        CacheKey key = std::move(deferred_store_order_.front());
+        deferred_store_order_.pop_front();
+        if (deferred_store_keys_.erase(key) == 0) {
+            continue;
+        }
+        if (!AcquireDeviceCachedBlock(key)) {
+            continue;  // already evicted: dropped, never copied
+        }
+        pending_stores_.push_back(StoreCandidate{.key = std::move(key)});
+        ++promoted;
+    }
+}
+
+std::vector<CacheCoordinator::StoreCandidate> CacheCoordinator::TakePendingStores() {
+    promoteDeferredUnderPressure();
+    return std::exchange(pending_stores_, {});
 }
 
 CacheBlockRef CacheCoordinator::AcquireDeviceCachedBlock(const CacheKey& key) const {

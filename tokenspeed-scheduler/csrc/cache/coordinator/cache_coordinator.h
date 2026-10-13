@@ -344,7 +344,21 @@ public:
     void QueueCachedBlocksForStore(std::span<const std::string> prefix_hashes);
     // Queue the newest already-published Device checkpoint from each state group.
     void QueueLatestSnapshotBlocksForStore(std::span<const std::string> prefix_hashes);
-    std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
+    // When newly published Device pages are copied to the Host tier.
+    //   kEager: every published page is queued for a store as it completes.
+    //   kOnReuse: a page is held as a deferred candidate and queued only when
+    //     a later admission hits it on the Device (second access); a page
+    //     evicted before that is dropped, never copied.
+    //   kOnReuseOrPressure: kOnReuse, plus the oldest deferred candidates are
+    //     queued while the Device pool runs low on empty blocks, so pages
+    //     about to be evicted still reach the Host tier.
+    // Explicit QueueCachedBlocksForStore / QueueLatestSnapshotBlocksForStore
+    // requests are always queued immediately.
+    enum class HostWritePolicy : std::uint8_t { kEager, kOnReuse, kOnReuseOrPressure };
+    void SetHostWritePolicy(HostWritePolicy policy) { host_write_policy_ = policy; }
+    HostWritePolicy GetHostWritePolicy() const noexcept { return host_write_policy_; }
+    std::size_t NumDeferredStores() const noexcept { return deferred_store_keys_.size(); }
+    std::vector<StoreCandidate> TakePendingStores();
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
     // One Host block per (group, bucket) entry, in the bucket of the Device
     // block it will mirror -- under page-cyclic sharding the owner of a Host
@@ -479,6 +493,15 @@ private:
     std::int32_t replay_window_tokens_{0};
     std::uint64_t next_access_epoch_{0};
     std::vector<StoreCandidate> pending_stores_;
+    HostWritePolicy host_write_policy_{HostWritePolicy::kEager};
+    // Deferred (not yet queued) store candidates, oldest first. The deque may
+    // hold keys already promoted or dropped; the set is the membership truth.
+    std::deque<CacheKey> deferred_store_order_;
+    std::unordered_set<CacheKey, CacheKeyHash> deferred_store_keys_;
+    void deferStore(CacheKey key);
+    void promoteDeferredStore(const CacheKey& key);
+    void promoteDeferredUnderPressure();
+    void compactDeferredStores();
     std::unordered_set<CacheKey, CacheKeyHash> storage_keys_;
     std::deque<CacheKey> storage_key_order_;
     std::size_t storage_key_limit_{0};

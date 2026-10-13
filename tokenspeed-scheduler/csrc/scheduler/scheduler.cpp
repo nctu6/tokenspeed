@@ -108,6 +108,21 @@ Scheduler::Scheduler(SchedulerConfig config)
         });
     }
 
+    // TOKENSPEED_KVSTORE_WRITE_POLICY: "reuse" (default), "reuse_pressure" or
+    // "eager" -- see CacheCoordinator::HostWritePolicy.
+    {
+        const char* policy = std::getenv("TOKENSPEED_KVSTORE_WRITE_POLICY");
+        const std::string name = policy != nullptr ? policy : "reuse";
+        if (name == "eager") {
+            coordinator_.SetHostWritePolicy(CacheCoordinator::HostWritePolicy::kEager);
+        } else if (name == "reuse_pressure") {
+            coordinator_.SetHostWritePolicy(CacheCoordinator::HostWritePolicy::kOnReuseOrPressure);
+        } else {
+            _assert(name == "reuse", "TOKENSPEED_KVSTORE_WRITE_POLICY must be eager, reuse or reuse_pressure");
+            coordinator_.SetHostWritePolicy(CacheCoordinator::HostWritePolicy::kOnReuse);
+        }
+    }
+
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {
         spdlog::set_level(spdlog::level::from_str(level));
     }
