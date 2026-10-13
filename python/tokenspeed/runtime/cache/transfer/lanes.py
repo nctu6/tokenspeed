@@ -34,6 +34,7 @@ backups and layerwise load fences for L2, the slot-state image for the pool
 
 from __future__ import annotations
 
+import os
 import threading
 from collections.abc import Sequence
 from typing import Any
@@ -184,23 +185,74 @@ def build_transfer_geometry(
     return geometry
 
 
-class HostTransferLane:
-    """Staging for one kind of transfer submission.
+class _LaneSlot:
+    """One staging workspace plus the event after the last payload that read it."""
 
-    A lane owns one transfer workspace and the event guarding that
-    workspace's pinned metadata staging. Two submissions that must never wait
-    on each other's staging (L2's stream-ordered and pinned write-backs; the
-    snapshot executor's stores and restores) take separate lanes.
-    """
-
-    __slots__ = ("metadata_done", "workspace")
+    __slots__ = ("workspace", "payload_done")
 
     def __init__(self) -> None:
         self.workspace = HostTransferWorkspace()
-        self.metadata_done = None
+        self.payload_done = None
+
+    def is_free(self) -> bool:
+        return self.payload_done is None or self.payload_done.query()
+
+
+class HostTransferLane:
+    """Staging for one kind of transfer submission.
+
+    A lane owns a small ring of transfer workspaces. Each workspace's pinned
+    metadata and Device tables are reused only after the payload that last
+    read them has completed, which the slot's ``payload_done`` event records.
+    Two submissions that must never wait on each other's staging (L2's
+    stream-ordered and pinned write-backs; the snapshot executor's stores and
+    restores) take separate lanes.
+
+    A single workspace is not enough. The metadata upload of submission N
+    queues on the transfer stream behind the payload of N-1, so a guard
+    recorded after that upload completes only when the N-1 payload does.
+    Submission N+1 would then block the submitting (forward) thread for that
+    entire copy. A bulk write-back after a prefill wave runs for seconds, so
+    the engine froze. With a ring, a submission takes a free workspace and
+    blocks only when every slot is still in flight. That bounds the staged
+    work and gives back-pressure without stalling the forward thread on one
+    slow copy.
+    """
+
+    __slots__ = ("_slots", "_max_slots", "_last")
+
+    def __init__(self, max_slots: int | None = None) -> None:
+        if max_slots is None:
+            max_slots = int(os.environ.get("TOKENSPEED_HOST_TRANSFER_LANE_SLOTS", "4"))
+        self._max_slots = max(1, int(max_slots))
+        self._slots: list[_LaneSlot] = [_LaneSlot()]
+        self._last: _LaneSlot | None = None
+
+    @property
+    def workspace(self):
+        """The workspace of the most recent submission (or the first slot)."""
+        return (self._last or self._slots[0]).workspace
+
+    def _acquire(self) -> _LaneSlot:
+        for slot in self._slots:
+            if slot is not self._last and slot.is_free():
+                return slot
+        if self._last is not None and self._last.is_free():
+            return self._last
+        if len(self._slots) < self._max_slots:
+            slot = _LaneSlot()
+            self._slots.append(slot)
+            return slot
+        # Every slot is in flight: wait for the oldest submission (the slot
+        # after the most recent one, round-robin) to retire.
+        index = (self._slots.index(self._last) + 1) % len(self._slots)
+        slot = self._slots[index]
+        slot.payload_done.synchronize()
+        return slot
 
     def _stage(
         self,
+        slot: _LaneSlot,
         transfers: Sequence[tuple[int, int, int]],
         *,
         device_buffers,
@@ -209,37 +261,24 @@ class HostTransferLane:
         stream,
         backend: str,
     ) -> int:
-        """Load this submission's block pairs into the lane's tables.
+        """Load this submission's block pairs into ``slot``'s tables.
 
-        Returns the number of block rows staged. CPU writes are not ordered by
-        stream FIFO, so the previous metadata upload is retired before its
-        pinned source is refilled, not at submit. Address-table allocation and
-        the metadata H2D are enqueued on ``stream`` itself: the payload kernel
-        reads those tables from that stream, and a copy issued on the caller's
-        stream would sit behind the wait recorded before this call with
-        nothing ordering it first.
+        Returns the number of block rows staged. The slot is free (its last
+        payload, and so its last metadata upload, completed), so the pinned
+        source can be refilled from the CPU immediately. Address-table
+        allocation and the metadata H2D are enqueued on ``stream`` itself:
+        the payload kernel reads those tables from that stream.
         """
-        if self.metadata_done is not None and not self.metadata_done.query():
-            self.metadata_done.synchronize()
-        num_blocks, _ = self.workspace.load_block_transfers(
-            transfers, geometry=geometry
-        )
+        workspace = slot.workspace
+        num_blocks, _ = workspace.load_block_transfers(transfers, geometry=geometry)
         with device_module.stream(stream):
-            mode = self.workspace.prepare_backend(
+            mode = workspace.prepare_backend(
                 device_buffers, host_buffer, backend=backend
             )
             if mode.uses_device_tables:
-                if self.metadata_done is None:
-                    self.metadata_done = device_module.Event()
-                try:
-                    self.workspace.commit_block_transfers(
-                        num_blocks, device_buffers[0].device, non_blocking=True
-                    )
-                finally:
-                    # Also protect a partially submitted upload if staging
-                    # fails. This event excludes the payload transfer; Device
-                    # table reuse remains ordered by the stream's FIFO.
-                    self.metadata_done.record(stream)
+                workspace.commit_block_transfers(
+                    num_blocks, device_buffers[0].device, non_blocking=True
+                )
         return num_blocks
 
     def _start(
@@ -290,30 +329,48 @@ class HostTransferLane:
             # read, or land on, their final bytes.
             stream.wait_stream(prerequisite_stream)
         if transfers:
-            num_blocks = self._stage(
-                transfers,
-                device_buffers=device_buffers,
-                host_buffer=host_buffer,
-                geometry=geometry,
-                stream=stream,
-                backend=backend,
-            )
-            transfer_cache_blocks(
-                direction,
-                device_buffers,
-                host_buffer,
-                geometry,
-                self.workspace,
-                stream,
-                num_blocks=num_blocks,
-                geometry_offset=0,
-                num_geometry_rows=geometry.num_field_rows,
-                backend=backend,
-                grid_cap=None,
-                layer_ready_flags=None,
-            )
+            slot = self._acquire()
+            # Mark the slot busy before staging: if staging raises midway, a
+            # partially submitted upload is still ordered behind this event.
+            slot.payload_done = None
+            self._last = slot
+            try:
+                num_blocks = self._stage(
+                    slot,
+                    transfers,
+                    device_buffers=device_buffers,
+                    host_buffer=host_buffer,
+                    geometry=geometry,
+                    stream=stream,
+                    backend=backend,
+                )
+                transfer_cache_blocks(
+                    direction,
+                    device_buffers,
+                    host_buffer,
+                    geometry,
+                    slot.workspace,
+                    stream,
+                    num_blocks=num_blocks,
+                    geometry_offset=0,
+                    num_geometry_rows=geometry.num_field_rows,
+                    backend=backend,
+                    grid_cap=None,
+                    layer_ready_flags=None,
+                )
+            except BaseException:
+                # Fence a partially submitted upload so the slot is reused
+                # only behind it.
+                tail = device_module.Event()
+                tail.record(stream)
+                slot.payload_done = tail
+                raise
         finish = device_module.Event()
         finish.record(stream)
+        if transfers:
+            # The completion event doubles as the slot's reuse guard: it is
+            # recorded right behind the payload that read the slot's tables.
+            slot.payload_done = finish
         return finish
 
     def start_d2h(self, transfers: Sequence[tuple[int, int, int]], **launch):

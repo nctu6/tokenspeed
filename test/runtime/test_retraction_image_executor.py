@@ -1018,7 +1018,8 @@ def test_a_lane_completes_a_zero_row_copy_without_touching_the_transport(backend
     assert lane.workspace.commit_block_transfers.call_count == (
         1 if backend == "auto" else 0
     )
-    assert lane.metadata_done is (events[2] if backend == "auto" else None)
+    # The non-empty copy's completion event guards its slot's reuse.
+    assert lane._last.payload_done is events[2]
 
 
 def test_completion_queue_releases_in_order_and_drops_on_reset():

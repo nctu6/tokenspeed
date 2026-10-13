@@ -694,7 +694,7 @@ class GroupAwareWireTest(unittest.TestCase):
             patch.object(
                 lanes_module.device_module,
                 "Event",
-                side_effect=[metadata_done, finish],
+                side_effect=[finish],
             ),
             patch.object(lanes_module, "transfer_cache_blocks") as transfer,
         ):
@@ -738,54 +738,62 @@ class GroupAwareWireTest(unittest.TestCase):
             layer_ready_flags=None,
         )
         finish.record.assert_called_once_with(executor.write_stream)
-        metadata_done.record.assert_called_once_with(executor.write_stream)
-        metadata_done.synchronize.assert_not_called()
-        self.assertIsNone(executor._ordered_write_lane.metadata_done)
+        # The completion event is the slot's reuse guard; nothing waits on it.
+        finish.synchronize.assert_not_called()
+        self.assertIsNone(executor._ordered_write_lane._last)
 
-        # Refill must wait for metadata, but must never wait for payload ACK;
-        # the upload and its retirement event sit inside the write-stream
-        # context, the payload launch names the stream explicitly.
-        for ready in (False, True):
-            with self.subTest(metadata_ready=ready):
-                metadata_done.reset_mock()
-                metadata_done.query.return_value = ready
-                order = Mock()
-                order.attach_mock(metadata_done.synchronize, "retire")
-                order.attach_mock(lane.workspace.load_block_transfers, "refill")
-                order.attach_mock(lane.workspace.commit_block_transfers, "upload")
-                order.attach_mock(metadata_done.record, "record")
-                with (
-                    no_current_stream,
-                    patch.object(lanes_module.device_module, "stream") as stream_ctx,
-                    patch.object(
-                        lanes_module.device_module, "Event", return_value=finish
-                    ),
-                    patch.object(lanes_module, "transfer_cache_blocks") as transfer,
-                ):
-                    order.attach_mock(stream_ctx, "stream")
-                    order.attach_mock(transfer, "payload")
-                    executor._start_writing(
-                        [8],
-                        [(0, 6, 10)],
-                        backup_pages=[],
-                        lane=lane,
-                        prerequisite_stream=prerequisite_stream,
-                    )
-                names = [call[0] for call in order.mock_calls]
-                self.assertEqual(
-                    names,
-                    ([] if ready else ["retire"])
-                    + [
-                        "refill",
-                        "stream",
-                        "stream().__enter__",
-                        "upload",
-                        "record",
-                        "stream().__exit__",
-                        "payload",
-                    ],
+    def test_lane_never_blocks_on_an_in_flight_payload_until_the_ring_is_full(self):
+        """A slow payload must not stall the next submissions (engine freeze).
+
+        The lane takes a free workspace for each submission and synchronizes
+        only once every slot of its ring is still in flight.
+        """
+        executor_module = self._executor_module()
+        lanes_module = _lanes_module()
+        executor, _ = self._make_write_executor(executor_module)
+        with patch.object(lanes_module, "HostTransferWorkspace", Mock):
+            lane = lanes_module.HostTransferLane(max_slots=2)
+        for ws in (lane.workspace,):
+            ws.load_block_transfers.return_value = (1, (0, 1))
+            ws.prepare_backend.return_value = SimpleNamespace(uses_device_tables=True)
+        busy = [Mock(name=f"payload{i}") for i in range(3)]
+        for event in busy:
+            event.query.return_value = False
+
+        def submit(event):
+            with (
+                patch.object(lanes_module, "HostTransferWorkspace", lambda: _ws()),
+                patch.object(lanes_module.device_module, "stream"),
+                patch.object(lanes_module.device_module, "Event", return_value=event),
+                patch.object(lanes_module, "transfer_cache_blocks") as transfer,
+            ):
+                lane.start_d2h(
+                    [(0, 1, 2)],
+                    device_buffers=executor.layout.buffers,
+                    host_buffer="host",
+                    geometry=executor._transfer_geometry,
+                    stream=executor.write_stream,
+                    prerequisite_stream=None,
+                    backend="auto",
                 )
-                finish.synchronize.assert_not_called()
+            return transfer.call_args.args[4]
+
+        def _ws():
+            ws = Mock()
+            ws.load_block_transfers.return_value = (1, (0, 1))
+            ws.prepare_backend.return_value = SimpleNamespace(uses_device_tables=True)
+            return ws
+
+        first = submit(busy[0])
+        second = submit(busy[1])
+        # The first payload is still running: a second workspace, no wait.
+        self.assertIsNot(first, second)
+        busy[0].synchronize.assert_not_called()
+        # Ring full (2 slots in flight): the oldest is retired, then reused.
+        third = submit(busy[2])
+        busy[0].synchronize.assert_called_once_with()
+        busy[1].synchronize.assert_not_called()
+        self.assertIs(third, first)
 
     def test_submit_write_backs_fences_only_stream_ordered_ops(self):
         executor_module = self._executor_module()
@@ -797,9 +805,7 @@ class GroupAwareWireTest(unittest.TestCase):
         pinned_finish = Mock(name="pinned_finish")
         events = iter(
             [
-                Mock(name="ordered_meta"),
                 ordered_finish,
-                Mock(name="pinned_meta"),
                 pinned_finish,
             ]
         )
@@ -897,7 +903,7 @@ class GroupAwareWireTest(unittest.TestCase):
         pinned_finish = Mock()
         ordered_finish.query.return_value = False
         pinned_finish.query.return_value = False
-        events = iter([Mock(), ordered_finish, Mock(), pinned_finish])
+        events = iter([ordered_finish, pinned_finish])
 
         class WriteBackOp:
             def __init__(self):
