@@ -94,6 +94,9 @@ __launch_bounds__(256) __global__ void unifiedInitKernel(
     int32_t const k = top_k_arr[b];
     float const p = top_p_arr[b];
     bool const topp_active = (k > max_topk);
+    // P >= 1 keeps the whole support: the apply kernel ignores the radix
+    // threshold for such rows, so do not run the radix passes over the vocab.
+    bool const topp_radix = topp_active && (p < 1.0f);
 
     // Set topk counter fields (thread 0). The radix kernels reset most fields
     // themselves between passes — only `skip` matters for short-circuiting.
@@ -115,9 +118,9 @@ __launch_bounds__(256) __global__ void unifiedInitKernel(
         auto* tpc = topp_counters + b;
         tpc->in = probs + static_cast<size_t>(b) * vocab_size;
         tpc->oriLen = vocab_size;
-        tpc->len = topp_active ? vocab_size : 0;
+        tpc->len = topp_radix ? vocab_size : 0;
         tpc->previousLen = vocab_size;
-        tpc->p = topp_active ? p : 0.0f;
+        tpc->p = topp_radix ? p : 0.0f;
         tpc->totalSum = 0.0f;
         tpc->sum = 0;
         tpc->kthValueBits = 0;
