@@ -974,12 +974,118 @@ def merge_contiguous_ranges(
     return [tuple(r) for r in merged]
 
 
+def strided_runs(
+    ranges: Sequence[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int, int, int]]:
+    """Group ranges into runs that one strided (2D) copy can move.
+
+    A run is a series of equal-size ranges that are back to back on the
+    Device side and evenly spaced on the Host side. One cache field over
+    consecutively allocated blocks is such a series: the Device keeps the
+    field's blocks contiguous, while the Host interleaves every field of a
+    block, so the Host side advances by a fixed block stride. Ranges are
+    independent and never overlap, so their order is free.
+
+    Args:
+        ranges: ``(device_buffer_index, device_offset, host_offset, num_bytes)``.
+
+    Returns:
+        ``(device_buffer_index, device_offset, host_offset, width, height,
+        host_pitch)`` runs covering exactly the input bytes: ``height`` rows
+        of ``width`` bytes, contiguous on the Device, ``host_pitch`` apart on
+        the Host.
+    """
+    runs: list[list[int]] = []
+    for buf, dev, host, size in sorted(ranges):
+        if size <= 0:
+            continue
+        if runs:
+            run = runs[-1]
+            r_buf, r_dev, r_host, width, height, pitch = run
+            if r_buf == buf and width == size and r_dev + width * height == dev:
+                step = host - (r_host + pitch * (height - 1))
+                if height == 1 and step >= width:
+                    run[5] = step
+                    run[4] = 2
+                    continue
+                if height > 1 and step == pitch:
+                    run[4] += 1
+                    continue
+        runs.append([buf, dev, host, size, 1, size])
+    return [tuple(run) for run in runs]
+
+
+_CUDART = None
+
+
+def _cudart():
+    """The process's CUDA runtime via ctypes, or False when unavailable."""
+    global _CUDART
+    if _CUDART is None:
+        _CUDART = False
+        if torch.cuda.is_available() and torch.version.cuda:
+            import ctypes
+
+            major = torch.version.cuda.split(".")[0]
+            for name in (f"libcudart.so.{major}", "libcudart.so"):
+                try:
+                    lib = ctypes.CDLL(name)
+                    fn = lib.cudaMemcpy2DAsync
+                except (OSError, AttributeError):
+                    continue
+                fn.restype = ctypes.c_int
+                fn.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_size_t,
+                    ctypes.c_void_p,
+                    ctypes.c_size_t,
+                    ctypes.c_size_t,
+                    ctypes.c_size_t,
+                    ctypes.c_int,
+                    ctypes.c_void_p,
+                ]
+                _CUDART = fn
+                break
+    return _CUDART
+
+
+_CUDA_MEMCPY_DEFAULT = 4
+
+
 def _transfer_dma(
     direction: Literal["d2h", "h2d"],
     device_buffers: Sequence[torch.Tensor],
     host_buffer: torch.Tensor,
     ranges: Sequence[tuple[int, int, int, int]],
 ) -> None:
+    """Issue the ranges as copy-engine transfers on the current stream.
+
+    On CUDA each strided run becomes one ``cudaMemcpy2DAsync``. A bulk
+    write-back is thousands of block x field ranges, and one Python-level
+    copy per range costs tens of milliseconds of submitting-thread time.
+    Elsewhere, or if the runtime cannot be loaded, it falls back to one
+    non-blocking tensor copy per range.
+    """
+    memcpy2d = _cudart() if device_buffers[0].device.type == "cuda" else False
+    if memcpy2d:
+        stream = torch.cuda.current_stream(device_buffers[0].device).cuda_stream
+        host_base = host_buffer.data_ptr()
+        bases = [
+            buffer.data_ptr() for buffer in device_buffers
+        ]
+        for buf, dev, host, width, height, pitch in strided_runs(ranges):
+            dev_ptr = bases[buf] + dev
+            host_ptr = host_base + host
+            if direction == "d2h":
+                dst, dpitch, src, spitch = host_ptr, pitch, dev_ptr, width
+            else:
+                dst, dpitch, src, spitch = dev_ptr, width, host_ptr, pitch
+            err = memcpy2d(
+                dst, dpitch, src, spitch, width, height, _CUDA_MEMCPY_DEFAULT, stream
+            )
+            if err != 0:
+                raise RuntimeError(f"cudaMemcpy2DAsync failed with error {err:d}")
+        return
     byte_buffers = tuple(
         buffer.view(torch.uint8).reshape(-1) for buffer in device_buffers
     )

@@ -1112,3 +1112,53 @@ def test_dma_transfer_matches_per_range_copy_after_merging():
     torch.cuda.synchronize()
     for _, d, h, n in ranges:
         assert torch.equal(back[d : d + n].cpu(), ref[d : d + n])
+
+
+def test_strided_runs_group_device_contiguous_evenly_spaced_host_rows():
+    from tokenspeed_kernel.ops.kvcache.host_transfer import strided_runs
+
+    # Field A of blocks 0..3: Device back to back, Host every 1000 bytes.
+    field_a = [(0, i * 100, 5000 + i * 1000, 100) for i in range(4)]
+    # Field B of the same blocks, interleaved 100 bytes after field A.
+    field_b = [(1, i * 100, 5100 + i * 1000, 100) for i in range(4)]
+    # A Host gap breaks the run: block 4 lands out of stride.
+    tail = [(0, 400, 20000, 100)]
+    runs = strided_runs(list(reversed(field_a + field_b + tail)))
+    assert runs == [
+        (0, 0, 5000, 100, 4, 1000),
+        (0, 400, 20000, 100, 1, 100),
+        (1, 0, 5100, 100, 4, 1000),
+    ]
+    covered = sum(width * height for _, _, _, width, height, _ in runs)
+    assert covered == 900
+
+
+def test_strided_dma_round_trip_with_interleaved_host_layout():
+    from tokenspeed_kernel.ops.kvcache.host_transfer import _transfer_dma
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    width, blocks, pitch = 256, 6, 1024
+    fields = [
+        torch.randint(0, 255, (blocks * width,), dtype=torch.uint8, device="cuda")
+        for _ in range(2)
+    ]
+    host = torch.zeros(blocks * pitch + 4096, dtype=torch.uint8, pin_memory=True)
+    ranges = [
+        (f, b * width, 64 + b * pitch + f * width, width)
+        for f in range(2)
+        for b in range(blocks)
+        if b != 3  # a hole keeps two runs per field
+    ]
+    _transfer_dma("d2h", fields, host, ranges)
+    torch.cuda.synchronize()
+    refs = [x.cpu() for x in fields]
+    for f, d, h, n in ranges:
+        assert torch.equal(host[h : h + n], refs[f][d : d + n])
+    back = [torch.zeros_like(x) for x in fields]
+    _transfer_dma("h2d", back, host, ranges)
+    torch.cuda.synchronize()
+    for f, d, h, n in ranges:
+        assert torch.equal(back[f][d : d + n].cpu(), refs[f][d : d + n])
+    # Bytes outside the ranges were never written.
+    assert torch.count_nonzero(back[0][3 * width : 4 * width]) == 0
