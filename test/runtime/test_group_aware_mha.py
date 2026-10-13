@@ -87,11 +87,14 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
         )
         return self.MHAAttnBackend(config, spec, kernel_page_size=kernel_page_size)
 
-    def test_mixed_batch_is_rejected_at_construction(self):
-        """--enable-mixed-batch fails at startup, not on the first mixed round."""
-        leaf = self._leaf(4)  # the default config builds fine
-        self.assertIsNotNone(leaf)
-        config = SimpleNamespace(**vars(leaf_config_for_test(self.torch)))
+    def test_mixed_batch_splits_extend_and_decode_requests(self):
+        """--enable-mixed-batch builds; a MIXED round's extend metadata covers
+        only the leading extend requests and the trailing decode requests get
+        their own paged-decode view."""
+        torch = self.torch
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+        config = SimpleNamespace(**vars(leaf_config_for_test(torch)))
         config.mixed_batch_enabled = True
         spec = SimpleNamespace(
             num_attention_heads=8,
@@ -101,8 +104,49 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
             backend_name="mha",
             skip_softmax_threshold=0.0,
         )
-        with self.assertRaisesRegex(ValueError, "enable-mixed-batch"):
-            self.MHAAttnBackend(config, spec, kernel_page_size=4)
+        leaf = self.MHAAttnBackend(config, spec, kernel_page_size=4)
+        # Two extend requests (5 and 3 new tokens) then two decode requests.
+        seq_lens = torch.tensor([5, 7, 10, 12], dtype=torch.int32)
+        page_table = torch.arange(16, dtype=torch.int32).view(4, 4)
+        ext = torch.tensor([5, 3, 0, 0], dtype=torch.int32)
+        pre = torch.tensor([0, 4, 0, 0], dtype=torch.int32)
+        leaf.init_forward_metadata(
+            4,
+            2,
+            seq_lens,
+            page_table,
+            ForwardMode.MIXED,
+            extend_seq_lens=ext,
+            extend_seq_lens_cpu=ext,
+            extend_prefix_lens=pre,
+            extend_prefix_lens_cpu=pre,
+            extend_with_prefix=True,
+            query_shard=None,
+            page_table_cpu=None,
+        )
+        extend = leaf.forward_extend_metadata
+        self.assertEqual(extend.cu_extend_seq_lens_cpu, [0, 5, 8])
+        self.assertEqual(extend.seq_lens.tolist(), [5, 7])
+        self.assertEqual(extend.page_table.shape[0], 2)
+        decode = leaf.mixed_decode_metadata
+        self.assertEqual(decode.seq_lens.tolist(), [10, 12])
+        self.assertEqual(decode.page_table.tolist(), page_table[2:].tolist())
+        # A plain extend round clears the decode view.
+        leaf.init_forward_metadata(
+            2,
+            2,
+            seq_lens[:2],
+            page_table[:2],
+            ForwardMode.EXTEND,
+            extend_seq_lens=ext[:2],
+            extend_seq_lens_cpu=ext[:2],
+            extend_prefix_lens=pre[:2],
+            extend_prefix_lens_cpu=pre[:2],
+            extend_with_prefix=True,
+            query_shard=None,
+            page_table_cpu=None,
+        )
+        self.assertIsNone(leaf.mixed_decode_metadata)
 
     def _router(self, group_ids=(FULL, SWA)):
         from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (

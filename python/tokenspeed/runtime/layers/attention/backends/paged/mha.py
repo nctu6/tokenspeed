@@ -109,12 +109,6 @@ class MHAAttnBackend(PagedAttentionBackend):
 
     def __init__(self, config: AttnConfig, spec: MHAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
-        if getattr(config, "mixed_batch_enabled", False):
-            raise ValueError(
-                "--enable-mixed-batch is not supported by the MHA attention "
-                "backend (it serves extend and decode rows in separate "
-                "forwards); drop the flag"
-            )
         # Map the selected backend to the corresponding kernel solution string.
         backend_name = spec.backend_name or "mha"
         self.kernel_solution = _KERNEL_SOLUTION_BY_BACKEND[backend_name]
@@ -163,11 +157,16 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
+        # MIXED round: the decode requests that follow the extend requests.
+        # Their KV is already written by the prologue; they attend through the
+        # paged decode kernel over this eager (non-graph) view.
+        self.mixed_decode_metadata: MHADecodeMetadata | None = None
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self.forward_decode_metadata = None
         self.forward_extend_metadata = None
+        self.mixed_decode_metadata = None
 
     def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
         # Decode metadata exists only in decode rounds.
@@ -196,13 +195,23 @@ class MHAAttnBackend(PagedAttentionBackend):
     ) -> None:
         reject_query_shard(query_shard, "MHAAttnBackend")
         del page_table_cpu
-        assert not forward_mode.is_mixed(), "mha backend does not support mixed batch"
         if not forward_mode.is_extend_or_mixed():
             raise RuntimeError(
                 "MHA decode metadata goes through refresh_decode_metadata; "
                 f"init_forward_metadata only serves extend ({forward_mode})"
             )
 
+        if forward_mode.is_mixed() and num_extends < bs:
+            self.mixed_decode_metadata = MHADecodeMetadata(
+                page_table=page_table[num_extends:bs],
+                seq_lens=seq_lens[num_extends:bs],
+            )
+        else:
+            self.mixed_decode_metadata = None
+        if forward_mode.is_mixed():
+            # Extend metadata covers only the leading extend requests.
+            bs = num_extends
+        page_table = page_table[:bs]
         seq_lens = seq_lens[:bs]
         extend_seq_lens = extend_seq_lens[:bs]
         extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu[:bs].tolist()]
@@ -330,8 +339,18 @@ class MHAAttnBackend(PagedAttentionBackend):
         assert layer.qk_head_dim == layer.v_head_dim
 
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        metadata = self.forward_decode_metadata
+        return self._decode_rows(
+            q, layer, token_to_kv_pool, self.forward_decode_metadata, kwargs.get("sinks")
+        )
 
+    def _decode_rows(
+        self,
+        q: torch.Tensor,
+        layer: PagedAttention,
+        token_to_kv_pool,
+        metadata: MHADecodeMetadata,
+        sinks: torch.Tensor | None,
+    ) -> torch.Tensor:
         scale_kwargs = {}
         if self.is_mxfp8:
             q, q_sf = self._quantize_mxfp8_tokens(q)
@@ -351,7 +370,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             softmax_scale=layer.scaling,
-            sinks=kwargs.get("sinks"),
+            sinks=sinks,
             max_seqlen_k=self.max_context_len,
             max_seqlen_q=max_seqlen_q,
             solution=self.kernel_solution,
@@ -379,6 +398,31 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         metadata = self.forward_extend_metadata
         sinks = kwargs.get("sinks")
+        decode = self.mixed_decode_metadata
+        if decode is not None:
+            # MIXED: extend tokens first, then one token per decode request.
+            num_extend_tokens = metadata.cu_extend_seq_lens_cpu[-1]
+            num_decode = decode.seq_lens.shape[0]
+            extend_out = self._extend_rows(
+                q[:num_extend_tokens],
+                k[:num_extend_tokens],
+                v[:num_extend_tokens],
+                layer,
+                token_to_kv_pool,
+                metadata,
+                sinks,
+            )
+            decode_out = self._decode_rows(
+                q[num_extend_tokens : num_extend_tokens + num_decode],
+                layer,
+                token_to_kv_pool,
+                decode,
+                sinks,
+            )
+            return torch.cat((extend_out, decode_out))
+        return self._extend_rows(q, k, v, layer, token_to_kv_pool, metadata, sinks)
+
+    def _extend_rows(self, q, k, v, layer, token_to_kv_pool, metadata, sinks):
         plan = self._plan_for_layer(layer, sinks)
         extend_mode = plan.get("extend_mode", "prewrite")
         if metadata.max_extend_prefix_len == 0 and extend_mode == "postwrite":
