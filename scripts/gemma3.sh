@@ -14,6 +14,8 @@
 #   KV_CACHE_DTYPE       default: empty (omit flag)
 #   ATTENTION_BACKEND    default: empty (engine auto). Set e.g. triton to force.
 #   VENV_DIR             default: ./.venv
+#   DISABLE_KVSTORE      default: 0. Set 1 to pass --disable-kvstore.
+#   EXTRA_ARGS           default: empty. Extra `tokenspeed serve` flags.
 #   TOKENSPEED_TRITON_PREFILL_SKIP_OOR   default: 1 (F1; kernel default on)
 #   TOKENSPEED_TRITON_DECODE_KV_SPLITS   default: legacy (F2; not auto)
 #   TOKENSPEED_FLASHINFER_FA2_EXTEND    default: off (F3; not 512/all)
@@ -51,6 +53,8 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 DTYPE="${DTYPE:-bfloat16}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"
+DISABLE_KVSTORE="${DISABLE_KVSTORE:-0}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 FORCE_DETERMINISTIC_RSAG="${FORCE_DETERMINISTIC_RSAG:-}"
 DISABLE_NCCL_NVLS="${DISABLE_NCCL_NVLS:-}"
 case "${VLLM_BATCH_INVARIANT:-}" in
@@ -102,6 +106,14 @@ fi
 if [[ -n "$DISABLE_NCCL_NVLS" ]]; then
     cmd+=(--disable-nccl-nvls)
     export NCCL_NVLS_ENABLE=0
+fi
+
+if [[ "$DISABLE_KVSTORE" == "1" ]]; then
+    cmd+=(--disable-kvstore)
+fi
+if [[ -n "$EXTRA_ARGS" ]]; then
+    # shellcheck disable=SC2206
+    cmd+=($EXTRA_ARGS)
 fi
 
 exec "${cmd[@]}"
