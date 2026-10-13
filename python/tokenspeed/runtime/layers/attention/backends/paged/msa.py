@@ -105,6 +105,12 @@ class MSAAttnBackend(PagedAttentionBackend):
 
     def __init__(self, config: AttnConfig, spec: MSAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
+        if getattr(config, "mixed_batch_enabled", False):
+            raise ValueError(
+                "--enable-mixed-batch is not supported by the MSA attention "
+                "backend (it serves extend and decode rows in separate "
+                "forwards); drop the flag"
+            )
 
         self.tp_q_head_num = max(spec.num_attention_heads // spec.attn_tp_size, 1)
         self.tp_kv_head_num = max(spec.num_kv_heads // spec.attn_tp_size, 1)

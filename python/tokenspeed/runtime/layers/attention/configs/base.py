@@ -211,6 +211,10 @@ class AttnConfig:
     # per request) instead of Eagle/MTP's per-step single-token decode. Backends
     # use this to expand decode metadata to spec_num_tokens rows per request.
     draft_block_decode: bool = False
+    # --enable-mixed-batch: forwards may carry extend and decode rows together.
+    # Leaves without mixed support reject it at construction (startup), not
+    # on the first mixed round.
+    mixed_batch_enabled: bool = False
     # KV parallelism (page-cyclic KV page sharding over a consecutive subgroup
     # of attention TP): one topology for target and continuation/MTP views;
     # KVP does not add ranks. Decode attends the owned pages and merges the
@@ -345,6 +349,7 @@ def model_wide_kwargs(
         pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
         is_draft=is_draft,
         draft_block_decode=draft_block_decode,
+        mixed_batch_enabled=bool(getattr(server_args, "enable_mixed_batch", False)),
     )
     attn_mapping = server_args.mapping.attn
     kwargs.update(

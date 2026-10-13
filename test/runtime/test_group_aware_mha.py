@@ -33,6 +33,21 @@ def _layer(group_id, layer_id=0):
     return SimpleNamespace(group_id=group_id, layer_id=layer_id)
 
 
+def leaf_config_for_test(torch):
+    return SimpleNamespace(
+        device="cpu",
+        dtype=torch.float16,
+        is_draft=False,
+        speculative_num_draft_tokens=1,
+        context_len=24,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_mxfp8=False,
+        draft_block_decode=False,
+        max_bs=8,
+        kernel_page_size=None,
+    )
+
+
 class RouterOverMhaLeavesTest(unittest.TestCase):
     """A router with two real MHAAttnBackend leaves (P=4 and P=2)."""
 
@@ -71,6 +86,23 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
             skip_softmax_threshold=0.0,
         )
         return self.MHAAttnBackend(config, spec, kernel_page_size=kernel_page_size)
+
+    def test_mixed_batch_is_rejected_at_construction(self):
+        """--enable-mixed-batch fails at startup, not on the first mixed round."""
+        leaf = self._leaf(4)  # the default config builds fine
+        self.assertIsNotNone(leaf)
+        config = SimpleNamespace(**vars(leaf_config_for_test(self.torch)))
+        config.mixed_batch_enabled = True
+        spec = SimpleNamespace(
+            num_attention_heads=8,
+            num_kv_heads=8,
+            attn_tp_size=1,
+            head_dim=16,
+            backend_name="mha",
+            skip_softmax_threshold=0.0,
+        )
+        with self.assertRaisesRegex(ValueError, "enable-mixed-batch"):
+            self.MHAAttnBackend(config, spec, kernel_page_size=4)
 
     def _router(self, group_ids=(FULL, SWA)):
         from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (

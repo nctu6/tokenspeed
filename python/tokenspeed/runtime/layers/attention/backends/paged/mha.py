@@ -109,6 +109,12 @@ class MHAAttnBackend(PagedAttentionBackend):
 
     def __init__(self, config: AttnConfig, spec: MHAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
+        if getattr(config, "mixed_batch_enabled", False):
+            raise ValueError(
+                "--enable-mixed-batch is not supported by the MHA attention "
+                "backend (it serves extend and decode rows in separate "
+                "forwards); drop the flag"
+            )
         # Map the selected backend to the corresponding kernel solution string.
         backend_name = spec.backend_name or "mha"
         self.kernel_solution = _KERNEL_SOLUTION_BY_BACKEND[backend_name]
