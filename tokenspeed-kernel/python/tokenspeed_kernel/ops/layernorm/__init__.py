@@ -35,7 +35,9 @@ from tokenspeed_kernel.ops.layernorm.triton import (
 from tokenspeed_kernel.ops.layernorm.triton import grouped_rmsnorm as _grouped_rmsnorm
 from tokenspeed_kernel.ops.layernorm.triton import (
     nvfp4_copy_supported,
+    qk_rmsnorm_rope_neox,
     reference_rmsnorm,
+    rmsnorm_residual_rmsnorm,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -224,6 +226,8 @@ __all__ = [
     "grouped_rmsnorm",
     "nvfp4_copy_supported",
     "qk_rmsnorm",
+    "qk_rmsnorm_rope_neox",
     "reference_rmsnorm",
     "rmsnorm",
+    "rmsnorm_residual_rmsnorm",
 ]

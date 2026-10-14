@@ -535,6 +535,7 @@ def test_the_boot_step_measures_releases_rebuilds_then_publishes() -> None:
         attn_backend="target backend",
         draft_attn_backend="draft backend",
         release_graphs=lambda: order.append(("release",)),
+        release_cache_pool=lambda: order.append(("release pool",)),
         set_cache_pool=lambda target, draft: order.append(("adopt", target, draft)),
     )
     built = SimpleNamespace(token_to_kv_pool="pool", draft_token_to_kv_pool="draft")
@@ -564,6 +565,7 @@ def test_the_boot_step_measures_releases_rebuilds_then_publishes() -> None:
     assert order == [
         ("probe", "args", 3, 500),
         ("release",),
+        ("release pool",),
         (
             "build",
             dict(

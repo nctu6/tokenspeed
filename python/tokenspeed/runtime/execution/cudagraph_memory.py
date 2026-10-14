@@ -257,7 +257,8 @@ def reserve_and_rebind(
 ) -> AttentionBuild:
     """Measure a capture on the probe pool, then rebuild the real one under it.
 
-    Order: measure, release (``empty_cache`` cannot return a live graph pool),
+    Order: measure, release the graphs (``empty_cache`` cannot return a live
+    graph pool) and the probe arena (the profile predates it),
     rebuild on the probe build's memory profile less the reserve, publish. The
     backends are handed back rather than rebuilt, so what serves is what was
     measured.
@@ -266,6 +267,7 @@ def reserve_and_rebind(
         executor, server_args, gpu_id, startup_resident_bytes=startup_resident_bytes
     )
     executor.release_graphs()
+    executor.release_cache_pool()
     attention = build_components(
         graph_reserve_bytes=graph_reserve_bytes,
         probe_batch_rows=None,

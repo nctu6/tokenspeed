@@ -548,6 +548,7 @@ import tokenspeed_kernel.ops.attention.mha.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mha.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mha.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mha.gluon  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.mha.fa4_sm90_hd512  # noqa: E402,F401
 
 # isort: on
 

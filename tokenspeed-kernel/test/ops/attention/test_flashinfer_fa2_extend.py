@@ -87,6 +87,8 @@ def _subprocess_select(env_mode: str, head_dim: int) -> str:
         """)
     env = os.environ.copy()
     env["TOKENSPEED_FLASHINFER_FA2_EXTEND"] = env_mode
+    # These checks gate FA2 itself; keep the SM90 hd512 CuTe kernel out.
+    env["TOKENSPEED_FA4_SM90_HD512"] = "off"
     # Avoid inheriting an override that would pin the solution.
     env.pop("TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_MHA_EXTEND_WITH_KVCACHE", None)
     proc = subprocess.run(
@@ -129,11 +131,29 @@ def test_selection_env_gates_fa2(mode, head_dim, expect_substr):
     assert expect_substr in name, (mode, head_dim, name)
 
 
+def test_default_mode_is_512() -> None:
+    env = os.environ.copy()
+    env.pop("TOKENSPEED_FLASHINFER_FA2_EXTEND", None)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from tokenspeed_kernel.ops.attention.mha._flashinfer import "
+            "paged_extend as pe; print(pe.fa2_extend_mode())",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert proc.stdout.strip().splitlines()[-1] == "512"
+
+
 @requires_cuda
 def test_selection_sm90_keeps_fa3_for_256():
     if _arch_major() != 9:
         pytest.skip("FA3 gate check is Hopper-only")
-    # Default off: 256 must still be FA3.
+    # Off: 256 must still be FA3.
     name_off = _subprocess_select("off", 256)
     assert name_off.startswith("fa3_"), name_off
     # Env on for 512 only: 256 still FA3 (SPECIALIZED > PERFORMANT).
@@ -347,6 +367,92 @@ def test_fa2_extend_matches_triton_and_fp32(
     err_triton = (out_triton.float() - ref.float()).abs().max().item()
     err_fa2 = (out_fa2.float() - ref.float()).abs().max().item()
     assert err_fa2 <= err_triton * 1.5 + 2e-2, (err_fa2, err_triton)
+
+
+@requires_cuda
+def test_fa2_extend_replan_while_gpu_lags_keeps_each_plan():
+    """Back-to-back forwards re-plan while the GPU is still behind the host.
+
+    ``plan(non_blocking=True)`` stages the plan in a pinned host buffer and
+    copies it asynchronously; re-planning the same wrapper before that copy
+    ran handed the earlier forward the later batch's work partition (a GPU
+    hang in serving when a long and a short request changed the batch shape).
+    """
+    if not _fa2_arch_ok():
+        pytest.skip("FA2 extend only on sm90 / sm12x")
+    from tokenspeed_kernel.ops.attention.mha._flashinfer import paged_extend as pe
+
+    head_dim, num_q, num_kv = 512, 32, 4
+    scale = 1.0 / math.sqrt(head_dim)
+    shapes = [([8192], [4]), ([0], [64]), ([4096, 16], [2, 33]), ([0], [5])]
+    batches = [
+        _build_extend_inputs(
+            device="cuda",
+            dtype=torch.bfloat16,
+            head_dim=head_dim,
+            num_q_heads=num_q,
+            num_kv_heads=num_kv,
+            page_size=64,
+            prefix_lens=prefix,
+            query_lens=query,
+        )
+        for prefix, query in shapes
+    ]
+
+    def run(inputs):
+        meta = inputs["host_meta"]
+        return pe._plan_and_run(
+            q=inputs["q"],
+            k_cache=inputs["k_cache"],
+            v_cache=inputs["v_cache"],
+            page_table=inputs["page_table"],
+            host_meta=pe.PagedExtendHostMeta(
+                cu_seqlens_q_cpu=meta["cu_seqlens_q_cpu"],
+                cache_seqlens_cpu=meta["cache_seqlens_cpu"],
+                plan_cache={},
+            ),
+            is_causal=True,
+            window_left=-1,
+            logit_cap=0.0,
+            softmax_scale=scale,
+        )
+
+    try:
+        expected = [run(inputs).clone() for inputs in batches]
+        torch.cuda.synchronize()
+    except Exception as exc:  # JIT / arch support
+        pytest.skip(f"FA2 kernel unavailable: {exc}")
+
+    # Hold the stream so every plan below is staged long before its copy runs.
+    torch.cuda._sleep(1_000_000_000)
+    outs = [run(inputs) for inputs in batches]
+    torch.cuda.synchronize()
+    for out, ref in zip(outs, expected):
+        torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+def test_fa2_wrapper_ring_waits_for_the_slot_copy(monkeypatch):
+    """A slot is re-planned only after the event recorded behind its copy."""
+    from tokenspeed_kernel.ops.attention.mha._flashinfer import paged_extend as pe
+
+    class FakeEvent:
+        def __init__(self):
+            self.waited = False
+
+        def synchronize(self):
+            self.waited = True
+
+    ring = pe._WrapperRing.__new__(pe._WrapperRing)
+    ring.wrappers = [object(), object()]
+    ring.copied = [None, None]
+    ring.next = 0
+    first = FakeEvent()
+    assert ring.acquire() == 0
+    ring.copied[0] = first
+    assert ring.acquire() == 1
+    assert not first.waited
+    assert ring.acquire() == 0
+    assert first.waited and ring.copied[0] is None
 
 
 @requires_cuda

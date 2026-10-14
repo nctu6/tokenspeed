@@ -408,19 +408,17 @@ def _mha_layer_geometry(spec, local_layer_id: int) -> tuple[int, int]:
 def _mha_plane_prefix(spec, group_id: str) -> str:
     """Plane namespace for an MHA layer's K/V planes.
 
-    A uniform model keeps the bare ``unit`` prefix every current model uses,
-    so its planes stay byte-for-byte ``unit.{occurrence}.k`` and the i-th
-    layer of each cache group deliberately shares one plane (full and sliding
-    layers are byte-equal, so the hybrid slab pairs them). A per-layer-geometry
-    model (gemma-4) cannot share a plane across groups: a 4 x 512 full layer
-    and a 16 x 256 sliding layer have different page strides, and
-    ``pack``'s exact-page-stride check rejects two payloads on one plane. Such
-    a model scopes the plane by its cache group so each geometry owns its own
-    plane namespace.
+    Every model shares the group-agnostic ``unit`` namespace: the i-th layer
+    of each cache group sits on slab i, so a parent spans one group's depth
+    and every group's CacheBlock fills the planes it is placed on. That holds
+    for a per-layer-geometry model (gemma-4) too: its 4 x 512 full row is half
+    its 16 x 256 sliding row, so ``pack`` places two full CacheBlocks per
+    parent on the same planes (exact page strides both ways). Scoping planes
+    per group instead made every parent carry all six groups' planes while
+    each group filled only its own, so five sixths of every page sat idle.
     """
-    if getattr(spec, "layer_kv_geometry", None) is None:
-        return "unit"
-    return f"unit.{group_id}"
+    del spec, group_id
+    return "unit"
 
 
 def _mha_layer_fields(

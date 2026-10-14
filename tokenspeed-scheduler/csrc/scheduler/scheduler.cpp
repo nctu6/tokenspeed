@@ -138,6 +138,18 @@ Scheduler::Scheduler(SchedulerConfig config)
         mixed_long_chunk_ = config_.enable_mixed_prefill_decode
                                 ? std::max(0, env_int("TOKENSPEED_MIXED_LONG_CHUNK", config_.max_scheduled_tokens / 2))
                                 : 0;
+        // TOKENSPEED_MIXED_DECODE_REF (default 4, mixed mode only): beside more
+        // than this many decodes a round's prefill share shrinks as ref/decodes.
+        mixed_decode_ref_ = config_.enable_mixed_prefill_decode
+                                ? std::max(0, env_int("TOKENSPEED_MIXED_DECODE_REF", 4))
+                                : 0;
+        // TOKENSPEED_MIXED_PREFILL_FLOOR (default: an eighth of a chunk): the
+        // least prefill a shrunk mixed round keeps. It is separate from the
+        // admission floor above: at a quarter chunk it pinned 32 decodes beside
+        // 1024 prefill tokens, so ref no longer mattered (Gemma 4 1K C32 P99 ITL
+        // 155 ms); an eighth halves that step while long prompts beside few
+        // decodes (128K C4) never reach the cap.
+        mixed_prefill_floor_ = std::max(0, env_int("TOKENSPEED_MIXED_PREFILL_FLOOR", config_.max_scheduled_tokens / 8));
     }
 
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {

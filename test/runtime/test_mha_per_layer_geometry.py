@@ -174,20 +174,20 @@ class PerLayerGeometryFieldTest(unittest.TestCase):
 
 
 class PerLayerPlaneScopingTest(unittest.TestCase):
-    """Per-layer-geometry groups never share a K/V plane.
+    """Per-layer-geometry groups share the group-agnostic slab planes.
 
-    Two cache groups whose layers differ in head_dim (gemma-4 full 4 x 512 vs
-    sliding 16 x 256) must land on distinct planes: ``pack``'s exact-page-stride
-    check rejects two different payload sizes sharing one plane. The uniform
-    default keeps the group-agnostic ``unit.{occurrence}`` plane every current
-    model relies on so byte-equal full/sliding layers still pair in one slab.
+    The i-th layer of every cache group sits on slab ``unit.i``, as in the
+    uniform model: gemma-4's 4 x 512 full row is half its 16 x 256 sliding
+    row, so ``pack`` puts two full CacheBlocks per parent on the same planes.
+    Per-group planes made each parent carry every group's planes while a
+    group filled only its own.
     """
 
     def _plane_ids(self, config, layer_id, group_id, occurrence):
         fields = _mha_layer_fields(config, layer_id, layer_id, group_id, occurrence)
         return tuple(f.plane_id for f in fields)
 
-    def test_distinct_groups_get_distinct_planes_when_per_layer(self):
+    def test_full_and_sliding_share_the_slab_plane_when_per_layer(self):
         config = _mha_config(
             layer_kv_geometry=_GEMMA4_GEOMETRY,
             num_kv_heads=16,
@@ -195,12 +195,10 @@ class PerLayerPlaneScopingTest(unittest.TestCase):
             attn_tp_size=1,
             cache_layer_types=tuple(_LAYER_TYPES * 2),
         )
-        # Occurrence 0 of the sliding group and occurrence 0 of the full group:
-        # under the old group-agnostic naming both were 'unit.0.k' and collided.
         sliding_planes = self._plane_ids(config, 0, "sliding_attention", 0)
         full_planes = self._plane_ids(config, 5, "full_attention", 0)
-        self.assertNotEqual(set(sliding_planes), set(full_planes))
-        self.assertEqual(len(set(sliding_planes) & set(full_planes)), 0)
+        self.assertEqual(set(sliding_planes), set(full_planes))
+        self.assertEqual(set(full_planes), {"unit.0.k", "unit.0.v"})
 
     def test_same_group_shares_a_plane_namespace_across_occurrences(self):
         config = _mha_config(
@@ -211,12 +209,12 @@ class PerLayerPlaneScopingTest(unittest.TestCase):
             cache_layer_types=tuple(_LAYER_TYPES * 2),
         )
         # Two layers of the SAME group with distinct occurrences get distinct
-        # planes within that group's namespace (occurrence separates them).
+        # slabs (occurrence separates them).
         occ0 = self._plane_ids(config, 0, "sliding_attention", 0)
         occ1 = self._plane_ids(config, 1, "sliding_attention", 1)
         self.assertNotEqual(set(occ0), set(occ1))
         for plane in occ0 + occ1:
-            self.assertTrue(plane.startswith("unit.sliding_attention."))
+            self.assertTrue(plane.startswith("unit."))
 
     def test_uniform_model_keeps_group_agnostic_unit_plane(self):
         config = _mha_config(
@@ -492,11 +490,19 @@ class PerLayerGeometryPackingTest(unittest.TestCase):
         # the old shared-slab pin; the derived path packs cleanly.
         layout = _pack_gemma4(_gemma4_split_config(attn_tp_size=1))
         packing = dict(layout.group_packing)
-        # Two geometries -> two distinct planes per occurrence -> no plane is
-        # shared, so the derived packing is the byte-ratio one.
+        # Full rows are half the sliding rows on the shared slab planes, so
+        # two full CacheBlocks fit where one sliding block does.
         self.assertEqual(packing["full_attention"], 2)
         for k in range(5):
             self.assertEqual(packing[f"sliding_attention_{k}"], 1)
+
+    def test_a_parent_spans_one_group_depth_not_every_group(self):
+        """Every group's CacheBlock fills the slab planes it lands on: the
+        parent is the sliding group's depth (two layers here) of K and V, not
+        the sum over all six groups."""
+        layout = _pack_gemma4(_gemma4_split_config(attn_tp_size=1))
+        sliding_page = _PREFIX_GRANULARITY * 16 * 256 * 2  # bf16 bytes
+        self.assertEqual(layout.lcm_block_bytes, 2 * 2 * sliding_page)
 
     def test_derived_packing_is_the_byte_ratio_full_gets_twice_sliding(self):
         """Full page 131072 B is half the sliding page 262144 B, so the full
@@ -552,8 +558,9 @@ class PoolRowViewWidthTest(unittest.TestCase):
         )
 
         kv_dtype = torch.bfloat16
-        # Group each layer at its own geometry, exactly as the recipe does,
-        # scoping planes per group so the two geometries never share a plane.
+        # Group each layer at its own geometry on the shared slab planes,
+        # exactly as the recipe does: the full layer's half-width pages pack
+        # two per parent on the sliding layer's plane.
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
             CacheFieldSpec,
             scatter_stored_dtype_name,
@@ -564,7 +571,7 @@ class PoolRowViewWidthTest(unittest.TestCase):
         def fields_for_layer(layer_id, group_id, occurrence):
             kv_heads, head_dim = self._GEOMETRY_POST_TP[layer_id]
             shape = (self._PREFIX, kv_heads, head_dim)
-            prefix = f"unit.{group_id}"
+            prefix = "unit"
             return (
                 CacheFieldSpec(
                     f"layer.{layer_id}.k", f"{prefix}.{occurrence}.k", shape, stored

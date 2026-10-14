@@ -328,6 +328,17 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertTrue(sa.enable_mixed_batch)
         self.assertEqual(sa.chunked_prefill_size, 4096)
 
+    def test_mixed_batch_and_4k_chunk_default_on_for_gemma4(self):
+        for arch in ("Gemma4ForConditionalGeneration", "Gemma4ForCausalLM"):
+            sa = self._resolve_scheduling_for_arch(arch)
+            self.assertTrue(sa.enable_mixed_batch, arch)
+            self.assertEqual(sa.chunked_prefill_size, 4096, arch)
+        sa = self._resolve_scheduling_for_arch(
+            "Gemma4ForConditionalGeneration", ["--disable-mixed-batch"]
+        )
+        self.assertFalse(sa.enable_mixed_batch)
+        self.assertEqual(sa.chunked_prefill_size, 8192)
+
     def test_mixed_batch_default_respects_explicit_flags(self):
         sa = self._resolve_scheduling_for_arch(
             "Gemma3ForConditionalGeneration", ["--disable-mixed-batch"]

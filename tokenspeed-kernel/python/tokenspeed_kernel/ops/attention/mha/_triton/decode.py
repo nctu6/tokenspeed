@@ -60,11 +60,16 @@ def _env_pos_int(name: str, default: int) -> int:
 
 
 def _parse_kv_splits_mode(name: str) -> str | int:
-    """``legacy`` (default) / ``auto`` / positive integer N (fixed N splits)."""
+    """``auto`` (default) / ``legacy`` / positive integer N (fixed N splits).
+
+    ``legacy`` runs one split per request, so a long single request launches
+    only ``head_blocks`` CTAs (4 for gemma-4's 512-wide full layers) and
+    leaves most SMs idle; ``auto`` splits by the attended length.
+    """
     raw = os.environ.get(name, "").strip().lower()
-    if raw in ("", "legacy"):
+    if raw == "legacy":
         return "legacy"
-    if raw == "auto":
+    if raw in ("", "auto"):
         return "auto"
     try:
         value = int(raw)
@@ -91,6 +96,10 @@ _TRITON_DECODE_SPLIT_MIN_TOKENS = _env_pos_int(
 )
 # Diagnostic/sweep knob: stage-1 CTAs to aim for, in multiples of the SM count.
 _TRITON_DECODE_TARGET_WAVES = _env_pos_int("TOKENSPEED_TRITON_DECODE_TARGET_WAVES", 2)
+# Grouped (GQA) stage-1 launch shape; 0 keeps the built-in choice. Sweep knobs.
+_GROUPED_BLOCK_N_ENV = int(os.environ.get("TOKENSPEED_TRITON_DECODE_GROUPED_BLOCK_N", "0") or 0)
+_GROUPED_WARPS_ENV = int(os.environ.get("TOKENSPEED_TRITON_DECODE_GROUPED_WARPS", "0") or 0)
+_GROUPED_STAGES_ENV = int(os.environ.get("TOKENSPEED_TRITON_DECODE_GROUPED_STAGES", "0") or 0)
 # Batch invariance: MAX no longer depends on batch size, so a request's split
 # count (hence its reduction order) depends only on its own length.
 _BATCH_INVARIANT = _env_truthy("VLLM_BATCH_INVARIANT")
@@ -660,10 +669,21 @@ def _decode_grouped_att_m_fwd(
     )
 
     extra_kargs = {}
-    num_stages = 2
+    # Wide heads (head_dim >= 512, e.g. Gemma 4 global layers) stream 64 KB
+    # K+V tiles per step; a third pipeline stage keeps HBM busy on long
+    # contexts (bs4 x 128K: 833 -> 720 us) at equal results.
+    num_stages = 3 if platform.is_nvidia and Lk >= 512 and Lk != 576 else 2
     if platform.is_amd:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16}
         num_stages = 1
+
+    num_warps = 4
+    if _GROUPED_BLOCK_N_ENV:
+        BLOCK = _GROUPED_BLOCK_N_ENV
+    if _GROUPED_WARPS_ENV:
+        num_warps = _GROUPED_WARPS_ENV
+    if _GROUPED_STAGES_ENV:
+        num_stages = _GROUPED_STAGES_ENV
 
     _fwd_grouped_kernel_stage1[grid](
         q,
@@ -697,7 +717,7 @@ def _decode_grouped_att_m_fwd(
         BLOCK_H=BLOCK_H,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
-        num_warps=4,
+        num_warps=num_warps,
         num_stages=num_stages,
         Lk=Lk,
         Lv=Lv,

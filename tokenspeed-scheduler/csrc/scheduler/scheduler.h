@@ -417,6 +417,13 @@ private:
     // this many per round while decodes ride the same round, which bounds the
     // decode step time (ITL) behind a long prompt. 0 disables.
     std::int32_t mixed_long_chunk_{0};
+    std::int32_t mixed_prefill_floor_{0};
+    // Mixed mode: with more than this many decodes in a round, the prefill
+    // tokens riding beside them are held to max_scheduled_tokens * ref / D
+    // (never below long_prefill_floor_), so a burst of new prompts cannot
+    // stretch every decode's step. 0 disables.
+    std::int32_t mixed_decode_ref_{0};
+    void capPrefillBesideDecodes(PlanBuild& build) const;
     std::int32_t prefillBudgetFor(const Request& request, const PlanBuild& build) const;
 
     SchedulerConfig config_;

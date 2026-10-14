@@ -20,8 +20,9 @@
 
 """FlashInfer FA2 paged-extend for large head_dim (Gemma-4 global layers).
 
-Enabled by ``TOKENSPEED_FLASHINFER_FA2_EXTEND`` (default ``off``). Uses only the
-public FlashInfer ``BatchPrefillWithPagedKVCacheWrapper`` API with
+Controlled by ``TOKENSPEED_FLASHINFER_FA2_EXTEND`` (default ``512``: the head
+dim no FA3 template serves, whose alternative is the Triton extend fallback;
+``off`` opts out, ``all`` widens it). Uses only the public FlashInfer ``BatchPrefillWithPagedKVCacheWrapper`` API with
 ``backend="fa2"`` forced so Hopper never silently selects FA3 templates that
 reject head_dim 512.
 """
@@ -51,15 +52,27 @@ logger = logging.getLogger(__name__)
 _FLOAT_WORKSPACE_BYTES = 256 * 1024 * 1024
 
 _float_workspace: dict[torch.device, torch.Tensor] = {}
-# One wrapper per (device, geometry) so each keeps its own int workspace;
-# float workspace is shared (calls are serialized on one stream).
-_wrapper_pool: dict[tuple[Any, ...], Any] = {}
+# A small ring of wrappers per (device, geometry), each with its own int and
+# pinned-host plan workspace; the float workspace is shared (calls are
+# serialized on one stream).
+#
+# ``plan(non_blocking=True)`` writes the plan into the wrapper's pinned host
+# buffer and enqueues an async H2D copy of it. The host runs ahead of the GPU
+# (overlap scheduling, launch queue), so re-planning the same wrapper for the
+# next forward can overwrite the pinned buffer before the previous copy has
+# executed: that forward's kernel then runs on another batch's work partition,
+# which reads out of range or never terminates (seen as a GPU hang when a long
+# request and a short one change the batch shape). Each planned slot records an
+# event after its copy, and a slot is re-planned only after that event; the ring
+# keeps that wait off the critical path.
+_WRAPPER_RING = 2
+_wrapper_pool: dict[tuple[Any, ...], "_WrapperRing"] = {}
 _warned_host_meta_fallback = False
 
 
 def _parse_fa2_extend_mode() -> str:
-    raw = os.environ.get("TOKENSPEED_FLASHINFER_FA2_EXTEND", "off")
-    mode = (raw or "off").strip().lower()
+    raw = os.environ.get("TOKENSPEED_FLASHINFER_FA2_EXTEND", "512")
+    mode = (raw or "512").strip().lower()
     if mode in ("0", "false", "no", "off", ""):
         return "off"
     if mode in ("512", "all"):
@@ -155,18 +168,48 @@ def _geometry_key(
     )
 
 
-def _get_wrapper(device: torch.device, geometry_key: tuple[Any, ...]):
-    from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+class _WrapperRing:
+    """Round-robin FA2 wrappers whose pinned plan buffer is reused only after
+    the H2D copy that read it has executed (see ``_WRAPPER_RING``)."""
 
-    wrapper = _wrapper_pool.get(geometry_key)
-    if wrapper is None:
+    def __init__(self, device: torch.device, size: int):
+        from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+
         float_ws = ensure_fa2_extend_workspace(device)
         # Force fa2: on Hopper ``auto`` would pick FA3 templates that reject 512.
-        wrapper = BatchPrefillWithPagedKVCacheWrapper(
-            float_ws, kv_layout="NHD", backend="fa2"
-        )
-        _wrapper_pool[geometry_key] = wrapper
-    return wrapper
+        self.wrappers = [
+            BatchPrefillWithPagedKVCacheWrapper(float_ws, kv_layout="NHD", backend="fa2")
+            for _ in range(size)
+        ]
+        self.copied: list[torch.cuda.Event | None] = [None] * size
+        self.next = 0
+
+    def acquire(self) -> int:
+        """The next slot, once its previous plan copy has left the pinned buffer."""
+        slot = self.next
+        self.next = (slot + 1) % len(self.wrappers)
+        event = self.copied[slot]
+        if event is not None:
+            event.synchronize()
+            self.copied[slot] = None
+        return slot
+
+    def planned(self, slot: int) -> None:
+        """Mark ``slot``'s plan copy as enqueued on the current stream."""
+        if torch.cuda.is_current_stream_capturing():
+            # A captured plan copy replays from the graph; nothing to fence.
+            return
+        event = torch.cuda.Event()
+        event.record()
+        self.copied[slot] = event
+
+
+def _get_ring(device: torch.device, geometry_key: tuple[Any, ...]) -> _WrapperRing:
+    ring = _wrapper_pool.get(geometry_key)
+    if ring is None:
+        ring = _WrapperRing(device, _WRAPPER_RING)
+        _wrapper_pool[geometry_key] = ring
+    return ring
 
 
 def _build_paged_plan_tensors(
@@ -273,7 +316,9 @@ def _plan_and_run(
 
     planned = host_meta.plan_cache.get(geometry)
     if planned is None:
-        wrapper = _get_wrapper(q.device, geometry)
+        ring = _get_ring(q.device, geometry)
+        slot = ring.acquire()
+        wrapper = ring.wrappers[slot]
         qo_indptr = torch.tensor(
             host_meta.cu_seqlens_q_cpu, dtype=torch.int32, device="cpu"
         )
@@ -298,6 +343,7 @@ def _plan_and_run(
             kv_data_type=k_cache.dtype,
             non_blocking=True,
         )
+        ring.planned(slot)
         host_meta.plan_cache[geometry] = wrapper
         planned = wrapper
     return planned.run(q, (k_cache, v_cache))

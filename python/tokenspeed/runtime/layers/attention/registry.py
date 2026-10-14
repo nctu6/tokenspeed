@@ -1303,6 +1303,14 @@ def create_attn_components(
             warmup_fa2_extend(config.device)
     except Exception as exc:  # noqa: BLE001 — never block server start
         logger.warning("FlashInfer FA2 extend warmup skipped: %s", exc)
+    try:
+        from tokenspeed_kernel.ops.attention.mha.fa4_sm90_hd512 import (
+            warmup_fa4_sm90_hd512,
+        )
+
+        warmup_fa4_sm90_hd512(config.device)
+    except Exception as exc:  # noqa: BLE001 — never block server start
+        logger.warning("fa4_sm90 hd512 extend warmup skipped: %s", exc)
 
     # One profile per boot, where a boot without a reserve takes it; a rebuild reuses it.
     if profiled_cache_bytes is None:

@@ -1132,6 +1132,30 @@ void Scheduler::scheduleShortPromptsAhead(AdmissionFeedback& feedback, PlanBuild
     }
 }
 
+// Decode-count-aware prefill budget for a mixed round: past mixed_decode_ref_
+// decodes, the prefill share shrinks as ref / D of a chunk, so the step every
+// decode waits for stays bounded while few-decode rounds (long-context
+// prefill beside a handful of decodes) keep the whole chunk.
+void Scheduler::capPrefillBesideDecodes(PlanBuild& build) const {
+    if (mixed_decode_ref_ <= 0 || !build.pushed_decode) {
+        return;
+    }
+    std::int32_t decodes = 0;
+    for (const auto& op : build.operations) {
+        if (std::holds_alternative<DecodeOperation>(op)) {
+            ++decodes;
+        }
+    }
+    if (decodes <= mixed_decode_ref_) {
+        return;
+    }
+    const std::int64_t share =
+        static_cast<std::int64_t>(config_.max_scheduled_tokens) * mixed_decode_ref_ / decodes;
+    const std::int32_t cap = std::max({static_cast<std::int32_t>(share), mixed_prefill_floor_,
+                                       build.state_prefill_reserve});
+    build.token_budget = std::min(build.token_budget, cap);
+}
+
 // The chunk budget one prefill may take this round. With decodes in the round
 // (mixed mode), a prefill that still has more than mixed_long_chunk_ tokens
 // to go is held to that many: the decode rows wait for the whole forward, so
@@ -1321,6 +1345,7 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
         });
         build.state_prefill_reserve = has_local_prefill ? MinPrefillChunkTokens(coordinator_) : 0;
         scheduleDecodeBatch(feedback, build, candidates);
+        capPrefillBesideDecodes(build);
     }
 
     scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);

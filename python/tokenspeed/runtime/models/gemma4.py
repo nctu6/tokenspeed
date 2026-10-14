@@ -71,6 +71,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel.ops.layernorm import (
+    qk_rmsnorm_rope_neox,
+    rmsnorm_residual_rmsnorm,
+)
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
@@ -675,16 +679,40 @@ class Gemma4Attention(nn.Module):
             )
         num_tokens = hidden_states.shape[0]
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # View the fused projection as [tokens, heads, head_dim] and slice the
+        # q/k/v heads out of it. The norms reduce over head_dim and the norm
+        # kernel reads these strided per-head views directly, writing
+        # contiguous outputs. Splitting the flat last dim and reshaping
+        # instead forces a copy of every slice (three extra kernels per
+        # layer on the decode path).
+        heads = qkv.view(num_tokens, -1, self.head_dim)
+        q, k, v = heads.split(
+            [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
+        )
 
-        # q/k norm (per head) then RoPE(q, k). The norms reduce over head_dim,
-        # so the head axis is folded into the row axis rather than materialised.
-        q = self.q_norm(q.reshape(-1, self.head_dim)).view(num_tokens, self.q_size)
-        k = self.k_norm(k.reshape(-1, self.head_dim)).view(num_tokens, self.kv_size)
-        q, k = self.rotary_emb(positions, q, k)
-
-        # v norm comes AFTER RoPE and applies only to v (v is never rotated).
-        v = self.v_norm(v.reshape(-1, self.head_dim)).view(num_tokens, self.kv_size)
+        # q/k norm (per head) then RoPE(q, k): one launch when the RoPE is a
+        # whole-head neox rotation from a cos|sin cache (both Gemma 4 layer
+        # types; the full layers' partial rotary is identity-padded).
+        if self._fused_qk_rope(qkv):
+            # Weightless v_norm shares the launch: q/k get norm+RoPE, v gets
+            # pure RMS (no learnable scale). Same math as the three separate
+            # norms + RoPE sequence below.
+            q, k, v = qk_rmsnorm_rope_neox(
+                q,
+                k,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.q_norm.variance_epsilon,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                v=v,
+            )
+        else:
+            q = self.q_norm(q).view(num_tokens, self.q_size)
+            k = self.k_norm(k).view(num_tokens, self.kv_size)
+            q, k = self.rotary_emb(positions, q, k)
+            # v norm comes AFTER RoPE and applies only to v (v is never rotated).
+            v = self.v_norm(v).view(num_tokens, self.kv_size)
 
         # Stock TokenSpeed: PagedAttention reads write locations from ctx
         # (cf. gemma3), not an explicit out_cache_loc argument.
@@ -693,6 +721,20 @@ class Gemma4Attention(nn.Module):
             attn_output = attn_output.reshape(attn_output.shape[0], -1)
         output, _ = self.o_proj(attn_output)
         return output
+
+
+    def _fused_qk_rope(self, qkv: torch.Tensor) -> bool:
+        rope = self.rotary_emb
+        cache = getattr(rope, "cos_sin_cache", None)
+        return (
+            qkv.is_cuda
+            and cache is not None
+            and cache.is_cuda
+            and getattr(rope, "is_neox_style", False)
+            and getattr(rope, "rotary_dim", None) == self.head_dim
+            and cache.shape[-1] == self.head_dim
+            and self.head_dim & (self.head_dim - 1) == 0
+        )
 
 
 class Gemma4MLP(nn.Module):
@@ -895,25 +937,55 @@ class Gemma4DecoderLayer(nn.Module):
             A ``(hidden_states, None)`` tuple: the scaled layer output and
             ``None`` for the residual stream (Gemma 4 carries none out of band).
         """
-        del residual  # Gemma 4 computes its own residuals; see docstring.
+        # Fused path (CUDA, wired by Gemma4Model): the block-boundary norms run
+        # as one kernel each -- post-attn norm + add + pre-FFN norm, and
+        # post-FFN norm + add + layer scalar + the NEXT layer's input norm (or
+        # the final norm). The layer then returns ``(normed, raw)`` and the
+        # next layer takes ``hidden_states`` as already input-normed with
+        # ``residual`` as its raw input. The math (and every bf16 rounding
+        # point) is the unfused sequence below.
+        next_norm = self.__dict__.get("_next_norm")
+        fused = next_norm is not None and hidden_states.is_cuda
 
         # Attention sublayer with explicit residual add #1.
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        elif not fused:
+            raise ValueError("Gemma4DecoderLayer got a residual on the unfused path")
         hidden_states = self.self_attn(positions, hidden_states, ctx)
         # o_proj is built reduce_results=False, so the shard sums are partial.
         if self.mapping.attn.tp_size > 1:
             hidden_states = all_reduce(hidden_states, self.mapping.attn.tp_group)
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = hidden_states + residual
+        if fused:
+            residual, hidden_states = rmsnorm_residual_rmsnorm(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.pre_feedforward_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+            )
+        else:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = hidden_states + residual
 
-        # Feed-forward sublayer with explicit residual add #2.
-        residual = hidden_states
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+            # Feed-forward sublayer with explicit residual add #2.
+            residual = hidden_states
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         # down_proj is built reduce_results=False, so the shard sums are partial.
         if self.mapping.dense.tp_size > 1:
             hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
+        if fused:
+            output, normed = rmsnorm_residual_rmsnorm(
+                hidden_states,
+                residual,
+                self.post_feedforward_layernorm.weight,
+                next_norm.weight,
+                self.post_feedforward_layernorm.variance_epsilon,
+                scale=self.layer_scalar,
+            )
+            return normed, output
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = hidden_states + residual
 
@@ -1005,6 +1077,15 @@ class Gemma4Model(nn.Module):
         # STANDARD x*weight RMSNorm (NOT Gemma 3's 1+weight GemmaRMSNorm); no
         # residual is folded into it (see forward / class docstring).
         self.norm = RMSNorm(self.hidden_size, eps=float(text_config.rms_norm_eps))
+        # Hand each layer the norm that follows it (the next layer's input
+        # norm, or the final norm) for the fused block-boundary kernel. Kept
+        # out of the module tree so it registers no duplicate parameters.
+        layers = [m for m in self.layers if isinstance(m, Gemma4DecoderLayer)]
+        if len(layers) == len(self.layers):
+            for idx, layer in enumerate(layers):
+                last = idx + 1 == len(layers)
+                nxt = self.norm if last else layers[idx + 1].input_layernorm
+                layer.__dict__["_next_norm"] = nxt
         # Normalizer cache keyed by compute dtype; see get_input_embeddings.
         self._normalizer_by_dtype: dict[torch.dtype, float] = {}
 
@@ -1090,7 +1171,10 @@ class Gemma4Model(nn.Module):
             hidden_states, residual = layer(positions, hidden_states, residual, ctx)
         # PLAIN final norm: no residual folded in, because the final layer
         # already closed its residual with an explicit add (unlike Gemma 3).
-        hidden_states = self.norm(hidden_states)
+        # On the fused path the last layer already applied it (and handed
+        # back its raw output as ``residual``).
+        if residual is None:
+            hidden_states = self.norm(hidden_states)
         return hidden_states, None
 
 

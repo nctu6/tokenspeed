@@ -67,7 +67,12 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
 # Paged-MHA architectures that run mixed prefill+decode rounds by default,
 # paired with a 4096-token prefill chunk (lower TTFT at equal throughput).
 MIXED_BATCH_DEFAULT_ARCHITECTURES = frozenset(
-    {"Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"}
+    {
+        "Gemma3ForConditionalGeneration",
+        "Gemma3ForCausalLM",
+        "Gemma4ForConditionalGeneration",
+        "Gemma4ForCausalLM",
+    }
 )
 MIXED_BATCH_DEFAULT_CHUNK = 4096
 

@@ -1167,3 +1167,223 @@ __all__ = [
     "qk_rmsnorm",
     "rmsnorm_fused_parallel",
 ]
+
+
+@triton.jit
+def _qk_rmsnorm_rope_neox_kernel(
+    q_in_ptr,
+    k_in_ptr,
+    v_in_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    cos_sin_ptr,
+    pos_ptr,
+    q_in_token_stride,
+    k_in_token_stride,
+    v_in_token_stride,
+    cos_sin_stride,
+    num_q_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    eps: tl.constexpr,
+    HAS_V: tl.constexpr,
+):
+    # Grid (token, head): [0, nq) = q (norm+RoPE), [nq, nq+nkv) = k (norm+RoPE),
+    # and when HAS_V the remaining [nq+nkv, nq+2*nkv) = v (weightless RMSNorm only).
+    HALF: tl.constexpr = head_dim // 2
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1)
+    offs = tl.arange(0, HALF)
+    out_ty = q_out_ptr.dtype.element_ty
+    if HAS_V:
+        if head >= (num_q_heads + num_kv_heads):
+            local_head = (head - num_q_heads - num_kv_heads).to(tl.int64)
+            src = v_in_ptr + token * v_in_token_stride + local_head * head_dim
+            dst = v_out_ptr + (token * num_kv_heads + local_head) * head_dim
+            x1 = tl.load(src + offs).to(tl.float32)
+            x2 = tl.load(src + HALF + offs).to(tl.float32)
+            rstd = tl.rsqrt(
+                (tl.sum(x1 * x1, axis=0) + tl.sum(x2 * x2, axis=0)) / head_dim + eps
+            )
+            # Weightless v_norm: x / rms(x), same rounding as RMSNormNoWeight.
+            tl.store(dst + offs, (x1 * rstd).to(out_ty))
+            tl.store(dst + HALF + offs, (x2 * rstd).to(out_ty))
+            return
+    if head >= num_q_heads:
+        local_head = (head - num_q_heads).to(tl.int64)
+        src = k_in_ptr + token * k_in_token_stride + local_head * head_dim
+        dst = k_out_ptr + (token * num_kv_heads + local_head) * head_dim
+        w_ptr = k_weight_ptr
+    else:
+        local_head = head.to(tl.int64)
+        src = q_in_ptr + token * q_in_token_stride + local_head * head_dim
+        dst = q_out_ptr + (token * num_q_heads + local_head) * head_dim
+        w_ptr = q_weight_ptr
+    x1 = tl.load(src + offs).to(tl.float32)
+    x2 = tl.load(src + HALF + offs).to(tl.float32)
+    rstd = tl.rsqrt(
+        (tl.sum(x1 * x1, axis=0) + tl.sum(x2 * x2, axis=0)) / head_dim + eps
+    )
+    n1 = (x1 * rstd * tl.load(w_ptr + offs).to(tl.float32)).to(out_ty).to(tl.float32)
+    n2 = (x2 * rstd * tl.load(w_ptr + HALF + offs).to(tl.float32)).to(out_ty)
+    n2 = n2.to(tl.float32)
+    pos = tl.load(pos_ptr + token).to(tl.int64)
+    cos = tl.load(cos_sin_ptr + pos * cos_sin_stride + offs).to(tl.float32)
+    sin = tl.load(cos_sin_ptr + pos * cos_sin_stride + HALF + offs).to(tl.float32)
+    tl.store(dst + offs, (n1 * cos - n2 * sin).to(out_ty))
+    tl.store(dst + HALF + offs, (n2 * cos + n1 * sin).to(out_ty))
+
+
+def qk_rmsnorm_rope_neox(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    v: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-head RMSNorm of q/k (+ optional weightless v) and neox RoPE on q/k.
+
+    ``q``/``k``/``v`` are ``[tokens, heads, head_dim]`` (or flat last-dim)
+    views whose rows may be strided, e.g. head slices of a fused qkv
+    projection. ``cos_sin_cache`` is ``[positions, head_dim]`` laid out as
+    ``cos | sin`` and RoPE spans the whole head (identity-padded caches cover
+    partial rotary). When ``v`` is given it is RMS-normalized without a
+    learnable scale (Gemma 4 ``v_norm``) in the same launch. Returns fresh
+    contiguous ``[tokens, heads * head_dim]`` tensors.
+    """
+    head_dim = q_weight.shape[0]
+    n_tokens = q.shape[0]
+    q_width, k_width = math.prod(q.shape[1:]), math.prod(k.shape[1:])
+    q_out = torch.empty((n_tokens, q_width), dtype=q.dtype, device=q.device)
+    k_out = torch.empty((n_tokens, k_width), dtype=k.dtype, device=k.device)
+    has_v = v is not None
+    v_width = math.prod(v.shape[1:]) if has_v else 0
+    v_out = (
+        torch.empty((n_tokens, v_width), dtype=v.dtype, device=v.device)
+        if has_v
+        else q_out
+    )
+    if n_tokens == 0:
+        return (q_out, k_out, v_out) if has_v else (q_out, k_out)
+    assert head_dim & (head_dim - 1) == 0, "head_dim must be a power of two"
+    assert cos_sin_cache.shape[-1] == head_dim, "RoPE must span the whole head"
+    assert q.stride(-1) == 1 and k.stride(-1) == 1
+    if has_v:
+        assert v.stride(-1) == 1
+    if q.dim() == 3:
+        assert q.stride(1) == head_dim and k.stride(1) == head_dim
+        if has_v:
+            assert v.stride(1) == head_dim
+    num_q_heads = q_out.shape[1] // head_dim
+    num_kv_heads = k_out.shape[1] // head_dim
+    if has_v:
+        assert v_out.shape[1] // head_dim == num_kv_heads
+    n_heads = num_q_heads + num_kv_heads + (num_kv_heads if has_v else 0)
+    _qk_rmsnorm_rope_neox_kernel[(n_tokens, n_heads)](
+        q,
+        k,
+        v if has_v else q,
+        q_out,
+        k_out,
+        v_out,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        q.stride(0),
+        k.stride(0),
+        v.stride(0) if has_v else q.stride(0),
+        cos_sin_cache.stride(0),
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        eps,
+        HAS_V=has_v,
+        num_warps=4 if head_dim <= 256 else 8,
+    )
+    return (q_out, k_out, v_out) if has_v else (q_out, k_out)
+
+
+@triton.jit
+def _rmsnorm_residual_rmsnorm_kernel(
+    x_ptr,
+    res_ptr,
+    w1_ptr,
+    w2_ptr,
+    scale_ptr,
+    y_ptr,
+    z_ptr,
+    x_stride,
+    res_stride,
+    N: tl.constexpr,
+    BLOCK: tl.constexpr,
+    eps: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+):
+    # y = (rmsnorm(x) * w1 + res) [* scale];  z = rmsnorm(y) * w2.
+    # Every intermediate is rounded to the activation dtype exactly where the
+    # unfused norm / add / mul sequence stores it.
+    row = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < N
+    ty = y_ptr.dtype.element_ty
+    x = tl.load(x_ptr + row * x_stride + offs, mask=mask, other=0.0).to(tl.float32)
+    rstd = tl.rsqrt(tl.sum(x * x, axis=0) / N + eps)
+    w1 = tl.load(w1_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    h = (x * rstd * w1).to(ty).to(tl.float32)
+    r = tl.load(res_ptr + row * res_stride + offs, mask=mask, other=0.0).to(tl.float32)
+    y = (h + r).to(ty)
+    if HAS_SCALE:
+        y = (y.to(tl.float32) * tl.load(scale_ptr).to(tl.float32)).to(ty)
+    tl.store(y_ptr + row * N + offs, y, mask=mask)
+    y = y.to(tl.float32)
+    rstd2 = tl.rsqrt(tl.sum(y * y, axis=0) / N + eps)
+    w2 = tl.load(w2_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    tl.store(z_ptr + row * N + offs, (y * rstd2 * w2).to(ty), mask=mask)
+
+
+def rmsnorm_residual_rmsnorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    next_weight: torch.Tensor,
+    eps: float,
+    scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sandwich-norm block boundary in one launch.
+
+    Returns ``(y, z)`` with ``y = (rmsnorm(x) * weight + residual) * scale``
+    (``scale`` a one-element device tensor, optional) and ``z = rmsnorm(y) *
+    next_weight``: a post-norm, residual add, optional output scale and the
+    next pre-norm, as in Gemma 4's decoder layers.
+    """
+    n = x.shape[-1]
+    y = torch.empty_like(residual)
+    z = torch.empty_like(residual)
+    if x.shape[0] == 0:
+        return y, z
+    assert x.stride(-1) == 1 and residual.stride(-1) == 1
+    block = triton.next_power_of_2(n)
+    _rmsnorm_residual_rmsnorm_kernel[(x.shape[0],)](
+        x,
+        residual,
+        weight,
+        next_weight,
+        scale if scale is not None else weight,
+        y,
+        z,
+        x.stride(0),
+        residual.stride(0),
+        n,
+        block,
+        eps,
+        HAS_SCALE=scale is not None,
+        num_warps=8 if block >= 4096 else 4,
+    )
+    return y, z

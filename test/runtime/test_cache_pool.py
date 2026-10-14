@@ -54,6 +54,17 @@ class CacheArenaContractTest(unittest.TestCase):
         self.assertEqual(arena.buffer.dtype, torch.uint8)
         self.assertEqual(arena.buffer.numel(), arena.plan.arena_bytes)
 
+    def test_release_frees_the_bytes_while_views_are_still_held(self):
+        arena = _arena()
+        view = arena.buffer[:4]
+
+        arena.release()
+
+        # A rebuilt arena is sized from a profile that predates this one, so
+        # the bytes must go even though pools/backends still hold views.
+        self.assertEqual(arena.buffer.untyped_storage().nbytes(), 0)
+        self.assertEqual(view.untyped_storage().nbytes(), 0)
+
     def test_materializes_every_planned_field_on_construction(self):
         arena = _arena()
 

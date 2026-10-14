@@ -20,8 +20,8 @@
 
 """Triton MHA decode: KV-split sizing policy (TOKENSPEED_TRITON_DECODE_KV_SPLITS).
 
-* ``legacy`` (default) keeps the old 4-wide grid with one split per request.
-* ``auto`` sizes MAX_KV_SPLITS on the host from static shapes + SM count and
+* ``legacy`` keeps the old 4-wide grid with one split per request.
+* ``auto`` (default) sizes MAX_KV_SPLITS on the host from static shapes + SM count and
   picks per-request splits on device from the actual KV length.
 * an integer N forces N splits (sweeps).
 
@@ -179,7 +179,7 @@ def test_resolve_modes_cpu(monkeypatch) -> None:
 @pytest.mark.parametrize(
     "env,expected",
     [
-        ({}, ("legacy", 16, 256, 2, False)),
+        ({}, ("auto", 16, 256, 2, False)),
         ({"TOKENSPEED_TRITON_DECODE_KV_SPLITS": "AUTO"}, ("auto", 16, 256, 2, False)),
         ({"TOKENSPEED_TRITON_DECODE_KV_SPLITS": "8"}, (8, 16, 256, 2, False)),
         (

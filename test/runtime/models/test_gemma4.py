@@ -835,7 +835,7 @@ def test_v_is_normalized_not_rotated() -> None:
     expected_v = attn.v_norm(v_split.reshape(-1, attn.head_dim)).view(
         num_tokens, attn.kv_size
     )
-    torch.testing.assert_close(capture.v, expected_v, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(capture.v, expected_v, rtol=1.6e-2, atol=1.6e-2)
 
     # A RoPE-rotated V would differ: rotate expected_v through the same RoPE
     # the layer uses (as a stand-in q, since RoPE rotates both its args) and
@@ -843,6 +843,67 @@ def test_v_is_normalized_not_rotated() -> None:
     positions = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
     rotated_v, _ = attn.rotary_emb(positions, expected_v.clone(), expected_v.clone())
     assert not torch.allclose(rotated_v, capture.v, rtol=1e-3, atol=1e-3)
+
+
+class _RefAttn(torch.nn.Module):
+    """Attention stand-in that keeps (q, k, v) by reference: no clone, so the
+    only kernels launched around it are the module's own."""
+
+    def __init__(self, num_heads: int, head_dim: int) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+
+    def forward(self, q, k, v, positions=None, ctx=None, **kwargs):
+        self.q, self.k, self.v = q, k, v
+        return q.new_zeros((q.shape[0], self.num_heads * self.head_dim))
+
+
+@_cuda_only
+@pytest.mark.parametrize(
+    "layer_id,layer_type",
+    [(_SLIDING_LAYER_ID, SLIDING_ATTENTION), (_FULL_LAYER_ID, FULL_ATTENTION)],
+)
+def test_qkv_norms_read_the_fused_projection_without_copies(
+    layer_id, layer_type
+) -> None:
+    """The q/k/v norms run on strided per-head views of the fused projection.
+
+    Regression: splitting the flat qkv and reshaping each slice to
+    ``[-1, head_dim]`` materialised three copies per layer, about 0.45 ms of
+    extra kernels per batch-32 decode step over 60 layers. The pre-attention
+    path must launch no copy kernel, and q/k/v must still equal the
+    reshape-based reference.
+    """
+    from torch.profiler import ProfilerActivity, profile
+
+    attn, _, _, _ = _run_forward_with_capture(layer_id, layer_type, 32)
+    ref = _RefAttn(attn.num_heads, attn.head_dim)
+    attn.attn = ref
+    hidden_states = torch.randn(
+        32, _HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"
+    )
+    positions = torch.arange(32, dtype=torch.int64, device="cuda")
+    attn.forward(positions, hidden_states, ctx=None)  # warm up kernels
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        attn.forward(positions, hidden_states, ctx=None)
+        torch.cuda.synchronize()
+    names = [e.name for e in prof.events() if e.device_type.name == "CUDA"]
+    copies = [n for n in names if "copy" in n.lower() and "splitK" not in n]
+    assert not copies, copies
+
+    qkv, _ = attn.qkv_proj(hidden_states)
+    q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+    hd = attn.head_dim
+    q_ref = attn.q_norm(q.reshape(-1, hd)).view(32, attn.q_size)
+    k_ref = attn.k_norm(k.reshape(-1, hd)).view(32, attn.kv_size)
+    q_ref, k_ref = attn.rotary_emb(positions, q_ref, k_ref)
+    v_ref = attn.v_norm(v.reshape(-1, hd)).view(32, attn.kv_size)
+    for got, want in ((ref.q, q_ref), (ref.k, k_ref), (ref.v, v_ref)):
+        assert got.shape == want.shape and got.is_contiguous()
+        torch.testing.assert_close(got, want, rtol=1.6e-2, atol=1.6e-2)
+
 
 # ---------------------------------------------------------------------------
 # Task-5 components: MLP guard, decoder layer_scalar, model embedding
@@ -1877,3 +1938,74 @@ def test_real_checkpoint_architecture_resolves_end_to_end() -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class _EchoAttn(torch.nn.Module):
+    """Attention stand-in returning q, so the layer output depends on the
+    q norm + RoPE result."""
+
+    def forward(self, q, k, v, positions=None, ctx=None, **kwargs):
+        return q
+
+
+@_cuda_only
+def test_fused_block_norms_match_the_unfused_layer_chain() -> None:
+    """Two wired decoder layers (sliding then full) on the fused path --
+    norm+add+norm block boundaries handed across layers and fused q/k norm +
+    RoPE -- equal the unfused per-op chain, including the final norm."""
+    from torch.profiler import ProfilerActivity, profile
+
+    old_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        layers = [
+            _build_decoder_layer(_SLIDING_LAYER_ID, "cuda"),
+            _build_decoder_layer(_FULL_LAYER_ID, "cuda"),
+        ]
+        final = RMSNorm(_HIDDEN_SIZE, eps=1e-6).cuda()
+    finally:
+        torch.set_default_dtype(old_dtype)
+    torch.manual_seed(0)
+    with torch.no_grad():
+        for layer in layers:
+            attn = layer.self_attn
+            attn.rotary_emb.cos_sin_cache = attn.rotary_emb.cos_sin_cache.cuda()
+            attn.attn = _EchoAttn()
+            for w in (
+                attn.qkv_proj.weight,
+                attn.o_proj.weight,
+                layer.mlp.gate_up_proj.weight,
+                layer.mlp.down_proj.weight,
+            ):
+                w.normal_(mean=0.0, std=0.02)
+            for norm in (
+                attn.q_norm,
+                attn.k_norm,
+                layer.input_layernorm,
+                layer.post_attention_layernorm,
+                layer.pre_feedforward_layernorm,
+                layer.post_feedforward_layernorm,
+            ):
+                norm.weight.uniform_(0.5, 1.5)
+            layer.layer_scalar.fill_(0.75)
+        final.weight.uniform_(0.5, 1.5)
+
+    x = torch.randn(7, _HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+    positions = torch.arange(100, 107, dtype=torch.int64, device="cuda")
+
+    def run(fused: bool) -> torch.Tensor:
+        for layer, nxt in zip(layers, (layers[1].input_layernorm, final)):
+            layer.__dict__["_next_norm"] = nxt if fused else None
+        hidden, residual = x, None
+        for layer in layers:
+            hidden, residual = layer(positions, hidden, residual, None)
+        return hidden if residual is not None else final(hidden)
+
+    want = run(False)
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        got = run(True)
+        torch.cuda.synchronize()
+    names = [e.name for e in prof.events() if e.device_type.name == "CUDA"]
+    assert sum("_rmsnorm_residual_rmsnorm_kernel" in n for n in names) == 4
+    assert sum("_qk_rmsnorm_rope_neox_kernel" in n for n in names) == 2
+    torch.testing.assert_close(got, want, rtol=3e-2, atol=3e-2)

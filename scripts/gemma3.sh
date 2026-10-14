@@ -17,8 +17,8 @@
 #   DISABLE_KVSTORE      default: 0. Set 1 to pass --disable-kvstore.
 #   EXTRA_ARGS           default: empty. Extra `tokenspeed serve` flags.
 #   TOKENSPEED_TRITON_PREFILL_SKIP_OOR   default: 1 (F1; kernel default on)
-#   TOKENSPEED_TRITON_DECODE_KV_SPLITS   default: legacy (F2; not auto)
-#   TOKENSPEED_FLASHINFER_FA2_EXTEND    default: off (F3; not 512/all)
+#   TOKENSPEED_TRITON_DECODE_KV_SPLITS   default: unset (kernel default auto)
+#   TOKENSPEED_FLASHINFER_FA2_EXTEND    default: unset (kernel default 512)
 #   VLLM_BATCH_INVARIANT default: empty. Truthy = --force-deterministic-rsag +
 #                        --disable-nccl-nvls (for TP>1 on hosts with broken
 #                        NVLS multicast, e.g. sm90). Single-GPU default is fine
@@ -69,12 +69,10 @@ export CUDA_VISIBLE_DEVICES="$CUDA_DEVICES"
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 export HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN:-}"
 
-# F1–F3 attention: conservative defaults (match kernel). Override for
-# DECODE_KV_SPLITS=auto / FA2_EXTEND=512 after A/B. (The sliding-window
-# KV-range trim is always on in the kernel, upstream #1559.)
+# F1–F3 attention: the kernel defaults apply unless set here (split-KV
+# decode auto, FA2 extend for head_dim 512). (The sliding-window KV-range
+# trim is always on in the kernel, upstream #1559.)
 export TOKENSPEED_TRITON_PREFILL_SKIP_OOR="${TOKENSPEED_TRITON_PREFILL_SKIP_OOR:-1}"
-export TOKENSPEED_TRITON_DECODE_KV_SPLITS="${TOKENSPEED_TRITON_DECODE_KV_SPLITS:-legacy}"
-export TOKENSPEED_FLASHINFER_FA2_EXTEND="${TOKENSPEED_FLASHINFER_FA2_EXTEND:-off}"
 
 if [[ ! -x "$VENV_DIR/bin/tokenspeed" && ! -f "$VENV_DIR/bin/activate" ]]; then
     echo "ERROR: venv not found at $VENV_DIR. Run ./scripts/install.sh first (or set VENV_DIR)." >&2

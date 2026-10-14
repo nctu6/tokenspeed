@@ -18,6 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include <cstdlib>
 #include "integration_test_helper.h"
 
 #include <algorithm>
@@ -258,6 +259,78 @@ TEST_F(MixedLongChunkSuite, LongPrefillBesideDecodesTakesAtMostHalfAChunk) {
     }
     EXPECT_GT(long_tokens, 0);
     EXPECT_LE(long_tokens, Config().max_scheduled_tokens / 2) << "decodes ride this round: the long chunk is capped";
+}
+
+class MixedDecodeRefSuite : public MixedLongChunkSuite {
+protected:
+    void SetUp() override {
+        ::setenv("TOKENSPEED_MIXED_DECODE_REF", "1", 1);
+        ::setenv("TOKENSPEED_LONG_PREFILL_FLOOR", "0", 1);
+        ::setenv("TOKENSPEED_MIXED_PREFILL_FLOOR", "0", 1);
+        MixedLongChunkSuite::SetUp();
+    }
+    void TearDown() override {
+        MixedLongChunkSuite::TearDown();
+        ::unsetenv("TOKENSPEED_MIXED_DECODE_REF");
+        ::unsetenv("TOKENSPEED_LONG_PREFILL_FLOOR");
+        ::unsetenv("TOKENSPEED_MIXED_PREFILL_FLOOR");
+    }
+    std::int32_t TokensOf(const ExecutionPlan& plan, const std::string& id) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* f = std::get_if<ForwardBatch>(&op)) {
+                for (std::size_t i = 0; i < f->request_ids.size(); ++i) {
+                    if (f->request_ids[i] == id) {
+                        return f->input_lengths[i];
+                    }
+                }
+            }
+        }
+        return -1;
+    }
+};
+
+TEST_F(MixedDecodeRefSuite, PrefillShareShrinksWithTheDecodeCount) {
+    for (const char* id : {"d0", "d1", "d2"}) {
+        Submit(MakeRequestSpec(id, /*num_pages=*/2, /*start=*/std::string(id) == "d0" ? 1 : (id[1] - '0') * 100));
+    }
+    auto first = PlanOnce();
+    ASSERT_EQ(ForwardIds(first).size(), 3u);
+    for (const char* id : {"d0", "d1", "d2"}) {
+        SendForwardDone(id, {7});
+    }
+    Submit(MakeRequestSpec("p", /*num_pages=*/100, /*start=*/1000));
+    auto second = PlanOnce();
+    const std::int32_t p_tokens = TokensOf(second, "p");
+    EXPECT_GT(p_tokens, 0) << "the prompt still advances beside the decodes";
+    EXPECT_LE(p_tokens, Config().max_scheduled_tokens / 3) << "ref=1 with 3 decodes: a third of the chunk";
+}
+
+class MixedPrefillFloorSuite : public MixedDecodeRefSuite {
+protected:
+    void SetUp() override {
+        MixedDecodeRefSuite::SetUp();
+    }
+    SchedulerConfig MakeConfig() override {
+        // Floor at half a chunk, applied before the scheduler reads it.
+        ::setenv("TOKENSPEED_MIXED_PREFILL_FLOOR",
+                 std::to_string(MixedDecodeRefSuite::MakeConfig().max_scheduled_tokens / 2).c_str(), 1);
+        return MixedDecodeRefSuite::MakeConfig();
+    }
+};
+
+TEST_F(MixedPrefillFloorSuite, ShrunkShareNeverDropsBelowTheMixedFloor) {
+    for (const char* id : {"d0", "d1", "d2"}) {
+        Submit(MakeRequestSpec(id, /*num_pages=*/2, /*start=*/std::string(id) == "d0" ? 1 : (id[1] - '0') * 100));
+    }
+    auto first = PlanOnce();
+    ASSERT_EQ(ForwardIds(first).size(), 3u);
+    for (const char* id : {"d0", "d1", "d2"}) {
+        SendForwardDone(id, {7});
+    }
+    Submit(MakeRequestSpec("p", /*num_pages=*/100, /*start=*/1000));
+    auto second = PlanOnce();
+    EXPECT_GT(TokensOf(second, "p"), Config().max_scheduled_tokens / 3)
+        << "ref=1 with 3 decodes would give a third; the floor keeps half";
 }
 
 class SchedulerKvCacheEventTestSuite : public SchedulerTestSuite {
