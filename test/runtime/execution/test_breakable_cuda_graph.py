@@ -769,6 +769,22 @@ class TestPrefillGraphMaxTokensResolution(unittest.TestCase):
             PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
         )
 
+    def test_mixed_batch_covers_the_whole_chunk(self):
+        from tokenspeed.runtime.execution.model_executor import (
+            _resolve_prefill_graph_max_tokens,
+        )
+
+        # Mixed rounds fill the chunk budget (decode rows included), so the
+        # ladder must reach the chunk or every full mixed round runs eager.
+        args = self._args(enable_mixed_batch=True, chunked_prefill_size=4096)
+        self.assertEqual(_resolve_prefill_graph_max_tokens(args), 4096)
+        args = self._args(
+            enable_mixed_batch=True, chunked_prefill_size=4096, max_total_tokens=3000
+        )
+        self.assertEqual(_resolve_prefill_graph_max_tokens(args), 3000)
+        args = self._args(enable_mixed_batch=False, chunked_prefill_size=4096)
+        self.assertEqual(_resolve_prefill_graph_max_tokens(args), 2048)
+
     def test_k3_transports_keep_prefill_graphs(self):
         from tokenspeed.runtime.execution.model_executor import (
             PREFILL_GRAPH_DEFAULT_MAX_TOKENS,

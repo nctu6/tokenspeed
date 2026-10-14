@@ -158,6 +158,9 @@ PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
 def _resolve_prefill_graph_max_tokens(server_args) -> int:
     """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget).
 
+    With mixed batching the default is the chunk itself (still bounded by the
+    kv budget): mixed rounds are full-chunk forwards.
+
     Returns 0 (graph off) when the MoE all-to-all backend is DeepEP: an
     extend-shaped forward takes DeepEP's normal dispatch, whose per-expert
     receive counts come back to the host, and a host sync cannot be captured.
@@ -167,8 +170,14 @@ def _resolve_prefill_graph_max_tokens(server_args) -> int:
     if server_args.prefill_graph_max_tokens is not None:
         return int(server_args.prefill_graph_max_tokens)
     cap = PREFILL_GRAPH_DEFAULT_MAX_TOKENS
-    if server_args.chunked_prefill_size:
-        cap = min(cap, int(server_args.chunked_prefill_size))
+    chunk = int(server_args.chunked_prefill_size or 0)
+    if getattr(server_args, "enable_mixed_batch", False) and chunk > 0:
+        # A mixed round fills the whole chunk budget (decode rows count against
+        # it), so a ladder stopping at the default cap leaves every full mixed
+        # round eager. Cover the chunk.
+        cap = max(cap, chunk)
+    if chunk > 0:
+        cap = min(cap, chunk)
     if server_args.max_total_tokens:
         cap = min(cap, int(server_args.max_total_tokens))
     return cap
@@ -1265,6 +1274,8 @@ class ModelExecutor:
                 input_ids,
                 self._active_multimodal_context,
             )
+        if mode is not None and (mode.is_extend() or mode.is_mixed()):
+            self.prefill_graph.note_eager(ctx)
         if (
             mode is not None
             and mode.is_extend()

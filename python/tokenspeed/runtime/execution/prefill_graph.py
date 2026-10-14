@@ -507,6 +507,9 @@ class PrefillGraph:
         self._encoder_handoff_storage: dict[HandoffSlot, torch.Tensor] = {}
         self._outputs: list[torch.Tensor] | None = None
         self._engaged_logged: set[str] = set()
+        # Replay/eager accounting for extend+mixed forwards, logged every
+        # _STATS_EVERY forwards so graph coverage is visible in the server log.
+        self._stats = {"replay": 0, "mixed_replay": 0, "eager": 0, "real": 0, "padded": 0}
         # Aux-capture mode baked into the graphs; mismatched live forwards run eager.
         self._captured_hidden_mode = None
         # One owner for ordinary and attention-containing captures. None is the
@@ -1288,6 +1291,7 @@ class PrefillGraph:
         assert bucket is not None, "replay() called without can_run()"
         self._log_engaged_once(bucket, ctx, multimodal_context is not None)
         num_tokens = ctx.input_num_tokens
+        self._note_forward(ctx, bucket)
         input_embeds = None
         if multimodal_context is not None:
             input_embeds = self._multimodal_input_embeds(
@@ -1537,6 +1541,32 @@ class PrefillGraph:
                 yield
         finally:
             ctx.input_num_tokens, ctx.global_num_tokens, ctx.global_bs = saved
+
+    _STATS_EVERY = 512
+
+    def note_eager(self, ctx: ForwardContext) -> None:
+        """Count an extend/mixed forward that ran eager (no fitting bucket)."""
+        if not self.disable:
+            self._note_forward(ctx, None)
+
+    def _note_forward(self, ctx: ForwardContext, bucket: int | None) -> None:
+        stats = self._stats
+        if bucket is None:
+            stats["eager"] += 1
+        else:
+            stats["replay"] += 1
+            if ctx.forward_mode is not None and ctx.forward_mode.is_mixed():
+                stats["mixed_replay"] += 1
+            stats["real"] += int(ctx.input_num_tokens)
+            stats["padded"] += int(bucket)
+        total = stats["replay"] + stats["eager"]
+        if total % self._STATS_EVERY == 0:
+            waste = 1.0 - stats["real"] / stats["padded"] if stats["padded"] else 0.0
+            logger.info(
+                f"prefill graph stats: {stats['replay']:d} replayed "
+                f"({stats['mixed_replay']:d} mixed), {stats['eager']:d} eager, "
+                f"padding {100.0 * waste:.1f}% of replayed tokens"
+            )
 
     def _log_engaged_once(
         self, bucket: int, ctx: ForwardContext, is_multimodal: bool
