@@ -188,6 +188,43 @@ TEST_F(StableCandidateOrderingSuite, ForwardBatchIsReproducibleAcrossMirroredSch
     EXPECT_EQ(ids_a, ids_b);
 }
 
+class LengthAwareAdmissionSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 512;
+        cfg.host_allocator.total_pages = 512;
+        cfg.cache_groups[0].total_pages = 512;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    static std::vector<std::string> ForwardIds(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* fwd = std::get_if<ForwardBatch>(&op)) {
+                return fwd->request_ids;
+            }
+        }
+        return {};
+    }
+};
+
+TEST_F(LengthAwareAdmissionSuite, ShortPromptIsAdmittedAheadOfALongChunkedPrefill) {
+    // 200 tokens with a 64-token budget: the long prompt is chunked and, by
+    // FIFO alone, would hold the head of line for three more rounds.
+    Submit(MakeRequestSpec("long", /*num_pages=*/100, /*start=*/1));
+    auto first = PlanOnce();
+    ASSERT_EQ(ForwardIds(first), std::vector<std::string>{"long"});
+    SendForwardDone("long");
+
+    Submit(MakeRequestSpec("short", /*num_pages=*/4, /*start=*/1000));
+    auto second = PlanOnce();
+    const auto ids = ForwardIds(second);
+    ASSERT_EQ(ids.size(), 2u);
+    EXPECT_EQ(ids[0], "short") << "the short prompt rides this round, ahead of the long chunk";
+    EXPECT_EQ(ids[1], "long") << "the long prefill keeps the rest of the budget";
+}
+
 class SchedulerKvCacheEventTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

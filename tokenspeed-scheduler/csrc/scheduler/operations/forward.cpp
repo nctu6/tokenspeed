@@ -1079,9 +1079,65 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
 // -- the two simply do not fit together), but it does seal new-prompt
 // admission (new_prompts_sealed): a newcomer taking the pages it is waiting
 // for would starve it.
+// Length-aware admission. The FIFO lets a resident chunked prefill hold the
+// head of line until its last chunk, so a 1K prompt that arrives behind a 128K
+// one waits for the whole long prefill (tens of seconds). When the resident
+// head has more than short_prompt_tokens_ left, admit short new prompts first,
+// whole and in FIFO order, while the round keeps long_prefill_floor_ tokens for
+// the long prefill, which then takes the rest of the budget as usual. A short
+// prompt that fails admission stops the pass without becoming the capacity
+// blocker: the long prefill keeps its claim on retraction.
+void Scheduler::scheduleShortPromptsAhead(AdmissionFeedback& feedback, PlanBuild& build,
+                                          std::span<Request* const> candidates, std::int32_t decode_reserve) {
+    if (short_prompt_tokens_ <= 0) {
+        return;
+    }
+    const bool long_head = std::ranges::any_of(candidates, [this, &build](const Request* request) {
+        return request->Is<fsm::Prefilling>() && !build.Scheduled(*request) &&
+               request->UnscheduledPrefillSize() > short_prompt_tokens_;
+    });
+    if (!long_head) {
+        return;
+    }
+    for (Request* request : candidates) {
+        if (build.Full(config_.max_batch_size)) {
+            return;
+        }
+        if (!request->Is<fsm::Submitted>() || build.Scheduled(*request)) {
+            continue;
+        }
+        const std::int32_t size = request->PrefillSize();
+        if (size > short_prompt_tokens_ || size > build.token_budget - long_prefill_floor_) {
+            continue;
+        }
+        feedback.admission_failed = false;
+        auto admitted = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget, decode_reserve,
+                                                 build.load_backs, build.prefetches);
+        if (!admitted) {
+            if (feedback.admission_failed) {
+                feedback.admission_failed = false;
+                return;
+            }
+            continue;
+        }
+        if (!admitted->operation) {
+            build.scheduled.insert(request);
+            continue;
+        }
+        pushOperation(build, *request, std::move(*admitted->operation));
+        request->TrackScheduledForward();
+        if (holdsHeadOfLine(*request)) {
+            return;  // did not fit whole after all; it is now the head
+        }
+    }
+}
+
 void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build,
                                          std::span<Request* const> candidates, bool new_prompts_sealed,
                                          std::int32_t decode_reserve) {
+    if (!new_prompts_sealed) {
+        scheduleShortPromptsAhead(feedback, build, candidates, decode_reserve);
+    }
     for (const bool resident : {true, false}) {
         if (!resident && new_prompts_sealed) {
             return;

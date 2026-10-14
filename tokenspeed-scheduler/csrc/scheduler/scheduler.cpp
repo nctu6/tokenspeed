@@ -123,6 +123,19 @@ Scheduler::Scheduler(SchedulerConfig config)
         }
     }
 
+    // TOKENSPEED_SHORT_PROMPT_TOKENS (default: one chunk) and
+    // TOKENSPEED_LONG_PREFILL_FLOOR (default: a quarter chunk): length-aware
+    // prefill admission. A short prompt no longer waits for a long chunked
+    // prefill to finish all its chunks. 0 disables.
+    {
+        const auto env_int = [](const char* name, std::int32_t fallback) {
+            const char* value = std::getenv(name);
+            return value != nullptr ? static_cast<std::int32_t>(std::atoi(value)) : fallback;
+        };
+        short_prompt_tokens_ = std::max(0, env_int("TOKENSPEED_SHORT_PROMPT_TOKENS", config_.max_scheduled_tokens));
+        long_prefill_floor_ = std::max(0, env_int("TOKENSPEED_LONG_PREFILL_FLOOR", config_.max_scheduled_tokens / 4));
+    }
+
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {
         spdlog::set_level(spdlog::level::from_str(level));
     }
