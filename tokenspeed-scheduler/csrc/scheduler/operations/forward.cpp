@@ -1132,6 +1132,23 @@ void Scheduler::scheduleShortPromptsAhead(AdmissionFeedback& feedback, PlanBuild
     }
 }
 
+// The chunk budget one prefill may take this round. With decodes in the round
+// (mixed mode), a prefill that still has more than mixed_long_chunk_ tokens
+// to go is held to that many: the decode rows wait for the whole forward, so
+// a full chunk at long context sets their step time. Short prompts and rounds
+// without decodes keep the whole budget.
+std::int32_t Scheduler::prefillBudgetFor(const Request& request, const PlanBuild& build) const {
+    if (mixed_long_chunk_ <= 0 || !build.pushed_decode) {
+        return build.token_budget;
+    }
+    const std::int32_t left =
+        request.Is<fsm::Submitted>() ? request.PrefillSize() : request.UnscheduledPrefillSize();
+    if (left <= mixed_long_chunk_) {
+        return build.token_budget;
+    }
+    return std::min(build.token_budget, std::max(mixed_long_chunk_, build.state_prefill_reserve));
+}
+
 void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build,
                                          std::span<Request* const> candidates, bool new_prompts_sealed,
                                          std::int32_t decode_reserve) {
@@ -1151,7 +1168,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 continue;
             }
             feedback.admission_failed = false;
-            if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget,
+            if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, prefillBudgetFor(*request, build),
                                                          decode_reserve, build.load_backs, build.prefetches)) {
                 if (!admitted->operation) {
                     // Gone to prefetch its L3 prefix (Prefetching): it holds

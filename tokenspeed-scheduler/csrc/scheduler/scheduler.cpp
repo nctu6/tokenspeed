@@ -134,6 +134,10 @@ Scheduler::Scheduler(SchedulerConfig config)
         };
         short_prompt_tokens_ = std::max(0, env_int("TOKENSPEED_SHORT_PROMPT_TOKENS", config_.max_scheduled_tokens));
         long_prefill_floor_ = std::max(0, env_int("TOKENSPEED_LONG_PREFILL_FLOOR", config_.max_scheduled_tokens / 4));
+        // TOKENSPEED_MIXED_LONG_CHUNK (default: half a chunk, mixed mode only).
+        mixed_long_chunk_ = config_.enable_mixed_prefill_decode
+                                ? std::max(0, env_int("TOKENSPEED_MIXED_LONG_CHUNK", config_.max_scheduled_tokens / 2))
+                                : 0;
     }
 
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {

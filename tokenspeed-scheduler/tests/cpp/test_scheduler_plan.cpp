@@ -225,6 +225,41 @@ TEST_F(LengthAwareAdmissionSuite, ShortPromptIsAdmittedAheadOfALongChunkedPrefil
     EXPECT_EQ(ids[1], "long") << "the long prefill keeps the rest of the budget";
 }
 
+class MixedLongChunkSuite : public LengthAwareAdmissionSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = LengthAwareAdmissionSuite::MakeConfig();
+        cfg.enable_mixed_prefill_decode = true;
+        return cfg;
+    }
+};
+
+TEST_F(MixedLongChunkSuite, LongPrefillBesideDecodesTakesAtMostHalfAChunk) {
+    Submit(MakeRequestSpec("d", /*num_pages=*/2, /*start=*/1));
+    auto first = PlanOnce();
+    ASSERT_EQ(ForwardIds(first), std::vector<std::string>{"d"});
+    SendForwardDone("d", {7});
+
+    Submit(MakeRequestSpec("long", /*num_pages=*/100, /*start=*/1000));
+    auto second = PlanOnce();
+    const ForwardBatch* fwd = nullptr;
+    for (const auto& op : second.Operations()) {
+        if (auto* f = std::get_if<ForwardBatch>(&op)) {
+            fwd = f;
+        }
+    }
+    ASSERT_NE(fwd, nullptr);
+    ASSERT_EQ(fwd->request_ids.size(), 2u);
+    std::int32_t long_tokens = -1;
+    for (std::size_t i = 0; i < fwd->request_ids.size(); ++i) {
+        if (fwd->request_ids[i] == "long") {
+            long_tokens = fwd->input_lengths[i];
+        }
+    }
+    EXPECT_GT(long_tokens, 0);
+    EXPECT_LE(long_tokens, Config().max_scheduled_tokens / 2) << "decodes ride this round: the long chunk is capped";
+}
+
 class SchedulerKvCacheEventTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

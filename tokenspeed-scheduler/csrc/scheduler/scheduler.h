@@ -413,6 +413,11 @@ private:
                                    std::span<Request* const> candidates, std::int32_t decode_reserve);
     std::int32_t short_prompt_tokens_{0};
     std::int32_t long_prefill_floor_{0};
+    // Mixed mode: a prefill with more than this many tokens left takes at most
+    // this many per round while decodes ride the same round, which bounds the
+    // decode step time (ITL) behind a long prompt. 0 disables.
+    std::int32_t mixed_long_chunk_{0};
+    std::int32_t prefillBudgetFor(const Request& request, const PlanBuild& build) const;
 
     SchedulerConfig config_;
     ReqPoolAllocator req_pool_allocator_;
