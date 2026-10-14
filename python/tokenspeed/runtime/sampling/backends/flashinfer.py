@@ -41,12 +41,14 @@ from tokenspeed_kernel.ops.sampling.flashinfer import (
     top_p_renorm_prob,
 )
 from tokenspeed_kernel.ops.sampling.triton import (
+    single_step_sample,
     gather_and_expand_scalars,
     gumbel_sample_from_pools_generic,
 )
 from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
+from tokenspeed.runtime.sampling.sampling_params import _TOP_K_FUSED_MAX
 from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
 from tokenspeed.runtime.execution.slot_state import aligned_slot_state_bytes
 from tokenspeed.runtime.sampling.backends.base import (
@@ -717,47 +719,47 @@ class FlashInferSamplingBackend(SamplingBackend):
             logits,
             temperature=temperatures,
         )
-        if _FUSED_TOPK_TOPP_AVAILABLE:
-            # Fused replacement for the back-to-back top_k_renorm_prob +
-            # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
-            # K = 1<<30 in top_ks routes per-row through the radix top-p
-            # only path. Availability decided once in
-            # tokenspeed_kernel.ops.sampling.cuda.
-            target_probs = fused_topk_topp_renorm(
+        if (
+            n == 1
+            and not dp_sampling
+            and _FUSED_TOPK_TOPP_AVAILABLE
+            and sampling_info.draft_probs is None
+        ):
+            # Non-speculative decode: one draw per row by inverse CDF with the
+            # row's final coin -- the chain kernel's N == 1 rule -- skipping the
+            # chain launch. Identity-filter rows (no top-k, top_p >= 1) read
+            # the softmax directly, so the renorm leaves them untouched.
+            renormed = fused_topk_topp_renorm(
+                target_probs, top_ks, top_ps, skip_identity_rows=True
+            )
+            single_step_sample(
+                target_probs,
+                renormed,
+                top_ks,
+                top_ps,
+                final_coins[:bs],
+                predict,
+                accept_index,
+                accept_length,
+                max_topk=_TOP_K_FUSED_MAX,
+            )
+        else:
+            self._renorm_and_chain_verify(
                 target_probs,
                 top_ks,
                 top_ps,
+                sampling_info,
+                pool_indices,
+                bs,
+                n,
+                predict,
+                accept_index,
+                accept_length,
+                candidates,
+                coins,
+                final_coins,
+                dp_sampling,
             )
-        else:
-            target_probs = top_k_renorm_prob(target_probs, top_ks)
-            target_probs = top_p_renorm_prob(
-                target_probs, top_ps, is_deterministic=True
-            )
-        target_probs = target_probs.reshape(bs, n, -1)
-
-        # Draft-prob rule when the drafter recorded its distributions (the
-        # DP shard gathers its own rows); target-only otherwise.
-        use_draft_prob = sampling_info.draft_probs is not None
-        draft_probs = (
-            self._gather_draft_probs(sampling_info.draft_probs, pool_indices, bs, n)
-            if use_draft_prob
-            else None
-        )
-        chain_speculative_sampling_target_only(
-            predicts=predict,
-            accept_index=accept_index,
-            accept_token_num=accept_length,
-            candidates=candidates,
-            uniform_samples=coins[:bs, :n],
-            uniform_samples_for_final_sampling=final_coins[:bs],
-            target_probs=target_probs,
-            draft_probs=draft_probs,
-            threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
-            threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-            deterministic=not dp_sampling,
-            use_draft_prob=use_draft_prob,
-            reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
-        )
         if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
             canonical_greedy_verify(
                 logits=logits,
@@ -819,6 +821,66 @@ class FlashInferSamplingBackend(SamplingBackend):
             )
 
         return predict, accept_length
+
+    def _renorm_and_chain_verify(
+        self,
+        target_probs,
+        top_ks,
+        top_ps,
+        sampling_info,
+        pool_indices,
+        bs,
+        n,
+        predict,
+        accept_index,
+        accept_length,
+        candidates,
+        coins,
+        final_coins,
+        dp_sampling,
+    ) -> None:
+        """Renormalize (top-k/top-p) and run the chain verify kernel."""
+        if _FUSED_TOPK_TOPP_AVAILABLE:
+            # Fused replacement for the back-to-back top_k_renorm_prob +
+            # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
+            # K = 1<<30 in top_ks routes per-row through the radix top-p
+            # only path. Availability decided once in
+            # tokenspeed_kernel.ops.sampling.cuda.
+            target_probs = fused_topk_topp_renorm(
+                target_probs,
+                top_ks,
+                top_ps,
+            )
+        else:
+            target_probs = top_k_renorm_prob(target_probs, top_ks)
+            target_probs = top_p_renorm_prob(
+                target_probs, top_ps, is_deterministic=True
+            )
+        target_probs = target_probs.reshape(bs, n, -1)
+
+        # Draft-prob rule when the drafter recorded its distributions (the
+        # DP shard gathers its own rows); target-only otherwise.
+        use_draft_prob = sampling_info.draft_probs is not None
+        draft_probs = (
+            self._gather_draft_probs(sampling_info.draft_probs, pool_indices, bs, n)
+            if use_draft_prob
+            else None
+        )
+        chain_speculative_sampling_target_only(
+            predicts=predict,
+            accept_index=accept_index,
+            accept_token_num=accept_length,
+            candidates=candidates,
+            uniform_samples=coins[:bs, :n],
+            uniform_samples_for_final_sampling=final_coins[:bs],
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
+            threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+            deterministic=not dp_sampling,
+            use_draft_prob=use_draft_prob,
+            reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
+        )
 
     def get_packed_output_d2h(
         self,

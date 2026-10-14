@@ -20,7 +20,8 @@ void fused_topk_topp_renorm(
     TensorView out,
     TensorView workspace,
     int64_t side_stream_handle,
-    bool enable_pdl
+    bool enable_pdl,
+    bool skip_identity_rows
 ) {
   CHECK_INPUT(probs);
   CHECK_INPUT(top_ks);
@@ -78,7 +79,8 @@ void fused_topk_topp_renorm(
       V,
       mainStream,
       sideStream,
-      enable_pdl);
+      enable_pdl,
+      skip_identity_rows);
 }
 
 int64_t fused_topk_topp_workspace_size(int64_t bs, int64_t V) {

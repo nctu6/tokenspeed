@@ -42,6 +42,9 @@ size_t getWorkspaceSize(SizeType32 batchSize, SizeType32 vocabSize);
 //                    top-k path; K >= V (e.g. (1<<30)) routes the row through
 //                    the radix top-p path.
 //   topPs[bs]      — float, per-row P in (0, 1].
+//   skipIdentityRows — leave outProbs untouched (zero) for rows with no top-k
+//                    and P >= 1, whose renormalized row equals probs; the
+//                    caller reads probs for those rows instead.
 //
 // Output:
 //   outProbs[bs, V] — same shape as probs; non-selected positions are 0; kept
@@ -52,7 +55,8 @@ size_t getWorkspaceSize(SizeType32 batchSize, SizeType32 vocabSize);
 void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float const* topPs,
                         float* outProbs, void* workspace, SizeType32 batchSize,
                         SizeType32 vocabSize, cudaStream_t mainStream,
-                        cudaStream_t memsetStream, bool enablePdl);
+                        cudaStream_t memsetStream, bool enablePdl,
+                        bool skipIdentityRows = false);
 
 }  // namespace fused_topk_topp
 

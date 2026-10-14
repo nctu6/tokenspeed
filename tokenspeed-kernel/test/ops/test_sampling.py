@@ -489,3 +489,82 @@ def test_min_p_renorm_prob_empty_batch(device: str) -> None:
 
     assert out.shape == probs.shape
     assert out.dtype == probs.dtype
+
+
+def _mixed_filter_rows(bs: int, vocab: int, device: str):
+    torch.manual_seed(7)
+    logits = torch.randn(bs, vocab, device=device) * 3
+    probs = torch.softmax(logits, dim=-1)
+    top_ks = torch.full((bs,), _TOP_K_DISABLED, dtype=torch.int32, device=device)
+    top_ps = torch.ones(bs, dtype=torch.float32, device=device)
+    top_ks[1::4] = 20  # top-k rows
+    top_ps[2::4] = 0.8  # top-p rows
+    return probs, top_ks, top_ps
+
+
+@requires_nvidia
+def test_fused_topk_topp_skip_identity_rows(device: str) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU is required for fused_topk_topp_renorm test")
+    probs, top_ks, top_ps = _mixed_filter_rows(16, 4096 + 3, device)
+    full = fused_topk_topp_renorm(probs.clone(), top_ks, top_ps)
+    skipped = fused_topk_topp_renorm(
+        probs.clone(), top_ks, top_ps, skip_identity_rows=True
+    )
+    identity = (top_ks > 128) & (top_ps >= 1.0)
+    assert torch.equal(skipped[~identity], full[~identity])
+    assert torch.count_nonzero(skipped[identity]) == 0
+
+
+@requires_nvidia
+@pytest.mark.parametrize("vocab", [512, 262208])
+def test_single_step_sample_matches_chain_kernel(vocab: int, device: str) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU is required for single_step_sample test")
+    from tokenspeed_kernel.ops.sampling.triton import single_step_sample
+    from tokenspeed_kernel.thirdparty.cuda.sampling_chain import (
+        chain_speculative_sampling_target_only,
+    )
+
+    bs = 16
+    probs, top_ks, top_ps = _mixed_filter_rows(bs, vocab, device)
+    coins = torch.rand(bs, device=device).clamp_(1e-6, 1 - 1e-6)
+    full = fused_topk_topp_renorm(probs.clone(), top_ks, top_ps)
+
+    ref_predict = torch.zeros(bs, dtype=torch.int32, device=device)
+    ref_index = torch.full((bs, 1), -1, dtype=torch.int32, device=device)
+    ref_len = torch.zeros(bs, dtype=torch.int32, device=device)
+    chain_speculative_sampling_target_only(
+        predicts=ref_predict,
+        accept_index=ref_index,
+        accept_token_num=ref_len,
+        candidates=torch.zeros(bs, 1, dtype=torch.int32, device=device),
+        uniform_samples=torch.rand(bs, 1, device=device),
+        uniform_samples_for_final_sampling=coins,
+        target_probs=full.view(bs, 1, -1),
+        draft_probs=None,
+        threshold_single=1.0,
+        threshold_acc=1.0,
+        deterministic=True,
+        use_draft_prob=False,
+        reject_draft_prob_threshold=1.0,
+    )
+
+    renormed = fused_topk_topp_renorm(
+        probs.clone(), top_ks, top_ps, skip_identity_rows=True
+    )
+    predict = torch.zeros(bs, dtype=torch.int32, device=device)
+    index = torch.full((bs, 1), -1, dtype=torch.int32, device=device)
+    length = torch.full((bs,), 7, dtype=torch.int32, device=device)
+    single_step_sample(
+        probs, renormed, top_ks, top_ps, coins, predict, index, length, max_topk=128
+    )
+
+    assert torch.equal(index, ref_index)
+    assert torch.equal(length, ref_len)
+    # Same inverse-CDF rule; only FP summation order differs, which can move a
+    # draw by one boundary token. Require the bulk to match and every draw to
+    # land in the row's support.
+    assert (predict == ref_predict).float().mean() >= 0.85
+    rows = torch.arange(bs, device=device)
+    assert torch.all(full[rows, predict.long()] > 0)

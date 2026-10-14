@@ -95,6 +95,7 @@ def fused_topk_topp_renorm(
     workspace: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     enable_pdl: bool | None = None,
+    skip_identity_rows: bool = False,
 ) -> torch.Tensor:
     """Fused TopK + TopP renormalization.
 
@@ -109,6 +110,9 @@ def fused_topk_topp_renorm(
              fresh one is allocated.
         enable_pdl: whether to use Programmatic Dependent Launch attributes.
                     ``None`` uses the global platform default.
+        skip_identity_rows: leave rows with no top-k and ``P >= 1`` zero in
+                    ``out`` (their renormalized row is ``probs`` itself); the
+                    caller must read ``probs`` for those rows.
 
     Returns:
         ``[bs, V]`` float32. Non-kept positions are 0; kept positions are
@@ -129,5 +133,6 @@ def fused_topk_topp_renorm(
         workspace,
         side_handle,
         enable_pdl,
+        skip_identity_rows,
     )
     return out

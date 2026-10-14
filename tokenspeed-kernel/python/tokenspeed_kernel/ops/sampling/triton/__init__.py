@@ -47,6 +47,7 @@ from .min_p import (
 )
 from .penalties import accumulate_counts_inplace, apply_penalties_logit_bias_inplace
 from .probability import min_p_renorm_prob
+from .single_step import single_step_sample
 from .spec_path import dflash2_greedy_path
 from .topk_topp import (
     _QRITA_PERCENTILE_TO_STD_TABLE,
@@ -77,6 +78,7 @@ __all__ = [
     "accumulate_counts_inplace",
     "selected_token_logprobs",
     "verify_chain_target_sampled",
+    "single_step_sample",
     "draft_tree_expand",
     "draft_tree_finalize",
     "logprob_topk",
