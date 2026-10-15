@@ -75,6 +75,14 @@ MIXED_BATCH_DEFAULT_ARCHITECTURES = frozenset(
     }
 )
 MIXED_BATCH_DEFAULT_CHUNK = 4096
+# Gemma 4 takes an 8192-token budget instead. The scheduler sizes the prefill
+# that rides beside decodes from a 4096-token reference chunk
+# (TOKENSPEED_MIXED_REF_CHUNK), so the larger budget only widens decode-free
+# rounds, e.g. a burst of short prompts prefilling in one forward.
+MIXED_BATCH_LARGE_CHUNK = 8192
+MIXED_BATCH_LARGE_CHUNK_ARCHITECTURES = frozenset(
+    {"Gemma4ForConditionalGeneration", "Gemma4ForCausalLM"}
+)
 
 logger = get_colorful_logger(__name__)
 
@@ -869,6 +877,11 @@ class ServerArgs:
         except Exception:
             return False
         archs = getattr(config, "architectures", None) or []
+        self._mixed_batch_chunk = (
+            MIXED_BATCH_LARGE_CHUNK
+            if any(a in MIXED_BATCH_LARGE_CHUNK_ARCHITECTURES for a in archs)
+            else MIXED_BATCH_DEFAULT_CHUNK
+        )
         return any(a in MIXED_BATCH_DEFAULT_ARCHITECTURES for a in archs)
 
     def resolve_memory_and_scheduling(self):
@@ -888,7 +901,9 @@ class ServerArgs:
         if self.enable_mixed_batch is None:
             self.enable_mixed_batch = self._mixed_batch_by_default()
             if self.enable_mixed_batch and self.chunked_prefill_size is None:
-                self.chunked_prefill_size = MIXED_BATCH_DEFAULT_CHUNK
+                self.chunked_prefill_size = getattr(
+                    self, "_mixed_batch_chunk", MIXED_BATCH_DEFAULT_CHUNK
+                )
 
         # Set the chunked prefill token budget.
         if self.chunked_prefill_size is None:

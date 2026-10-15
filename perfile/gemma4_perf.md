@@ -547,3 +547,48 @@ Numbers below are the default path (no env), fixed seeds; columns tok/s | mean T
 | 128K C4 s33 | 8.23 / 56108 (xb22) | **8.22** / 56381 | – |
 
 Remaining: C32 TPOT 35.8 vs vLLM 33.0 ms (mixed rounds); C8 margin is thin (+0.9%).
+
+## 2026-10-15 decode-skip + 8192 chunk with a 4096 mixed reference + first-chunk stream fix
+
+Changes measured here (all default path, no env knobs): (1) Gemma 4 takes an 8192-token chunk budget while the mixed-round
+sizing (`capPrefillBesideDecodes`, floors, long chunk) stays anchored to a 4096 reference chunk (`TOKENSPEED_MIXED_REF_CHUNK`);
+Gemma 3 stays at 4096. (2) The overlap schedule no longer plans a decode for a request whose declared budget the forwards in
+flight already cover (that step ran after the request was done and the next prompt queued behind it, ~7 ms at C1).
+(3) smg always sends a stream's first chunk, even when the first token decodes to empty text (chat and completions), so such a
+request no longer reports its whole generation time as TTFT.
+
+Protocol: cold server per case group, `vllm bench serve` random, out 256, ignore_eos, same seeds on every side, mean of the seeds
+(C1 s41/s42, C8 s52/s63, C32 s22/s33, 128K C1 s71, 128K C4 s72/s73), N=max(16,8*C). before = the pushed default (b18e37bf),
+after = this change, vLLM = 0.31.0 (`vllm/vllm-openai:latest`). Quality: verbatim identical to the reference output for the
+after build.
+
+| Case | System | TPS (tok/s) | TTFT mean (ms) | TPOT median (ms) |
+|---|---|---|---|---|
+| 1K C1 | before | 53.38 | 123.2 | 18.32 |
+| 1K C1 | after | **55.39** | **112.6** | **17.67** |
+| 1K C1 | vLLM 0.31.0 | 48.53 | 113.4 | 20.23 |
+| 1K C8 | before | 341.98 | 744.6 | 21.07 |
+| 1K C8 | after | **348.22** | **632.8** | **20.25** |
+| 1K C8 | vLLM 0.31.0 | 334.30 | 700.9 | 20.87 |
+| 1K C32 | before | 813.61 | 807.5 | 37.19 |
+| 1K C32 | after | **834.02** | **750.0** | 36.22 |
+| 1K C32 | vLLM 0.31.0 | 804.73 | 1712.7 | **32.80** |
+| 128K C1 | before | 7.28 | 28991.7 | 24.21 |
+| 128K C1 | after | **7.44** | **28387.8** | **23.53** |
+| 128K C1 | vLLM 0.31.0 | 4.83 | 30670.6 | 87.44 |
+| 128K C4 | before | 8.22 | 58228.0 | 301.82 |
+| 128K C4 | after | **8.28** | 58432.8 | **293.68** |
+| 128K C4 | vLLM 0.31.0 | 7.23 | 60219.5 | 355.11 |
+
+Tail latency (prose only, same seeds, mean of seeds): 1K C8 P99 ITL is 24.1 ms vs vLLM 22.3 ms and P99 TTFT 884 ms vs 811 ms
+(before: 4367 ms, the empty-first-chunk artifact fixed by the smg change); 1K C32 P99 TTFT is 3.47 s vs 3.30 s and P99 ITL
+97 ms vs 96 ms; C1 P99 ITL 22.4 ms vs 21.0 ms. Correction: the "1K C8 P99 ITL 39.9 ms regression" recorded in the tables
+above was single-run noise, not a regression; same-seed cold runs give 24.1 ms (before 25.7 ms).
+
+Remaining loss: **1K C32 TPOT, 36.22 ms vs vLLM 32.80 ms.** It is mostly a metric effect, not a slower decode step:
+TPOT = (latency - TTFT) / 255, so the 960 ms lower TTFT (750 vs 1713 ms) by itself adds ~3.8 ms to TPOT at the same end-to-end
+time. End to end the build is faster: mean request latency 9742 ms vs 10173 ms (-4.2%) and throughput +3.6%. Pure decode is
+already ahead (decode-only profile at C32: 27.1 vs 27.7 ms median ITL, same GEMM kernels, faster attention). Trading TTFT
+back toward vLLM's (DECODE_REF 16-24 variants) moves TPOT to ~31-33 ms but costs 1-3% throughput without the decode-skip, so
+the default keeps the lower TTFT and the higher throughput. 128K C4 TTFT is flat within run-to-run spread (58.2 vs 58.4 s;
+range across runs 56.3-59.1 s) while TPS and TPOT improve; 128K C1/C4 do not regress.

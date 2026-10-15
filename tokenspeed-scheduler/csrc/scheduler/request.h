@@ -91,6 +91,13 @@ public:
     std::int32_t GeneratedTokens() const { return std::max(0, TokenSize() - submitted_prompt_size_); }
     std::int32_t RemainingNewTokens() const { return std::max(0, max_new_tokens_ - GeneratedTokens()); }
     bool HasGeneratedOutput() const { return GeneratedTokens() > 0; }
+    // True when the forwards still in flight already cover every token this
+    // request may generate: another decode step could only produce output
+    // past its declared budget. An undeclared budget (max_new_tokens == 0)
+    // is never covered.
+    bool DeclaredBudgetCoveredByInFlight() const {
+        return max_new_tokens_ > 0 && RemainingNewTokens() <= ResultsInFlight();
+    }
     // The budget that was still open when the current admission was granted:
     // stamped by the admission events (a first chunk, a restore), frozen for
     // the admission's whole life where RemainingNewTokens() shrinks with

@@ -1133,9 +1133,11 @@ void Scheduler::scheduleShortPromptsAhead(AdmissionFeedback& feedback, PlanBuild
 }
 
 // Decode-count-aware prefill budget for a mixed round: past mixed_decode_ref_
-// decodes, the prefill share shrinks as ref / D of a chunk, so the step every
-// decode waits for stays bounded while few-decode rounds (long-context
-// prefill beside a handful of decodes) keep the whole chunk.
+// decodes, the prefill share shrinks as ref / D of a reference chunk, so the
+// step every decode waits for stays bounded while few-decode rounds
+// (long-context prefill beside a handful of decodes) keep the reference
+// chunk. A round with decodes never takes more than the reference chunk, so a
+// larger budget only widens decode-free rounds.
 void Scheduler::capPrefillBesideDecodes(PlanBuild& build) const {
     if (mixed_decode_ref_ <= 0 || !build.pushed_decode) {
         return;
@@ -1146,11 +1148,11 @@ void Scheduler::capPrefillBesideDecodes(PlanBuild& build) const {
             ++decodes;
         }
     }
+    build.token_budget = std::min(build.token_budget, std::max(mixed_ref_chunk_, build.state_prefill_reserve));
     if (decodes <= mixed_decode_ref_) {
         return;
     }
-    const std::int64_t share =
-        static_cast<std::int64_t>(config_.max_scheduled_tokens) * mixed_decode_ref_ / decodes;
+    const std::int64_t share = static_cast<std::int64_t>(mixed_ref_chunk_) * mixed_decode_ref_ / decodes;
     const std::int32_t cap = std::max({static_cast<std::int32_t>(share), mixed_prefill_floor_,
                                        build.state_prefill_reserve});
     build.token_budget = std::min(build.token_budget, cap);
@@ -1227,6 +1229,16 @@ void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& buil
             return;
         }
         if ((!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) || build.Scheduled(*request)) {
+            continue;
+        }
+        // Under the overlap schedule the next decode is planned before the
+        // previous result lands. A request whose declared budget is already
+        // covered by the forwards in flight (every forward yields at least one
+        // token) would only get a step nobody reads: it occupies the GPU for a
+        // whole step after the request is done, and the next prompt queues
+        // behind it. At C1 that step is ~18 ms; the follow-up request sees about
+        // half of it as extra queueing. An undeclared budget never qualifies.
+        if (request->Is<fsm::Decoding>() && request->DeclaredBudgetCoveredByInFlight()) {
             continue;
         }
         feedback.admission_failed = false;
