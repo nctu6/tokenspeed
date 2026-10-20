@@ -219,7 +219,9 @@ The capacity guarantees are retention-specific:
   Without it an endpoint with no spare block needs a fresh **empty** parent
   per state group at its first boundary crossing. A full pool can deadlock
   when residents are retraction-exempt because their generation is covered by
-  admission headroom (§4). Invariant: *no request needs an empty parent
+  admission headroom; this reserve makes that rare, and the last-resort
+  fallback in §4 (drop the exemption when no other victim exists) is the
+  backstop if it is not enough. Invariant: *no request needs an empty parent
   for its first crossing* — it already owns the block. Later crossings
   re-acquire from the shared pool and depend on the capacity bound (§1.4) and
   admission back-pressure.
@@ -458,14 +460,47 @@ abort, in one place.** `chooseVictim` ranks only candidates whose image fits
 (`imageFits`: a blob slot is free and `CacheCoordinator::SnapshotPoolHolds`
 the tail, the published pages being assumed to ride L2); when none does — and
 without a pool none ever does — it names the newest retractable resident (the
-least work lost; exempt requests excluded, they finish on their own reserve)
-and `Scheduler::onImageDoesNotFit` aborts it: `fsm::AbortEvent` frees its
-pages and slot in that very round, the blocked grant proceeds exactly as after
-a retraction, and the plan records it (`ExecutionPlan::aborts`, a
+least work lost) and `Scheduler::onImageDoesNotFit` aborts it: `fsm::AbortEvent`
+frees its pages and slot in that very round, the blocked grant proceeds exactly
+as after a retraction, and the plan records it (`ExecutionPlan::aborts`, a
 `SchedulerAbort{request_id, AbortReason::kImageDoesNotFit, detail}`) so the
 runtime fails the request toward its client with the shortfall and the knob
 to raise (`--retraction-snapshot-host-gb` / `--retraction-snapshot-ratio`,
 `--retraction-snapshot-max-requests`).
+
+**Exempt residents are excluded first, but not forever.** Normally a
+reserve-covered request (§1.4) is no victim: it is expected to finish on the
+pages it already holds and free them then. That expectation fails when the
+device cache is full and such a request still needs its *next* page to decode —
+it cannot get one, cannot produce a token, cannot finish, and cannot free a
+page. With every resident in that state nothing is ever retracted and the
+engine wedges in empty rounds (seen at gemma-4 C=512, where two full-attention
+groups double per-request KV: `decoding=128 reserve_exempt=128 inflight=0`). So
+once no ordinary victim remains and the blocker is a resident stuck on its own
+next page (a `Submitted`-prompt blocker is served by admission back-pressure
+instead, never a sacrifice), `chooseVictim` **drops the exemption** and offers
+the newest resident (preferring a quiescent one). What happens next turns on
+whether the sacrifice is reversible:
+- **Retract-to-host is reversible** — the victim is imaged and restored, losing
+  no work — so whenever a blob slot is free and the image fits, the exemption
+  is dropped *freely*. This is also the healthy high-concurrency churn:
+  retract-and-grant keeps the engine full as covered decodes make room for
+  blocked ones (at gemma-4 C=512 it runs a few hundred times per run with zero
+  aborts, holding throughput at vLLM parity). Suppressing it here — waiting for
+  a completion instead — leaves the engine under-full and costs throughput.
+- **An abort is lossy** (no host room to image: no pool, or the pool is full),
+  so it is the true last resort. It fires only to break a genuine wedge: never
+  while some resident can still decode in place (its reserve covers the next
+  step, no new block needed in any group — `canConsumeReservedTokensInPlace`),
+  because that resident will produce a token and free pages on its own. This
+  keeps a no-pool engine from aborting a request the §1.4 reserve path is about
+  to satisfy by back-pressure.
+
+Because the retract path can image up to every resident at once, the snapshot
+blob slots (`SnapshotSlotAllocator`) must cover the whole resident set: the
+allocator hands out slots `1..N`, so it is sized `max_retracted_requests - 1`
+to keep its highest slot inside the executor's `[0, max_retracted_requests)`
+snapshot arena.
 The same site handles a victim that passed the probe but whose L2 leg fell
 back to a pool that then could not take it. Waiting instead would deadlock
 once every resident needs a page; charging worst-case host room at admission

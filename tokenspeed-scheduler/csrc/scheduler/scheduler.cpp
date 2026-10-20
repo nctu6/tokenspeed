@@ -86,7 +86,15 @@ CacheKey eventKey(const CacheKey& key) {
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{validated(std::move(config))},
       req_pool_allocator_{config_.max_batch_size},
-      snapshot_slots_{config_.max_retracted_requests},
+      // ReqPoolAllocator reserves slot 0 and hands out 1..size, but the
+      // retraction snapshot arena on the executor is sized exactly
+      // max_retracted_requests and indexed [0, max_retracted_requests), so a
+      // slot == max_retracted_requests (emitted when size == that value) is
+      // out of range and crashes the data plane. Size the allocator one lower
+      // so its highest slot is max_retracted_requests - 1, inside the arena.
+      // (Only reachable once this many requests are retracted at once, which
+      // the capacity-deadlock fallback can now drive to the limit.)
+      snapshot_slots_{std::max(1, config_.max_retracted_requests - 1)},
       block_pool_{config_.device_allocator.NumUsableBlocks(), slotsPerParentByGroup(config_)},
       host_pool_{hostPoolBlocks(config_), slotsPerParentByGroup(config_)},
       snapshot_pool_{snapshotPoolBlocks(config_), slotsPerParentByGroup(config_)},

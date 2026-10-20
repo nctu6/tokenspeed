@@ -601,7 +601,8 @@ std::optional<Scheduler::PrefillAdmission> Scheduler::schedulePrefillCandidate(
 // RemotePrefilling. Transient obstacles (a forward still out, a PD transfer
 // pin) do NOT redirect the choice; the caller waits for the chosen victim to
 // quiesce rather than sacrificing a worse-ranked request.
-Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candidates) const {
+Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candidates,
+                                                 bool drop_exempt_last_resort) const {
     const auto retractable = [](const Request& request) {
         return request.IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>() &&
                !request.ReserveCoversGeneration(kRetractionSafeSteps);
@@ -633,7 +634,72 @@ Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candid
             return VictimChoice{.victim = request, .image_fits = true};
         }
     }
-    return VictimChoice{.victim = newest, .image_fits = false};
+    if (newest != nullptr) {
+        return VictimChoice{.victim = newest, .image_fits = false};
+    }
+    if (!drop_exempt_last_resort) {
+        // Every retractable candidate is reserve-exempt and the blocker is a
+        // waiting prompt, not a stuck resident: the pool drains as the exempt
+        // residents finish on their own reserve and admission back-pressure
+        // holds the prompt until it fits. Sacrificing a covered resident here
+        // would abort a request the reserve path (scheduler.md §1.4) is about
+        // to satisfy -- so no victim, the caller waits.
+        return VictimChoice{.victim = nullptr, .image_fits = false};
+    }
+    // Last resort when every retractable candidate was excluded above by the
+    // ReserveCoversGeneration() exemption (its reserve is assumed to cover its
+    // whole remaining generation, so it would finish on the pages it holds and
+    // free them then). That assumption breaks once the device cache is full
+    // and such a request still needs its NEXT page to decode: it cannot get
+    // one, cannot produce a token, cannot finish, and cannot free a page.
+    // With every resident in that state nothing is ever retracted and the
+    // engine wedges in empty rounds (observed at gemma-4 C=512:
+    // decoding=128 reserve_exempt=128 inflight=0).
+    //
+    // Offer the newest resident (prefer a quiescent one) as the victim.
+    Request* fallback = nullptr;
+    Request* fallback_quiescent = nullptr;
+    for (Request* request : candidates) {
+        if (!request->IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>()) {
+            continue;
+        }
+        fallback = request;  // submission order; newest wins
+        if (request->ResultsInFlight() == 0 && !pdTransferInFlight(*request)) {
+            fallback_quiescent = request;
+        }
+    }
+    Request* chosen = fallback_quiescent != nullptr ? fallback_quiescent : fallback;
+    if (chosen == nullptr) {
+        return VictimChoice{.victim = nullptr, .image_fits = false};
+    }
+    // Retracting to host is reversible -- the victim is imaged and restored,
+    // losing no work -- so when a snapshot blob slot is free and the image
+    // fits, drop the exemption freely: this is also the healthy high-
+    // concurrency churn (retract-and-grant keeps the engine full as covered
+    // decodes make room for blocked ones; at gemma-4 C=512 it runs ~450 times
+    // with zero aborts).
+    if (snapshot_slots_.AvailableSlots() > 0 && imageFits(*chosen)) {
+        return VictimChoice{.victim = chosen, .image_fits = true};
+    }
+    // No image fits: the only way to free the page is an ABORT (lossy -- the
+    // victim fails toward its client). Do that only to break a genuine wedge,
+    // never while a resident can still decode in place: if some resident's
+    // reserve covers its next step (no new block needed in any group) it will
+    // produce a token and free pages on its own, so wait rather than abort a
+    // covered request the reserve path (scheduler.md §1.4) is about to satisfy.
+    // This O(residents x groups) scan runs only here -- the rare round with no
+    // ordinary victim, a stuck-resident blocker, and no host room to image --
+    // never on the steady decode path.
+    const bool any_resident_can_grow_in_place =
+        std::ranges::any_of(candidates, [this](const Request* request) {
+            return request->IsAnyOf<fsm::Decoding, fsm::PrefillDone>() &&
+                   canConsumeReservedTokensInPlace(coordinator_, request->BlockTablesRef(),
+                                                   config_.decode_input_tokens, request->NumComputedTokens());
+        });
+    if (any_resident_can_grow_in_place) {
+        return VictimChoice{.victim = nullptr, .image_fits = false};
+    }
+    return VictimChoice{.victim = chosen, .image_fits = false};
 }
 
 // The first half of a retraction: hashes the prefix pages the victim
@@ -817,7 +883,16 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
     }
 
     while (true) {
-        const VictimChoice choice = chooseVictim(candidates);
+        // Allow the exempt last resort only when the blocker is a resident
+        // stuck on its own next page (Decoding/PrefillDone): freeing a page is
+        // the only thing that can unblock it. A Submitted-prompt blocker is
+        // served by admission back-pressure (scheduler.md §1.4), never by
+        // sacrificing a covered resident. This is a cheap gate; chooseVictim
+        // still confirms the engine is genuinely wedged (no resident can
+        // decode in place) before it drops any exemption, and pays for that
+        // scan only on the rare round that reaches the last resort.
+        const bool blocker_is_stuck_resident = blocker->IsAnyOf<fsm::Decoding, fsm::PrefillDone>();
+        const VictimChoice choice = chooseVictim(candidates, blocker_is_stuck_resident);
         Request* victim = choice.victim;
         if (victim == nullptr) {
             return;  // everything resident is exempt; only a completion can free capacity

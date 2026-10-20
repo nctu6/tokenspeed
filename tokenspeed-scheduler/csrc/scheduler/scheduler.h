@@ -356,7 +356,14 @@ private:
         Request* victim{nullptr};
         bool image_fits{false};
     };
-    VictimChoice chooseVictim(std::span<Request* const> candidates) const;
+    // `drop_exempt_last_resort` lets the choice sacrifice an otherwise-exempt
+    // resident (ReserveCoversGeneration true) when every candidate is exempt
+    // and the blocker is itself a resident that cannot progress -- the
+    // capacity-deadlock backstop. The caller passes false while a waiting
+    // prompt is the blocker, where admission back-pressure (not a sacrifice)
+    // is the correct response. No default: the two paths differ in whether a
+    // covered request may be aborted.
+    VictimChoice chooseVictim(std::span<Request* const> candidates, bool drop_exempt_last_resort) const;
     // The first half of a retraction: publishes the pages the victim completed
     // since its last admission (see forward.cpp).
     void publishCompletedPrefix(Request& victim);
