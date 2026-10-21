@@ -513,7 +513,7 @@ class DeepseekV4MoE(nn.Module):
             topk_output = self._compute_topk_output(hidden_states, input_ids)
         deferred_finalize = (
             hidden_states.dtype == torch.bfloat16
-            and self.experts.supports_deferred_finalize
+            and self.experts.supports_deferred_cuda_finalize
         )
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
@@ -530,9 +530,6 @@ class DeepseekV4MoE(nn.Module):
         if deferred_finalize:
             # Reduce routed rows and add the shared expert in one finalize.
             gemm2_out, expert_weights, expanded_idx = routed
-            if expert_weights is None:
-                # Precomputed-route kernels return no weights; routing holds them.
-                expert_weights = topk_output.topk_weights
             return moe_finalize_fuse_shared(
                 gemm2_out,
                 expanded_idx,
