@@ -717,7 +717,11 @@ class ModelConfig:
         # (gemma3/gemma4), while ``resolve_architecture`` / text_config still
         # carry ``*ForConditionalGeneration``.
         _mm_archs = _model_architectures(self.hf_config, self.hf_text_config)
-        self.is_multimodal = is_multimodal_model(_mm_archs)
+        self.is_multimodal = (
+            self.model_profile.is_multimodal
+            if self.model_profile is not None
+            else is_multimodal_model(_mm_archs)
+        )
         self.is_multimodal_gen = is_multimodal_gen_model(_mm_archs)
         self.is_image_gen = is_image_gen_model(_mm_archs)
         self.is_audio_model = is_audio_model(_mm_archs)
