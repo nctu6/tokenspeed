@@ -75,6 +75,7 @@ __all__ = [
     "new_attention_schedule",
     "index_score",
     "index_topk",
+    "index_select_all",
     "compressor_tail_scatter",
     "compressor_pool",
     "compressor_metadata",
@@ -495,8 +496,9 @@ def index_topk(
             pages are ignored; tables may be expanded/noncontiguous views.
         visible_lens: Int32/int64 [T] causal row counts: floor((position+1)/ratio).
         candidate_blocks: None for Full; otherwise int32/int64 [T, <=2048]
-            unique request-local block IDs, padded with -1. Reindex reads and
-            scores ONLY these blocks, reapplying visible_lens to their rows.
+            request-local block IDs, padded with -1. Reindex selects only from
+            these blocks, reapplying visible_lens to their rows. Blackwell
+            native sparse scoring reads those blocks directly from the cache.
         topk: Row selection capacity in [1, 512]; V4.1 uses 512.
         candidate_topk: Source block capacity in [0, 2048], 2048 for candidate-source Full,
             0 for ordinary Full and Reindex. Not derived from selected Top512.
@@ -532,13 +534,23 @@ def index_topk(
     scores packed FP4 inputs with FP32 accumulation and DeepSelect selects rows
     and block maxima; on Hopper, DeepGEMM scores FP8 ``index_v4`` rows and the
     in-tree CuTe DSL DeepSelect kernel selects. This native accumulation
-    differs from the portable reference's intermediate BF16 rounding. Native query tiles cap logits at
-    32MiB for paged queries and 128MiB for a zero-row-stride request table.
+    differs from the portable reference's intermediate BF16 rounding.
+    Full-scoring query tiles cap logits at 32MiB for paged queries and
+    128MiB for a zero-row-stride request table.
     That broadcast layout gathers packed history once per call and packs Q
     once before the score tiles; no payload survives the call. For unsharded
     68-byte MXFP4 caches, AMD Gluon Full similarly caps each FP32 logits query
     tile at 32MiB instead of limiting history width; Reindex scores only the
     candidate rows.
+    Blackwell Reindex uses DeepGEMM's native sparse MQA scorer when the index
+    page stride is a multiple of 512 bytes. It reads the owner's cache directly,
+    with BF16 head weights, weighted head reduction and logits. DeepSelect
+    consumes those BF16 scores directly. Tiles follow query_chunk_size, with
+    at most 16384 BF16 logits per query; no candidate K payload is copied.
+    This applies equally to broadcast and paged query tables, including short
+    final tiles. Other page strides keep full scoring
+    followed by candidate masking. The candidate selection semantics are the
+    same; BF16 scores need not produce the FP32 path's exact Top-K at ties.
     """
     from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
         is_hopper_indexer_available,
@@ -1107,3 +1119,71 @@ import tokenspeed_kernel.ops.attention.dsv41.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.flash_mla  # noqa: E402,F401
 
 # isort: on
+
+
+def index_select_all(page_table, visible_lens, pages, candidate_block_size, out):
+    """Select every valid causal row without projections, scores or Top-K.
+
+    Args:
+        page_table: Integer [T, logical_pages] request tables; null page 0 and
+            entries outside [1, pages) are ignored.
+        visible_lens: Integer [T] causal row counts, bounded by out[0].shape[1].
+        pages: Physical page count, including the reserved null page.
+        candidate_block_size: Must be 8, as for index_topk.
+        out: Contiguous int32 row IDs, lengths, block IDs, block lengths, with
+            shapes [T, K], [T], [T, C], [T]. C=0 disables candidate publication.
+            Otherwise C must cover every visible block.
+
+    Returns:
+        The four destinations, fully written with sorted IDs and -1 padding.
+        The caller must prove that all visible rows/blocks fit these outputs;
+        this helper does not score or truncate a candidate selection.
+    """
+    rows, lengths, blocks, block_lengths = out
+    n = page_table.shape[0]
+    if (
+        page_table.ndim != 2
+        or page_table.dtype not in (torch.int32, torch.int64)
+        or visible_lens.shape != (n,)
+        or visible_lens.dtype not in (torch.int32, torch.int64)
+        or visible_lens.device != page_table.device
+        or pages < 1
+        or candidate_block_size != 8
+        or rows.ndim != 2
+        or blocks.ndim != 2
+        or not 1 <= rows.shape[1] <= 512
+        or not 0 <= blocks.shape[1] <= 2048
+    ):
+        raise ValueError("Invalid all-history selection geometry")
+    shapes = ((n, rows.shape[1]), (n,), (n, blocks.shape[1]), (n,))
+    for tensor, shape in zip(out, shapes, strict=True):
+        if (
+            tensor.shape != shape
+            or tensor.dtype != torch.int32
+            or tensor.device != page_table.device
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                "All-history outputs must be contiguous int32 destinations"
+            )
+    if page_table.is_cuda:
+        return _kernel("index_select_all", page_table)(
+            page_table, visible_lens, pages, candidate_block_size, out
+        )
+    for destination, counts, stride in ((rows, lengths, 1), (blocks, block_lengths, 8)):
+        ids = torch.arange(destination.shape[1], dtype=torch.int32)
+        offsets = ids * stride
+        valid = offsets[None, :] < visible_lens[:, None]
+        if page_table.shape[1]:
+            physical = page_table[:, (offsets // 64).clamp_max(page_table.shape[1] - 1)]
+            valid &= (
+                (offsets[None, :] // 64 < page_table.shape[1])
+                & (physical > 0)
+                & (physical < pages)
+            )
+        else:
+            valid.fill_(False)
+        selected = torch.where(valid, ids[None, :], 2147483647).sort(dim=1).values
+        destination.copy_(selected.masked_fill(selected == 2147483647, -1))
+        counts.copy_(valid.sum(dim=1))
+    return out

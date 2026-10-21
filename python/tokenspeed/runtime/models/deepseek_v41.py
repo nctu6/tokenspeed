@@ -1028,9 +1028,12 @@ class DeepseekV41Attention(nn.Module):
                         rows.query.request_indices,
                     )
                 if self.indexer is not None:
-                    index_q, index_weights = self.indexer(
-                        hidden_states, index_q_input, positions, self.rotary_emb
-                    )
+                    if backend.indexer_needs_scores(
+                        self.layer_id, positions, requests, mode
+                    ):
+                        index_q, index_weights = self.indexer(
+                            hidden_states, index_q_input, positions, self.rotary_emb
+                        )
                     if mode.is_decode():
                         prepared = backend.prepare_global_selection(
                             self.layer_id,

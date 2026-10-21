@@ -326,6 +326,9 @@ class _Backend:
         )
         return (q * 0.25).to(q.dtype)
 
+    def indexer_needs_scores(self, layer_id, positions, requests, mode):
+        return True
+
 
 @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
 @pytest.mark.parametrize("fused", [False, True])
@@ -2582,3 +2585,37 @@ def test_ced_q_input_follows_narrowed_rows(layer_id):
     torch.testing.assert_close(actual, expected[keep], rtol=0, atol=0)
     if layer_id == 20:
         assert narrowed.global_writes[layer_id][0].shape[0] == 6
+
+
+@pytest.mark.parametrize("layer_id", [2, 20, 24])
+def test_short_history_skips_query_projections_but_preserves_keys(
+    monkeypatch, layer_id
+):
+    config = _config()
+    attention = DeepseekV41Attention(
+        config,
+        _mapping(0, 1, 1),
+        layer_id,
+        v41._ced_decoder_start(config),
+        None,
+        f"layers.{layer_id}.attn",
+        aux_stream=None,
+    )
+    _initialize(attention)
+    positions = torch.arange(4)
+    backend = _Backend(positions, torch.zeros_like(positions))
+    monkeypatch.setattr(_Backend, "indexer_needs_scores", lambda *args: False)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Short history must not project index Q or weights")
+
+    monkeypatch.setattr(attention.indexer, "forward", forbidden)
+    attention(
+        positions,
+        torch.randn(4, 128, dtype=torch.bfloat16),
+        _ctx(backend, 4, ForwardMode.EXTEND),
+    )
+    assert backend.calls[-1][3:5] == (None, None)
+    assert bool(backend.global_writes) == (layer_id in (2, 20))
+    if layer_id in (2, 20):
+        assert backend.global_writes[layer_id][1].numel() > 0

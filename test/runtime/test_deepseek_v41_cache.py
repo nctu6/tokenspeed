@@ -236,32 +236,8 @@ def test_rebinding_cache_pool_drops_pool_derived_state():
 
 
 def _tables(device):
-    widths = v41_table_widths(512, 0)
-    tables = {
-        gid: torch.zeros((2, width), dtype=torch.int32, device=device)
-        for gid, width in widths.items()
-    }
-    # Different parent assignments: SWA parents 1..8, r2 parent 8, r1 parent 9,
-    # tails parent 10. Groups are mutually exclusive tenants, not slices that
-    # can all bind the same parent at the same time. Each group numbers its
-    # pages in its own domain, so a parent's first page is packing * parent;
-    # the tables start one page in, as they always have. Spelling the ids as
-    # literals silently pins them to one packing table.
     packing = _config(device).component(DeepseekV41Config).row_layout().group_packing
-    used = {SWA: 4, R2: widths[R2], R1: widths[R1], TAIL: 100}
-    for gid, parent in ((R2, 8), (R1, 9), (TAIL, 10)):
-        first = packing[gid] * parent + 1
-        assert (
-            first + 2 * used[gid] <= packing[gid] * 16
-        ), f"{gid} needs {2 * used[gid]} pages from parent {parent}"
-    for req in range(2):
-        tables[SWA][req, :4] = torch.arange(1 + req * 4, 5 + req * 4, device=device)
-        for gid, parent in ((R2, 8), (R1, 9), (TAIL, 10)):
-            start = packing[gid] * parent + 1 + req * used[gid]
-            tables[gid][req, : used[gid]] = torch.arange(
-                start, start + used[gid], device=device
-            )
-    return tables
+    return _tables_with_packing(device, packing)
 
 
 def _extend(backend, tables, lengths, prefixes, replays, prompt_lens):
@@ -1071,24 +1047,28 @@ def test_pool_reports_the_whole_arena_as_kv_bytes():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_pool_zeroes_fresh_pages_per_group():
-    pool = _pool(_recipe("cuda"), "cuda")
+@pytest.mark.parametrize("dspark", [False, True])
+def test_pool_zeroes_fresh_pages_per_group(dspark):
+    recipe = _dspark_recipe("cuda") if dspark else _recipe("cuda")
+    pool = _pool(recipe, "cuda")
     assert pool.requires_page_zeroing
     pool.arena.buffer.fill_(1)
-    # One parent belongs to one group: SWA page 1 is parent 1, R2 pages 41..60
-    # are parent 3. Zeroing must touch only those parents.
-    pool.zero_new_blocks({SWA: np.asarray([1]), R2: np.asarray([41])})
+    r2_packing = pool.arena.plan.group(R2).cache_blocks_per_lcm_block
+    r2_page = 2 * r2_packing + 1
+    # SWA uses parent 1 and R2 uses parent 3. Clearing a fresh page must
+    # preserve its neighbor, including when two SWA pages share a parent.
+    pool.zero_new_blocks({SWA: np.asarray([1]), R2: np.asarray([r2_page])})
     assert pool.swa(3)[1].count_nonzero() == 0 and pool.swa(3)[2].count_nonzero() > 0
-    assert pool.global_kv(8)[41].count_nonzero() == 0
-    assert pool.global_kv(8)[21].count_nonzero() > 0
+    assert pool.global_kv(8)[r2_page].count_nonzero() == 0
+    assert pool.global_kv(8)[r2_page + 1].count_nonzero() > 0
+    if dspark:
+        for stage in range(3):
+            assert pool.dspark_kv(stage)[1].count_nonzero() == 0
+            assert pool.dspark_kv(stage)[2].count_nonzero() > 0
 
 
 def test_dspark_windows_join_the_swa_group():
-    recipe = _recipe("cpu")
-    recipe.server_args.speculative_algorithm = "DSPARK"
-    recipe.draft_model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(dspark_num_stages=3)
-    )
+    recipe = _dspark_recipe("cpu")
     assert recipe.dspark_stages() == 3
     groups = dict(recipe.groups())
     assert {s.group_id for s in groups} == set(V41_GROUP_GEOMETRY)
@@ -1098,12 +1078,18 @@ def test_dspark_windows_join_the_swa_group():
     for stage in range(3):
         field = fields[f"layer.39.dspark_kv{stage}"]
         assert field.shape == (64, 512) and field.dtype == "bfloat16"
-    # The SWA page grows by the three stage rows; the other groups repack so
-    # every group stays inside the padding budget.
+    # The three stage rows enlarge each SWA page. Two fit in a parent while
+    # all groups meet the index alignment and stay inside the padding budget.
     layout = _layout(recipe)
-    assert layout.lcm_block_bytes == 1_571_328
-    assert dict(layout.group_packing) == {SWA: 1, R2: 22, R1: 66, TAIL: 62}
+    assert layout.lcm_block_bytes == 3_225_600
+    assert dict(layout.group_packing) == {SWA: 2, R2: 45, R1: 140, TAIL: 126}
     recipe.check_layout(layout)
+    setup = recipe.setup()
+    assert setup.spec.token_capacity == 1024
+    assert (
+        setup.spec.memory_plan.arena_bytes + setup.fixed_workspace_bytes
+        <= recipe.cache_budget_bytes
+    )
     pool = _pool(recipe, "cpu")
     assert pool.dspark_kv(2).shape[1:] == (64, 512)
     assert pool.dspark_kv(2).dtype == torch.bfloat16
@@ -1125,7 +1111,8 @@ def test_dspark_windows_join_the_swa_group():
         recipe.groups()
 
 
-def test_pd_contract_plan_and_manifest():
+@pytest.mark.parametrize("dspark", [False, True])
+def test_pd_contract_plan_and_manifest(dspark):
     import numpy as np
 
     from tokenspeed.runtime.pd.cache_protocol import (
@@ -1135,7 +1122,7 @@ def test_pd_contract_plan_and_manifest():
     )
     from tokenspeed.runtime.pd.transfer_plan import CacheTransferPlanner
 
-    recipe = _recipe("cpu")
+    recipe = _dspark_recipe("cpu") if dspark else _recipe("cpu")
     recipe.attn_config = replace(recipe.attn_config, pd_disaggregation_enabled=True)
     pool = _pool(recipe, "cpu")
     assert pool.arena.supports_disaggregation is True
@@ -1160,9 +1147,10 @@ def test_pd_contract_plan_and_manifest():
     )
     with pytest.raises(Exception, match="semantics"):
         validate_cache_peer_layout(contract, cached_peer)
-    assert {f.field_id for f in contract.fields_for_group(SWA)} == {
-        f"layer.{i}.swa" for i in range(40)
-    }
+    swa_fields = {f"layer.{i}.swa" for i in range(40)}
+    if dspark:
+        swa_fields.update(f"layer.39.dspark_kv{stage}" for stage in range(3))
+    assert {f.field_id for f in contract.fields_for_group(SWA)} == swa_fields
     assert {f.field_id for f in contract.fields_for_group(R2)} == {
         f"layer.{o}.{name}" for o in (2, 8, 14) for name in ("global_kv", "index_k")
     }
@@ -1251,6 +1239,13 @@ def test_every_cache_format_packs_to_the_plane_it_declares(cache_format, dspark)
     assert widths["swa"] == rows.swa_row_bytes
     assert widths["global_kv"] == rows.global_row_bytes
     assert widths["index_k"] == rows.index_row_bytes
+    if cache_format == "v41":
+        # Native sparse index scoring reads both ordinary and DSpark arenas.
+        assert all(
+            f.page_stride_bytes % 512 == 0
+            for f in layout.fields
+            if f.field_id.endswith(".index_k")
+        )
 
 
 def test_recipe_exact_geometry_capacity_and_dispatch():
@@ -2494,3 +2489,263 @@ def test_global_rope_write_graph_refreshes_positions_slots_and_padding(
             main_cache.data_ptr(),
         ] == addresses
         assert torch.all(main_cache[0] == 165) and torch.all(index_cache[0] == 165)
+
+
+def _dspark_recipe(device):
+    recipe = _recipe(device)
+    recipe.server_args.speculative_algorithm = "DSPARK"
+    recipe.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(dspark_num_stages=3)
+    )
+    return recipe
+
+
+def _tables_with_packing(device, packing):
+    widths = v41_table_widths(512, 0)
+    tables = {
+        gid: torch.zeros((2, width), dtype=torch.int32, device=device)
+        for gid, width in widths.items()
+    }
+    # Disjoint parent assignments: SWA fits in parents 1..8, R2 starts at 9,
+    # R1 at 10 and tails at 11. Groups are mutually exclusive tenants. Each
+    # group numbers its own pages with page 0 reserved, so parent n begins at
+    # packing * (n - 1) + 1. Derive the IDs from the pool's packing so DSpark
+    # can put multiple SWA pages in one parent.
+    used = {SWA: 4, R2: widths[R2], R1: widths[R1], TAIL: 100}
+    for gid, parent in ((R2, 8), (R1, 9), (TAIL, 10)):
+        first = packing[gid] * parent + 1
+        assert (
+            first + 2 * used[gid] <= packing[gid] * 16
+        ), f"{gid} needs {2 * used[gid]} pages from parent {parent}"
+    for req in range(2):
+        tables[SWA][req, :4] = torch.arange(1 + req * 4, 5 + req * 4, device=device)
+        for gid, parent in ((R2, 8), (R1, 9), (TAIL, 10)):
+            start = packing[gid] * parent + 1 + req * used[gid]
+            tables[gid][req, : used[gid]] = torch.arange(
+                start, start + used[gid], device=device
+            )
+    return tables
+
+
+@pytest.mark.parametrize(
+    "bound, kinds",
+    [
+        (512, ("all", "all", "all")),
+        (513, ("all", "full", "full")),
+        (1024, ("all", "full", "full")),
+        (1026, ("full", "full", "full")),
+        (16384, ("full", "full", "full")),
+        (16385, ("full", "full", "candidates")),
+        (None, ("full", "full", "candidates")),
+    ],
+)
+def test_index_selection_follows_model_coverage(bound, kinds):
+    config = _config("cpu")
+    spec = replace(
+        config.component(DeepseekV41Config), index_topk=512, candidate_topk=2048
+    )
+    backend = DeepseekV41AttentionBackend(config, spec)
+    assert (
+        tuple(backend._index_selection_kind(layer, bound) for layer in (2, 20, 24))
+        == kinds
+    )
+
+
+@pytest.mark.parametrize("length", [0, 1, 4, 5, 16, 17])
+def test_prefill_selection_skips_only_redundant_work(length):
+    backend = _backend("cpu", 2)
+    meta = _extend(
+        backend, _tables("cpu"), [max(length, 1)], [0], [0], [max(length, 1)]
+    )
+    if length == 0:
+        meta.positions.fill_(-1)
+    q = torch.zeros(max(length, 1), 2, 128, dtype=torch.bfloat16)
+    weights = torch.ones(max(length, 1), 2, dtype=torch.bfloat16)
+
+    def scored(
+        q,
+        weights,
+        cache,
+        table,
+        visible,
+        candidates,
+        topk,
+        candidate_topk,
+        block_size,
+        query_chunk,
+        score_chunk,
+        group,
+        out,
+        solution,
+    ):
+        for ids, counts, stride in ((out[0], out[1], 1), (out[2], out[3], 8)):
+            values = torch.arange(ids.shape[1]).expand_as(ids)
+            ids.copy_(values.masked_fill(values * stride >= visible[:, None], -1))
+            counts.copy_((ids >= 0).sum(dim=1))
+        return out
+
+    with patch.object(dsv41, "index_topk", side_effect=scored) as topk:
+        for layer in (20, 24):
+            needs_scores = backend.indexer_needs_scores(
+                layer, meta.positions, meta.request_indices, ForwardMode.EXTEND
+            )
+            assert needs_scores == (length > 4)
+            backend.select_global(
+                layer,
+                q if needs_scores else None,
+                weights if needs_scores else None,
+                meta.positions,
+                meta.request_indices,
+                ForwardMode.EXTEND,
+                None,
+            )
+        if length <= 4:
+            topk.assert_not_called()
+        else:
+            assert topk.call_count == 2
+            assert topk.call_args_list[0].args[5] is None
+            assert (topk.call_args_list[1].args[5] is None) == (length <= 16)
+    record = backend.sparse_topk.prefill
+    assert record.candidates.lengths[-1].item() == min((length + 7) // 8, 2)
+    assert record.lengths[-1].item() == min(length, 4)
+    slots, lengths = backend.select_global(
+        25, None, None, meta.positions, meta.request_indices, ForwardMode.EXTEND, None
+    )
+    assert slots is record.physical_slots and lengths is record.lengths
+
+
+def test_free_query_window_does_not_inherit_canonical_prefill_length():
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    meta = _extend(backend, tables, [1], [0], [0], [1])
+    assert not backend.indexer_needs_scores(
+        20, meta.positions, meta.request_indices, ForwardMode.EXTEND
+    )
+    assert backend.indexer_needs_scores(
+        20, torch.tensor([100]), torch.tensor([0]), ForwardMode.EXTEND
+    )
+    assert (
+        backend._index_history_bound(
+            torch.tensor([100]), torch.tensor([0]), ForwardMode.EXTEND
+        )
+        == tables[R1].shape[1] * 64
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "verify_width,dspark,deferred",
+    [(1, False, True), (5, True, True), (5, False, False)],
+)
+def test_one_index_graph_crosses_coverage_limits_with_padding(
+    verify_width, dspark, deferred, monkeypatch
+):
+    backend = _verify_backend("cuda", 2, verify_width)
+    if dspark:
+        backend.set_cache_pool(_pool(_dspark_recipe("cuda"), "cuda"))
+        backend.init_cuda_graph_state(
+            2, max_tokens_per_req=verify_width, overlap_schedule_depth=1
+        )
+    backend.spec = replace(backend.spec, index_topk=64, candidate_topk=16)
+    packing = {
+        group.group_id: group.cache_blocks_per_lcm_block
+        for group in backend.cache_pool.arena.plan.groups
+    }
+    tables = _tables_with_packing("cuda", packing)
+    sparse_scores = None
+    if current_platform().is_blackwell:
+        from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm
+
+        sparse_scores = Mock(wraps=deep_gemm._sparse_candidate_scores)
+        monkeypatch.setattr(deep_gemm, "_sparse_candidate_scores", sparse_scores)
+    cache = backend.cache_pool.index_k(20)
+    logical = torch.arange(256, device="cuda")
+    slots = tables[R1][0, logical // 64].long() * 64 + logical % 64
+    torch.manual_seed(304)
+    dsv41.cache_scatter(
+        torch.randn(256, 128, device="cuda", dtype=torch.bfloat16),
+        cache,
+        slots,
+        backend.index_format,
+    )
+    index_heads = 32 if current_platform().is_blackwell else 2
+    q = torch.randn(
+        2 * verify_width, index_heads, 128, device="cuda", dtype=torch.bfloat16
+    )
+    weights = torch.rand(
+        2 * verify_width, index_heads, device="cuda", dtype=torch.bfloat16
+    )
+    req = torch.zeros(2, dtype=torch.int64, device="cuda")
+    seq = torch.zeros(2, dtype=torch.int32, device="cuda")
+    rope_cache = _global_rope_table()
+
+    def refresh(length, use_graph):
+        seq.fill_(length)
+        incoming = dict(tables)
+        incoming[R1] = tables[R1][:1, : max(1, (length + 63) // 64)]
+        backend.refresh_decode_metadata(
+            2,
+            int(length > 0),
+            req,
+            seq,
+            forward_mode=ForwardMode.DECODE,
+            block_tables=incoming,
+            for_graph_replay=use_graph,
+        )
+
+    def run():
+        meta = backend.query_metadata(ForwardMode.DECODE)
+        query = (
+            dsv41.IndexQueryInput(q, meta.positions, rope_cache, 0.023456789)
+            if deferred
+            else q
+        )
+        for layer in (20, 24, 28):
+            assert backend.indexer_needs_scores(
+                layer, meta.positions, meta.request_indices, ForwardMode.DECODE
+            )
+            backend.select_global(
+                layer,
+                query,
+                weights,
+                meta.positions,
+                meta.request_indices,
+                ForwardMode.DECODE,
+                None,
+            )
+        record = backend.sparse_topk.decode
+        return (
+            record.logical_rows,
+            record.lengths,
+            record.candidates.block_ids,
+            record.candidates.lengths,
+        )
+
+    refresh(0, True)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outputs = run()
+    torch.cuda.current_stream().wait_stream(stream)
+    for length in (1, 64, 65, 128, 129, 191, 0, 1):
+        refresh(length, True)
+        graph.replay()
+        captured = tuple(t.clone() for t in outputs)
+        refresh(length, False)
+        for actual, wanted in zip(captured, run(), strict=True):
+            torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
+        end = max(length, verify_width)
+        live_lengths = (
+            [min(i, 64) for i in range(end - verify_width + 1, end + 1)]
+            if length
+            else [0] * verify_width
+        )
+        assert captured[1].tolist() == live_lengths + [0] * verify_width
+        padding = verify_width if length else 0
+        for ids, counts in ((captured[0], captured[1]), (captured[2], captured[3])):
+            assert (ids[padding:] == -1).all() and (counts[padding:] == 0).all()
+    if sparse_scores is not None:
+        assert sparse_scores.call_count > 0

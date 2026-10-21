@@ -28,9 +28,12 @@ from test_attention_dsv41 import _reference_quantize
 from test_attention_dsv41 import device as device
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
+from tokenspeed_kernel.ops.attention.dsv41._deep_gemm.indexer import gather_index_pages
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
+    gather_index_cache,
     pack_index_inputs,
     pack_index_queries,
+    prepare_candidate_scores,
 )
 
 
@@ -408,7 +411,19 @@ def run_index_topk_full_and_reindex(
     got = dsv41.index_topk(**kwargs)
     if match_triton:
         want = implementation.index_topk(
-            q, w, cache, table, lens, None, topk, candidate_topk, 8, 2, 64, None, None
+            q,
+            w,
+            cache,
+            table,
+            lens,
+            None,
+            topk,
+            candidate_topk,
+            8,
+            2,
+            64,
+            None,
+            None,
         )
         for actual, expected in zip(got, want, strict=True):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -434,7 +449,19 @@ def run_index_topk_full_and_reindex(
         reindex = dsv41.index_topk(**kwargs)
         if match_triton:
             want_reindex = implementation.index_topk(
-                q, w, cache, table, lens, got[2], topk, 0, 8, 2, 64, None, None
+                q,
+                w,
+                cache,
+                table,
+                lens,
+                got[2],
+                topk,
+                0,
+                8,
+                2,
+                64,
+                None,
+                None,
             )
             for actual, expected in zip(reindex, want_reindex, strict=True):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -657,3 +684,232 @@ def test_index_pack_boundaries_and_graph_refresh(device):
             rtol=0,
             atol=0,
         )
+
+
+@pytest.mark.parametrize("target", ["cpu", "cuda"])
+@pytest.mark.parametrize("candidate_capacity", [0, 64, 2048])
+def test_select_all_causal_pages_and_replay(target, candidate_capacity):
+    if target == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires GPU")
+    # Include a strided table, a partial final block, missing/invalid pages,
+    # and a padded query. Invalid entries must compact into a sorted prefix.
+    table = torch.full((5, 16), -1, dtype=torch.int32, device=target)[:, ::2]
+    table.copy_(torch.tensor([1, 0, -1, 99, 2, 3, 4, 5], device=target))
+    lengths = torch.zeros(10, dtype=torch.int32, device=target)[::2]
+    out = tuple(
+        torch.empty(shape, dtype=torch.int32, device=target)
+        for shape in ((5, 512), (5,), (5, candidate_capacity), (5,))
+    )
+
+    def run():
+        return dsv41.index_select_all(table, lengths, 6, 8, out)
+
+    run()
+    graph = None
+    if target == "cuda":
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+    for visible in ([0, 1, 129, 512, 0], [512, 257, 9, 63, 0]):
+        lengths.copy_(torch.tensor(visible, device=target))
+        table[4].fill_(-1)
+        if graph is None:
+            run()
+        else:
+            graph.replay()
+        for row, length in enumerate(visible):
+            pages = table[row].cpu().tolist()
+            wanted = [i for i in range(length) if 0 < pages[i // 64] < 6]
+            blocks = sorted({i // 8 for i in wanted}) if candidate_capacity else []
+            assert out[1][row].item() == len(wanted)
+            assert out[3][row].item() == len(blocks)
+            assert out[0][row].cpu().tolist() == wanted + [-1] * (512 - len(wanted))
+            assert out[2][row].cpu().tolist() == blocks + [-1] * (
+                candidate_capacity - len(blocks)
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_select_all_tile_slices_reuse_compilation():
+    from utils import assert_no_triton_compile
+
+    # Prefill tiles pass row slices of shared buffers; the slice start must
+    # not select a compilation through the pointers' alignment.
+    table = torch.arange(1, 9, dtype=torch.int32, device="cuda").repeat(9, 1)
+    lengths = torch.full((9,), 300, dtype=torch.int32, device="cuda")
+    out = tuple(
+        torch.empty(shape, dtype=torch.int32, device="cuda")
+        for shape in ((9, 512), (9,), (9, 64), (9,))
+    )
+
+    def run(start, stop):
+        dsv41.index_select_all(
+            table[start:stop],
+            lengths[start:stop],
+            9,
+            8,
+            tuple(x[start:stop] for x in out),
+        )
+
+    run(0, 4)
+    with assert_no_triton_compile(implementation._index_select_all):
+        for start, stop in ((1, 4), (3, 9), (5, 6), (2, 7)):
+            run(start, stop)
+    torch.testing.assert_close(out[1], lengths)
+
+
+def _candidate_reference(logits, lengths, candidates, block_size, alignment):
+    logits, lengths, candidates = (x.cpu() for x in (logits, lengths, candidates))
+    count = candidates.shape[1]
+    stride = (count * block_size + alignment - 1) // alignment * alignment
+    scores = torch.full((logits.shape[0], stride), -torch.inf)
+    normalized = torch.full(candidates.shape, -1, dtype=torch.int32)
+    ends = torch.zeros(logits.shape[0], dtype=torch.int32)
+    for row in range(logits.shape[0]):
+        end = max(0, min(int(lengths[row]), logits.shape[1]))
+        ids = sorted(
+            int(c)
+            for c in candidates[row]
+            if 0 <= c < (end + block_size - 1) // block_size
+        )
+        for i, c in enumerate(ids):
+            if i and c == ids[i - 1]:
+                continue
+            normalized[row, i] = c
+            n = min(block_size, end - c * block_size)
+            scores[row, i * block_size : i * block_size + n] = logits[
+                row, c * block_size : c * block_size + n
+            ]
+            ends[row] = i * block_size + n
+    return scores, ends, normalized
+
+
+@pytest.mark.parametrize(
+    "count,block_size,alignment,sorted_ids",
+    [
+        (1, 1, 4, False),
+        (17, 3, 16, False),
+        (128, 8, 64, True),
+        (512, 8, 64, False),
+        (513, 8, 64, False),
+        (512, 8, 8192, True),
+        (2048, 8, 64, True),
+    ],
+)
+def test_candidate_scores_causal_duplicates_and_strides(
+    device, count, block_size, alignment, sorted_ids
+):
+    torch.manual_seed(923)
+    logits = torch.randn(5, 2302, device=device)[:, ::2]
+    lengths = torch.tensor([-5, 0, 17, 1150, 2000], device=device, dtype=torch.int64)
+    candidates = torch.randint(-4, 180, (5, count * 2), device=device)[:, ::2]
+    if sorted_ids:
+        candidates.copy_(
+            candidates.masked_fill(candidates < 0, 2**31 - 1).sort().values
+        )
+        candidates.masked_fill_(candidates == 2**31 - 1, -1)
+    expected = _candidate_reference(logits, lengths, candidates, block_size, alignment)
+    actual = prepare_candidate_scores(
+        logits, lengths, candidates, block_size, alignment
+    )
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
+
+
+def test_candidate_scores_graph_refresh(device):
+    torch.manual_seed(924)
+    logits = torch.randn(3, 4096, device=device)
+    lengths = torch.zeros(3, device=device, dtype=torch.int32)
+    candidates = torch.full((3, 512), -1, device=device, dtype=torch.int32)
+    prepare_candidate_scores(logits, lengths, candidates, 8, 64)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = prepare_candidate_scores(logits, lengths, candidates, 8, 64)
+    for step in range(4):
+        lengths.copy_(torch.tensor([0, 7, 4096], device=device) - step)
+        candidates.random_(-5, 512)
+        logits.normal_()
+        graph.replay()
+        expected = _candidate_reference(logits, lengths, candidates, 8, 64)
+        for got, want in zip(actual, expected, strict=True):
+            torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
+
+
+def _gather_inputs(capacity, strided, dtype):
+    torch.manual_seed(731 + capacity)
+    pages = capacity // 64 + 2
+    storage = torch.randint(
+        0, 256, (pages, 8704 if strided else 4352), device="cuda", dtype=torch.uint8
+    )
+    cache = storage[:, :4352]
+    table = torch.randperm(pages, device="cuda")[: capacity // 64].to(dtype)
+    if strided:
+        backing = torch.empty(table.numel() * 2, device="cuda", dtype=dtype)
+        backing[1::2] = table
+        table = backing[1::2]
+    if table.numel():
+        table[0] = 0
+    if table.numel() > 2:
+        table[1::17] = -1
+        table[2::31] = pages + 123
+    return cache, table
+
+
+def _gather_reference(cache, table):
+    logical = torch.arange(table.numel() * 64, device=cache.device, dtype=torch.int64)
+    pages = table[logical // 64]
+    slots = (pages.to(torch.int64) * 64 + logical % 64).masked_fill(
+        (pages < 0) | (pages >= cache.shape[0]), -1
+    )
+    return gather_index_cache(cache, slots, 64)
+
+
+@pytest.mark.parametrize(
+    "capacity,strided,dtype",
+    [
+        (64, False, torch.int32),
+        (8192, True, torch.int64),
+        (1048576, False, torch.int64),
+    ],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_prefill_gather_matches_slot_materialization(capacity, strided, dtype):
+    cache, pages = _gather_inputs(capacity, strided, dtype)
+    gather_index_pages(cache, pages, 64)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = gather_index_pages(cache, pages, 64)
+    for pattern in ("reverse", "invalid", "zero", "changed_payload"):
+        if pattern == "reverse":
+            pages.copy_(pages.flip(0))
+        elif pattern == "invalid":
+            pages.fill_(-1)
+        elif pattern == "zero":
+            pages.zero_()
+        else:
+            cache.random_(0, 256)
+        graph.replay()
+        for got, want in zip(actual, _gather_reference(cache, pages), strict=True):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_prefill_gather_page_zero_and_invalid_page_bytes(dtype):
+    cache, _ = _gather_inputs(64, True, dtype)
+    pages = torch.tensor(
+        [0, -1, cache.shape[0], torch.iinfo(dtype).max, 1], device="cuda", dtype=dtype
+    )
+    data, scales = gather_index_pages(cache, pages, 64)
+    expected_data = torch.zeros((320, 64), device="cuda", dtype=torch.uint8)
+    expected_scales = torch.full((320,), 0x7F7F7F7F, device="cuda", dtype=torch.int32)
+    for out_page, physical_page in ((0, 0), (4, 1)):
+        expected_data[out_page * 64 : (out_page + 1) * 64] = cache[
+            physical_page, :4096
+        ].reshape(64, 64)
+        expected_scales[out_page * 64 : (out_page + 1) * 64] = cache[
+            physical_page, 4096:
+        ].view(torch.int32)
+    torch.testing.assert_close(data, expected_data, rtol=0, atol=0)
+    torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)

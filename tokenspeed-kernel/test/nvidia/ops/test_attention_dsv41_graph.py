@@ -505,3 +505,55 @@ def test_padded_copy_and_changed_graph_inputs(rows, heads, padded):
         graph.replay()
         torch.testing.assert_close(out[:, :heads], x, rtol=0, atol=0)
         assert torch.count_nonzero(out[:, heads:]) == 0
+
+
+@pytest.mark.parametrize("heads", [2, 32])
+def test_index_selection_overwrites_poisoned_outputs_on_every_graph_replay(heads):
+    q = torch.randn(4, heads, 128, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(4, heads, device="cuda", dtype=torch.bfloat16)
+    cache = torch.zeros(2, 64, 68, device="cuda", dtype=torch.uint8)
+    values = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    dsv41.cache_scatter(values, cache, torch.arange(128, device="cuda"), "index")
+    table = torch.ones(4, 1, device="cuda", dtype=torch.int32)
+    lengths = torch.zeros(4, device="cuda", dtype=torch.int32)
+    out = tuple(
+        torch.full(shape, 123456, device="cuda", dtype=torch.int32)
+        for shape in ((4, 16), (4,), (4, 4), (4,))
+    )
+
+    def run():
+        return dsv41.index_topk(
+            q,
+            weights,
+            cache,
+            table,
+            lengths,
+            None,
+            16,
+            4,
+            8,
+            256,
+            256,
+            None,
+            out,
+            solution=None,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for live_lengths in ([0, 0, 0, 0], [0, 12, 0, 2], [5, 0, 16, 0]):
+        lengths.copy_(torch.tensor(live_lengths, device="cuda", dtype=torch.int32))
+        for tensor in out:
+            tensor.fill_(123456)
+        graph.replay()
+        for row, count in enumerate(live_lengths):
+            assert out[1][row].item() == count
+            assert out[3][row].item() == (count + 7) // 8
+            torch.testing.assert_close(
+                out[0][row, :count],
+                torch.arange(count, device="cuda", dtype=torch.int32),
+            )
+            assert bool((out[0][row, count:] == -1).all())
+            assert bool((out[2][row, (count + 7) // 8 :] == -1).all())

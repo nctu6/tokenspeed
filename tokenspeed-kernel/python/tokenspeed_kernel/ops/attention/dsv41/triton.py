@@ -2265,51 +2265,30 @@ def _clean_logits(
     CAP,
     P: tl.constexpr,
     PAGED: tl.constexpr,
+    LIVE_TILES_ONLY: tl.constexpr,
     B: tl.constexpr,
 ):
     row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
-    column = tile * B + tl.arange(0, B)
-    valid = (column < CAP) & (column < tl.load(L + row * L0))
-    if PAGED:
-        page = tl.load(
-            T + row * T0 + (column // P) * T1, valid & (column // P < TC), other=0
-        ).to(tl.int64)
-        valid &= (page >= 0) & (page < NP) & (column // P < TC)
-    value = tl.load(X + row * X0 + column, valid, other=-float("inf"))
-    tl.store(O + row * CAP + column, value, column < CAP)
+    end = tl.load(L + row * L0)
+    if not LIVE_TILES_ONLY or tile * B < end:
+        column = tile * B + tl.arange(0, B)
+        valid = (column < CAP) & (column < end)
+        if PAGED:
+            page = tl.load(
+                T + row * T0 + (column // P) * T1, valid & (column // P < TC), other=0
+            ).to(tl.int64)
+            valid &= (page >= 0) & (page < NP) & (column // P < TC)
+        value = tl.load(X + row * X0 + column, valid, other=-float("inf"))
+        # Write the entire last live 1024-value tile, including its -inf tail.
+        # DeepSelect can prefetch the last 512-value segment before masking it.
+        tl.store(O + row * CAP + column, value, column < CAP)
 
 
 def clean_logits(values, lengths, table, pages, capacity, page_size):
-    if (
-        values.ndim != 2
-        or values.shape[0] != lengths.numel()
-        or values.shape[1] < capacity
-        or values.stride(1) != 1
-        or values.dtype != torch.float32
-    ):
-        raise RuntimeError("DeepGEMM returned incompatible FP32 score geometry")
-    output = torch.empty(
-        (values.shape[0], capacity), dtype=torch.float32, device=values.device
+    """Copy logits, masking every future row and invalid page to -inf."""
+    return _clean_logits_output(
+        values, lengths, table, pages, capacity, page_size, False
     )
-    if output.numel():
-        _clean_logits[(values.shape[0], triton.cdiv(capacity, 1024))](
-            values,
-            lengths,
-            table if table is not None else lengths,
-            output,
-            values.stride(0),
-            lengths.stride(0),
-            table.stride(0) if table is not None else 0,
-            table.stride(1) if table is not None else 0,
-            table.shape[1] if table is not None else 0,
-            pages,
-            capacity,
-            page_size,
-            table is not None,
-            1024,
-            num_warps=4,
-        )
-    return output
 
 
 @triton.jit(
@@ -2511,8 +2490,8 @@ def _reduce_blocks(
 
 
 @triton.jit(
-    do_not_specialize=["C0", "C1", "L0", "N", "W"],
-    do_not_specialize_on_alignment=["C0", "C1", "L0", "N", "W"],
+    do_not_specialize=["C0", "C1", "L0", "N", "W", "X0", "X1", "SW"],
+    do_not_specialize_on_alignment=["C0", "C1", "L0", "N", "W", "X0", "X1", "SW"],
 )
 def _normalize_candidates(
     C,
@@ -2524,6 +2503,12 @@ def _normalize_candidates(
     L0,
     N,
     W,
+    X,
+    S,
+    X0,
+    X1,
+    SW,
+    GATHER: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     B: tl.constexpr,
 ):
@@ -2535,12 +2520,24 @@ def _normalize_candidates(
     candidate = tl.where(
         (candidate >= 0) & (candidate < count), candidate, 2147483647
     ).to(tl.int32)
-    candidate = tl.sort(candidate, descending=False)
+    previous = tl.gather(candidate, tl.maximum(i - 1, 0), axis=0)
+    if tl.sum((candidate < previous).to(tl.int32), axis=0) != 0:
+        candidate = tl.sort(candidate, descending=False)
     previous = tl.gather(candidate, tl.maximum(i - 1, 0), axis=0)
     valid = (candidate != 2147483647) & ((i == 0) | (candidate != previous))
     tl.store(O + row * N + i, tl.where(valid, candidate, -1), i < N)
     span = i * BLOCK_SIZE + tl.minimum(BLOCK_SIZE, end - candidate * BLOCK_SIZE)
     tl.store(E + row, tl.max(tl.where(valid, span, 0), axis=0))
+    if GATHER:
+        lane = tl.arange(0, BLOCK_SIZE)
+        position = tl.where(valid, candidate, 0)[:, None] * BLOCK_SIZE + lane[None, :]
+        value = tl.load(
+            X + row * X0 + position * X1,
+            valid[:, None] & (i[:, None] < N) & (position < end),
+            other=-float("inf"),
+        )
+        offset = i[:, None] * BLOCK_SIZE + lane[None, :]
+        tl.store(S + row * SW + offset, value, offset < SW)
 
 
 @triton.jit(
@@ -2698,6 +2695,13 @@ def prepare_candidate_scores(logits, lengths, candidates, block_size, alignment)
     scores = torch.empty(
         (logits.shape[0], stride), dtype=torch.float32, device=logits.device
     )
+    # Small candidate sets fit their scores in the normalization CTA. Larger
+    # sets need the separate tiled gather to retain memory-level parallelism.
+    fused_gather = (
+        0 < count <= 512
+        and block_size in (1, 2, 4, 8)
+        and stride <= triton.next_power_of_2(count) * block_size
+    )
     _normalize_candidates[(logits.shape[0],)](
         candidates,
         lengths,
@@ -2708,10 +2712,18 @@ def prepare_candidate_scores(logits, lengths, candidates, block_size, alignment)
         lengths.stride(0),
         count,
         logits.shape[1],
+        logits,
+        scores,
+        logits.stride(0),
+        logits.stride(1),
+        stride,
+        fused_gather,
         block_size,
         triton.next_power_of_2(count),
-        num_warps=8,
+        num_warps=4 if fused_gather else 8,
     )
+    if fused_gather:
+        return scores, end, normalized
     _gather_candidates[(logits.shape[0], triton.cdiv(stride, 1024))](
         logits,
         lengths,
@@ -3526,6 +3538,160 @@ def _copy_attention_heads(dst, src, sink, sink_out):
         4096,
         num_warps=4,
     )
+
+
+@triton.jit(
+    do_not_specialize=["TS0", "TS1", "LS", "TC", "PAGES", "C"],
+    # Prefill tiles pass row slices of shared buffers, so the pointers'
+    # alignment changes with the tile start.
+    do_not_specialize_on_alignment=[
+        "Table",
+        "Visible",
+        "Rows",
+        "Lengths",
+        "Blocks",
+        "BlockLengths",
+        "TS0",
+        "TS1",
+        "LS",
+        "TC",
+        "PAGES",
+        "C",
+    ],
+)
+def _index_select_all(
+    Table,
+    Visible,
+    Rows,
+    Lengths,
+    Blocks,
+    BlockLengths,
+    TS0,
+    TS1,
+    LS,
+    TC,
+    PAGES,
+    K: tl.constexpr,
+    C,
+    BLOCK_SIZE: tl.constexpr,
+    ROW_BLOCK: tl.constexpr,
+    CANDIDATE_BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    visible = tl.load(Visible + row * LS)
+    ids = tl.arange(0, ROW_BLOCK)
+    page = tl.load(
+        Table + row * TS0 + (ids // 64) * TS1, (ids < K) & (ids // 64 < TC), other=-1
+    )
+    valid = (ids < K) & (ids < visible) & (page > 0) & (page < PAGES)
+    selected = tl.sort(tl.where(valid, ids, 2147483647))
+    tl.store(
+        Rows + row * K + ids, tl.where(selected == 2147483647, -1, selected), ids < K
+    )
+    tl.store(Lengths + row, tl.sum(valid.to(tl.int32)))
+    count = tl.full((), 0, tl.int32)
+    if C:
+        candidate_ids = tl.arange(0, CANDIDATE_BLOCK)
+        offsets = candidate_ids * BLOCK_SIZE
+        candidate_pages = tl.load(
+            Table + row * TS0 + (offsets // 64) * TS1,
+            (candidate_ids < C) & (offsets // 64 < TC),
+            other=-1,
+        )
+        candidate_valid = (
+            (candidate_ids < C)
+            & (offsets < visible)
+            & (candidate_pages > 0)
+            & (candidate_pages < PAGES)
+        )
+        candidate_selected = tl.sort(
+            tl.where(candidate_valid, candidate_ids, 2147483647)
+        )
+        tl.store(
+            Blocks + row * C + candidate_ids,
+            tl.where(candidate_selected == 2147483647, -1, candidate_selected),
+            candidate_ids < C,
+        )
+        count = tl.sum(candidate_valid.to(tl.int32))
+    tl.store(BlockLengths + row, count)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_index_select_all",
+    name="triton_dsv41_index_select_all",
+    solution="triton",
+    signatures=_INTEGER_SIGNATURES,
+    capability=_CAPABILITY,
+    priority=Priority.PORTABLE,
+)
+def index_select_all(page_table, visible_lens, pages, candidate_block_size, out):
+    """Publish every valid causal row and block into caller-owned destinations."""
+    if page_table.shape[0]:
+        _index_select_all[(page_table.shape[0],)](
+            page_table,
+            visible_lens,
+            *out,
+            *page_table.stride(),
+            visible_lens.stride(0),
+            page_table.shape[1],
+            pages,
+            out[0].shape[1],
+            out[2].shape[1],
+            candidate_block_size,
+            triton.next_power_of_2(out[0].shape[1]),
+            triton.next_power_of_2(max(1, out[2].shape[1])),
+            num_warps=4,
+        )
+    return out
+
+
+def clean_logits_for_selection(values, lengths, table, pages, capacity, page_size):
+    """Copy valid logits for bounded DeepSelect consumers, preserving row layout.
+
+    Every live 1024-value tile is fully initialized, including its -inf tail;
+    wholly future tiles are unspecified. Consumers must pass exclusive ends.
+    Ordinary clean_logits retains its full-width contract, including on Hopper.
+    """
+    return _clean_logits_output(
+        values, lengths, table, pages, capacity, page_size, True
+    )
+
+
+def _clean_logits_output(
+    values, lengths, table, pages, capacity, page_size, live_tiles_only
+):
+    if (
+        values.ndim != 2
+        or values.shape[0] != lengths.numel()
+        or values.shape[1] < capacity
+        or values.stride(1) != 1
+        or values.dtype != torch.float32
+    ):
+        raise RuntimeError("DeepGEMM returned incompatible FP32 score geometry")
+    output = torch.empty(
+        (values.shape[0], capacity), dtype=torch.float32, device=values.device
+    )
+    if output.numel():
+        _clean_logits[(values.shape[0], triton.cdiv(capacity, 1024))](
+            values,
+            lengths,
+            table if table is not None else lengths,
+            output,
+            values.stride(0),
+            lengths.stride(0),
+            table.stride(0) if table is not None else 0,
+            table.stride(1) if table is not None else 0,
+            table.shape[1] if table is not None else 0,
+            pages,
+            capacity,
+            page_size,
+            table is not None,
+            live_tiles_only,
+            1024,
+            num_warps=4,
+        )
+    return output
 
 
 @triton.jit
