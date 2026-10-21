@@ -124,7 +124,8 @@ def test_the_device_builds_the_pd_transfer_peer_from_the_mapping(monkeypatch, ro
         # ServerArgs exposes the first --served-model-name as the canonical id.
         canonical_served_model_name="m",
         app_key="k",
-        metrics_reporters="",
+        enable_metrics=False,
+        metrics_reporters=None,
         disaggregation_ib_device=None,
         disaggregation_layerwise_interval=0,
         mapping=mapping,
