@@ -28,6 +28,10 @@ from test_attention_dsv41 import _reference_quantize
 from test_attention_dsv41 import device as device
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
+from tokenspeed_kernel.ops.attention.dsv41.triton import (
+    pack_index_inputs,
+    pack_index_queries,
+)
 
 
 def _inputs(device, dtype):
@@ -565,3 +569,91 @@ def test_native_broadcast_history_matches_paged_and_refreshes_graph(device):
     graph.replay()
     for actual, expected in zip(captured, run(table), strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "tokens,heads,layout",
+    [
+        (0, 32, "contiguous"),
+        (1, 1, "contiguous"),
+        (5, 7, "broadcast"),
+        (16, 32, "strided"),
+        (65, 32, "contiguous"),
+        (129, 32, "strided"),
+    ],
+)
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+def test_index_pack_matches_independent_fp4_oracle(
+    device, tokens, heads, layout, weight_dtype, output_dtype
+):
+    torch.manual_seed(617)
+    q = torch.randn(tokens * 2, heads * 2, 256, device=device).bfloat16()[
+        ::2, ::2, 1::2
+    ]
+    weights = torch.randn(tokens * 2, heads * 2, device=device, dtype=weight_dtype)[
+        ::2, ::2
+    ]
+    if layout == "contiguous":
+        q, weights = q.contiguous(), weights.contiguous()
+    elif layout == "broadcast":
+        q = torch.randn(1, 1, 128, device=device).bfloat16().expand(tokens, heads, -1)
+        weights = torch.randn(1, 1, device=device, dtype=weight_dtype).expand(
+            tokens, heads
+        )
+    q_before, weights_before = q.clone(), weights.clone()
+    (data, scales), output_weights = pack_index_inputs(q, weights, output_dtype)
+    assert (
+        data.is_contiguous()
+        and scales.is_contiguous()
+        and output_weights.is_contiguous()
+    )
+    packed = torch.cat(
+        (data.cpu().reshape(-1, 64), scales.cpu().view(torch.uint8).reshape(-1, 4)), 1
+    )
+    expected, _ = _reference_quantize(q, "index")
+    torch.testing.assert_close(packed, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        output_weights,
+        weights.to(output_dtype).contiguous(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(q, q_before, rtol=0, atol=0)
+    torch.testing.assert_close(weights, weights_before, rtol=0, atol=0)
+    if weights.dtype == output_dtype and weights.is_contiguous():
+        assert output_weights is weights
+
+
+def test_index_pack_boundaries_and_graph_refresh(device):
+    q = torch.zeros(8, 32, 128, device=device, dtype=torch.bfloat16)
+    weights = torch.zeros(8, 32, device=device, dtype=torch.bfloat16)
+    pack_index_inputs(q, weights, torch.float32)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        (data, scales), fp32_weights = pack_index_inputs(q, weights, torch.float32)
+    for seed in range(3):
+        torch.manual_seed(seed)
+        q.normal_()
+        q[0].zero_()
+        q[1].fill_(6 * 2.0**-126)
+        q[2].fill_(2.0**-127)
+        q[3].fill_(-(2.0**-127))
+        midpoints = torch.tensor(
+            [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5, 6], device=device
+        )
+        q[4].copy_(midpoints.repeat(16).expand(32, -1))
+        q[5].copy_(-q[4])
+        q[6].fill_(-0.0)
+        weights.normal_()
+        weights[0].fill_(-0.0)
+        graph.replay()
+        old_data, old_scales = pack_index_queries(q)
+        torch.testing.assert_close(data, old_data, rtol=0, atol=0)
+        torch.testing.assert_close(scales, old_scales, rtol=0, atol=0)
+        torch.testing.assert_close(
+            fp32_weights.view(torch.int32),
+            weights.float().view(torch.int32),
+            rtol=0,
+            atol=0,
+        )

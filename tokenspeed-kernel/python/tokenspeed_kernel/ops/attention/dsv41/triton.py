@@ -1437,6 +1437,9 @@ def _rotate_interleaved(value, partner, cosine, sine, odd):
 @triton.jit
 def _swa_rope_insert(
     X,
+    W,
+    EPS: tl.constexpr,
+    HAS_NORM: tl.constexpr,
     POS,
     CS,
     CACHE,
@@ -1468,8 +1471,12 @@ def _swa_rope_insert(
     slot = tl.load(SLOTS + token * S0).to(tl.int64)
     live = (slot >= P) & (slot < NP * P)
     x = tl.load(X + token * X0 + d * X1).to(tl.float32)
-    # RMSNorm has already rounded to BF16 in the caller's existing primitive.
     normalized = x
+    if HAS_NORM:
+        rstd = tl.rsqrt(tl.sum(x * x, 0) / 512 + EPS)
+        normalized = (
+            (x * rstd * tl.load(W + d).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        )
     partner = tl.gather(normalized, d ^ 1, axis=0)
     pair = (d - 448) // 2
     rope = d >= 448
@@ -1535,13 +1542,27 @@ def _swa_rope_insert(
     priority=Priority.PORTABLE,
 )
 def triton_dsv41_swa_rope_scatter(
-    values, positions, cos_sin_cache, cache, slots, cache_format, out
+    values,
+    positions,
+    cos_sin_cache,
+    cache,
+    slots,
+    cache_format,
+    out,
+    norm_weight,
+    norm_eps,
 ):
     if cache_format not in _PAGED_FORMATS["swa"].values():
         raise ValueError(f"{cache_format!r} is not a SWA row format")
     dim, group, value_bytes, row_bytes, quantized = _layout(cache_format)
     _cache(cache, cache_format)
-    _same_device(values, (positions, cos_sin_cache, cache, slots, out))
+    _same_device(values, (positions, cos_sin_cache, cache, slots, out, norm_weight))
+    if norm_weight is not None and (
+        norm_weight.shape != (512,) or not norm_weight.is_contiguous() or norm_eps <= 0
+    ):
+        raise ValueError(
+            "SWA normalization requires contiguous [512] weights and positive epsilon"
+        )
     if values.dtype != torch.bfloat16 or values.ndim != 2 or values.shape[1] != 512:
         raise ValueError("SWA values must be BF16 [tokens,512]")
     _integers(positions, values.shape[:1], "positions")
@@ -1565,6 +1586,9 @@ def triton_dsv41_swa_rope_scatter(
         return
     _swa_rope_insert[(values.shape[0],)](
         values,
+        norm_weight,
+        norm_eps,
+        norm_weight is not None,
         positions,
         cos_sin_cache,
         cache,
@@ -3364,6 +3388,144 @@ def clean_block_maxima(
             1024,
         )
     return cleaned, maxima, ends
+
+
+@triton.jit(do_not_specialize=["N"], do_not_specialize_on_alignment=["N"])
+def _pack_index_inputs(
+    X,
+    W,
+    V,
+    S,
+    OW,
+    N,
+    H: tl.constexpr,
+    X0: tl.constexpr,
+    X1: tl.constexpr,
+    X2: tl.constexpr,
+    W0: tl.constexpr,
+    W1: tl.constexpr,
+    CONVERT_WEIGHTS: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    row = (tl.program_id(0) * ROWS + tl.arange(0, ROWS)).to(tl.int64)
+    d = tl.arange(0, 128)
+    token, head = row // H, row % H
+    x = tl.load(
+        X + token[:, None] * X0 + head[:, None] * X1 + d[None, :] * X2,
+        (row < N)[:, None],
+        other=0,
+    ).to(tl.float32)
+    grouped = tl.reshape(x, (ROWS, 4, 32))
+    amax = tl.maximum(tl.max(tl.abs(grouped), 2), 6.0 * 1.1754943508222875e-38)
+    raw = tl.div_rn(amax, 6.0)
+    bits = raw.to(tl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    scale = (exponent << 23).to(tl.float32, bitcast=True)
+    normalized = tl.reshape(tl.div_rn(grouped, scale[:, :, None]), (ROWS, 128))
+    code = _e2m1_encode(normalized).to(tl.int32)
+    pairs = tl.reshape(code, (ROWS, 64, 2))
+    packed = tl.sum(pairs << (tl.arange(0, 2)[None, None, :] * 4), 2).to(tl.uint8)
+    word = tl.sum(exponent.to(tl.uint32) << (tl.arange(0, 4)[None, :] * 8), 1)
+    tl.store(
+        V + row[:, None] * 64 + tl.arange(0, 64)[None, :], packed, (row < N)[:, None]
+    )
+    tl.store(S + row, word.to(tl.int32), row < N)
+    if CONVERT_WEIGHTS:
+        weight = tl.load(W + token * W0 + head * W1, row < N, other=0).to(tl.float32)
+        tl.store(OW + row, weight, row < N)
+
+
+def pack_index_inputs(values, weights, weights_dtype):
+    """Pack [T,H,128] queries and convert head weights for the selected scorer.
+
+    Both inputs may be strided, including broadcast read views. Returns packed
+    uint8 [T,H,64] codes/int32 [T,H] scales and contiguous [T,H] weights with
+    explicit weights_dtype (FP32 for full scoring, BF16 for native sparse).
+    Contiguous matching weights are borrowed read-only; other weights are
+    converted in the packing launch. No additional scaling is applied.
+    """
+    if weights_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError("Native index head weights must be FP32 or BF16")
+    convert = weights.dtype != weights_dtype or not weights.is_contiguous()
+    if not convert and values.shape[0] < 16:
+        # With no conversion to fuse, small batches favor the original
+        # per-head launch. Larger batches benefit from sharing each CTA.
+        return pack_index_queries(values), weights
+    data = torch.empty((*values.shape[:2], 64), dtype=torch.uint8, device=values.device)
+    scales = torch.empty(values.shape[:2], dtype=torch.int32, device=values.device)
+    output_weights = (
+        torch.empty(weights.shape, dtype=weights_dtype, device=weights.device)
+        if convert
+        else weights
+    )
+    count = values.shape[0] * values.shape[1]
+    if count:
+        rows = 4 if values.shape[0] <= 64 else 8
+        _pack_index_inputs[(triton.cdiv(count, rows),)](
+            values,
+            weights,
+            data,
+            scales,
+            output_weights,
+            count,
+            values.shape[1],
+            *values.stride(),
+            *weights.stride(),
+            convert,
+            rows,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return (data, scales), output_weights
+
+
+@triton.jit(do_not_specialize=["tokens"])
+def _copy_attention_heads_kernel(
+    X,
+    Y,
+    S,
+    D,
+    tokens,
+    HX: tl.constexpr,
+    HY: tl.constexpr,
+    X0: tl.constexpr,
+    X1: tl.constexpr,
+    X2: tl.constexpr,
+    Y0: tl.constexpr,
+    Y1: tl.constexpr,
+    Y2: tl.constexpr,
+    HS: tl.constexpr,
+    S0: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row, head, col = i // (HY * 512), i // 512 % HY, i % 512
+    x = tl.load(X + row * X0 + head * X1 + col * X2, (row < tokens) & (head < HX), 0)
+    tl.store(Y + row * Y0 + head * Y1 + col * Y2, x, row < tokens)
+    if HS:
+        if tl.program_id(0) == 0:
+            h = tl.arange(0, triton.next_power_of_2(HY))
+            sink = tl.load(S + h * S0, h < HS, -float("inf"))
+            tl.store(D + h, sink, h < HY)
+
+
+def _copy_attention_heads(dst, src, sink, sink_out):
+    """Copy 512-wide heads, zero extra heads, and optionally pad the FP32 sink."""
+    _copy_attention_heads_kernel[(max(1, triton.cdiv(dst.numel(), 4096)),)](
+        src,
+        dst,
+        sink,
+        sink_out,
+        src.shape[0],
+        src.shape[1],
+        dst.shape[1],
+        *src.stride(),
+        *dst.stride(),
+        0 if sink is None else sink.numel(),
+        0 if sink is None else sink.stride(0),
+        4096,
+        num_warps=4,
+    )
 
 
 @triton.jit

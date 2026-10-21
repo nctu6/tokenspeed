@@ -76,6 +76,9 @@ from weakref import WeakValueDictionary
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention.dsv41 import (
+    IndexKeyInput,
+    IndexQueryInput,
+    index_query_rope_weights,
     rope_inplace,
     rope_pad_query,
 )
@@ -85,7 +88,10 @@ from tokenspeed_kernel.ops.gemm import (
     mm,
     prepare_mxfp8_weight_scales,
 )
-from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.ops.quantization import (
+    quantize_fp8,
+    rmsnorm_quantize_fp8_group32,
+)
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -327,8 +333,18 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         cached.copy_(prepared)
 
     def apply(
-        self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None
+        self,
+        layer: nn.Module,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.dtype],
+        bias: torch.Tensor | None,
     ) -> torch.Tensor:
+        if isinstance(x, tuple):
+            codes, scales, output_dtype = x
+            if codes.shape[0] == 0:
+                return codes.new_empty(
+                    (*codes.shape[:-1], layer.weight.shape[0]), dtype=output_dtype
+                )
+            return super().apply(layer, codes, bias, scales, output_dtype)
         if x.shape[0] == 0:
             return x.new_empty((*x.shape[:-1], layer.weight.shape[0]))
         if (
@@ -700,26 +716,60 @@ class DeepseekV41Indexer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        qr: torch.Tensor,
+        qr: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.dtype],
         positions: torch.Tensor,
         rotary: DeepseekV41RotaryEmbedding,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | IndexQueryInput, torch.Tensor]:
         q, _ = self.wq_b(qr, block_scale=None, output_dtype=None)
-        q = rotary.apply_owned(
-            q.unflatten(-1, (self.n_local_heads, self.head_dim)), positions, False
-        )
+        q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
         weights, _ = self.weights_proj(x, block_scale=None, output_dtype=None)
-        return q, weights * self.scale
+        if (
+            q.is_cuda
+            and current_platform().is_blackwell
+            and q.dtype == weights.dtype == torch.bfloat16
+            and self.head_dim == 128
+            and rotary.dim == 64
+        ):
+            rotary._prepare_cache(q.device)
+            if self.n_local_heads == 32:
+                # The scorer chooses BF16 sparse or FP32 Full weights, so it
+                # fuses their conversion with RoPE and Q packing in one launch.
+                return (
+                    IndexQueryInput(q, positions, rotary.cos_sin_cache, self.scale),
+                    weights,
+                )
+            return index_query_rope_weights(
+                q,
+                weights,
+                positions,
+                rotary.cos_sin_cache,
+                self.scale,
+            )
+        return rotary.apply_owned(q, positions, False), weights * self.scale
 
     def key(
         self,
         latent: torch.Tensor,
         positions: torch.Tensor,
         rotary: DeepseekV41RotaryEmbedding,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | IndexKeyInput:
         if self.wk is None:
             raise RuntimeError("Only a KV owner can project index keys")
         key, _ = self.wk(latent, block_scale=None, output_dtype=None)
+        if (
+            key.is_cuda
+            and current_platform().is_blackwell
+            and key.dtype == torch.bfloat16
+            and self.head_dim == 128
+            and rotary.dim == 64
+        ):
+            rotary._prepare_cache(key.device)
+            return IndexKeyInput(
+                key,
+                self.k_norm.weight,
+                rotary.cos_sin_cache,
+                self.k_norm.variance_epsilon,
+            )
         return rotary.apply_owned(_attention_norm(key, self.k_norm), positions, False)
 
 
@@ -860,9 +910,28 @@ class DeepseekV41Attention(nn.Module):
             hidden_states, self.layer_id, positions, requests, backend, mode
         )
         index_k = self.indexer.key(latent, row_positions, self.rotary_emb)
-        main_k = self.rotary_emb.apply_owned(latent, row_positions, False)
+        main_rope_cache = None
+        if (
+            latent.is_cuda
+            and current_platform().is_blackwell
+            and latent.dtype == torch.bfloat16
+            and latent.shape[-1] == 512
+            and self.rotary_emb.dim == 64
+            and backend.global_format == "global"
+        ):
+            self.rotary_emb._prepare_cache(latent.device)
+            main_k = latent
+            main_rope_cache = self.rotary_emb.cos_sin_cache
+        else:
+            main_k = self.rotary_emb.apply_owned(latent, row_positions, False)
         backend.write_global(
-            self.layer_id, main_k, index_k, row_positions, row_requests, mode
+            self.layer_id,
+            main_k,
+            index_k,
+            row_positions,
+            row_requests,
+            mode,
+            main_rope_cache=main_rope_cache,
         )
 
     @break_point
@@ -895,7 +964,32 @@ class DeepseekV41Attention(nn.Module):
             return hidden_states[:0]
         qkv, _ = self.wq_a_wkv(hidden_states, block_scale=None, output_dtype=None)
         qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
-        qr = _attention_norm(qr, self.q_norm)
+        if (
+            rows.keep_rows is None
+            and qr.is_cuda
+            and qr.dtype == torch.bfloat16
+            and current_platform().is_nvidia
+            and isinstance(self.wq_b.quant_method, _ReferenceFp8LinearMethod)
+        ):
+            qr, codes, scales = rmsnorm_quantize_fp8_group32(
+                qr,
+                self.q_norm.weight,
+                self.q_norm.variance_epsilon,
+                override=None,
+                solution="triton",
+            )
+            q_input = (codes, scales, qr.dtype)
+        else:
+            qr = q_input = _attention_norm(qr, self.q_norm)
+        index_q_input = qr
+        if (
+            isinstance(q_input, tuple)
+            and self.indexer is not None
+            and isinstance(self.indexer.wq_b.quant_method, _ReferenceFp8LinearMethod)
+        ):
+            # Both reference methods consume canonical group-32 UE8M0 scales;
+            # mm owns the selected kernel's layout conversion.
+            index_q_input = q_input
         if hidden_states.is_cuda:
             # Lazy shared constants are produced before the fork event, so both
             # branches observe them even on the first eager decode after loading.
@@ -912,6 +1006,9 @@ class DeepseekV41Attention(nn.Module):
         if overlap:
             for tensor in (hidden_states, qr, positions, requests):
                 tensor.record_stream(self.stream_fork.aux_stream)
+            if isinstance(index_q_input, tuple):
+                for tensor in index_q_input[:2]:
+                    tensor.record_stream(self.stream_fork.aux_stream)
         index_q, index_weights, index_group, prepared = None, None, None, None
         with self.stream_fork.scope(enable=overlap, overlap=True) as fork:
             # Submit the longer compressor/index branch first. Serial eager and
@@ -925,13 +1022,14 @@ class DeepseekV41Attention(nn.Module):
                         t.index_select(0, rows.keep_rows)
                         for t in (hidden_states, qr, swa)
                     )
+                    q_input = index_q_input = qr
                     positions, requests = (
                         rows.query.positions,
                         rows.query.request_indices,
                     )
                 if self.indexer is not None:
                     index_q, index_weights = self.indexer(
-                        hidden_states, qr, positions, self.rotary_emb
+                        hidden_states, index_q_input, positions, self.rotary_emb
                     )
                     if mode.is_decode():
                         prepared = backend.prepare_global_selection(
@@ -944,18 +1042,23 @@ class DeepseekV41Attention(nn.Module):
                             index_group,
                         )
                         index_q = index_weights = None
-            q, _ = self.wq_b(qr, block_scale=None, output_dtype=None)
+            q, _ = self.wq_b(q_input, block_scale=None, output_dtype=None)
             q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
             if q.is_cuda and mode.is_decode() and self.head_dim == 512:
                 q = rope_pad_query(q, positions, self.rotary_emb.cos_sin_cache, None)
             else:
                 q = self.rotary_emb.apply_owned(q, positions, False)
-            swa = _attention_norm(swa, self.kv_norm)
             swa_rope_cache = None
+            swa_norm_weight = None
             if swa.is_cuda and self.head_dim == 512 and self.rotary_emb.dim == 64:
                 self.rotary_emb._prepare_cache(swa.device)
                 swa_rope_cache = self.rotary_emb.cos_sin_cache
+                if current_platform().is_blackwell:
+                    swa_norm_weight = self.kv_norm.weight
+                else:
+                    swa = _attention_norm(swa, self.kv_norm)
             else:
+                swa = _attention_norm(swa, self.kv_norm)
                 swa = self.rotary_emb.apply_owned(swa, positions, False)
         if overlap:
             # Aux-owned scratch can outlive this layer through source/reuse
@@ -982,6 +1085,8 @@ class DeepseekV41Attention(nn.Module):
             softmax_scale=self.head_dim**-0.5,
             index_process_group=index_group,
             swa_rope_cache=swa_rope_cache,
+            swa_norm_weight=swa_norm_weight,
+            swa_norm_eps=self.kv_norm.variance_epsilon,
         )
         out = self.rotary_emb.apply_owned(out[:, : self.n_local_heads], positions, True)
         grouped = out.reshape(out.shape[0], self.n_local_groups, -1)

@@ -279,7 +279,10 @@ class _Backend:
             output = _norm(output.to(torch.bfloat16), norm_weight, norm_eps)
         return output, row_positions, row_requests
 
-    def write_global(self, owner, main, index, positions, requests, mode):
+    def write_global(
+        self, owner, main, index, positions, requests, mode, main_rope_cache
+    ):
+        assert main_rope_cache is None
         self.global_writes[owner] = (
             main.clone(),
             index.clone(),
@@ -302,6 +305,8 @@ class _Backend:
         softmax_scale,
         index_process_group,
         swa_rope_cache,
+        swa_norm_weight,
+        swa_norm_eps,
     ):
         self.calls.append(
             (
@@ -388,15 +393,25 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     assert output.next_token_logits.argmax(-1).item() == expected_token
 
 
-def test_reference_fp8_floor_and_rounding():
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_reference_fp8_floor_and_rounding(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
     levels = [0.0, 1e-7, 1e-4, 448.0 / 64, 449.0 / 64, 448.0, 896.0]
-    x = torch.tensor(levels, dtype=torch.float32).unsqueeze(-1).expand(-1, 32).clone()
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    x = (
+        torch.tensor(levels, dtype=dtype, device=device)
+        .unsqueeze(-1)
+        .expand(-1, 32)
+        .clone()
+    )
     x[:, ::2].neg_()
     codes, scales = v41_quantize_fp8(x)
-    amax = x.abs().amax(-1).clamp_min(1e-4)
+    amax = x.float().abs().amax(-1).clamp_min(1e-4)
     rounded = torch.tensor(
         [2.0 ** math.ceil(math.log2(float(value))) for value in amax * (1.0 / 448.0)],
         dtype=torch.float32,
+        device=device,
     )
     torch.testing.assert_close(
         scales.view(torch.float8_e8m0fnu).float().flatten(), rounded, rtol=0, atol=0
@@ -1194,6 +1209,12 @@ def test_cuda_exact_fp8_linear_and_engram_method(monkeypatch):
         torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.002)
     else:
         codes, sf = v41_quantize_fp8(x)
+        prequantized, _ = linear(
+            (codes, sf, x.dtype),
+            block_scale=None,
+            output_dtype=None,
+        )
+        torch.testing.assert_close(prequantized, actual, rtol=0, atol=0)
         dequant = (
             codes.float().unflatten(-1, (-1, 32))
             * sf.view(torch.float8_e8m0fnu).float().unsqueeze(-1)
@@ -1779,33 +1800,37 @@ def _assert_decode_graph_matches_eager(adapter, backend, tables, device, steps):
             captured = forward()
     torch.cuda.current_stream().wait_stream(stream)
     arena.copy_(before_capture)
-    for step, (length, actual_bs) in enumerate(steps):
-        ids.fill_(7 + step)
-        previous[0] = torch.tensor([6 + step, 4 + step, 3 + step], device=device)
-        mask[0] = bool(actual_bs)
-        hashes.copy_(adapter.model.engram_hash(ids, previous, mask))
-        before = arena.clone()
-        for replay in (False, True):
-            backend.refresh_decode_metadata(
-                2,
-                actual_bs,
-                torch.tensor([0], device=device),
-                torch.tensor([length], device=device),
-                forward_mode=ForwardMode.DECODE,
-                block_tables=tables,
-                num_extends=0,
-                for_graph_replay=replay,
-            )
-            if not replay:
-                expected = forward().clone()
-                expected_cache = arena.clone()
-                arena.copy_(before)
-            else:
-                graph.replay()
-                torch.testing.assert_close(captured, expected, rtol=0, atol=0)
-                torch.testing.assert_close(arena, expected_cache, rtol=0, atol=0)
-                assert captured.dtype == torch.float32
-                assert torch.isfinite(captured).all()
+    try:
+        for step, (length, actual_bs) in enumerate(steps):
+            ids.fill_(7 + step)
+            previous[0] = torch.tensor([6 + step, 4 + step, 3 + step], device=device)
+            mask[0] = bool(actual_bs)
+            hashes.copy_(adapter.model.engram_hash(ids, previous, mask))
+            before = arena.clone()
+            for replay in (False, True):
+                backend.refresh_decode_metadata(
+                    2,
+                    actual_bs,
+                    torch.tensor([0], device=device),
+                    torch.tensor([length], device=device),
+                    forward_mode=ForwardMode.DECODE,
+                    block_tables=tables,
+                    num_extends=0,
+                    for_graph_replay=replay,
+                )
+                if not replay:
+                    expected = forward().clone()
+                    expected_cache = arena.clone()
+                    arena.copy_(before)
+                else:
+                    graph.replay()
+                    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(arena, expected_cache, rtol=0, atol=0)
+                    assert captured.dtype == torch.float32
+                    assert torch.isfinite(captured).all()
+    finally:
+        # Release captured collectives before process-group teardown, even on failure.
+        graph.reset()
 
 
 def test_distributed_attention_tp4(monkeypatch, tmp_path):
@@ -1839,19 +1864,7 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         for name, param in sharded.named_parameters():
             source = full_params[name]
             loader = getattr(param, "weight_loader", v41.default_weight_loader)
-            if name in (
-                "wq_a.weight",
-                "wkv.weight",
-                "compressor.wkv.weight",
-                "compressor.wkv_wgate.weight",
-                "wq_a_wkv.weight",
-                "indexer.wq_b.weight",
-                "indexer.weights_proj.weight",
-                "indexer.wk.weight",
-            ):
-                loader(param, source, shard_id=None, begin_size=None)
-            else:
-                loader(param, source)
+            loader(param, source)
         pos = torch.arange(4, device=device)
         backend = _Backend(pos, torch.zeros_like(pos))
         x = torch.randn(4, 128, dtype=torch.bfloat16, device=device)
@@ -1869,6 +1882,7 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         monkeypatch.setattr(
             expert_module, "get_moe_backend", lambda: MoeBackend.MEGA_MOE
         )
+        monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
         monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
         monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 128)
         monkeypatch.setitem(global_server_args_dict, "max_num_seqs", 8)
@@ -1878,7 +1892,7 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         config.n_routed_experts = 32
         config.head_dim, config.index_head_dim = 512, 128
         config.qk_rope_head_dim, config.q_lora_rank = 64, 128
-        with torch.device(device):
+        with set_default_torch_dtype(torch.bfloat16), torch.device(device):
             adapter = DeepseekV41ForCausalLM(
                 SimpleNamespace(text_config=config),
                 mapping,
@@ -2539,3 +2553,32 @@ def test_snapshot_full_text_manifest_and_wo_a_dtype(monkeypatch):
                     tensor = handle.get_slice(name)
                     assert tensor.get_dtype() == "F8_E4M3"
                     assert tensor.get_shape() == [8192, 4096]
+
+
+@pytest.mark.parametrize("layer_id", [0, 20])
+def test_ced_q_input_follows_narrowed_rows(layer_id):
+    torch.manual_seed(913)
+    config = _config()
+    attn = DeepseekV41Attention(
+        config,
+        _mapping(0, 1, 1),
+        layer_id,
+        layer_id,
+        None,
+        f"layers.{layer_id}.attn",
+        aux_stream=None,
+    )
+    _initialize(attn)
+    positions = torch.arange(6)
+    requests = torch.zeros(6, dtype=torch.int64)
+    x = torch.randn(6, 128, dtype=torch.bfloat16)
+    full = _Backend(positions, requests)
+    expected = attn(positions, x, _ctx(full, 6, ForwardMode.EXTEND))
+    keep = torch.tensor([1, 3, 5])
+    query = SimpleNamespace(positions=positions[keep], request_indices=requests[keep])
+    view = V41DecoderView(query, None, (), keep, None)
+    narrowed = _Backend(positions, requests, view)
+    actual = attn(positions, x, _ctx(narrowed, 6, ForwardMode.EXTEND))
+    torch.testing.assert_close(actual, expected[keep], rtol=0, atol=0)
+    if layer_id == 20:
+        assert narrowed.global_writes[layer_id][0].shape[0] == 6

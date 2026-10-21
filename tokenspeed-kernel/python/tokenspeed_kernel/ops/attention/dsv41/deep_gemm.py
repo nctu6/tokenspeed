@@ -27,6 +27,10 @@ from tokenspeed_kernel.ops.attention.dsv4.deep_gemm import (
     _mxfp4_cache_view,
     warmup_mqa_logits,
 )
+from tokenspeed_kernel.ops.attention.dsv41._inputs import IndexQueryInput
+from tokenspeed_kernel.ops.attention.dsv41._triton.rope import (
+    triton_dsv41_index_query_rope_quant,
+)
 from tokenspeed_kernel.ops.attention.dsv41.cute_dsl import (
     sparse_index_scores,
     sparse_index_scores_supported,
@@ -45,7 +49,7 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     clean_logits,
     dense_ranges,
     gather_index_cache,
-    pack_index_queries,
+    pack_index_inputs,
     quantize_index_queries,
     safe_metadata,
     write_selection,
@@ -190,8 +194,9 @@ def index_topk(
         raise ValueError(
             "Native CSA2 selection requires replicated heads and 8-row blocks"
         )
+    query_values = index_q.values if isinstance(index_q, IndexQueryInput) else index_q
     out = _index_topk_outputs(
-        index_q,
+        query_values,
         weights,
         index_cache,
         page_table,
@@ -205,7 +210,7 @@ def index_topk(
         process_group,
         out,
     )
-    n = index_q.shape[0]
+    n = query_values.shape[0]
     rows, lengths, blocks, block_lengths = out
     capacity = page_table.shape[1] * 64
     if capacity == 0:
@@ -222,13 +227,22 @@ def index_topk(
     cache = index_cache.as_strided(
         (index_cache.shape[0], 64 * 68), (index_cache.stride(0), 1)
     )
-    queries = pack_index_queries(index_q)
-    weights = weights.float().contiguous()
+    if isinstance(index_q, IndexQueryInput):
+        queries, weights = triton_dsv41_index_query_rope_quant(
+            index_q.values,
+            weights,
+            index_q.positions,
+            index_q.cos_sin_cache,
+            index_q.weight_scale,
+            torch.float32,
+        )
+    else:
+        queries, weights = pack_index_inputs(index_q, weights, torch.float32)
     keys = None
     if dense:
         # A zero row stride is a proof that all queries address one request's
         # history. Gather once for this call; never retain payload across writes.
-        logical = torch.arange(capacity, dtype=torch.int64, device=index_q.device)
+        logical = torch.arange(capacity, dtype=torch.int64, device=query_values.device)
         pages = page_table[0, logical // 64]
         slots = (pages.to(torch.int64) * 64 + logical % 64).masked_fill(
             (pages < 0) | (pages >= index_cache.shape[0]), -1

@@ -1022,12 +1022,23 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         return pooled, pair_positions, pair_requests
 
     def write_global(
-        self, owner, main_kv, index_k, positions, request_indices, forward_mode
+        self,
+        owner,
+        main_kv,
+        index_k,
+        positions,
+        request_indices,
+        forward_mode,
+        main_rope_cache,
     ) -> None:
-        """Store both post-RoPE owner fields, including memory-only positions.
+        """Store both owner fields, including memory-only positions.
 
         main_kv is BF16/FP32 [rows,512], index_k [rows,128]. Positions name
         global row STARTS (j*ratio), not pair ends; ratio-1 uses token positions.
+        main_rope_cache is None for post-RoPE main rows, or the FP32 RoPE table
+        for BF16 pre-RoPE main rows written through the fused global FP4 codec.
+        index_k is post-RoPE, or IndexKeyInput for a fused norm/RoPE/cache write.
+        Neither path modifies the input rows.
         Both writes are enqueued on the model stream before returning; later
         attention on that stream observes both fields, without a host sync.
         """
@@ -1035,7 +1046,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
 
         gid = self._owner_group(owner)
         ratio = self.spec.compress_ratios[owner]
-        if main_kv.shape != (positions.numel(), 512) or index_k.shape != (
+        index_values = (
+            index_k.values if isinstance(index_k, dsv41.IndexKeyInput) else index_k
+        )
+        if main_kv.shape != (positions.numel(), 512) or index_values.shape != (
             positions.numel(),
             128,
         ):
@@ -1053,9 +1067,41 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 positions + (ratio - 1) < floor[request_indices.clamp_min(0)]
             )
             slots = slots.masked_fill(below, -1)
-        dsv41.cache_scatter(
-            main_kv, self.cache_pool.global_kv(owner), slots, self.global_format
-        )
+        if main_rope_cache is None:
+            dsv41.cache_scatter(
+                main_kv, self.cache_pool.global_kv(owner), slots, self.global_format
+            )
+        else:
+            if self.global_format != "global":
+                raise ValueError(
+                    "Fused global RoPE requires the global FP4 cache format"
+                )
+            dsv41.global_rope_scatter(
+                main_kv,
+                positions,
+                main_rope_cache,
+                self.cache_pool.global_kv(owner),
+                slots,
+            )
+        if isinstance(index_k, dsv41.IndexKeyInput):
+            if self.index_format == "index":
+                dsv41.index_key_norm_rope_scatter(
+                    index_k.values,
+                    index_k.norm_weight,
+                    positions,
+                    index_k.cos_sin_cache,
+                    index_k.norm_eps,
+                    self.cache_pool.index_k(owner),
+                    slots,
+                )
+                return
+            index_k = dsv41.index_key_norm_rope(
+                index_k.values,
+                index_k.norm_weight,
+                positions,
+                index_k.cos_sin_cache,
+                index_k.norm_eps,
+            )
         dsv41.cache_scatter(
             index_k, self.cache_pool.index_k(owner), slots, self.index_format
         )
@@ -1084,10 +1130,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
     ):
         """Select/reuse request-local global rows; return (physical slots, lengths).
 
-        Index Q is post-RoPE BF16 [T,Hindex,128]; weights are already scaled as
-        in the model reference. Supply both only at an index source, otherwise
-        None. A sharded indexer must supply its head-reduction process group;
-        replicated indexer heads supply None. Candidates survive Reindex updates.
+        Index Q is post-RoPE BF16 [T,Hindex,128] with already-scaled weights,
+        or IndexQueryInput containing pre-RoPE BF16 values, paired with
+        unscaled BF16 weights. Preprocessing applies its weight_scale once.
+        Supply both only at an index source, otherwise None. A sharded indexer
+        must supply its head-reduction process group; replicated indexer heads
+        supply None. Candidates survive Reindex updates.
         Decode graph Full sources use the refresh's full query window; consumers
         may reorder/subset it. A subset Reindex and its Reuse consumers share the
         same window tensors. Other source windows retain eager coverage validation.
@@ -1432,10 +1480,14 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         softmax_scale: float,
         index_process_group,
         swa_rope_cache,
+        swa_norm_weight,
+        swa_norm_eps,
     ) -> torch.Tensor:
         """Joint SWA/global attention; returns BF16 [T,Hlocal,512], BEFORE inverse RoPE.
 
-        q and swa_kv are post-RoPE [T,Hlocal,512] / [T,512]. Each SWA input
+        q and swa_kv are [T,Hlocal,512] / [T,512]. q is post-RoPE; SWA can
+        defer RMSNorm and RoPE using swa_norm_weight/eps and swa_rope_cache.
+        Each SWA input
         corresponds to the explicit query positions/requests. Global memory is
         written separately by write_global; index inputs follow select_global.
         Prefill SWA writes follow all old-prefix reads, using only LCM-retained
@@ -1515,6 +1567,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     softmax_scale=softmax_scale,
                     index_process_group=index_process_group,
                     swa_rope_cache=swa_rope_cache,
+                    swa_norm_weight=swa_norm_weight,
+                    swa_norm_eps=swa_norm_eps,
                 )
             return out
         if n == 0:
@@ -1561,6 +1615,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     locations,
                     self.swa_format,
                     None,
+                    swa_norm_weight,
+                    swa_norm_eps,
                 )
             swa_slots, swa_lens = (
                 (metadata.swa_read_slots, metadata.swa_read_lens)
@@ -1604,6 +1660,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 locations,
                 self.swa_format,
                 current,
+                swa_norm_weight,
+                swa_norm_eps,
             )
         logical_rows = None
         if owner >= 0:

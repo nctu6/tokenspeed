@@ -50,11 +50,14 @@ the block's ids, positions, HC mix and workspace addressing.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.attention.dsv41._inputs import IndexKeyInput, IndexQueryInput
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
+    "IndexKeyInput",
+    "IndexQueryInput",
     "decode_rows",
     "decode_window",
     "global_slots",
@@ -64,6 +67,10 @@ __all__ = [
     "cache_scatter",
     "cache_gather",
     "index_q_quantize",
+    "index_key_norm_rope",
+    "index_key_norm_rope_scatter",
+    "index_query_rope_weights",
+    "index_query_rope_quant",
     "selected_attention",
     "new_attention_schedule",
     "index_score",
@@ -72,6 +79,7 @@ __all__ = [
     "compressor_pool",
     "compressor_metadata",
     "swa_rope_scatter",
+    "global_rope_scatter",
     "rope_inplace",
     "rope_pad_query",
     "dspark_rows",
@@ -90,6 +98,82 @@ def _kernel(mode: str, x: torch.Tensor):
         traits=None,
         solution=None,
         override=None,
+    )
+
+
+def index_key_norm_rope(values, weight, positions, cos_sin_cache, eps):
+    """Normalize BF16 [T,128] index keys and rotate their interleaved tail.
+
+    weight is contiguous BF16 [128], positions is integer [T], cos_sin_cache
+    is FP32 [max_position, rotary_dim], and eps is positive. Negative positions
+    use row zero. Returns fresh contiguous BF16 [T,128] rows, preserving the
+    inputs and the intermediate BF16 normalization rounding before RoPE.
+    """
+    return _kernel("index_key_norm_rope", values)(
+        values, weight, positions, cos_sin_cache, eps
+    )
+
+
+def global_rope_scatter(values, positions, cos_sin_cache, cache, slots):
+    """Rotate BF16 [T,512] global keys and write page-planar FP4 cache rows.
+
+    positions and slots are integer [T]; cos_sin_cache is FP32 [max_position,64].
+    cache is uint8 [pages,64,288]. Negative positions use table row zero; negative
+    and out-of-range slots skip writes. Valid write slots must be unique, and
+    runtime null pages must already map to -1. Returns None, preserves values,
+    and retains the intermediate BF16 rounding before global E2M1/E4M3 packing.
+    """
+    _kernel("global_rope_scatter", values)(
+        values, positions, cos_sin_cache, cache, slots
+    )
+
+
+def index_key_norm_rope_scatter(
+    values, weight, positions, cos_sin_cache, eps, cache, slots
+):
+    """Normalize and rotate BF16 [T,128] keys, then store packed FP4 pages.
+
+    weight is BF16 [128], positions and slots are integer [T], cos_sin_cache
+    is FP32 [max_position, rotary_dim], and eps is positive. cache is the
+    owner's uint8 [pages,64,68] field. Negative/out-of-range slots skip writes;
+    valid slots must be unique and runtime null pages must map to -1. Returns
+    None, preserves inputs and retains BF16 rounding after norm and RoPE.
+    """
+    _kernel("index_key_norm_rope_scatter", values)(
+        values, weight, positions, cos_sin_cache, eps, cache, slots
+    )
+
+
+def index_query_rope_quant(
+    query, head_weights, positions, cos_sin_cache, weight_scale, output_dtype
+):
+    """Rotate and pack BF16 [T,H,128] queries and scale BF16 [T,H] weights.
+
+    positions is integer [T], cos_sin_cache is FP32 [max_position,64], and
+    weight_scale is applied in FP32 then rounded to BF16. output_dtype selects
+    BF16 or FP32 head weights for the scorer. Returns ((uint8 [T,H,64] FP4
+    values, int32 [T,H] E8M0 scale words), weights [T,H]). Inputs are preserved;
+    RoPE retains its BF16 rounding before quantization. Negative positions use
+    table row zero.
+    """
+    return _kernel("index_query_rope_quant", query)(
+        query, head_weights, positions, cos_sin_cache, weight_scale, output_dtype
+    )
+
+
+def index_query_rope_weights(
+    query, head_weights, positions, cos_sin_cache, weight_scale
+):
+    """Rotate BF16 [T,H,128] queries in place and scale BF16 [T,H] weights.
+
+    positions is integer [T] and cos_sin_cache is FP32 [max_position,64].
+    weight_scale is multiplied in FP32 then rounded to BF16. Returns
+    (query, scaled_weights), with fresh contiguous BF16 [T,H] weights and
+    query rotated in place. Head weights are preserved; negative positions
+    use table row zero.
+    """
+    return _kernel("index_query_rope_weights", query)(
+        query, head_weights, positions, cos_sin_cache, weight_scale
     )
 
 
@@ -158,6 +242,8 @@ def swa_rope_scatter(
     slots: torch.Tensor,
     cache_format: str,
     out: torch.Tensor | None,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
 ) -> torch.Tensor | None:
     """Rotate normalized BF16 SWA rows and quantize directly into planar pages.
 
@@ -167,9 +253,18 @@ def swa_rope_scatter(
     declares. Invalid/null slots skip writes. If out is supplied, write all
     quantized/dequantized BF16 [T,512] rows there, including rows outside
     persistent retention. Read old prefixes before this operation.
+    If norm_weight is supplied, normalize and round to BF16 before RoPE.
     """
     _kernel("swa_rope_scatter", values)(
-        values, positions, cos_sin_cache, cache, slots, cache_format, out
+        values,
+        positions,
+        cos_sin_cache,
+        cache,
+        slots,
+        cache_format,
+        out,
+        norm_weight,
+        norm_eps,
     )
     return out
 
@@ -372,7 +467,7 @@ def index_score(
 
 
 def index_topk(
-    index_q: torch.Tensor,
+    index_q: torch.Tensor | IndexQueryInput,
     weights: torch.Tensor,
     index_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -390,8 +485,10 @@ def index_topk(
     """Bounded Full/Reindex scoring, Top-K rows, and optional source candidates.
 
     Args:
-        index_q: Post-RoPE BF16 [T, H, 128], quantized internally (index Q only).
-        weights: BF16/FP32 [T, H], scaled as documented by index_score.
+        index_q: Post-RoPE BF16 [T,H,128], or IndexQueryInput to fuse RoPE and
+            quantization into native scoring's input preparation.
+        weights: BF16/FP32 [T,H], already scaled for a tensor index_q, or
+            unscaled BF16 weights when index_q is IndexQueryInput.
         index_cache: Owner's strided uint8 [pages, 64, 68] index field.
         page_table: Int32/int64 [T, logical_pages], a request table per query.
             Entries address this index field, not the main-KV field. Invalid
@@ -413,6 +510,7 @@ def index_topk(
             [T, candidate_topk], [T]), or None to allocate them.
         solution: Optional registered implementation restriction. Pass None for
             automatic kernel selection.
+
 
     Returns:
         (logical_row_ids, row_lengths, candidate_block_ids, candidate_lengths).
@@ -450,11 +548,12 @@ def index_topk(
 
     # Each target scores the index rows its own cache format stores: FP4 with
     # DeepSelect on Blackwell, FP8 with the CuTe DSL DeepSelect kernel on Hopper.
+    query_values = index_q.values if isinstance(index_q, IndexQueryInput) else index_q
     row_bytes = index_cache.shape[2] if index_cache.ndim == 3 else 0
     shaped = (
-        index_q.is_cuda
+        query_values.is_cuda
         and process_group is None
-        and index_q.shape[1] == 32
+        and query_values.shape[1] == 32
         and index_cache.ndim == 3
         and index_cache.shape[1] == 64
         and index_cache.stride(1) == row_bytes
@@ -476,14 +575,14 @@ def index_topk(
         132: "fp8_scaled",
     }.get(row_bytes, "unknown")
     index_shards = 1
-    index_heads = index_q.shape[1]
+    index_heads = query_values.shape[1]
     if process_group is not None:
         index_shards = torch.distributed.get_world_size(process_group)
         index_heads *= index_shards
     kernel = select_kernel(
         "attention",
         "dsv41_index_topk",
-        format_signature(x=dense_tensor_format(index_q.dtype)),
+        format_signature(x=dense_tensor_format(query_values.dtype)),
         features=None,
         platform=None,
         traits={
@@ -495,6 +594,19 @@ def index_topk(
         solution=solution,
         override=None,
     )
+    if (
+        isinstance(index_q, IndexQueryInput)
+        and kernel.name != "deep_gemm_dsv41_index_topk"
+    ):
+        # Explicit portable/backend overrides still consume every supplied
+        # preprocessing input. Preserve projected Q for other query windows.
+        index_q, weights = index_query_rope_weights(
+            query_values.clone(),
+            weights,
+            index_q.positions,
+            index_q.cos_sin_cache,
+            index_q.weight_scale,
+        )
     return kernel(
         index_q,
         weights,
@@ -988,6 +1100,7 @@ def compressor_metadata(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.dsv41.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsv41._triton.rope  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_select  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_gemm  # noqa: E402,F401

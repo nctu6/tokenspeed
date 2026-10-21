@@ -23,6 +23,7 @@ from unittest.mock import patch
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention import dsv41
+from tokenspeed_kernel.ops.attention.dsv41.triton import _copy_attention_heads
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,
@@ -483,3 +484,24 @@ def test_sparse_index_scores_address_a_cache_whose_scale_plane_passes_four_gigae
     assert (actual[finite] - expected[finite]).abs().max() <= 1e-3 * expected[
         finite
     ].abs().max()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "rows,heads,padded", [(1, 16, 64), (16, 16, 64), (33, 80, 128), (129, 64, 64)]
+)
+def test_padded_copy_and_changed_graph_inputs(rows, heads, padded):
+    x = torch.randn(rows, heads + 2, 512, device="cuda", dtype=torch.bfloat16)[
+        :, :heads
+    ]
+    out = torch.full((rows, padded, 512), 77, device="cuda", dtype=x.dtype)
+    _copy_attention_heads(out, x, None, None)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _copy_attention_heads(out, x, None, None)
+    for _ in range(3):
+        x.normal_()
+        out.fill_(77)
+        graph.replay()
+        torch.testing.assert_close(out[:, :heads], x, rtol=0, atol=0)
+        assert torch.count_nonzero(out[:, heads:]) == 0

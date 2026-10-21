@@ -412,6 +412,7 @@ def test_selected_logits_do_not_gather_original_input_indices():
     )
     hidden = torch.arange(16).view(2, 8).float()
     processor = SimpleNamespace(
+        _query_shard=lambda metadata: None,
         _resolve_logits_layout_plan=lambda *args: None,
         _get_logits=lambda h, *args, **kwargs: h,
         _query_shard=lambda metadata: None,
