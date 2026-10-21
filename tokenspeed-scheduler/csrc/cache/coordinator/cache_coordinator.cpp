@@ -1052,7 +1052,7 @@ void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> co
         return;
     }
     for (const CacheGroup& group : groups_) {
-        if (group.Spec().kind == AttnKind::kMambaState) {
+        if (group.Spec().attn_kind == AttnKind::kState) {
             continue;
         }
         // A tail hash holds fewer blocks than a page; Contains filters.

@@ -347,10 +347,23 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // rather than a capacity one. The P role is exempt: it never decodes
     // locally and never retracts, so there is no decode room to prepay.
     const std::int32_t headroom = config_.role == Role::kP ? 0 : request->AdmissionHeadroom(kRetractionSafeSteps);
+    // Sliding-window prepay (docs/design/scheduler.md §1). A remote landing
+    // has no later local chunk: the peer fills the whole prompt.
+    const std::int32_t later_chunk_tokens = source == fsm::PrefillSource::kLocal ? unscheduled - tokens_this_round : 0;
+    // Only beside another page holder, so a request alone asks for what
+    // max_single_request_tokens counts. Any holder, not only one sharing the
+    // hit: hit pages may become shared after this admission.
+    const bool others_hold_pages = (hit_tokens > 0 || later_chunk_tokens > 0) &&
+                                   std::ranges::any_of(requests_, [request](const std::unique_ptr<Request>& other) {
+                                       return other.get() != request && other->HoldsPages();
+                                   });
     const PrefillReserve reserve{
         .decode_input_tokens = decode_input_tokens,
         .completes_prefill = completes_prefill,
         .prompt_headroom_tokens = headroom > 0 ? unscheduled - tokens_this_round + headroom : 0,
+        .swa_hit_tokens = others_hold_pages ? hit_tokens : 0,
+        .swa_later_chunk_tokens = others_hold_pages ? later_chunk_tokens : 0,
+        .swa_prompt_after_hit_tokens = unscheduled,
     };
     std::vector<BlockTable> tables(static_cast<std::size_t>(coordinator_.NumGroups()));
     // Every State table starts as [checkpoint or zero state, fresh] for a
@@ -629,18 +642,18 @@ std::optional<Scheduler::PrefillAdmission> Scheduler::schedulePrefillCandidate(
 // that abort rather than in a wait that could deadlock once every resident
 // needs a page.
 //
-// Exempt in both tiers: a request whose reserve already covers its whole
-// generation -- retracting it frees exactly what its readmission must take
-// back, pure thrash -- and it is not aborted either: it completes on its own
-// reserve and frees its pages then. Excluded by state: Retracted, Restoring,
-// RemotePrefilling. Transient obstacles (a forward still out, a PD transfer
-// pin) do NOT redirect the choice; the caller waits for the chosen victim to
-// quiesce rather than sacrificing a worse-ranked request.
-Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candidates,
-                                                 bool drop_exempt_last_resort) const {
-    const auto retractable = [](const Request& request) {
+// Exempt in both tiers, unless `ignore_exemption` is set (the empty-round
+// retraction of maybeRetractForCapacity): a request whose reserve already
+// covers its whole generation -- retracting it frees exactly what its
+// readmission must take back, pure thrash -- and it is not aborted either: it
+// completes on its own reserve and frees its pages then. Excluded by state:
+// Retracted, Restoring, RemotePrefilling. Transient obstacles (a forward still
+// out, a PD transfer pin) do NOT redirect the choice; the caller waits for the
+// chosen victim to quiesce rather than sacrificing a worse-ranked request.
+Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const {
+    const auto retractable = [ignore_exemption](const Request& request) {
         return request.IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>() &&
-               !request.ReserveCoversGeneration(kRetractionSafeSteps);
+               (ignore_exemption || !request.ReserveCoversGeneration(kRetractionSafeSteps));
     };
     // Rank first, then probe the host fit in rank order, so the probe (which
     // hashes the candidate's completed pages) runs for as few candidates as
@@ -669,72 +682,7 @@ Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candid
             return VictimChoice{.victim = request, .image_fits = true};
         }
     }
-    if (newest != nullptr) {
-        return VictimChoice{.victim = newest, .image_fits = false};
-    }
-    if (!drop_exempt_last_resort) {
-        // Every retractable candidate is reserve-exempt and the blocker is a
-        // waiting prompt, not a stuck resident: the pool drains as the exempt
-        // residents finish on their own reserve and admission back-pressure
-        // holds the prompt until it fits. Sacrificing a covered resident here
-        // would abort a request the reserve path (scheduler.md §1.4) is about
-        // to satisfy -- so no victim, the caller waits.
-        return VictimChoice{.victim = nullptr, .image_fits = false};
-    }
-    // Last resort when every retractable candidate was excluded above by the
-    // ReserveCoversGeneration() exemption (its reserve is assumed to cover its
-    // whole remaining generation, so it would finish on the pages it holds and
-    // free them then). That assumption breaks once the device cache is full
-    // and such a request still needs its NEXT page to decode: it cannot get
-    // one, cannot produce a token, cannot finish, and cannot free a page.
-    // With every resident in that state nothing is ever retracted and the
-    // engine wedges in empty rounds (observed at gemma-4 C=512:
-    // decoding=128 reserve_exempt=128 inflight=0).
-    //
-    // Offer the newest resident (prefer a quiescent one) as the victim.
-    Request* fallback = nullptr;
-    Request* fallback_quiescent = nullptr;
-    for (Request* request : candidates) {
-        if (!request->IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>()) {
-            continue;
-        }
-        fallback = request;  // submission order; newest wins
-        if (request->ResultsInFlight() == 0 && !pdTransferInFlight(*request)) {
-            fallback_quiescent = request;
-        }
-    }
-    Request* chosen = fallback_quiescent != nullptr ? fallback_quiescent : fallback;
-    if (chosen == nullptr) {
-        return VictimChoice{.victim = nullptr, .image_fits = false};
-    }
-    // Retracting to host is reversible -- the victim is imaged and restored,
-    // losing no work -- so when a snapshot blob slot is free and the image
-    // fits, drop the exemption freely: this is also the healthy high-
-    // concurrency churn (retract-and-grant keeps the engine full as covered
-    // decodes make room for blocked ones; at gemma-4 C=512 it runs ~450 times
-    // with zero aborts).
-    if (snapshot_slots_.AvailableSlots() > 0 && imageFits(*chosen)) {
-        return VictimChoice{.victim = chosen, .image_fits = true};
-    }
-    // No image fits: the only way to free the page is an ABORT (lossy -- the
-    // victim fails toward its client). Do that only to break a genuine wedge,
-    // never while a resident can still decode in place: if some resident's
-    // reserve covers its next step (no new block needed in any group) it will
-    // produce a token and free pages on its own, so wait rather than abort a
-    // covered request the reserve path (scheduler.md §1.4) is about to satisfy.
-    // This O(residents x groups) scan runs only here -- the rare round with no
-    // ordinary victim, a stuck-resident blocker, and no host room to image --
-    // never on the steady decode path.
-    const bool any_resident_can_grow_in_place =
-        std::ranges::any_of(candidates, [this](const Request* request) {
-            return request->IsAnyOf<fsm::Decoding, fsm::PrefillDone>() &&
-                   canConsumeReservedTokensInPlace(coordinator_, request->BlockTablesRef(),
-                                                   config_.decode_input_tokens, request->NumComputedTokens());
-        });
-    if (any_resident_can_grow_in_place) {
-        return VictimChoice{.victim = nullptr, .image_fits = false};
-    }
-    return VictimChoice{.victim = chosen, .image_fits = false};
+    return VictimChoice{.victim = newest, .image_fits = false};
 }
 
 // The first half of a retraction: hashes the prefix pages the victim
@@ -866,7 +814,10 @@ void Scheduler::onImageDoesNotFit(Request& victim, ImageShortfall shortfall, Pla
 // in the same plan build: the freed capacity reaches the request it was
 // freed for within this very round, so there is never a free page waiting
 // for whoever asks first next round -- which is what used to require a
-// cross-round capacity barrier.
+// cross-round capacity barrier. The one exception is the empty-round
+// retraction, when the round runs nothing: its freed pages go first to the
+// round's decodes, none of which got a page, and to the blocker only when
+// none fits.
 //
 // The victim's own device blocks return to the pool immediately; both legs
 // of the image copy are ordered on the forward thread's stream BEFORE
@@ -911,19 +862,23 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
     }
 
     while (true) {
-        // Allow the exempt last resort only when the blocker is a resident
-        // stuck on its own next page (Decoding/PrefillDone): freeing a page is
-        // the only thing that can unblock it. A Submitted-prompt blocker is
-        // served by admission back-pressure (scheduler.md §1.4), never by
-        // sacrificing a covered resident. This is a cheap gate; chooseVictim
-        // still confirms the engine is genuinely wedged (no resident can
-        // decode in place) before it drops any exemption, and pays for that
-        // scan only on the rare round that reaches the last resort.
-        const bool blocker_is_stuck_resident = blocker->IsAnyOf<fsm::Decoding, fsm::PrefillDone>();
-        const VictimChoice choice = chooseVictim(candidates, blocker_is_stuck_resident);
+        VictimChoice choice = chooseVictim(candidates, /*ignore_exemption=*/false);
+        // A finished request whose last forward is still out frees its pages
+        // when that forward lands (settleFinishedRequests), so a round that
+        // waits for it is not empty either.
+        const bool empty_round =
+            choice.victim == nullptr && build.operations.empty() && build.snapshot_restores.empty() &&
+            build.remote_prefill.empty() && build.remote_decode.empty() &&
+            std::ranges::none_of(requests_,
+                                 [](const std::unique_ptr<Request>& request) { return request->Is<fsm::Finishing>(); });
+        if (empty_round) {
+            // Nothing is retractable under the exemption and the round runs
+            // nothing: the empty-round retraction (docs/design/scheduler.md §2).
+            choice = chooseVictim(candidates, /*ignore_exemption=*/true);
+        }
         Request* victim = choice.victim;
         if (victim == nullptr) {
-            return;  // everything resident is exempt; only a completion can free capacity
+            return;  // nothing to retract, or this round's work will free capacity when it completes
         }
         if (victim->ResultsInFlight() > 0 || pdTransferInFlight(*victim)) {
             // The victim is chosen but not quiescent: a forward's KV write or
@@ -938,7 +893,10 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             // waiting prompt -- granting it back to the victim's own
             // readmission is the loop the grant exists to break. With nobody
             // to serve, retracting it would only cost the image's copies and
-            // its restore: it waits for a completion instead.
+            // its restore: it waits for a completion instead. An empty round
+            // has no completion to wait for, and its decodes take the freed
+            // pages first (below): there the victim is retracted whenever a
+            // decode is left to serve.
             const auto blocked = std::ranges::find_if(feedback.capacity_blocked, [victim](Request* request) {
                 // An earlier iteration may have retracted one of them.
                 return request != victim &&
@@ -946,11 +904,14 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             });
             const auto waiting = std::ranges::find_if(
                 candidates, [victim](Request* request) { return request != victim && request->Is<fsm::Submitted>(); });
+            const bool decode_left = std::ranges::any_of(candidates, [victim](Request* request) {
+                return request != victim && request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>();
+            });
             if (blocked != feedback.capacity_blocked.end()) {
                 blocker = *blocked;
             } else if (waiting != candidates.end()) {
                 blocker = *waiting;
-            } else {
+            } else if (!empty_round || !decode_left) {
                 return;
             }
         }
@@ -968,6 +929,16 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         }
         if (shortfall) {
             onImageDoesNotFit(*victim, *shortfall, build);
+        }
+
+        if (empty_round) {
+            // The round's decodes, none of which got a page, take the freed
+            // pages before the blocker; a victim that is still the blocker had
+            // nobody else to serve (docs/design/scheduler.md §2).
+            scheduleDecodeBatch(feedback, build, candidates);
+            if (build.pushed_decode || blocker == victim) {
+                return;
+            }
         }
         if (build.Full(config_.max_batch_size)) {
             return;
@@ -1248,13 +1219,13 @@ void Scheduler::capPrefillBesideDecodes(PlanBuild& build) const {
             ++decodes;
         }
     }
-    build.token_budget = std::min(build.token_budget, std::max(mixed_ref_chunk_, build.state_prefill_reserve));
+    build.token_budget = std::min(build.token_budget, std::max(mixed_ref_chunk_, build.pending_prefill_reserve));
     if (decodes <= mixed_decode_ref_) {
         return;
     }
     const std::int64_t share = static_cast<std::int64_t>(mixed_ref_chunk_) * mixed_decode_ref_ / decodes;
     const std::int32_t cap = std::max({static_cast<std::int32_t>(share), mixed_prefill_floor_,
-                                       build.state_prefill_reserve});
+                                       build.pending_prefill_reserve});
     build.token_budget = std::min(build.token_budget, cap);
 }
 
@@ -1272,7 +1243,7 @@ std::int32_t Scheduler::prefillBudgetFor(const Request& request, const PlanBuild
     if (left <= mixed_long_chunk_) {
         return build.token_budget;
     }
-    return std::min(build.token_budget, std::max(mixed_long_chunk_, build.state_prefill_reserve));
+    return std::min(build.token_budget, std::max(mixed_long_chunk_, build.pending_prefill_reserve));
 }
 
 void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build,

@@ -366,7 +366,8 @@ private:
     // fires only when no prefill progressed and admission failed. Retracts
     // victims and RETRIES the blocked admission in the same plan build, so
     // the freed capacity reaches the request it was freed for -- never a
-    // free page waiting for whoever asks first next round.
+    // free page waiting for whoever asks first next round. The empty-round
+    // retraction offers it to the round's failed decodes first.
     void maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                  std::vector<WriteBackOperation>& write_back_operations);
     // Who gives way, and whether it can be imaged. `victim` is nullptr when
@@ -377,14 +378,8 @@ private:
         Request* victim{nullptr};
         bool image_fits{false};
     };
-    // `drop_exempt_last_resort` lets the choice sacrifice an otherwise-exempt
-    // resident (ReserveCoversGeneration true) when every candidate is exempt
-    // and the blocker is itself a resident that cannot progress -- the
-    // capacity-deadlock backstop. The caller passes false while a waiting
-    // prompt is the blocker, where admission back-pressure (not a sacrifice)
-    // is the correct response. No default: the two paths differ in whether a
-    // covered request may be aborted.
-    VictimChoice chooseVictim(std::span<Request* const> candidates, bool drop_exempt_last_resort) const;
+    // `ignore_exemption`: the empty-round retraction (docs/design/scheduler.md §2).
+    VictimChoice chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const;
     // The first half of a retraction: publishes the pages the victim completed
     // since its last admission (see forward.cpp).
     void publishCompletedPrefix(Request& victim);
@@ -417,6 +412,10 @@ private:
     void maybeForceRetraction(PlanBuild& build, std::span<Request* const> candidates,
                               std::vector<WriteBackOperation>& write_back_operations);
 
+    // The stall diagnostic (docs/design/scheduler.md §2), called once per
+    // NextExecutionPlan. It never changes a plan.
+    void trackStalledRounds(std::size_t num_live_requests, bool plan_is_empty);
+
     // One plan-building grammar per engine role: the roles share the
     // scheduling mechanism (schedulePrefill / scheduleDecode / admission)
     // and the two phase helpers below, but compose genuinely different
@@ -432,7 +431,6 @@ private:
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
-
     // Length-aware prefill admission (see scheduleShortPromptsAhead): prompts
     // of at most short_prompt_tokens_ may be admitted ahead of a resident
     // chunked prefill with more than that left, as long as the round keeps at
@@ -481,6 +479,10 @@ private:
     // retracted.
     std::int64_t plan_calls_{0};
     std::string forced_victim_id_;
+
+    // Consecutive stalled rounds (trackStalledRounds); 0 after any round
+    // that schedules work or leaves work in flight.
+    std::int64_t stalled_rounds_{0};
 
     // Submission order -- the FIFO every scheduling phase walks, identical
     // on every rank because the mirrored schedulers receive identical
