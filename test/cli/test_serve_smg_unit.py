@@ -1096,6 +1096,59 @@ async def test_run_smg_wires_metrics_port_into_engine_spawn(capsys):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pinned", [None, 9123])
+async def test_run_smg_control_port_avoids_the_next_gateway_port(pinned):
+    """Unpinned, the control server gets a drawn port, never user_port + 1."""
+    engine = _make_proc(returncode=0)
+    gateway = _make_proc(returncode=0)
+
+    startup_done = asyncio.Event()
+
+    async def wait_then_zero():
+        await startup_done.wait()
+        return 0
+
+    engine.wait = AsyncMock(side_effect=wait_then_zero)
+    gateway.wait = AsyncMock(side_effect=wait_then_zero)
+
+    async def probe_then_schedule_release(*args, **kwargs):
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.05, startup_done.set)
+
+    opts = OrchestratorOpts(
+        engine_startup_timeout=10, gateway_startup_timeout=10, control_port=pinned
+    )
+    control_mock = AsyncMock(return_value=True)
+    with patch(
+        "tokenspeed.cli.serve_smg.spawn_engine", AsyncMock(return_value=engine)
+    ), patch(
+        "tokenspeed.cli.serve_smg.spawn_gateway", AsyncMock(return_value=gateway)
+    ), patch(
+        "tokenspeed.cli.serve_smg.wait_grpc_serving", AsyncMock()
+    ), patch(
+        "tokenspeed.cli.serve_smg.wait_http_ready",
+        side_effect=probe_then_schedule_release,
+    ), patch(
+        "tokenspeed.cli.serve_smg.terminate_then_kill", AsyncMock()
+    ), patch(
+        "tokenspeed.cli.serve_smg._free_port_avoiding_ephemeral_range",
+        return_value=41234,
+    ), patch(
+        "tokenspeed.cli.serve_smg._start_control_server", control_mock
+    ):
+        rc = await run_smg(
+            engine_args=["--model", "/tmp/x"],
+            gateway_args=["--model", "/tmp/x"],
+            opts=opts,
+            user_host="127.0.0.1",
+            user_port=8000,
+        )
+
+    assert rc == 0
+    assert control_mock.await_args.kwargs["port"] == (pinned or 41234)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "metric_args",
     [

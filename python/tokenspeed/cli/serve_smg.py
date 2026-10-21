@@ -980,8 +980,14 @@ async def run_smg(
         sys.stdout.write(f"ts serve ready on http://{user_host}:{user_port}\n")
         sys.stdout.flush()
 
+        # Drawn like the metrics port rather than defaulting to user_port + 1:
+        # that is the next instance's gateway port when several ts serve
+        # instances share a host on consecutive ports, so the first to bind
+        # it broke the other's gateway.
         control_port = (
-            opts.control_port if opts.control_port is not None else user_port + 1
+            opts.control_port
+            if opts.control_port is not None
+            else _free_port_avoiding_ephemeral_range()
         )
         control_ok = await _start_control_server(
             gateway_url=f"http://{user_host}:{user_port}",
