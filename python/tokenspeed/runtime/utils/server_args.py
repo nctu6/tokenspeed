@@ -991,11 +991,12 @@ class ServerArgs:
             # decoding but silently wrong for any serving deployment where
             # requests carry sampling params, since the model collapses into
             # repetition-mode loops within a few hundred steps. Default to the
-            # sampling-respecting backend on NVIDIA where flashinfer is
-            # available, fall back to greedy elsewhere; users can still opt
-            # into greedy explicitly via ``--sampling-backend greedy``.
+            # sampling-respecting backend on NVIDIA and Ascend; users can
+            # still opt into greedy explicitly via ``--sampling-backend greedy``.
             if current_platform().is_nvidia:
                 self.sampling_backend = "flashinfer"
+            elif current_platform().is_npu:
+                self.sampling_backend = "ascend_full"
             else:
                 self.sampling_backend = "greedy"
 
@@ -1441,6 +1442,16 @@ class ServerArgs:
         self.kv_offload_config = dict(options, layers=list(layers))
 
     def resolve_speculative_decoding(self):
+        if self.speculative_algorithm == "DUMMY":
+            if (
+                self.speculative_draft_model_path is not None
+                or self.draft_model_path_use_base
+            ):
+                raise ValueError("DUMMY drafting does not accept a draft model path")
+            if int(self.speculative_num_draft_tokens) <= 1:
+                raise ValueError(
+                    "DUMMY drafting requires --speculative-num-draft-tokens > 1"
+                )
         if self.synthetic_acceptance_length is not None:
             length = self.synthetic_acceptance_length
             if (
@@ -3199,6 +3210,7 @@ class ServerArgs:
                 "flashinfer_full",
                 "triton",
                 "triton_full",
+                "ascend_full",
             ],
             default=ServerArgs.sampling_backend,
             help="Sampling backend. "
@@ -3211,6 +3223,7 @@ class ServerArgs:
             "via the softmax+renorm+min_p kernel sequence. "
             "'triton_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
             "with Triton Gumbel-Max for single-step sampling. "
+            "'ascend_full': graph-safe Ascend top-k/top-p/min-p sampling and chain verify. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
             "Finite top_k values must be < 128 or -1.",
         )
@@ -3397,7 +3410,7 @@ class ServerArgs:
             "--speculative-algorithm",
             type=str,
             help="Speculative algorithm. In-tree: EAGLE3, MTP, DFLASH, "
-            "DSPARK; plugins may register more (validated after plugin "
+            "DSPARK, DUMMY; plugins may register more (validated after plugin "
             "discovery).",
         )
         parser.add_argument(

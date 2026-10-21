@@ -1199,7 +1199,8 @@ def _set_mla_kv_buffer_kernel(
     total_dim = nope_dim + rope_dim
     mask = offs < total_dim
     if write_mask_ptr is not None:
-        mask &= tl.load(write_mask_ptr + pid_loc)
+        # Some backends load torch.bool storage as a byte; masks must be int1.
+        mask &= tl.load(write_mask_ptr + pid_loc).to(tl.int1)
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = (
@@ -1273,7 +1274,9 @@ def _set_mla_kv_buffer_per_loc_kernel(
     loc_mask = loc_indices < n_loc
     locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
     if write_mask_ptr is not None:
-        loc_mask &= tl.load(write_mask_ptr + loc_indices, mask=loc_mask, other=False)
+        loc_mask &= tl.load(
+            write_mask_ptr + loc_indices, mask=loc_mask, other=False
+        ).to(tl.int1)
 
     nope_offs = tl.arange(0, nope_dim)
     src_nope = tl.load(
@@ -2984,7 +2987,7 @@ def _index_k_scatter_kernel(
     d = tl.arange(0, BLOCK_HD)
     owned = tl.full((), True, tl.int1)
     if HAS_WRITE_MASK:
-        owned = tl.load(write_mask_ptr + t)
+        owned = tl.load(write_mask_ptr + t).to(tl.int1)
     hd_mask = (d < HD) & owned
     fp8_dst = page * page_bytes + slot * HD + d
     tl.store(

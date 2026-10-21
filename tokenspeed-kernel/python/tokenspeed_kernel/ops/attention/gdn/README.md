@@ -20,6 +20,13 @@ cache, invalidation after source changes, and both launch orders. Runtime GDN
 tests additionally check CUDA Graph dependency edges and exact replay results
 for decode, MTP, BF16 state, and prefill.
 
+## Chain verification
+
+ReplaySSM chains use chunked verification on Blackwell for 13–16 tokens and
+at least 24 (request, value-head) states. Other shapes and platforms retain
+step-by-step verification. `test/runtime/test_gdn_verify_policy.py` checks this
+selection and its boundaries without launching device kernels.
+
 ## Variable prefill lengths
 
 The Triton L2-normalization fallback uses a runtime token count. The launch

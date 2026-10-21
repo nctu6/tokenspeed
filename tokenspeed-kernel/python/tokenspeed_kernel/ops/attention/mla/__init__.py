@@ -42,6 +42,24 @@ from tokenspeed_kernel.signature import (
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 
 
+def mla_prolog_available() -> bool:
+    """Whether the optional Ascend Lite MLA prolog is available."""
+    if not current_platform().is_npu:
+        return False
+    from tokenspeed_kernel_npu.ops.mla_prolog import mla_prolog_available as available
+
+    return available()
+
+
+def mla_prolog(*args, **kwargs) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Run the Ascend Lite MLA prolog when its input is eligible."""
+    if not current_platform().is_npu:
+        raise NotImplementedError("Lite MLA prolog is only available on Ascend")
+    from tokenspeed_kernel_npu.ops.mla_prolog import mla_prolog as npu_mla_prolog
+
+    return npu_mla_prolog(*args, **kwargs)
+
+
 # One UE8M0 scale per 32 consecutive head_dim elements (MXFP8).
 MXFP8_ATTENTION_BLOCK_SCALE = MXFP8_BLOCK_SCALE
 
@@ -1318,6 +1336,9 @@ import tokenspeed_kernel.ops.attention.mla.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.tokenspeed_mla  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.gluon  # noqa: E402,F401
+
+if current_platform().is_npu:
+    import tokenspeed_kernel.ops.attention.mla.ascend  # noqa: E402,F401
 
 # isort: on
 

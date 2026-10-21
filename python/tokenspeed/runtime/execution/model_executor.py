@@ -624,7 +624,14 @@ class ModelExecutor:
             # already happened in create_model_runner, right after both
             # models loaded. Here only the drafter instance is built and
             # wired to the target.
-            DrafterImpl = get_drafter_impl(config.spec_algo, draft_model_runner.model)
+            if config.spec_algo != "DUMMY" and draft_model_runner is None:
+                raise ValueError(
+                    f"{config.spec_algo} speculative decoding requires a draft model"
+                )
+            DrafterImpl = get_drafter_impl(
+                config.spec_algo,
+                None if draft_model_runner is None else draft_model_runner.model,
+            )
             self.drafter = DrafterImpl(
                 spec_num_tokens=config.spec_num_tokens,
                 spec_num_steps=config.spec_num_steps,
@@ -1116,6 +1123,8 @@ class ModelExecutor:
         count lets the tuner enumerate every smaller bucket, exactly as the
         target's prefill does for the target experts.
         """
+        if self.drafter.draft_model_runner is None:
+            return
         from tokenspeed.runtime.layers.moe.expert import MoELayer
 
         tuned: set[tuple] = set()
@@ -1860,7 +1869,7 @@ class ModelExecutor:
             # each as the per-rank token counts sizing its collectives
             # (idle_forward_global_num_tokens); every step runs the IDLE forward
             # over an empty window with its own spec_step_idx.
-            if self.drafter is not None:
+            if self.drafter is not None and self.drafter.draft_model_runner is not None:
                 # A draft model that reads request-token history takes the view
                 # on every forward; the idle rank hands it an empty one, as the
                 # target's idle forward above does.
