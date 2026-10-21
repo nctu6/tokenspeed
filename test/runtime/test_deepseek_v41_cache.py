@@ -1199,6 +1199,7 @@ def test_pd_contract_plan_and_manifest():
         request_row=1,
         prefix_len=prefix_len,
         prompt_len=prompt_len,
+        state_prefix_cached=False,
     )
     blocks = {group.group_id: group.block_ids for group in manifest.groups}
     specs = {spec.group_id: spec for spec in contract.group_specs}
