@@ -117,6 +117,7 @@ _CACHE_LAYER_VIEW_ARCHITECTURES = frozenset(
     {
         "NemotronHForCausalLM",
         "NemotronH_Nano_Omni_Reasoning_V3",
+        "NemotronH_Omni_Reasoning_V3",
     }
 )
 
@@ -1628,6 +1629,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Gemma4ForConditionalGeneration",
         "NemotronH_Nano_Omni_Reasoning_V3",
         "MuseSparkForConditionalGeneration",
+        "NemotronH_Omni_Reasoning_V3",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
 
