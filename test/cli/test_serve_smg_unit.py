@@ -27,7 +27,10 @@ import json
 import os
 import signal
 import sys
+from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
+from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -47,6 +50,8 @@ from tokenspeed.cli.serve_smg import (
     INKLING_TOOL_CALL_PARSER,
     KIMI_K3_REASONING_PARSER,
     KIMI_K3_TOOL_CALL_PARSER,
+    MUSE_SPARK_REASONING_PARSER,
+    MUSE_SPARK_TOOL_CALL_PARSER,
     _add_metrics_port,
     _add_rl_control_port,
     _args_with_default_model_parsers,
@@ -63,6 +68,7 @@ from tokenspeed.cli.serve_smg import (
     _is_deepseek_v4_model,
     _is_inkling_model,
     _is_kimi_k3_model,
+    _is_muse_spark_model,
     _prewarm_hf_tokenizer,
     _set_default_grpc_max_message_bytes,
     _template_tokenizer,
@@ -155,6 +161,7 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "--disable-circuit-breaker",
         "--disable-retries",
         "--disable-load-monitoring",
+        "--disable-health-check",
         "--policy",
         "passthrough",
         "--tokenizer-cache-enable-l0",
@@ -280,6 +287,7 @@ def test_smg_disable_flags_appended_when_absent():
         "--disable-circuit-breaker",
         "--disable-retries",
         "--disable-load-monitoring",
+        "--disable-health-check",
     ]
 
 
@@ -293,6 +301,7 @@ def test_smg_disable_flags_not_duplicated():
         "--disable-circuit-breaker",
         "--disable-retries",
         "--disable-load-monitoring",
+        "--disable-health-check",
     ]
 
 
@@ -302,11 +311,12 @@ def test_smg_disable_defaults_turn_off_load_monitoring():
     assert gateway_args.count("--disable-load-monitoring") == 1
 
 
-def test_smg_disable_flag_set_covers_all_three():
+def test_smg_disable_flag_set_covers_single_worker_safety_defaults():
     assert _DEFAULT_SMG_DISABLE_FLAGS == (
         "--disable-circuit-breaker",
         "--disable-retries",
         "--disable-load-monitoring",
+        "--disable-health-check",
     )
 
 
@@ -318,6 +328,7 @@ def test_cache_aware_policy_keeps_load_monitoring():
     assert "--disable-load-monitoring" not in gateway_args
     assert "--disable-circuit-breaker" in gateway_args
     assert "--disable-retries" in gateway_args
+    assert "--disable-health-check" in gateway_args
 
 
 def test_cache_aware_policy_equals_form_keeps_load_monitoring():
@@ -399,8 +410,88 @@ def test_get_from_args_takes_the_last_occurrence():
     assert _get_from_args(["--port", "8000", "--port", "8413"], "--port") == "8413"
 
 
-def test_deepseek_v4_model_id_gets_default_parsers():
-    model = "deepseek-ai/DeepSeek-V4-Flash"
+def _make_muse_spark_model_dir(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "muse_spark",
+                "architectures": ["MuseSparkForConditionalGeneration"],
+            }
+        )
+    )
+    return str(tmp_path)
+
+
+def _make_deepseek_v4_model_dir(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v4"}))
+    return str(tmp_path)
+
+
+def _make_kimi_k3_model_dir(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "kimi_k3",
+                "architectures": ["KimiK3ForConditionalGeneration"],
+            }
+        )
+    )
+    return str(tmp_path)
+
+
+class _ModelFamily(NamedTuple):
+    """One model family's detector and the parser defaults it injects."""
+
+    name: str
+    model_id: str
+    make_model_dir: Callable[[Path], str]
+    detector: Callable[[str | None], bool]
+    reasoning_parser: str
+    tool_call_parser: str
+
+
+_MODEL_FAMILIES = (
+    _ModelFamily(
+        "muse_spark",
+        "meta-models/Muse-Spark-Open-816B-A42B",
+        _make_muse_spark_model_dir,
+        _is_muse_spark_model,
+        MUSE_SPARK_REASONING_PARSER,
+        MUSE_SPARK_TOOL_CALL_PARSER,
+    ),
+    _ModelFamily(
+        "deepseek_v4",
+        "deepseek-ai/DeepSeek-V4-Flash",
+        _make_deepseek_v4_model_dir,
+        _is_deepseek_v4_model,
+        DEEPSEEK_V4_REASONING_PARSER,
+        DEEPSEEK_V4_TOOL_CALL_PARSER,
+    ),
+    _ModelFamily(
+        "kimi_k3",
+        "moonshotai/Kimi-K3",
+        _make_kimi_k3_model_dir,
+        _is_kimi_k3_model,
+        KIMI_K3_REASONING_PARSER,
+        KIMI_K3_TOOL_CALL_PARSER,
+    ),
+)
+
+
+@pytest.mark.parametrize("family", _MODEL_FAMILIES, ids=lambda f: f.name)
+def test_model_is_detected_from_id_or_local_config(tmp_path, family):
+    assert family.detector(family.model_id)
+    assert family.detector(family.make_model_dir(tmp_path))
+    for other in _MODEL_FAMILIES:
+        if other.model_id != family.model_id:
+            assert not family.detector(other.model_id)
+    assert not family.detector(None)
+
+
+@pytest.mark.parametrize("from_local_config", [False, True], ids=["id", "local_config"])
+@pytest.mark.parametrize("family", _MODEL_FAMILIES, ids=lambda f: f.name)
+def test_model_gets_default_parsers(tmp_path, family, from_local_config):
+    model = family.make_model_dir(tmp_path) if from_local_config else family.model_id
 
     engine_args, gateway_args = _args_with_default_model_parsers(
         ["--model", model],
@@ -411,42 +502,36 @@ def test_deepseek_v4_model_id_gets_default_parsers():
         "--model",
         model,
         "--reasoning-parser",
-        DEEPSEEK_V4_REASONING_PARSER,
+        family.reasoning_parser,
     ]
+    # Order matters: the reasoning parser is appended before the tool parser.
     assert gateway_args == [
         "--model",
         model,
         "--reasoning-parser",
-        DEEPSEEK_V4_REASONING_PARSER,
+        family.reasoning_parser,
         "--tool-call-parser",
-        DEEPSEEK_V4_TOOL_CALL_PARSER,
+        family.tool_call_parser,
     ]
 
 
-def test_deepseek_v4_parser_defaults_preserve_explicit_user_values():
-    model = "deepseek-ai/DeepSeek-V4-Flash"
+@pytest.mark.parametrize("family", _MODEL_FAMILIES, ids=lambda f: f.name)
+def test_model_parser_defaults_preserve_explicit_values(tmp_path, family):
+    model = family.make_model_dir(tmp_path)
+    engine_args = ["--model", model, "--reasoning-parser", "custom_reasoning"]
+    gateway_args = [
+        "--model",
+        model,
+        "--reasoning-parser",
+        "custom_reasoning",
+        "--tool-call-parser",
+        "custom_tools",
+    ]
 
-    engine_args, gateway_args = _args_with_default_model_parsers(
-        ["--model", model, "--reasoning-parser", "none"],
-        [
-            "--model",
-            model,
-            "--reasoning-parser",
-            "none",
-            "--tool-call-parser",
-            "json",
-        ],
+    assert _args_with_default_model_parsers(engine_args, gateway_args) == (
+        engine_args,
+        gateway_args,
     )
-
-    assert engine_args == ["--model", model, "--reasoning-parser", "none"]
-    assert gateway_args == [
-        "--model",
-        model,
-        "--reasoning-parser",
-        "none",
-        "--tool-call-parser",
-        "json",
-    ]
 
 
 def test_deepseek_v4_parser_defaults_fill_missing_parser_only():
@@ -503,73 +588,6 @@ def test_deepseek_v4_default_reasoning_parser_survives_gateway_defaults():
     assert gateway_args.count("--reasoning-parser") == 1
     idx = gateway_args.index("--reasoning-parser")
     assert gateway_args[idx + 1] == DEEPSEEK_V4_REASONING_PARSER
-
-
-def test_local_deepseek_v4_config_is_detected(tmp_path):
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v4"}))
-
-    assert _is_deepseek_v4_model(str(tmp_path))
-
-
-def _make_kimi_k3_model_dir(tmp_path):
-    (tmp_path / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "kimi_k3",
-                "architectures": ["KimiK3ForConditionalGeneration"],
-            }
-        )
-    )
-    return str(tmp_path)
-
-
-def test_kimi_k3_model_is_detected_from_id_or_local_config(tmp_path):
-    assert _is_kimi_k3_model("moonshotai/Kimi-K3")
-    assert _is_kimi_k3_model(_make_kimi_k3_model_dir(tmp_path))
-    assert not _is_kimi_k3_model("deepseek-ai/DeepSeek-V4-Flash")
-    assert not _is_kimi_k3_model(None)
-
-
-def test_kimi_k3_model_gets_default_parsers(tmp_path):
-    model = _make_kimi_k3_model_dir(tmp_path)
-
-    engine_args, gateway_args = _args_with_default_model_parsers(
-        ["--model", model],
-        ["--model", model],
-    )
-
-    assert engine_args == [
-        "--model",
-        model,
-        "--reasoning-parser",
-        KIMI_K3_REASONING_PARSER,
-    ]
-    assert gateway_args == [
-        "--model",
-        model,
-        "--reasoning-parser",
-        KIMI_K3_REASONING_PARSER,
-        "--tool-call-parser",
-        KIMI_K3_TOOL_CALL_PARSER,
-    ]
-
-
-def test_kimi_k3_parser_defaults_preserve_explicit_values(tmp_path):
-    model = _make_kimi_k3_model_dir(tmp_path)
-    engine_args = ["--model", model, "--reasoning-parser", "custom_reasoning"]
-    gateway_args = [
-        "--model",
-        model,
-        "--reasoning-parser",
-        "custom_reasoning",
-        "--tool-call-parser",
-        "custom_tools",
-    ]
-
-    assert _args_with_default_model_parsers(engine_args, gateway_args) == (
-        engine_args,
-        gateway_args,
-    )
 
 
 def _make_inkling_model_dir(tmp_path):
@@ -1545,6 +1563,7 @@ def test_run_smg_from_args_reads_the_template_after_prewarm(tmp_path, monkeypatc
         "--disable-circuit-breaker",
         "--disable-retries",
         "--disable-load-monitoring",
+        "--disable-health-check",
         "--policy",
         "passthrough",
         "--tokenizer-cache-enable-l0",

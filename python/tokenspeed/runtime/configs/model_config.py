@@ -1627,6 +1627,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Gemma3ForConditionalGeneration",
         "Gemma4ForConditionalGeneration",
         "NemotronH_Nano_Omni_Reasoning_V3",
+        "MuseSparkForConditionalGeneration",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
 

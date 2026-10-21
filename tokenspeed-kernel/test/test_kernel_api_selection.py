@@ -297,6 +297,7 @@ def test_residual_family_exports_and_modes():
     expected_exports = {
         "attn_res_fwd",
         "attn_res_fwd_available",
+        "boundary_gathers_mailbox",
         "gated_residual_combine",
         "gated_residual_mix",
         "mhc_apply_pre",
@@ -305,6 +306,9 @@ def test_residual_family_exports_and_modes():
         "mhc_post",
         "mhc_pre",
         "pad_gated_residual_projection_weight",
+        "post_norm_residual_pre_norm",
+        "post_norm_residual_pre_norm_bf16",
+        "residual_gate_coefficients",
     }
     assert set(_residual_pkg.__all__) == expected_exports
     residual_modes = {
@@ -342,6 +346,7 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
     """Only proven same-band overlaps may use specialized priority offsets."""
     registry = KernelRegistry.get()
     expected_offsets = {
+        "gluon_mxfp4_a4w4_ep_deferred_precomputed_moe_apply": Priority.SPECIALIZED + 1,
         "gluon_mxfp4_dynamic_moe_apply": Priority.SPECIALIZED + 1,
         # Prefer the coupled MXFP8 bank over the overlapping A16 EP8 plan.
         "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply": Priority.SPECIALIZED + 1,
@@ -3797,6 +3802,46 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
         registry.clear_cache()
 
     assert plan["apply_kernel_name"] == kernel_name
+
+
+def test_gluon_mxfp4_a4w4_deferred_ep4_traits_select_matching_kernel(
+    mi350_platform: PlatformInfo,
+) -> None:
+    """The deferred A4W4 route path is selected for EP4."""
+    registry = KernelRegistry.get()
+    kernel_name = "gluon_mxfp4_a4w4_ep_deferred_precomputed_moe_apply"
+    if registry.get_by_name(kernel_name) is None:
+        pytest.skip(f"{kernel_name} is unavailable")
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        plan = kernel_moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="silu",
+            requires_deferred_finalize=True,
+            routing_mode="precomputed_topk",
+            a2a_backend="none",
+            ep_size=4,
+            ispp=4096,
+            internal_activation_dtype="mxfp4",
+            with_bias=False,
+            solution="gluon",
+            hidden=8192,
+            swiglu_form="standard",
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=False,
+            combine_order="rank",
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert plan["apply_kernel_name"] == kernel_name
+    assert plan["supports_prequantized_input"] is True
 
 
 def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
