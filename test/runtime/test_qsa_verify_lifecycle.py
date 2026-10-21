@@ -24,10 +24,18 @@ Exercise execution modes with all consumers, then each optional consumer alone.
 The same runner entry also commits ordinary hybrid targets without a Qwen4 root.
 """
 
+import os
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+# CI registration (AST-parsed, runtime no-op).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
@@ -50,16 +58,12 @@ def _runner(
     events = []
     commits = {"recurrent": [], "ple": [], "qsa": []}
     wrapper = object.__new__(ForwardStepRunner)
-    wrapper.config = SimpleNamespace(
-        spec_algo="MTP", max_req_pool_size=8, spec_topk=1
-    )
+    wrapper.config = SimpleNamespace(spec_algo="MTP", max_req_pool_size=8, spec_topk=1)
     wrapper.device = "cpu"
-    wrapper.runtime_states = None
-    wrapper._expert_load_rows = None
     full_backend = object.__new__(AttentionBackend)
     full_backend.device = "cpu"
 
-    def commit_recurrent(accepted_lengths, accepted_path=None):
+    def commit_recurrent(accepted_lengths, *, accepted_path):
         events.append("recurrent")
         commits["recurrent"].append(accepted_lengths.tolist())
 
@@ -129,6 +133,8 @@ def _runner(
     wrapper._prepare_decode_metadata = lambda *args, **kwargs: events.append("metadata")
     wrapper._init_forward_metadata = lambda *args, **kwargs: events.append("metadata")
     wrapper._cuda_graph_key = lambda bs: bs
+    wrapper._prepare_request_token_history_graph_inputs = lambda **kwargs: None
+    wrapper._expert_load_rows = None
     wrapper._graph_debug = False
     wrapper.deepep_adapter = SimpleNamespace(replay=lambda: None)
     result = (
@@ -152,8 +158,6 @@ def _runner(
 
 def _run(wrapper, mode):
     ctx = SimpleNamespace(
-        output_layout=None,
-        query_shard=None,
         attn_backend=wrapper.attn_backend,
         bs=2,
         num_extends=1 if mode.is_mixed() else (2 if mode.is_extend() else 0),
@@ -162,6 +166,8 @@ def _run(wrapper, mode):
         all_decode_or_idle=mode.is_decode(),
         capture_hidden_mode=None,
         input_num_tokens=8,
+        output_layout=None,
+        query_shard=None,
     )
     empty = torch.empty(0, dtype=torch.int32)
     result = wrapper(
@@ -249,3 +255,7 @@ def test_failed_execution_does_not_commit_stale_staging(use_graph):
         _run(wrapper, ForwardMode.DECODE)
     assert events == ["metadata", "execute"]
     assert commits == {"recurrent": [], "ple": [], "qsa": []}
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
