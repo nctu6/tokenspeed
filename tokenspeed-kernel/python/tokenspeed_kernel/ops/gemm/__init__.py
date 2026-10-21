@@ -1484,6 +1484,10 @@ def dsv4_linear_fp32(
         "hidden_inner_stride_one": hidden_states.stride(-1) == 1,
         "hidden_rank": hidden_states.ndim,
         "weight_contiguous": weight.is_contiguous(),
+        "ll_bf16_supported": (
+            hidden_states.ndim == 2
+            and ll_bf16_router_supported(hidden_states, weight, hidden_states.shape[0])
+        ),
     }
     signature = format_signature(
         hidden_states=dense_tensor_format(hidden_states.dtype),
