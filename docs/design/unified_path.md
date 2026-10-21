@@ -603,8 +603,15 @@ attention DP the split graph stays off: the narrowed row count is rank-local
 (which prompts complete on this rank), so the decoder bucket and the
 collective shapes its graph bakes would differ across ranks, and the stages
 size their collectives from their own rows, which the DP metadata gather
-does not carry (the same gap that keeps narrowing itself unimplemented under
-DP).
+does not carry. Eager TP1 attention/dense with fused EP may narrow: the
+fused dispatch exchanges the actual local row counts, while the original
+DP counts remain capacity bounds. The CPU metadata gather also carries
+per-rank decode request counts. V4.1 DSpark sizes its one draft forward at
+block width times these counts, including in aggregated mixed batches.
+Prefill writes context KV; if another rank has decodes, prefill-only and
+idle ranks join its draft collectives with empty rows. A round with no
+decodes performs no draft forward. Decode graph warmup and capture use the
+same uniform padded decode counts as their target batches.
 
 ### Prefill requests without generated outputs
 
