@@ -400,6 +400,50 @@ to the large-M kernel once those tiles alone exceed the CUs. Split partials are
 FP32 and the shared reduction sums them in split order, so results are
 deterministic.
 
+### gfx1250 dense BF16 large-M projection
+
+`gluon_mm_a16w16_largem_gfx1250` is a compute-bound BF16 GEMM for prefill
+projections with many rows.
+
+#### Contract
+
+- The operation computes `A @ B.T` from contiguous BF16 `[M, K]` and `[N, K]`
+  with `M >= 512` and K a multiple of 128, producing a contiguous BF16
+  `[M, N]`. The registered op accepts the weight shapes listed in
+  `use_gluon_largem_gfx1250`.
+- Ragged M and N are handled in-kernel. The row count is a runtime argument,
+  so any number of rows reuses one compiled kernel.
+
+#### Algorithm
+
+Wide problems (at least 4096 rows and 1536 columns) run
+`_wmma_tdm_dense_largem_warp_pipeline_kernel`:
+
+- Each CTA computes a `256 x 256` tile on eight waves, two per SIMD, through a
+  double-buffered TDM pipeline. `warp_pipeline_stage` alternates the two waves
+  on a SIMD between TDM issue plus LDS reads and WMMA, so one wave's memory
+  work overlaps the other's matrix work. Partitioned padded LDS layouts let
+  the paired waves read different LDS partitions.
+- CTAs run as `2 x 2` clusters. Each TDM load multicasts an A or B panel to
+  the two CTAs that share it, halving operand reads from L2, and a cluster
+  arrive/wait per K tile keeps the CTAs in step.
+- TDM descriptors are bounded at the real M and N, so loads past the edge read
+  zeros and the output, staged in the freed operand LDS, is written by one
+  clipped TDM store. Edge clusters run whole, so ragged shapes need no special
+  path and every cluster barrier completes.
+- Clusters are assigned contiguous runs per XCD so clusters sharing operands
+  share an L2.
+
+Narrower or shorter problems keep `_wmma_tdm_dense_largem_kernel` and its
+own tile choice. The general BF16 GEMM's large-M route
+(`_launch_largem`) uses the same selection for FP32 or BF16 output; a
+row-strided output also takes the older kernel, whose masked stores accept
+it.
+
+When the tile count is not a multiple of the CU count, the last partial wave
+of tiles leaves CUs idle; this tail is the main remaining gap to the WMMA
+peak.
+
 ### gfx1250 MXFP8 large-M projection
 
 `gluon_mm_mxfp8_ue8m0_largem_gfx1250` covers DeepSeek V4.1 MXFP8 projections
