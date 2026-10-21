@@ -507,7 +507,9 @@ class BaseGrammarBackend:
             self.compiled_keys.clear()
 
 
-def create_grammar_backend(server_args: ServerArgs, tokenizer, vocab_size):
+def create_grammar_backend(
+    server_args: ServerArgs, tokenizer, vocab_size, stop_token_ids=None
+):
 
     if server_args.grammar_backend == "none":
 
@@ -523,6 +525,7 @@ def create_grammar_backend(server_args: ServerArgs, tokenizer, vocab_size):
             tokenizer,
             vocab_size=vocab_size,
             disable_any_whitespace=server_args.disable_any_whitespace,
+            stop_token_ids=stop_token_ids,
         )
 
     else:
