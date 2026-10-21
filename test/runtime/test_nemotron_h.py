@@ -1167,6 +1167,54 @@ def test_static_per_tensor_checkpoint_runs_a_merged_projection(
     assert torch.equal(out_prequantized, out)
 
 
+def test_mtp_head_takes_its_checkpoint_kv_cache_scales_at_startup_only(
+    tmp_path, monkeypatch
+):
+    from safetensors.torch import save_file
+    from tokenspeed_kernel.ops.attention.prologue import FP8TensorScales
+
+    from tokenspeed.runtime.configs.load_config import LoadConfig
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.model_loader import loader
+    from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
+    from tokenspeed.runtime.models.nemotron_h_nextn import NemotronHForCausalLMNextN
+
+    config = _config(
+        hidden_size=256,
+        num_nextn_predict_layers=1,
+        mtp_layers_block_type=["attention", "moe"],
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=256,
+        moe_shared_expert_intermediate_size=256,
+    )
+    mapping = Mapping(rank=0, world_size=1)
+    with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
+        head = NemotronHForCausalLMNextN(config, mapping)
+    attn = head.layers[0].mixer.attn
+    scales = {
+        "mtp.layers.0.mixer.k_proj.k_scale": torch.tensor([0.0614]),
+        "mtp.layers.0.mixer.v_proj.v_scale": torch.tensor([0.0513]),
+    }
+    # A raw update stream (the Model Updater SDK) may carry them; it changes nothing.
+    head.load_weights(list(scales.items()))
+    assert attn.fp8_kv_scales is None
+
+    save_file(scales, str(tmp_path / "model.safetensors"))
+    monkeypatch.setattr(loader, "_initialize_model", lambda *args: head)
+    loader.DefaultModelLoader(LoadConfig()).load_model(
+        model_config=SimpleNamespace(
+            model_path=str(tmp_path),
+            revision=None,
+            dtype=torch.bfloat16,
+            mapping=mapping,
+        ),
+        device_config=SimpleNamespace(device="cuda"),
+    )
+    k, v = (t.item() for t in scales.values())
+    assert attn.fp8_kv_scales == FP8TensorScales(k, v)
+
+
 def test_mtp_checkpoint_names_map_onto_the_head():
     from tokenspeed.runtime.models.nemotron_h_nextn import _mtp_param_name
 

@@ -2632,7 +2632,8 @@ class ServerArgs:
             choices=["auto", "bfloat16", "fp8", "fp8_e4m3", "mxfp8"],
             help='Data type for kv cache storage. "auto" and "bfloat16" store BF16 '
             'rows (fp16 activations convert on write). "fp8" is an alias for '
-            '"fp8_e4m3" (unit scale). "mxfp8" stores '
+            '"fp8_e4m3" (unit scale, or the checkpoint\'s per-tensor KV-cache '
+            'scales where the model loads them). "mxfp8" stores '
             "block-scaled fp8-e4m3 (one UE8M0 scale per 32 head_dim elements) and "
             "requires --block-size 128 with an MHA attention backend.",
         )
