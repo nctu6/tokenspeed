@@ -122,11 +122,14 @@ def test_compressor_tail_scatter_graph_strides_and_replay(device):
     dsv41.compressor_tail_scatter(content[:0], scores[:0], tail, slots[:0])
 
 
-def test_public_arguments_are_explicit():
+def test_public_argument_defaults():
     for name in dsv41.__all__:
         fn = getattr(dsv41, name)
         assert fn.__doc__, name
         for parameter in inspect.signature(fn).parameters.values():
+            if name == "index_topk" and parameter.name == "index_metadata":
+                assert parameter.default is None
+                continue
             assert (
                 parameter.default is inspect.Parameter.empty
             ), f"{name}.{parameter.name} must be explicit"

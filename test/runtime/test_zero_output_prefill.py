@@ -747,6 +747,7 @@ def test_layout_and_decoder_metadata_agree_on_current_prefill_target(
         _swa_plans={},
         _prepared_selections={},
         _decode_schedules={},
+        _index_geometry={},
         sparse_topk={},
         _check_tables=lambda *args: None,
         _upload_int64=lambda values: torch.tensor(values, dtype=torch.int64),

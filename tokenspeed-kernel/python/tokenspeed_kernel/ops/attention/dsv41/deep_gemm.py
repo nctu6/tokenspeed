@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.attention.dsv41._deep_gemm.indexer import (
     gather_index_pages,
 )
 from tokenspeed_kernel.ops.attention.dsv41._inputs import IndexQueryInput
+from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexGeometry
 from tokenspeed_kernel.ops.attention.dsv41._triton.rope import (
     triton_dsv41_index_query_rope_quant,
 )
@@ -123,6 +124,9 @@ def _paged_scores(
     valid_lengths,
     capacity,
     page_size,
+    index_metadata,
+    tile_begin,
+    tile_end,
     prepare_blocks,
 ):
     if cache.stride(0) >= 2**31 or cache.stride(0) % 16 or cache.data_ptr() % 16:
@@ -138,13 +142,21 @@ def _paged_scores(
     api = _api(queries)
     # Native TMA loads have no page upper-bound mask. Sanitize a scratch table
     # before launching, leaving the scheduler's LCM tables unchanged.
-    table, lengths = safe_metadata(
-        block_table, valid_lengths, cache.shape[0], capacity, page_size
-    )
-    context_lens = lengths[:, None]
-    schedule = api.get_paged_mqa_logits_metadata(
-        context_lens, page_size, api.get_num_sms()
-    )
+    key = (tile_begin, tile_end, cache.shape[0], capacity, page_size, api.get_num_sms())
+    geometry = index_metadata.paged.get(key) if index_metadata is not None else None
+    if geometry is None:
+        table, lengths = safe_metadata(
+            block_table, valid_lengths, cache.shape[0], capacity, page_size
+        )
+        context_lens = lengths[:, None]
+        schedule = api.get_paged_mqa_logits_metadata(
+            context_lens, page_size, api.get_num_sms()
+        )
+        if index_metadata is not None:
+            geometry = IndexGeometry((table, lengths, context_lens, schedule))
+            index_metadata.paged[key] = geometry
+    else:
+        table, lengths, context_lens, schedule = geometry.acquire()
     logits = api.fp8_fp4_paged_mqa_logits(
         q=(
             queries[0].contiguous().view(torch.int8).unsqueeze(1),
@@ -232,6 +244,7 @@ def index_topk(
     score_chunk_size,
     process_group,
     out,
+    index_metadata,
 ):
     """Score bounded query tiles; cache and selections remain caller owned."""
     if process_group is not None or candidate_block_size != 8:
@@ -310,6 +323,7 @@ def index_topk(
                 candidates,
                 _api(packed),
                 skip_score_topk=topk,
+                index_metadata=index_metadata,
             )
             indices = _native_indices(logits, ends, topk)
             selected = finish_selection(
@@ -338,6 +352,9 @@ def index_topk(
                 visible,
                 capacity,
                 64,
+                index_metadata,
+                begin,
+                end,
                 prepare_blocks,
             )
         selected = (
@@ -633,8 +650,10 @@ def hopper_index_topk(
     score_chunk_size,
     process_group,
     out,
+    index_metadata,
 ):
     """Score FP8 index rows on tensor cores, select with CuTe DSL DeepSelect."""
+    del index_metadata
     if process_group is not None or candidate_block_size != 8:
         raise ValueError(
             "Native CSA2 selection requires replicated heads and 8-row blocks"

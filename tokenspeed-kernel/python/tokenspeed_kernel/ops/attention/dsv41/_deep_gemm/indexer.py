@@ -26,6 +26,7 @@ from functools import lru_cache
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexGeometry, IndexMetadata
 from tokenspeed_kernel.thirdparty.deep_select import deep_select_alignment
 
 
@@ -333,12 +334,15 @@ def _sparse_candidate_scores(
     api: object,
     *,
     skip_score_topk: int,
+    index_metadata: IndexMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return BF16 logits, candidate-row ends and sorted unique 8-row block IDs.
 
     index_topk supplies a query tile, 1..2048 candidate blocks, BF16 weights
     and FP4 cache pages with 512-byte aligned sub-2GiB strides. Native scoring
-    reads K in place; each call owns its schedule and BF16 candidate logits.
+    reads K in place. index_metadata shares immutable candidate geometry and
+    schedules within one invocation; queries, weights, KV values and logits
+    are never cached.
     Invalid pages, duplicates and future blocks are removed; page zero is valid.
 
     skip_score_topk is the selection width, or zero for all scores. Pools that
@@ -351,44 +355,75 @@ def _sparse_candidate_scores(
     blocks = triton.cdiv(count, alignment // 8) * (alignment // 8)
     width = blocks * 8
     _warmup_sparse_mqa(api, blocks, cache.device, api.get_pdl())
-    normalized = torch.empty((tokens, blocks), dtype=torch.int32, device=cache.device)
-    ends = torch.empty(tokens, dtype=torch.int32, device=cache.device)
-    sparse = torch.empty_like(normalized)
-    context = torch.empty_like(ends)
-    _normalize_candidate_blocks[(tokens,)](
-        candidates,
-        visible,
-        page_table,
-        normalized,
-        sparse,
-        context,
-        ends,
-        *candidates.stride(),
-        visible.stride(0),
-        *page_table.stride(),
+    key = (
         cache.shape[0],
-        count,
         capacity,
         blocks,
         skip_score_topk,
-        triton.next_power_of_2(blocks),
-        num_warps=4,
+        api.get_num_sms(),
+        api.get_pdl(),
+        tuple(
+            (t.data_ptr(), t.shape, t.stride(), t.dtype)
+            for t in (page_table, visible, candidates)
+        ),
     )
-    # A broadcast table proves request identity and permits native query-pair
-    # reuse. Otherwise keep rows distinct, including reordered/strided views.
-    requests = (
-        torch.zeros(tokens, dtype=torch.int32, device=cache.device)
-        if page_table.stride(0) == 0
-        else torch.arange(tokens, dtype=torch.int32, device=cache.device)
-    )
-    table = page_table.to(torch.int32).contiguous()
-    if table.stride(0) < table.shape[1]:
-        # A one-row broadcast slice is "contiguous" to Torch despite its zero
-        # row stride. Native metadata also uses that stride as its page bound.
-        table = table.clone(memory_format=torch.contiguous_format)
-    schedule = api.get_paged_sparse_mqa_logits_metadata(
-        context, table, requests, 64, sparse, torch.int8, 8
-    )
+    geometry = index_metadata.sparse.get(key) if index_metadata is not None else None
+    if geometry is None:
+        normalized = torch.empty(
+            (tokens, blocks), dtype=torch.int32, device=cache.device
+        )
+        ends = torch.empty(tokens, dtype=torch.int32, device=cache.device)
+        sparse = torch.empty_like(normalized)
+        context = torch.empty_like(ends)
+        _normalize_candidate_blocks[(tokens,)](
+            candidates,
+            visible,
+            page_table,
+            normalized,
+            sparse,
+            context,
+            ends,
+            *candidates.stride(),
+            visible.stride(0),
+            *page_table.stride(),
+            cache.shape[0],
+            count,
+            capacity,
+            blocks,
+            skip_score_topk,
+            triton.next_power_of_2(blocks),
+            num_warps=4,
+        )
+        # A broadcast table proves request identity and permits native query-pair
+        # reuse. Otherwise keep rows distinct, including reordered/strided views.
+        requests = (
+            torch.zeros(tokens, dtype=torch.int32, device=cache.device)
+            if page_table.stride(0) == 0
+            else torch.arange(tokens, dtype=torch.int32, device=cache.device)
+        )
+        table = page_table.to(torch.int32).contiguous()
+        if table.stride(0) < table.shape[1]:
+            # A one-row broadcast slice is "contiguous" to Torch despite its zero
+            # row stride. Native metadata also uses that stride as its page bound.
+            table = table.clone(memory_format=torch.contiguous_format)
+        schedule = api.get_paged_sparse_mqa_logits_metadata(
+            context, table, requests, 64, sparse, torch.int8, 8
+        )
+        if index_metadata is not None:
+            # Retain results and source views to keep pointer-based keys valid.
+            # The schedule embeds the page mapping, so build scratch can expire.
+            index_metadata.sparse[key] = IndexGeometry(
+                (
+                    normalized,
+                    ends,
+                    schedule,
+                    page_table,
+                    visible,
+                    candidates,
+                )
+            )
+    else:
+        normalized, ends, schedule, *_ = geometry.acquire()
     scores = api.fp8_fp4_paged_sparse_mqa_logits(
         q=(
             queries[0].contiguous().view(torch.int8).unsqueeze(1),

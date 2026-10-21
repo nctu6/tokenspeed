@@ -424,6 +424,7 @@ def run_index_topk_full_and_reindex(
             64,
             None,
             None,
+            index_metadata=None,
         )
         for actual, expected in zip(got, want, strict=True):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -462,6 +463,7 @@ def run_index_topk_full_and_reindex(
                 64,
                 None,
                 None,
+                index_metadata=None,
             )
             for actual, expected in zip(reindex, want_reindex, strict=True):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -75,6 +75,7 @@ __all__ = [
     "new_attention_schedule",
     "index_score",
     "index_topk",
+    "new_index_metadata",
     "index_select_all",
     "compressor_tail_scatter",
     "compressor_pool",
@@ -482,6 +483,7 @@ def index_topk(
     process_group: torch.distributed.ProcessGroup | None,
     out: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
     solution: str | None,
+    index_metadata: object | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bounded Full/Reindex scoring, Top-K rows, and optional source candidates.
 
@@ -512,7 +514,12 @@ def index_topk(
             [T, candidate_topk], [T]), or None to allocate them.
         solution: Optional registered implementation restriction. Pass None for
             automatic kernel selection.
-
+        index_metadata: Object from new_index_metadata for these exact table and
+            length tensors, shared only within one invocation, or None (default). Native
+            kernels reuse Full schedules and matching immutable sparse candidate
+            geometry across layers. Table, lengths and candidate contents must
+            not change while sharing this object; graph replay refreshes the
+            captured producers. A new invocation needs a fresh object.
 
     Returns:
         (logical_row_ids, row_lengths, candidate_block_ids, candidate_lengths).
@@ -557,6 +564,13 @@ def index_topk(
         is_native_indexer_available,
     )
     from tokenspeed_kernel.thirdparty.deep_select import is_deep_select_available
+
+    if index_metadata is not None:
+        from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexMetadata
+
+        if not isinstance(index_metadata, IndexMetadata):
+            raise TypeError("index_metadata must come from new_index_metadata")
+        index_metadata.validate(page_table, visible_lens)
 
     # Each target scores the index rows its own cache format stores: FP4 with
     # DeepSelect on Blackwell, FP8 with the CuTe DSL DeepSelect kernel on Hopper.
@@ -633,6 +647,7 @@ def index_topk(
         score_chunk_size,
         process_group,
         out,
+        index_metadata,
     )
 
 
@@ -1187,3 +1202,18 @@ def index_select_all(page_table, visible_lens, pages, candidate_block_size, out)
         destination.copy_(selected.masked_fill(selected == 2147483647, -1))
         counts.copy_(valid.sum(dim=1))
     return out
+
+
+def new_index_metadata(page_table: torch.Tensor, visible_lens: torch.Tensor) -> object:
+    """Create invocation-owned reusable index geometry for these exact inputs.
+
+    page_table and visible_lens have the index_topk contract and must remain
+    unchanged for this object's lifetime. Share it only between layers of one
+    forward; create a new object for every eager invocation and graph capture.
+    Replay recomputes the captured producers. No KV values or scores are cached.
+    Consumers on other streams wait for metadata producers before reading.
+    Cached geometry is retained until this object is released.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexMetadata
+
+    return IndexMetadata(page_table, visible_lens)

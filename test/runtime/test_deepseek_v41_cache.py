@@ -215,6 +215,8 @@ def test_rebinding_cache_pool_drops_pool_derived_state():
     backend._decode_schedule_keepalive.append(torch.empty(1))
     backend._decode_schedules[(0, 0)] = (torch.empty(1), None, object())
     backend._prepared_selections[()] = ()
+    backend.begin_indexer_forward()
+    backend._index_geometry[()] = object()
 
     new_pool = _pool(_recipe("cpu"), "cpu")
     backend.set_cache_pool(new_pool)
@@ -231,6 +233,8 @@ def test_rebinding_cache_pool_drops_pool_derived_state():
     assert not backend._decode_schedule_keepalive
     assert not backend._decode_schedules
     assert not backend._prepared_selections
+    assert not backend._index_geometry
+    backend.end_indexer_forward()
     backend.init_cuda_graph_state(2, max_tokens_per_req=1, overlap_schedule_depth=1)
     assert backend._decode_buffers is not old_buffers
 
@@ -686,6 +690,7 @@ def test_decoder_view_keeps_compute_rows_and_selects_only_valid_logits():
 
 
 def _decode_compute(backend, inputs, bs):
+    backend.begin_indexer_stage()
     content, scores, q, swa, iq, iw, sink = inputs
     mode = ForwardMode.DECODE
     meta = backend.query_metadata(mode)
@@ -2577,6 +2582,7 @@ def test_prefill_selection_skips_only_redundant_work(length):
         group,
         out,
         solution,
+        index_metadata,
     ):
         for ids, counts, stride in ((out[0], out[1], 1), (out[2], out[3], 8)):
             values = torch.arange(ids.shape[1]).expand_as(ids)
@@ -2694,6 +2700,7 @@ def test_one_index_graph_crosses_coverage_limits_with_padding(
         )
 
     def run():
+        backend.begin_indexer_stage()
         meta = backend.query_metadata(ForwardMode.DECODE)
         query = (
             dsv41.IndexQueryInput(q, meta.positions, rope_cache, 0.023456789)
@@ -2749,3 +2756,129 @@ def test_one_index_graph_crosses_coverage_limits_with_padding(
             assert (ids[padding:] == -1).all() and (counts[padding:] == 0).all()
     if sparse_scores is not None:
         assert sparse_scores.call_count > 0
+
+
+def test_index_geometry_reuse_and_forward_lifetime():
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    positions = torch.tensor([127, 255])
+    requests = torch.tensor([0, 1])
+
+    def prepare(pos, req, group, ratio):
+        table = tables[group]
+        return backend._selection_geometry(
+            pos, req, table, table, ratio, 0, 2, None, ForwardMode.DECODE
+        )
+
+    previous = prepare(positions, requests, R2, 2)
+    backend.begin_indexer_forward()
+    first = prepare(positions, requests, R2, 2)
+    assert first is not previous
+    assert prepare(positions.clone(), requests, R2, 2) is not first
+    assert prepare(positions, requests.flip(0), R2, 2) is not first
+    assert prepare(positions, requests, R1, 1) is not first
+    for _ in range(3):
+        backend.begin_indexer_stage()
+        assert prepare(positions, requests, R2, 2) is first
+    # Refresh invalidates scratch even inside a full-forward scope.
+    backend.refresh_decode_metadata(
+        2,
+        2,
+        requests,
+        (positions + 1).to(torch.int32),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=tables,
+        for_graph_replay=False,
+    )
+    assert not backend._index_geometry
+    prepare(positions, requests, R2, 2)
+    backend.end_indexer_forward()
+    assert not backend._index_geometry
+    assert not backend._in_model_forward
+    for _ in range(2):
+        previous = prepare(positions, requests, R2, 2)
+        positions.sub_(32)
+        backend.begin_indexer_stage()
+        refreshed = prepare(positions, requests, R2, 2)
+        assert refreshed is not previous
+        torch.testing.assert_close(refreshed.lengths, previous.lengths - 16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_index_geometry_scope_preserves_all_indexer_selections_in_graph(monkeypatch):
+    backend = _backend("cuda", 2)
+    backend.cache_pool.arena.buffer.zero_()
+    tables = _tables("cuda")
+    requests = torch.tensor([0, 1], device="cuda")
+    lengths = torch.tensor([128, 256], device="cuda", dtype=torch.int32)
+    backend.refresh_decode_metadata(
+        2,
+        2,
+        requests,
+        lengths,
+        forward_mode=ForwardMode.DECODE,
+        block_tables=tables,
+        for_graph_replay=False,
+    )
+    meta = backend.query_metadata(ForwardMode.DECODE)
+    index_q = torch.randn(2, 2, 128, device="cuda", dtype=torch.bfloat16)
+    index_weights = torch.rand(2, 2, device="cuda", dtype=torch.bfloat16)
+    selection_table = Mock(wraps=dsv41.selection_table)
+    monkeypatch.setattr(dsv41, "selection_table", selection_table)
+
+    def forward(shared):
+        outputs = []
+        if shared:
+            backend.begin_indexer_forward()
+        for stage in ((2, 8, 14), (20,), (24, 28, 32, 36)):
+            backend.begin_indexer_stage()
+            for layer in stage:
+                if not shared:
+                    backend.begin_indexer_stage()
+                outputs.extend(
+                    backend.select_global(
+                        layer,
+                        index_q,
+                        index_weights,
+                        meta.positions,
+                        meta.request_indices,
+                        ForwardMode.DECODE,
+                        None,
+                    )
+                )
+        if shared:
+            backend.end_indexer_forward()
+            assert not backend._index_geometry
+        return outputs
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        forward(True)
+        selection_table.reset_mock()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = forward(True)
+        assert selection_table.call_count == 2
+    torch.cuda.current_stream().wait_stream(stream)
+    for live, seq_lens in ((2, [129, 257]), (1, [320]), (0, []), (2, [32, 512])):
+        index_q.normal_()
+        index_weights.uniform_()
+        for group in (R2, R1):
+            tables[group].copy_(tables[group].roll(1, dims=1))
+            tables[group][:, 0] = 0
+        backend.refresh_decode_metadata(
+            2,
+            live,
+            requests[:live],
+            torch.tensor(seq_lens, device="cuda", dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            block_tables={group: table.flip(0) for group, table in tables.items()},
+            for_graph_replay=True,
+        )
+        selection_table.reset_mock()
+        expected = forward(False)
+        assert selection_table.call_count == 8
+        graph.replay()
+        for got, want in zip(captured, expected, strict=True):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)

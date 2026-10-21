@@ -1572,6 +1572,8 @@ class DeepseekV41Model(nn.Module):
                 self.embed_tokens.weight.new_empty((0, self.config.hidden_size)),
                 None,
             )
+        backend = ctx.attn_backend
+        backend.begin_indexer_forward()
         state = self.encoder_forward(
             input_ids,
             positions,
@@ -1584,7 +1586,9 @@ class DeepseekV41Model(nn.Module):
         )
         state = self.narrowing_forward(state, ctx)
         hidden, captured = self.decoder_forward(state, ctx)
-        return self.finish_forward(hidden, captured, ctx)
+        output = self.finish_forward(hidden, captured, ctx)
+        backend.end_indexer_forward()
+        return output
 
     def _run_layer(
         self,
@@ -1623,6 +1627,7 @@ class DeepseekV41Model(nn.Module):
         image_mask: torch.Tensor | None,
     ) -> V41RowState:
         """Embed and run the layers below the candidate source, one row per token."""
+        ctx.attn_backend.begin_indexer_stage()
         if pp_inbound is not None:
             raise NotImplementedError("V4.1 baseline does not accept pipeline state")
         if input_ids.ndim != 1 or positions.shape != input_ids.shape:
@@ -1672,6 +1677,7 @@ class DeepseekV41Model(nn.Module):
         forward's real rows (an encoder graph output): only the real rows are
         used. A window-only stack has no candidate source and passes through.
         """
+        ctx.attn_backend.begin_indexer_stage()
         start = self.ced_decoder_start
         if start >= len(self.layers):
             return state
@@ -1741,6 +1747,7 @@ class DeepseekV41Model(nn.Module):
                 hidden for layer_id in self.dspark_capture_layers if layer_id > start
             )
             return hidden, captured
+        ctx.attn_backend.begin_indexer_stage()
         layers = self.layers[start + 1 :]
         if layers:
             with report_collective_sizing(ctx, state.rows, None):

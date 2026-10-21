@@ -20,6 +20,8 @@
 
 """Deferred indexer preprocessing through native and portable selection."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 from tokenspeed_kernel._triton import triton
@@ -648,3 +650,141 @@ def test_live_logits_masks_prefetched_tail_for_selection(poison):
         torch.testing.assert_close(output[live], expected[live], rtol=0, atol=0)
         for actual, wanted in zip(result, select(expected), strict=True):
             torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("changed", ["candidates", "table", "lengths", "topk", "pages"])
+def test_sparse_metadata_reuses_only_matching_input_geometry(monkeypatch, changed):
+    args = list(_sparse_inputs(4, 128, True))
+    _sparse_candidate_scores(*args, skip_score_topk=0)
+    api = args[-1]
+    schedule = Mock(wraps=api.get_paged_sparse_mqa_logits_metadata)
+    monkeypatch.setattr(api, "get_paged_sparse_mqa_logits_metadata", schedule)
+    metadata = dsv41.new_index_metadata(args[3], args[4])
+    baseline = _sparse_candidate_scores(
+        *args, skip_score_topk=0, index_metadata=metadata
+    )
+    assert schedule.call_count == 1
+    # New views of the same immutable candidate pool share the producer.
+    args[5] = args[5].view_as(args[5])
+    args[1].neg_()
+    reused = _sparse_candidate_scores(*args, skip_score_topk=0, index_metadata=metadata)
+    assert schedule.call_count == 1
+    assert reused[1].data_ptr() == baseline[1].data_ptr()
+    assert reused[2].data_ptr() == baseline[2].data_ptr()
+    topk = 0
+    if changed == "candidates":
+        args[5] = args[5].clone()
+        args[5][:, 0] = 10
+    elif changed == "table":
+        args[3] = args[3].clone()
+    elif changed == "lengths":
+        args[4] = args[4].clone()
+    elif changed == "topk":
+        topk = 512
+    else:
+        args[2] = args[2][:-1]
+    _sparse_candidate_scores(*args, skip_score_topk=topk, index_metadata=metadata)
+    assert schedule.call_count == 2
+
+
+def test_sparse_metadata_reuse_across_streams_and_graph_replay(monkeypatch):
+    args = _sparse_inputs(4, 128, True)
+    queries, weights, cache, table, lengths, candidates, api = args
+    _sparse_candidate_scores(*args, skip_score_topk=0)
+    second_weights = -weights.contiguous()
+    second_args = (queries, second_weights, cache, table, lengths, candidates, api)
+    schedule = Mock(wraps=api.get_paged_sparse_mqa_logits_metadata)
+    monkeypatch.setattr(api, "get_paged_sparse_mqa_logits_metadata", schedule)
+    producer, consumer = torch.cuda.Stream(), torch.cuda.Stream()
+    current = torch.cuda.current_stream()
+    producer.wait_stream(current)
+    consumer.wait_stream(current)
+
+    def run():
+        metadata = dsv41.new_index_metadata(table, lengths)
+        first = _sparse_candidate_scores(
+            *args, skip_score_topk=0, index_metadata=metadata
+        )
+        with torch.cuda.stream(consumer):
+            second = _sparse_candidate_scores(
+                *second_args, skip_score_topk=0, index_metadata=metadata
+            )
+        producer.wait_stream(consumer)
+        assert first[1].data_ptr() == second[1].data_ptr()
+        return first, second
+
+    with torch.cuda.stream(producer):
+        run()
+        schedule.reset_mock()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=producer):
+            captured = run()
+        assert schedule.call_count == 1
+    current.wait_stream(producer)
+    for end in (0, 511, 4097):
+        lengths.fill_(end)
+        candidates.random_(-1, max(1, end // 8 + 1))
+        cache[:, :4096].random_(0, 256)
+        weights.normal_()
+        second_weights.normal_()
+        producer.wait_stream(current)
+        before = schedule.call_count
+        with torch.cuda.stream(producer):
+            eager = run()
+        current.wait_stream(producer)
+        assert schedule.call_count == before + 1
+        graph.replay()
+        assert schedule.call_count == before + 1
+        for actual, replayed, inputs in zip(
+            eager, captured, (args, second_args), strict=True
+        ):
+            expected = _reference_sparse_scores(*inputs[:-1])[:3]
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(replayed, expected, rtol=0, atol=0)
+
+
+def test_full_metadata_reuses_schedule_and_refreshes_live_inputs(monkeypatch):
+    queries, weights, cache, table, lengths, _, api = _sparse_inputs(4, 128, False)
+    head_weights = (weights.float(), -weights.float())
+    capacity = table.shape[1] * 64
+    schedule = Mock(wraps=api.get_paged_mqa_logits_metadata)
+    monkeypatch.setattr(api, "get_paged_mqa_logits_metadata", schedule)
+
+    def run(shared):
+        metadata = dsv41.new_index_metadata(table, lengths) if shared else None
+        return tuple(
+            deep_gemm._paged_scores(
+                queries,
+                cache,
+                current_weights,
+                table,
+                lengths,
+                capacity,
+                64,
+                metadata,
+                0,
+                table.shape[0],
+                True,
+            )
+            for current_weights in head_weights
+        )
+
+    run(True)
+    schedule.reset_mock()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(True)
+    assert schedule.call_count == 1
+    for visible in ([0, 81, 4097, capacity], [511, 0, 16384, 1025]):
+        lengths.copy_(torch.tensor(visible, dtype=torch.int32, device="cuda"))
+        table.copy_(table.roll(1, dims=1))
+        for weights in head_weights:
+            weights.normal_()
+        expected = run(False)
+        before = schedule.call_count
+        eager = run(True)
+        assert schedule.call_count == before + 1
+        graph.replay()
+        assert schedule.call_count == before + 1
+        torch.testing.assert_close(eager, expected, rtol=0, atol=0)
+        torch.testing.assert_close(captured, expected, rtol=0, atol=0)
