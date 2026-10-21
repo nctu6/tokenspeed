@@ -239,6 +239,39 @@ def fp8_quantize_by_multiplier(x, multiplier):
 
 
 @triton.jit
+def fp8_dequantize_unscaled(raw, token_scale, channel_scale):
+    """The scaled FP8 GEMM's output from an unscaled one, widened to FP32.
+
+    ``raw`` is a 16-bit load of an FP8 GEMM run with unit scales (the codes'
+    product, rounded once to the 16-bit output dtype); ``token_scale`` and
+    ``channel_scale`` are the FP32 per-token and per-channel dequant scales it
+    did not apply. The result is ``(raw * token_scale) * channel_scale`` in
+    FP32 (token first, as the scaled GEMMs' epilogues multiply), rounded to
+    ``raw``'s dtype as their output is, then widened back to FP32.
+    """
+    value = (raw.to(tl.float32) * token_scale) * channel_scale
+    return value.to(raw.dtype).to(tl.float32)
+
+
+def dequantize_unscaled_fp8(
+    raw: torch.Tensor, token_scales: torch.Tensor, channel_scales: torch.Tensor
+) -> torch.Tensor:
+    """``fp8_dequantize_unscaled`` in PyTorch, for a whole ``[M, N]`` output.
+
+    Args:
+        raw: ``[M, N]`` 16-bit output of an FP8 GEMM run with unit scales.
+        token_scales: FP32 ``[M]`` / ``[M, 1]`` per-token scales.
+        channel_scales: FP32 ``[N]`` / ``[N, 1]`` per-channel scales.
+
+    Returns:
+        ``[M, N]`` tensor in ``raw``'s dtype: ``(raw * token) * channel`` in
+        FP32, rounded once.
+    """
+    value = raw.float() * token_scales.reshape(-1, 1)
+    return (value * channel_scales.reshape(1, -1)).to(raw.dtype)
+
+
+@triton.jit
 def _fp8_token_quantize_kernel(
     x_ptr,
     q_ptr,
@@ -656,6 +689,168 @@ def triton_quantize_fp8_per_token(
             f"scale_encoding={scale_encoding!r}"
         )
     return fp8_quantize_per_token(x, enable_pdl=enable_pdl)
+
+
+# The widest SwiGLU half (intermediate size) one program holds: a row per
+# program, for the per-token amax of the FP8 output.
+_SILU_AND_MUL_FP8_MAX_INTERMEDIATE_SIZE = 16384
+
+
+@triton.jit
+def _silu_and_mul_quantize_fp8_kernel(
+    y_ptr,
+    token_scale_ptr,
+    channel_scale_ptr,
+    codes_ptr,
+    scale_ptr,
+    width,
+    y_row_stride,
+    codes_row_stride,
+    BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < width
+    # The channel scales are parameters nothing in the decode graph writes.
+    gate_scale = tl.load(channel_scale_ptr + cols, mask=mask, other=0.0)
+    up_scale = tl.load(channel_scale_ptr + width + cols, mask=mask, other=0.0)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    token_scale = tl.load(token_scale_ptr + row)
+    y_row = y_ptr + row * y_row_stride
+    gate = fp8_dequantize_unscaled(
+        tl.load(y_row + cols, mask=mask, other=0.0), token_scale, gate_scale
+    )
+    up = fp8_dequantize_unscaled(
+        tl.load(y_row + width + cols, mask=mask, other=0.0), token_scale, up_scale
+    )
+    # silu_and_mul's FP32 SwiGLU, rounded once to the 16-bit dtype it stores.
+    act = (gate * tl.sigmoid(gate) * up).to(y_ptr.dtype.element_ty).to(tl.float32)
+    act = tl.where(mask, act, 0.0)
+    amax = tl.max(tl.abs(act), axis=0)
+    codes = fp8_quantize_by_multiplier(act, fp8_token_multiplier(amax))
+    tl.store(codes_ptr + row * codes_row_stride + cols, codes, mask=mask)
+    tl.store(scale_ptr + row, fp8_token_scale(amax))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def triton_silu_and_mul_quantize_fp8(
+    x: torch.Tensor,
+    token_scales: torch.Tensor,
+    channel_scales: torch.Tensor,
+    *,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``silu_and_mul_quantize_fp8`` in one launch with one program per row.
+
+    Each element is the scaled GEMM's 16-bit output
+    (``fp8_dequantize_unscaled``), the SwiGLU ``silu(gate) * up`` is evaluated
+    in FP32 and rounded once to ``x``'s dtype as ``silu_and_mul`` stores it,
+    and that row is quantized as ``fp8_quantize_per_token`` would quantize it.
+
+    Args:
+        x: ``[M, 2 * I]`` BF16 or FP16 unscaled GEMM output (gate columns,
+            then up columns) with a contiguous last axis.
+        token_scales: FP32 ``[M, 1]`` or ``[M]`` per-token scales of the
+            GEMM's FP8 input.
+        channel_scales: FP32 ``[2 * I, 1]`` or ``[2 * I]`` per-channel weight
+            scales of the GEMM.
+        enable_pdl: Launch with Programmatic Dependent Launch.
+
+    Returns:
+        ``(codes, scales)``: contiguous FP8 E4M3 ``[M, I]`` codes and FP32
+        ``[M, 1]`` scales of the activation.
+
+    Raises:
+        ValueError: A layout or dtype outside the above, or ``I`` above 16384.
+    """
+    if x.ndim != 2 or x.stride(-1) != 1 or x.shape[-1] % 2:
+        raise ValueError(
+            "x must be [M, 2 * I] with a contiguous last axis, got shape "
+            f"{tuple(x.shape)} stride {x.stride()}"
+        )
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"x must be BF16 or FP16, got {x.dtype}")
+    m, width = x.shape[0], x.shape[1] // 2
+    if width > _SILU_AND_MUL_FP8_MAX_INTERMEDIATE_SIZE:
+        raise ValueError(
+            f"I={width} exceeds the one-row-per-program limit "
+            f"{_SILU_AND_MUL_FP8_MAX_INTERMEDIATE_SIZE}"
+        )
+    for name, scales, count in (
+        ("token_scales", token_scales, m),
+        ("channel_scales", channel_scales, 2 * width),
+    ):
+        if (
+            scales.dtype != torch.float32
+            or scales.numel() != count
+            or not scales.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must be {count} contiguous FP32 values, got "
+                f"{scales.dtype} {tuple(scales.shape)}"
+            )
+    codes = torch.empty((m, width), dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+    if m == 0:
+        return codes, scales
+    block = triton.next_power_of_2(width)
+    _silu_and_mul_quantize_fp8_kernel[(m,)](
+        x,
+        token_scales,
+        channel_scales,
+        codes,
+        scales,
+        width,
+        x.stride(0),
+        codes.stride(0),
+        BLOCK=block,
+        ENABLE_PDL=enable_pdl,
+        num_warps=min(max(block // 512, 1), 16),
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+    return codes, scales
+
+
+def triton_rmsnorm_quantize_fp8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    residual: torch.Tensor | None,
+    round_residual_sum_bf16: bool,
+    x_scale: float | None,
+    residual_scale: float | None,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    """``rmsnorm_quantize_fp8`` by the Triton RMSNorm, whose launch also writes
+    the per-token FP8 codes and scales of its output (``token_fp8_out``).
+
+    Arguments and returns are those of ``rmsnorm_quantize_fp8``.
+    """
+    # The Triton RMSNorm module imports this module's FP8 helpers.
+    from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
+
+    rows = x.numel() // x.shape[-1]
+    codes = torch.empty((rows, x.shape[-1]), dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty((rows, 1), dtype=torch.float32, device=x.device)
+    normed = rmsnorm(
+        x,
+        weight,
+        eps,
+        residual,
+        enable_pdl=enable_pdl,
+        round_residual_sum_bf16=round_residual_sum_bf16,
+        x_scale=x_scale,
+        residual_scale=residual_scale,
+        token_fp8_out=(codes, scales),
+    )
+    if residual is None:
+        return normed, None, codes, scales
+    out, residual_sum = normed
+    return out, residual_sum, codes, scales
 
 
 @triton.jit

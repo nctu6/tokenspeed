@@ -25,9 +25,11 @@ per-token x per-channel FP8 rows, what it receives for ``quant="fp8"``
 without ``A_scales`` (FP8 codes and ``[M, 1]`` scales, from the Triton
 quantizer up to 64 rows and from TRT-LLM's token quantizer above, as
 ``quantize_fp8`` selects them by row count), and the scale layouts and tile
-constexprs the small-M wrapper launches with.
+constexprs the small-M wrapper launches with. Also how the functions that
+write that quantizer's codes from an RMSNorm or a SwiGLU launch their kernels.
 Kernel bodies and launches are recorders; the numerics run on the GPU
-(``test/nvidia/ops/gemm/test_fp8_channel_small_m.py``).
+(``test/nvidia/ops/gemm/test_fp8_channel_small_m.py``,
+``test_fp8_unscaled_consumers.py`` and ``layernorm/test_rmsnorm_token_fp8.py``).
 """
 
 from __future__ import annotations
@@ -36,10 +38,15 @@ import dataclasses
 
 import pytest
 import tokenspeed_kernel.ops.gemm as gemm
+import tokenspeed_kernel.ops.layernorm.triton as triton_layernorm
 import tokenspeed_kernel.ops.quantization as quantization
 import torch
 from tokenspeed_kernel.ops.gemm import triton_fp8_channel
-from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.ops.quantization import (
+    quantize_fp8,
+    rmsnorm_quantize_fp8,
+    silu_and_mul_quantize_fp8,
+)
 from tokenspeed_kernel.ops.quantization import triton as quant_triton
 from tokenspeed_kernel.platform import ArchVersion, Platform, pdl_enabled
 from tokenspeed_kernel.registry import KernelRegistry
@@ -396,3 +403,78 @@ def test_the_triton_quantizer_launches_as_asked(arch, monkeypatch, enable_pdl):
     assert launch["kwargs"]["ENABLE_PDL"] is enable_pdl
     assert launch["kwargs"].get("launch_pdl", False) is enable_pdl
     assert codes.dtype == FP8 and tuple(scales.shape) == (8, 1)
+
+
+def _fused_fp8_calls(enable_pdl):
+    """One rmsnorm_quantize_fp8 call with every option, and one
+    silu_and_mul_quantize_fp8 call, on 8 rows."""
+    x = torch.empty(8, 4096, dtype=torch.bfloat16)
+    weight = torch.empty(4096, dtype=torch.bfloat16)
+
+    def norm():
+        return rmsnorm_quantize_fp8(
+            x,
+            weight,
+            1e-6,
+            residual=torch.empty_like(x),
+            round_residual_sum_bf16=True,
+            x_scale=0.5,
+            residual_scale=2.0,
+            enable_pdl=enable_pdl,
+        )
+
+    def swiglu():
+        return silu_and_mul_quantize_fp8(
+            x, torch.ones(8, 1), torch.ones(4096, 1), enable_pdl=enable_pdl
+        )
+
+    return norm, swiglu
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_fused_fp8_quantizers_launch_as_asked(arch, monkeypatch, enable_pdl):
+    """rmsnorm_quantize_fp8 and silu_and_mul_quantize_fp8 launch their Triton
+    kernels once each, one program per row, with the caller's ``enable_pdl``
+    and every option the call uses."""
+    launches = {"norm": _LaunchRecorder(), "swiglu": _LaunchRecorder()}
+    monkeypatch.setattr(triton_layernorm, "_rmsnorm_kernel", launches["norm"])
+    monkeypatch.setattr(
+        quant_triton, "_silu_and_mul_quantize_fp8_kernel", launches["swiglu"]
+    )
+    norm, swiglu = _fused_fp8_calls(enable_pdl)
+    out, residual_sum, codes, scales = norm()
+    act_codes, act_scales = swiglu()
+    (norm_launch,) = launches["norm"].launches
+    (swiglu_launch,) = launches["swiglu"].launches
+    for launch in (norm_launch, swiglu_launch):
+        assert launch["grid"] == (8,)
+        assert launch["kwargs"]["ENABLE_PDL"] is enable_pdl
+        assert launch["kwargs"].get("launch_pdl", False) is enable_pdl
+    norm_kwargs = norm_launch["kwargs"]
+    assert norm_kwargs["TOKEN_FP8_OUT"] and norm_kwargs["fp8_out_ptr"] is codes
+    assert norm_kwargs["fp8_scale_ptr"] is scales
+    assert norm_kwargs["HAS_RESIDUAL"] and norm_kwargs["ROUND_RESIDUAL_SUM_BF16"]
+    assert norm_kwargs["SCALE_INPUTS_BF16"]
+    assert out.shape == residual_sum.shape == (8, 4096)
+    assert codes.dtype == FP8 and tuple(codes.shape) == (8, 4096)
+    assert act_codes.dtype == FP8 and tuple(act_codes.shape) == (8, 2048)
+    assert tuple(scales.shape) == tuple(act_scales.shape) == (8, 1)
+
+
+@pytest.mark.parametrize("intermediate_size", [16384, 16385])
+def test_silu_and_mul_fp8_refuses_a_half_wider_than_16384(
+    arch, monkeypatch, intermediate_size
+):
+    """One program holds a SwiGLU half of at most 16,384 columns. Wider, the
+    call raises ValueError before any launch."""
+    recorder = _LaunchRecorder()
+    monkeypatch.setattr(quant_triton, "_silu_and_mul_quantize_fp8_kernel", recorder)
+    x = torch.empty(2, 2 * intermediate_size, dtype=torch.bfloat16)
+    args = (x, torch.ones(2, 1), torch.ones(2 * intermediate_size, 1))
+    if intermediate_size > 16384:
+        with pytest.raises(ValueError, match="I=16385 exceeds"):
+            silu_and_mul_quantize_fp8(*args, enable_pdl=False)
+        assert not recorder.launches
+    else:
+        silu_and_mul_quantize_fp8(*args, enable_pdl=False)
+        assert len(recorder.launches) == 1
