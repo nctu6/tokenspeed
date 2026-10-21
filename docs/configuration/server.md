@@ -47,6 +47,29 @@ files with the checkpoint. Pass a custom filename pattern through
 `{"pattern": "model-rank-{rank}-part-{part}.safetensors"}`. The serving CLI does
 not expose this loader or its extra configuration.
 
+## Sparse KV Offloading
+
+`--kv-offload-config` accepts a JSON object with four required fields:
+`layers` (unique target attention layer IDs), `hot_tokens` (a positive power of
+two), `host_gb` (a finite positive budget in GiB), and `overlap` (an explicit
+boolean enabling cross-layer prefetch). Omitting the argument disables offload.
+The model cache recipe validates supported fields, selection capacity and
+execution constraints; unsupported recipes reject the configuration.
+
+Model-specific behavior stays in `--hf-overrides`. For a plugin supporting a
+window ring, set its `kv_offload_window_ring` option explicitly. Do not put
+`window_ring` in the runtime object or use the legacy `hf_overrides.kv_offload`
+entry; both are rejected. This option does not enable MTP, CUDA Graph, scheduler
+overlap, or change numerical settings implicitly.
+
+Offloading uses capacity aborts instead of snapshot recovery. Its snapshot
+pool is disabled automatically; positive snapshot sizes, snapshot request
+caps and `--debug-force-retraction-interval` are rejected. Under decode
+memory pressure the scheduler releases the victim's history blocks and
+request slot and reports `CapacityAbort` to the client. A client that wants
+to continue must submit a new request. The fixed hot allocation persists;
+its request partition is invalidated before another PD owner uses it.
+
 ## Precision and quantization
 
 | Parameter | Purpose |
