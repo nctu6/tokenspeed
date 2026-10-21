@@ -282,7 +282,7 @@ def test_gdn_chain_pdl_toggle(
         with torch.cuda.graph(graph):
             actual = forward()
         names, edges = _graph_kernel_edges(graph)
-        stages = ("pack_gdn", "causal_conv1d", "gdn", "rms_norm")
+        stages = ("pack_gdn", "causal_conv1d", "gdn", "gated_rmsnorm")
         for stage in stages:
             assert any(stage in name for name in names.values()), names
         if steps > 1:
