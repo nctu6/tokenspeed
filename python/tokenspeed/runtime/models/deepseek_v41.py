@@ -153,8 +153,8 @@ from tokenspeed.runtime.multimodal.embedder import (
 )
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
+    MultimodalForwardContext,
     MultimodalInputs,
-    is_mm_pad_value_for,
     substitute_mm_pad_,
 )
 from tokenspeed.runtime.utils import add_prefix
@@ -1832,6 +1832,34 @@ class DeepseekV41Model(nn.Module):
         )
 
 
+def _image_mask_from_spans(
+    input_ids: torch.Tensor, mm_context: MultimodalForwardContext
+) -> torch.Tensor:
+    """Mark image spans; InputBuffers may already have clamped hashed IDs.
+
+    Walks the spans exactly as ``MultimodalEmbedder._plan`` places embeddings,
+    so routing and embedding placement agree; change the two together.
+    """
+    mask = torch.zeros_like(input_ids, dtype=torch.bool)
+    base = 0
+    for mm_input, prefix, length in zip(
+        mm_context.mm_inputs,
+        mm_context.extend_prefix_lens,
+        mm_context.extend_seq_lens,
+    ):
+        if mm_input is not None and length > 0:
+            for item in mm_input.mm_items:
+                if item is None or item.modality != Modality.IMAGE or not item.offsets:
+                    continue
+                for start, end in item.offsets:
+                    start = max(start, prefix)
+                    stop = min(end + 1, prefix + length)
+                    if start < stop:
+                        mask[base + start - prefix : base + stop - prefix] = True
+        base += max(length, 0)
+    return mask
+
+
 class DeepseekV41ForCausalLM(BaseCausalLM):
     """V4.1 language and vision model with strict checkpoint coverage."""
 
@@ -1980,8 +2008,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             and mm_context.has_extend_inputs()
             and not ctx.forward_mode.is_decode_or_idle()
         ):
-            # Capture the image mask before restoring hashed placeholder IDs.
-            result["image_mask"] = is_mm_pad_value_for(input_ids, Modality.IMAGE)
+            if result["image_mask"] is None:
+                result["image_mask"] = _image_mask_from_spans(input_ids, mm_context)
             substitute_mm_pad_(input_ids, {Modality.IMAGE: self.config.image_token_id})
             embeds, _ = self.vision_embedder.apply(
                 input_ids=input_ids,

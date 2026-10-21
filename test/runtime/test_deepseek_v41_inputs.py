@@ -34,6 +34,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from torch import nn
 
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.engine.scheduler_utils import (
@@ -56,6 +57,13 @@ from tokenspeed.runtime.execution.types import (
 )
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.models.deepseek_v41 import DeepseekV41ForCausalLM
+from tokenspeed.runtime.multimodal.embedder import MultimodalEmbedder, pad_input_tokens
+from tokenspeed.runtime.multimodal.inputs import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalForwardContext,
+    MultimodalInputs,
+)
 
 VOCAB_SIZE = 128
 
@@ -1268,3 +1276,70 @@ def test_forced_single_token_resets_draft_tree_parents(buffers):
     assert ib.force_single_token_verify_buf[0].item()
     assert runtime.future_parent_map[0].tolist() == [-1, 0, 1, 2]
     assert runtime.future_parent_map[1].tolist() == tree.tolist()
+
+
+@pytest.mark.parametrize(
+    "prefix,length,image_rows",
+    [
+        (0, 7, [False, False, True, True, True, False, False]),
+        (0, 3, [False, False, True]),
+        (3, 2, [True, True]),
+        (5, 2, [False, False]),
+    ],
+)
+def test_image_mask_survives_input_clamp(buffers, prefix, length, image_rows):
+    ib, runtime = buffers
+    encoded = torch.ones(3, 4, device=ib.device)
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE, offsets=[(2, 4)], hash=123, encoded=encoded
+    )
+    item.set_pad_value()
+    mm_inputs = MultimodalInputs(mm_items=[item])
+    prompt = pad_input_tokens([10, 11, 5, 5, 5, 12, 13], mm_inputs)
+    states = {
+        "text": _state([20, 21], []),
+        "image": _state(prompt, []),
+        "decode": _state([30, 31], [32]),
+    }
+    runtime.valid_cache_lengths[3] = 2
+    # Even a hash-like generated ID must not mark a decode row as an image.
+    runtime.future_input_map[3] = item.pad_value
+    op = _op(states, list(states), [1, 2, 3], [2, length, 1], [0, prefix], [0, 0], [-1])
+    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    ids = ib.input_ids_buf  # Include padding rows in the mask check.
+    assert ((ids >= 0) & (ids < VOCAB_SIZE)).all()
+    context = MultimodalForwardContext(
+        mm_inputs=[None, mm_inputs, None],
+        extend_prefix_lens=[0, prefix],
+        extend_seq_lens=[2, length],
+        max_encoder_tokens=32,
+    )
+
+    # Exercise the real hook and scatter with small, pre-encoded image features.
+    adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
+    nn.Module.__init__(adapter)
+    adapter.config = SimpleNamespace(image_token_id=5)
+    adapter.model = nn.Module()
+    adapter.model.embed_tokens = nn.Embedding.from_pretrained(
+        torch.zeros(VOCAB_SIZE, 4, device=ib.device)
+    )
+    adapter.vision = None
+    adapter.vision_embedder = MultimodalEmbedder()
+    ctx = SimpleNamespace(forward_mode=ForwardMode.MIXED)
+    result = adapter.prepare_model_kwargs(ctx, ids, {"multimodal_context": context})
+    expected = [False] * 2 + image_rows + [False] * (ids.numel() - 2 - length)
+    assert result["image_mask"].tolist() == expected
+    if any(image_rows):
+        torch.testing.assert_close(
+            result["input_embeds"][:, 0].bool(), result["image_mask"]
+        )
+    else:
+        assert result["input_embeds"] is None
+
+    # The scatter releases completed encodings; restore the fixture for a second call.
+    item.encoded = encoded
+    explicit = torch.zeros_like(result["image_mask"])
+    result = adapter.prepare_model_kwargs(
+        ctx, ids, {"multimodal_context": context, "image_mask": explicit}
+    )
+    assert result["image_mask"] is explicit
