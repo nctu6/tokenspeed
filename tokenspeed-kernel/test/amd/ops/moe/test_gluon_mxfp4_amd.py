@@ -34,6 +34,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # no
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import (  # noqa: E402
     fused as gfx1250_fused,
 )
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import (  # noqa: E402
+    decode_tile_config,
+)
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (  # noqa: E402
     _resolve_block_m,
 )
@@ -1206,3 +1209,114 @@ def test_gfx1250_epilogue_fp8_matches_fp32_result(
     assert fused.shape == staged.shape
     assert torch.count_nonzero(as_fp32).item() > 0
     torch.testing.assert_close(fused.float(), staged.float(), rtol=0.0, atol=0.0)
+
+
+def test_gfx1250_decode_tile_config_streams_long_k_in_wide_rows() -> None:
+    long_k = decode_tile_config(3584)
+    short_k = decode_tile_config(384)
+    assert long_k["block_k"] == 512 and short_k["block_k"] == 128
+    assert long_k["block_n"] == short_k["block_n"] == 128
+
+
+def _sparse_decode_moe_case(num_tokens: int):
+    """Decode MoE inputs where most experts are idle, leaving padded blocks."""
+    generator = torch.Generator(device="cuda").manual_seed(20261012 + num_tokens)
+    hidden_size, intermediate_size, num_experts, top_k = 2048, 256, 64, 4
+    raw = make_mxfp4_moe_weights(num_experts, hidden_size, intermediate_size, generator)
+    w13_bias = 0.05 * torch.randn(
+        (num_experts, 2 * intermediate_size), device="cuda", generator=generator
+    )
+    w2_bias = 0.05 * torch.randn(
+        (num_experts, hidden_size), device="cuda", generator=generator
+    )
+    module = _make_static_fp8_moe_module(
+        raw,
+        preprocess_gluon_mxfp4_gfx1250_moe_weights,
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+    )
+    hidden_states = torch.randn(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_ids = (
+        torch.rand(num_tokens, num_experts, device="cuda", generator=generator)
+        .argsort(dim=1)[:, :top_k]
+        .to(torch.int32)
+    )
+    topk_weights = torch.rand(num_tokens, top_k, device="cuda", generator=generator)
+    return raw, module, w13_bias, w2_bias, hidden_states, topk_ids, topk_weights
+
+
+def _run_gfx1250_decode_moe(module, hidden_states, topk_ids, topk_weights):
+    return _gfx1250_static_moe(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        module.w13_weight_triton_tensor,
+        module.w2_weight_triton_tensor,
+        w13_bias=module.w13_weight_bias,
+        w2_bias=module.w2_weight_bias,
+        w13_mx_scale=module.w13_precision_config.b_mx_scale,
+        w2_mx_scale=module.w2_precision_config.b_mx_scale,
+        activation_dtype="fp8",
+        decode=True,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 5, 16])
+def test_gfx1250_decode_moe_skips_idle_experts(num_tokens: int) -> None:
+    """Long-K gate/up and short-K down decode tiles over a sparse routing."""
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 MXFP4 MoE decode kernel")
+
+    raw, module, w13_bias, w2_bias, hidden_states, topk_ids, topk_weights = (
+        _sparse_decode_moe_case(num_tokens)
+    )
+    actual = _run_gfx1250_decode_moe(module, hidden_states, topk_ids, topk_weights)
+    expected = _fp8_mxfp4_swiglu_moe_reference(
+        hidden_states,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        w13_bias,
+        raw["w2_weight"],
+        raw["w2_scale"],
+        w2_bias,
+        topk_ids,
+        topk_weights,
+    )
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(expected).item() > 0
+    # The reference rounds the intermediate to BF16 before its FP8 cast, so an
+    # element on an FP8 rounding boundary can land one step away after the
+    # 2048-long gate/up reduction.
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=2e-2)
+
+
+def test_gfx1250_decode_moe_reuses_binaries_across_batch_sizes() -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 MXFP4 MoE decode kernel")
+
+    _, module, _, _, hidden_states, topk_ids, topk_weights = _sparse_decode_moe_case(16)
+    # Four routed rows per token: 1 token warms the non-divisible row-count
+    # class and 4 tokens the divisible-by-16 class.
+    for num_tokens in (1, 4):
+        _run_gfx1250_decode_moe(
+            module,
+            hidden_states[:num_tokens],
+            topk_ids[:num_tokens],
+            topk_weights[:num_tokens],
+        )
+    torch.cuda.synchronize()
+    with assert_no_triton_compile(gfx1250_fused._matmul_decode):
+        for num_tokens in (2, 3, 8, 13, 16):
+            _run_gfx1250_decode_moe(
+                module,
+                hidden_states[:num_tokens],
+                topk_ids[:num_tokens],
+                topk_weights[:num_tokens],
+            )
+        torch.cuda.synchronize()

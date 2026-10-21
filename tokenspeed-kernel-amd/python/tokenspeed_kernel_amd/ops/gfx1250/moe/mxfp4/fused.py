@@ -60,7 +60,10 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
     get_tdm_gather_scatter_idx_layout,
     ragged_metadata_fields,
 )
-from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import _matmul_decode
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import (
+    _matmul_decode,
+    decode_tile_config,
+)
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.quantize import (
     launch_triton_quantize_mxfp4_activation_gfx1250,
 )
@@ -1328,7 +1331,8 @@ def matmul(
         decode: Select the small-M, M-ragged decode kernel.
         partial_tdm: Split each TDM descriptor load across half the warps so a
             pair of operand loads issues as one fused TDM operation. Requires
-            4 or 8 warps.
+            4 or 8 warps. The decode kernel pairs each weight load with its
+            scale load instead, and requires weight scales.
 
     Returns:
         ``(output, kernel)`` where ``kernel`` is the Triton/Gluon launch object.
@@ -2694,6 +2698,9 @@ def _precomputed_topk_route(
     )
 
 
+_PREFILL_TILES = {"block_n": 256, "block_k": 256, "num_warps": 4, "num_buffers": 3}
+
+
 def gluon_mxfp_precomputed_mxfp4_fused_moe(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -2803,15 +2810,13 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             "gfx1250 Gluon MXFP4 MoE supports activation 'silu', "
             f"'swiglu', or 'situ', got {activation!r}"
         )
-    launch = dict(
-        block_m=block_m,
-        block_n=256,
-        block_k=256,
-        num_warps=4,
-        num_buffers=3,
-        decode=decode,
-        partial_tdm=partial_tdm,
-    )
+    if decode:
+        gate_up_tiles = decode_tile_config(int(hidden_states.shape[-1]))
+        # The down projection reduces over the activation's half of W13's N.
+        down_tiles = decode_tile_config(int(w13_raw.shape[-1]) // 2)
+    else:
+        gate_up_tiles = down_tiles = _PREFILL_TILES
+    launch = dict(block_m=block_m, decode=decode, partial_tdm=partial_tdm)
     if activation_dtype == "mxfp4":
         x_mxfp4, x_mx_scale = launch_triton_quantize_mxfp4_activation_gfx1250(
             hidden_states
@@ -2828,6 +2833,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             out_dtype=torch.bfloat16,
             fused_activation=fused_activation,
             scale_preshuffle=True,
+            **gate_up_tiles,
             **launch,
         )
         intermediate, intermediate_mx_scale = (
@@ -2855,6 +2861,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             out_dtype=torch.float8_e4m3fn,
             fused_activation=fused_activation,
             scale_preshuffle=True,
+            **gate_up_tiles,
             **launch,
         )
         stage2_kwargs = dict(x_format="e4m3", x_global_scale=w2_weight.act_scale)
@@ -2867,6 +2874,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         a_ragged_metadata=ragged_metadata,
         scatter_indx=scatter_indx,
         out_dtype=out_dtype,
+        **down_tiles,
         scale_load_mode="swizzle",
         **launch,
     )

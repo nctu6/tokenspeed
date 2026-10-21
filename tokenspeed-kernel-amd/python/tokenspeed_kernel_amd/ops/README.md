@@ -1374,6 +1374,17 @@ With MXFP4 activations, step 2 quantizes the input to MXFP4 instead, the
 gate/up GEMM stores a BF16 intermediate, and a second quantizer pass converts
 it to MXFP4 before the down GEMM.
 
+Decode (a few routed rows per expert) uses a separate kernel that streams
+each touched expert's weights once, so its tiles target HBM streaming rather
+than reuse. Every program owns one 16-row block of one expert and a 128-column
+slice. Padding blocks of the over-sized grid carry a `-1` schedule entry and
+exit after one load. The program issues its weight TDM loads as soon as the
+expert ID is known, before the row metadata, gather indices and scatter rows
+that the activation loads and epilogue need. Long reductions (gate/up) load
+512-wide K steps, i.e. 256-byte MXFP4 row segments. Short reductions (down)
+load 128-wide steps so three buffers hold all of K in a small LDS footprint,
+and more programs stay resident to hide each one's fixed latency.
+
 The launcher resolves the row tile from the gathered row count and expert
 count unless the caller pins it. The kernels mask ragged M and N edges rather
 than peeling them, so a trailing partial tile loads only the rows that exist.
