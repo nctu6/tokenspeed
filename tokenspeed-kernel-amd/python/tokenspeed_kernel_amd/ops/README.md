@@ -1310,9 +1310,11 @@ lane fetches four K steps' scales with one load), the gate/up GEMM with fused
 SiLU-and-mul and MXFP4 requantization in sorted-route order, the down GEMM
 writing BF16 per-route rows, and the slot-order combine. Up to 1024 routes,
 one extra program of the quantization launch sorts the routes into expert
-blocks (atomic per-expert cursors; order within a block does not matter);
-larger route sets run the block-aligned `gluon_moe_sorting` first. Both GEMMs
-are `e2m1 x e2m1` scaled 16x16x128 MFMAs that load weights straight into
+blocks (atomic per-expert cursors; order within a block does not matter): it
+first fills every routed row with the padding id, one store per 256 rows,
+and the routes overwrite their rows after a drain and barrier. Larger route
+sets run the block-aligned `gluon_moe_sorting` first. Both GEMMs are
+`e2m1 x e2m1` scaled 16x16x128 MFMAs that load weights straight into
 registers.
 
 Block height follows the average routes per expert: 16 rows up to 4 routes
