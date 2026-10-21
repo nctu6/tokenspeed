@@ -50,6 +50,7 @@ from tqdm.auto import tqdm
 
 from tokenspeed.runtime.configs.load_config import LoadConfig
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.hf_hub_retry import call_with_hf_rate_limit_retry
 from tokenspeed.runtime.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
@@ -124,15 +125,22 @@ def get_quant_config(
     model_name_or_path = model_config.model_path
     is_local = os.path.isdir(model_name_or_path)
     if not is_local:
-        # Download the config files.
-        with get_lock(model_name_or_path, load_config.download_dir):
-            hf_folder = snapshot_download(
+
+        def download_config_files() -> str:
+            return snapshot_download(
                 model_name_or_path,
                 revision=model_config.revision,
                 allow_patterns="*.json",
                 cache_dir=load_config.download_dir,
                 local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
                 tqdm_class=DisabledTqdm,
+            )
+
+        # Download the config files.
+        with get_lock(model_name_or_path, load_config.download_dir):
+            hf_folder = call_with_hf_rate_limit_retry(
+                f"downloading config files of {model_name_or_path}",
+                download_config_files,
             )
     else:
         hf_folder = model_name_or_path
@@ -201,7 +209,10 @@ def download_weights_from_hf(
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
         # Before we download we look at that is available:
         fs = HfFileSystem()
-        file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+        file_list = call_with_hf_rate_limit_retry(
+            f"listing weight files of {model_name_or_path}",
+            lambda: fs.ls(model_name_or_path, detail=False, revision=revision),
+        )
 
         # depending on what is available we download different things
         for pattern in allow_patterns:
@@ -211,10 +222,9 @@ def download_weights_from_hf(
                 break
 
     logger.info(f"Using model weights format {allow_patterns!s}")
-    # Use file lock to prevent multiple processes from
-    # downloading the same model weights at the same time.
-    with get_lock(model_name_or_path, cache_dir):
-        hf_folder = snapshot_download(
+
+    def download_weights() -> str:
+        return snapshot_download(
             model_name_or_path,
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
@@ -222,6 +232,14 @@ def download_weights_from_hf(
             tqdm_class=DisabledTqdm,
             revision=revision,
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        )
+
+    # Use file lock to prevent multiple processes from
+    # downloading the same model weights at the same time.
+    with get_lock(model_name_or_path, cache_dir):
+        hf_folder = call_with_hf_rate_limit_retry(
+            f"downloading weights of {model_name_or_path}",
+            download_weights,
         )
     return hf_folder
 
@@ -240,17 +258,24 @@ def download_safetensors_index_file_from_hf(
             weights. If None, will use HF defaults.
         revision (Optional[str]): The revision of the model.
     """
+
+    def download_index_file() -> str:
+        return hf_hub_download(
+            repo_id=model_name_or_path,
+            filename=index_file,
+            cache_dir=cache_dir,
+            revision=revision,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        )
+
     # Use file lock to prevent multiple processes from
     # downloading the same model weights at the same time.
     with get_lock(model_name_or_path, cache_dir):
         try:
             # Download the safetensors index file.
-            hf_hub_download(
-                repo_id=model_name_or_path,
-                filename=index_file,
-                cache_dir=cache_dir,
-                revision=revision,
-                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            call_with_hf_rate_limit_retry(
+                f"downloading {index_file} of {model_name_or_path}",
+                download_index_file,
             )
         # If file not found on remote or locally, we should not fail since
         # only some models will have index_file.
