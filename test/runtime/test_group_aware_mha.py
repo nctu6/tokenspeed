@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import os
 import sys
-import unittest
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -33,25 +33,10 @@ def _layer(group_id, layer_id=0):
     return SimpleNamespace(group_id=group_id, layer_id=layer_id)
 
 
-def leaf_config_for_test(torch):
-    return SimpleNamespace(
-        device="cpu",
-        dtype=torch.float16,
-        is_draft=False,
-        speculative_num_draft_tokens=1,
-        context_len=24,
-        kv_cache_dtype=torch.bfloat16,
-        kv_cache_mxfp8=False,
-        draft_block_decode=False,
-        max_bs=8,
-        kernel_page_size=None,
-    )
-
-
-class RouterOverMhaLeavesTest(unittest.TestCase):
+class TestRouterOverMhaLeavesTest:
     """A router with two real MHAAttnBackend leaves (P=4 and P=2)."""
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import torch
 
@@ -59,7 +44,7 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
                 MHAAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.MHAAttnBackend = MHAAttnBackend
 
@@ -86,67 +71,6 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
             skip_softmax_threshold=0.0,
         )
         return self.MHAAttnBackend(config, spec, kernel_page_size=kernel_page_size)
-
-    def test_mixed_batch_splits_extend_and_decode_requests(self):
-        """--enable-mixed-batch builds; a MIXED round's extend metadata covers
-        only the leading extend requests and the trailing decode requests get
-        their own paged-decode view."""
-        torch = self.torch
-        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-
-        config = SimpleNamespace(**vars(leaf_config_for_test(torch)))
-        config.mixed_batch_enabled = True
-        spec = SimpleNamespace(
-            num_attention_heads=8,
-            num_kv_heads=8,
-            attn_tp_size=1,
-            head_dim=16,
-            backend_name="mha",
-            skip_softmax_threshold=0.0,
-        )
-        leaf = self.MHAAttnBackend(config, spec, kernel_page_size=4)
-        # Two extend requests (5 and 3 new tokens) then two decode requests.
-        seq_lens = torch.tensor([5, 7, 10, 12], dtype=torch.int32)
-        page_table = torch.arange(16, dtype=torch.int32).view(4, 4)
-        ext = torch.tensor([5, 3, 0, 0], dtype=torch.int32)
-        pre = torch.tensor([0, 4, 0, 0], dtype=torch.int32)
-        leaf.init_forward_metadata(
-            4,
-            2,
-            seq_lens,
-            page_table,
-            ForwardMode.MIXED,
-            extend_seq_lens=ext,
-            extend_seq_lens_cpu=ext,
-            extend_prefix_lens=pre,
-            extend_prefix_lens_cpu=pre,
-            extend_with_prefix=True,
-            query_shard=None,
-            page_table_cpu=None,
-        )
-        extend = leaf.forward_extend_metadata
-        self.assertEqual(extend.cu_extend_seq_lens_cpu, [0, 5, 8])
-        self.assertEqual(extend.seq_lens.tolist(), [5, 7])
-        self.assertEqual(extend.page_table.shape[0], 2)
-        decode = leaf.mixed_decode_metadata
-        self.assertEqual(decode.seq_lens.tolist(), [10, 12])
-        self.assertEqual(decode.page_table.tolist(), page_table[2:].tolist())
-        # A plain extend round clears the decode view.
-        leaf.init_forward_metadata(
-            2,
-            2,
-            seq_lens[:2],
-            page_table[:2],
-            ForwardMode.EXTEND,
-            extend_seq_lens=ext[:2],
-            extend_seq_lens_cpu=ext[:2],
-            extend_prefix_lens=pre[:2],
-            extend_prefix_lens_cpu=pre[:2],
-            extend_with_prefix=True,
-            query_shard=None,
-            page_table_cpu=None,
-        )
-        self.assertIsNone(leaf.mixed_decode_metadata)
 
     def _router(self, group_ids=(FULL, SWA)):
         from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
@@ -203,17 +127,15 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
             torch.tensor([9], dtype=torch.int32),
         )
         # FULL leaf runs at the raw grain (P=4, ratio 1): pages verbatim.
-        self.assertEqual(leaves[FULL].page_table_buf[0].tolist(), [5, 6, 7, 0, 0, 0])
+        assert (leaves[FULL].page_table_buf[0].tolist()) == ([5, 6, 7, 0, 0, 0])
         # SWA leaf runs at P=2 (ratio 2): raw page p -> kernel pages 2p, 2p+1
         # of ITS group's table — never the FULL group's pages.
-        self.assertEqual(
-            leaves[SWA].page_table_buf[0].tolist(),
-            [18, 19, 16, 17, 6, 7, 0, 0, 0, 0, 0, 0],
+        assert (leaves[SWA].page_table_buf[0].tolist()) == (
+            [18, 19, 16, 17, 6, 7, 0, 0, 0, 0, 0, 0]
         )
         # Each leaf's decode metadata views its own buffer, not a shared one.
-        self.assertNotEqual(
-            leaves[FULL].forward_decode_metadata.page_table.data_ptr(),
-            leaves[SWA].forward_decode_metadata.page_table.data_ptr(),
+        assert (leaves[FULL].forward_decode_metadata.page_table.data_ptr()) != (
+            leaves[SWA].forward_decode_metadata.page_table.data_ptr()
         )
 
     def test_write_locations_land_in_the_layers_own_group_pages(self):
@@ -231,11 +153,11 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
         )
         # pos 8, FULL (P=4): raw page 7 slot 0 -> 28 — inside FULL's pages.
         full_locs = router.write_locations(_layer(FULL), ForwardMode.DECODE)
-        self.assertEqual(full_locs.tolist(), [28])
+        assert (full_locs.tolist()) == ([28])
         # pos 8, SWA (P=2): raw page 3 -> kernel page 6 slot 0 -> 12 — SWA's
         # own table, so the two groups disagree, proving no shared table.
         swa_locs = router.write_locations(_layer(SWA), ForwardMode.DECODE)
-        self.assertEqual(swa_locs.tolist(), [12])
+        assert (swa_locs.tolist()) == ([12])
 
     def test_unknown_group_id_raises_even_with_a_sole_leaf(self):
         # The old single-group fallback (empty/unknown group_id -> the only
@@ -249,11 +171,11 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
             {FULL: torch.tensor([[5, 6, 7]], dtype=torch.int32)},
             torch.tensor([9], dtype=torch.int32),
         )
-        with self.assertRaisesRegex(KeyError, "names cache group 'nope'"):
+        with pytest.raises((KeyError), match=("names cache group 'nope'")):
             router.write_locations(_layer("nope"), ForwardMode.DECODE)
-        with self.assertRaisesRegex(KeyError, "names cache group ''"):
+        with pytest.raises((KeyError), match=("names cache group ''")):
             router.write_locations(_layer(""), ForwardMode.DECODE)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

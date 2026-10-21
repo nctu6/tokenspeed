@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 import sys
-import unittest
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,10 +21,10 @@ GPT_OSS_LAYER_TYPES = (
 )
 
 
-class MHAPoolGroupPublicationTest(unittest.TestCase):
+class TestMHAPoolGroupPublicationTest:
     """Constructs a real (tiny, CPU) MHATokenToKVPool; skips without deps."""
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import torch
 
@@ -31,7 +32,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
                 MHATokenToKVPool,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.MHATokenToKVPool = MHATokenToKVPool
 
@@ -97,15 +98,14 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
         # The scheduler allocates pages only through configured groups, so
         # plain models keep one full-history group published.
         pool = self._pool()
-        self.assertEqual(len(pool.arena.cache_group_specs), 1)
+        assert (len(pool.arena.cache_group_specs)) == (1)
         spec = pool.arena.cache_group_specs[0]
-        self.assertEqual(spec.group_id, "full_attention")
-        self.assertEqual(spec.attn_kind, "full_history")
-        self.assertIn("full_attention", pool.arena.cache_group_page_counts)
-        self.assertIsNotNone(pool.arena.buffer)
-        self.assertEqual(
-            pool.k_buffer[0].untyped_storage().data_ptr(),
-            pool.arena.buffer.untyped_storage().data_ptr(),
+        assert (spec.group_id) == ("full_attention")
+        assert (spec.attn_kind) == ("full_history")
+        assert ("full_attention") in (pool.arena.cache_group_page_counts)
+        assert (pool.arena.buffer) is not None
+        assert (pool.k_buffer[0].untyped_storage().data_ptr()) == (
+            pool.arena.buffer.untyped_storage().data_ptr()
         )
 
     def test_hybrid_no_spec_publishes_two_groups(self):
@@ -116,15 +116,13 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             sliding_window_tokens=128,
             layer_num=len(GPT_OSS_LAYER_TYPES),
         )
-        self.assertEqual(
-            {s.group_id for s in pool.arena.cache_group_specs},
-            {"full_attention", "sliding_attention"},
+        assert ({s.group_id for s in pool.arena.cache_group_specs}) == (
+            {"full_attention", "sliding_attention"}
         )
-        self.assertEqual(
-            set(pool.arena.cache_group_page_counts),
-            {"full_attention", "sliding_attention"},
+        assert (set(pool.arena.cache_group_page_counts)) == (
+            {"full_attention", "sliding_attention"}
         )
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

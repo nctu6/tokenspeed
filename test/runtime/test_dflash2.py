@@ -250,8 +250,8 @@ def test_candidate_unary_logits_are_promoted_to_fp32() -> None:
     )
 
 
-# Backend names, spelled as --drafter-attention-backend takes them, whose
-# kernel call sites forward layer.sliding_window_size.
+# Registered backends declaring sliding-window support, including QSA's
+# dense MHA path and V4.1's model-specific window.
 _WINDOW_AWARE_BACKENDS = frozenset(
     (
         "mha",
@@ -263,8 +263,8 @@ _WINDOW_AWARE_BACKENDS = frozenset(
         "mla",
         "gluon",
         "tokenspeed_mla",
-        "deepseek_v41",
         "qsa",
+        "deepseek_v41",
     )
 )
 
@@ -397,9 +397,13 @@ def test_the_path_kernel_reproduces_the_torch_walk() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_official_nodes_capture_and_replay_in_one_cuda_graph() -> None:
+    torch.manual_seed(0)
     device = torch.device("cuda")
     conv = DFlashGroupedConv(16, taps=2, group_size=4, block_size=8).to(device)
     selector = CandidateSelector(16, vocab_size=32, rank=4, top_k=4).to(device)
+    for module in (conv, selector):
+        for parameter in module.parameters():
+            torch.nn.init.normal_(parameter)
     static_hidden = torch.randn(8, 16, device=device)
     static_candidates = torch.randint(32, (1, 7, 4), device=device)
     static_unary = torch.randn(1, 7, 4, device=device)
@@ -435,6 +439,7 @@ def test_official_nodes_capture_and_replay_in_one_cuda_graph() -> None:
     eager_scores = selector(
         static_candidates, static_unary, finished[1:].unsqueeze(0), static_anchor
     )
+    assert torch.isfinite(eager_scores).all()
     expected = torch.empty_like(static_out)
     _walk_greedy_path(static_candidates, eager_scores, static_anchor, expected)
     torch.testing.assert_close(replayed, expected)
