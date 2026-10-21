@@ -366,12 +366,6 @@ and stores BF16. The live row count and split-buffer stride are runtime
 arguments that do not specialize the producer or reduction, so warming a
 projection covers other batch sizes with the same model dimensions.
 
-The gfx1250 AttnRes launch has two fixed warp configurations: eight warps
-below 256 tokens when mixing snapshots, and four otherwise. Normal startup's
-prefill and decode warmups compile both before serving. Direct kernel callers
-must warm both token ranges; disabling startup warmups can defer compilation
-until the first call in an unwarmed range.
-
 ### gfx1250 BF16 GEMM
 
 `gluon_mm_a16w16_gfx1250` is a general BF16 GEMM with FP32 or BF16 output. It
@@ -1462,6 +1456,47 @@ applies the existing value projection to the latent output. Graph replay reads
 updated page tables and lengths in place.
 
 ## Residual
+
+### gfx1250 Kimi K3 AttnRes
+
+`attention/kda/attn_res.py` mixes the current residual with up to 11 stored
+block residuals (snapshots) and applies the following RMSNorm in one launch.
+
+#### Contract
+
+- Candidates are the `N - 1` snapshots, then the current residual. Each is
+  scored by `<v * rsqrt(mean(v^2) + eps), res_weight * score_rms_weight>` in
+  FP32; the softmax-weighted sum is rounded to BF16 before the output RMSNorm.
+- With `delta`, the BF16-rounded `layer_residual + delta` is written back and
+  is the current residual. With a snapshot write, it is also stored to snapshot
+  row `N - 1`, which the mix does not read.
+- `N` and the snapshot write switch are compile-time; the token count and the
+  snapshot-row stride (`T * H` for block-major storage) are runtime, so batch
+  sizes share binaries. Rows and pointers must be 4-byte aligned.
+
+#### Algorithm
+
+One workgroup handles one token. BF16 rows are read as 32-bit words holding an
+(even, odd) element pair, so each element converts to FP32 with one shift or
+mask, and results are packed back into words before 128-bit stores.
+
+The snapshots form one `[BLOCK_ROWS, H / 2]` word tile (`BLOCK_ROWS` is `N - 1`
+rounded up to a power of two) with every row of a column in the same lane.
+Each row is a buffer load from its own 64-bit row base, so offsets stay 32-bit
+at any token count, and masked padding columns read zero. All loads, including
+the three weight vectors, issue before the first store because the compiler
+cannot hoist a load above a possibly aliasing store. One two-operand reduction
+then yields every row's square sum and score dot product. When the tile has a
+spare row, it carries the current residual so that reduction scores all
+candidates; otherwise the current residual gets its own reduction. The softmax
+weights are normalized once, so the mix is a lane-local FMA per element.
+
+Launch shapes fall into three warp counts. From 256 tokens, the bandwidth-bound
+launch uses 4 warps (one per SIMD): each lane holds a wide register tile, so
+loads stay in flight with no cross-warp reduction traffic. Decode grids use a
+few WGPs and each token's workgroup is VALU-bound: 8 warps up to 16 tokens or
+4 snapshots, and 16 warps for larger tiles at larger batches. Startup prefill
+warmups and decode graph captures compile all three.
 
 ### gfx950 mHC pre-mapping
 
