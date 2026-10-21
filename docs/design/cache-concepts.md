@@ -1112,6 +1112,10 @@ layers ──group──▶ groups ──pack──▶ CacheLayout ──bind─
   the full group packs two CacheBlocks per parent to the sliding group's
   one), and a whole-parent padding metric would wrongly charge each group
   for the other's planes and reject a layout that in fact wastes nothing.
+  parent, not an allocation. A parent's bytes are exactly its planes': each
+  plane is already a multiple of every tenant's packing, so the parent is not
+  rounded up again to the LCM of all the packings, which only added bytes no
+  field addresses.
 * **`bind`** (`CacheLayout.bind(num_lcm_blocks)`) multiplies that parent out
   by a count and yields the `CacheMemoryPlan` the arena allocates from and
   the PD wire carries.

@@ -143,7 +143,9 @@ from one first bound to that pool:
   trees, re-runs `bind_cache_groups` and the initialisation sequence above,
   freezes the workspace again and captures again.
 * The KV budget reserves what the graphs will cost: a probe binds the
-  smallest arena the family can run on and captures a few entries of each
+  smallest arena the family can run on (refused, with the numbers, when the
+  memory profile cannot hold it, since a serving arena would not fit either)
+  and captures a few entries of each
   ladder -- the widest three, then one a third and one two thirds of the
   way down -- with a driver-memory delta around each capture. The widest
   samples form a window priced at its positive bytes, plus one granule the
