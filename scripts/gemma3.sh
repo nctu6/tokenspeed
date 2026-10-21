@@ -46,6 +46,9 @@ cd "$REPO_ROOT"
 
 MODEL_PATH="${MODEL_PATH:-/models/google/gemma-3-27b-it}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-test}"
+# gemma templates are not a Symphony "hf" table (the gateway would refuse
+# them); passthrough returns text as generated, nctu6's proven config.
+REASONING_PARSER="${REASONING_PARSER:-passthrough}"
 HOST_PORT="${HOST_PORT:-8778}"
 CUDA_DEVICES="${CUDA_DEVICES:-6}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-452}"
@@ -84,6 +87,7 @@ source "$VENV_DIR/bin/activate"
 cmd=(
     tokenspeed serve "$MODEL_PATH"
     --served-model-name "$SERVED_MODEL_NAME"
+    --reasoning-parser "$REASONING_PARSER"
     --host 0.0.0.0
     --port "$HOST_PORT"
     --trust-remote-code

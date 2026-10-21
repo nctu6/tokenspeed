@@ -559,6 +559,19 @@ would cost concurrency on every request to protect against a rare shortfall.
 The debug knob (§2, below) never aborts: a forced retraction whose image does
 not fit is refused and logged.
 
+> **Implemented last resort (`chooseVictim(drop_exempt_last_resort)`).** When
+> the blocker is a resident stuck on its own next page and every retractable
+> candidate is reserve-exempt, the victim policy drops the exemption on the
+> newest resident: a reversible host-retraction (the image fits a free
+> snapshot slot) is taken freely — the healthy high-concurrency churn that
+> keeps the engine full (at gemma-4 C=512 it runs ~400 times with zero
+> aborts) — and an abort only when no image fits and no resident can decode in
+> place, i.e. a genuine wedge. A waiting-prompt blocker is served by admission
+> back-pressure (§1.4), never by sacrificing a covered resident. This is the
+> reserve-exempt capacity-deadlock fix; it supersedes the earlier "empty-round
+> retraction" phrasing above, which this section still describes for the
+> retract-and-grant flow it shares.
+
 **The victim's pages are released — and grantable — immediately**, before
 either copy has run. Both legs are stream-ordered: their tickets pin only the
 Host destinations, and the runtime fences the **forward thread's stream** on

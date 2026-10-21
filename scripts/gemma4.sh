@@ -53,6 +53,9 @@ cd "$REPO_ROOT"
 
 MODEL_PATH="${MODEL_PATH:-/models/google/gemma-4-31B-it}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-test}"
+# gemma templates are not a Symphony "hf" table (the gateway would refuse
+# them); passthrough returns text as generated, nctu6's proven config.
+REASONING_PARSER="${REASONING_PARSER:-passthrough}"
 HOST_PORT="${HOST_PORT:-8779}"
 CUDA_DEVICES="${CUDA_DEVICES:-6,7}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-2}"
@@ -93,6 +96,7 @@ source "$VENV_DIR/bin/activate"
 cmd=(
     tokenspeed serve "$MODEL_PATH"
     --served-model-name "$SERVED_MODEL_NAME"
+    --reasoning-parser "$REASONING_PARSER"
     --host 0.0.0.0
     --port "$HOST_PORT"
     --trust-remote-code
@@ -120,6 +124,13 @@ fi
 if [[ -n "$DISABLE_NCCL_NVLS" ]]; then
     cmd+=(--disable-nccl-nvls)
     export NCCL_NVLS_ENABLE=0
+fi
+
+# Extra serve/gateway args (space-separated), e.g. EXTRA_SERVE_ARGS="--reasoning-parser passthrough".
+if [[ -n "${EXTRA_SERVE_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206
+    _extra=($EXTRA_SERVE_ARGS)
+    cmd+=("${_extra[@]}")
 fi
 
 exec "${cmd[@]}"

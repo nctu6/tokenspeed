@@ -82,6 +82,7 @@ from tokenspeed.runtime.execution.types import (
     InputLogprobPlan,
     ModelExecutionResult,
     NGramInputs,
+    PoolerForwardResult,
     RequestHistorySeeds,
     StopCriteria,
 )
@@ -406,6 +407,9 @@ class ModelExecutorConfig:
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
+    # Embedding (pooling) serving: forward produces one vector per request,
+    # samples nothing, and runs eager (no decode graph, see ForwardStepRunner).
+    is_embedding: bool = False
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -479,6 +483,7 @@ class ModelExecutorConfig:
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
             enforce_eager=server_args.enforce_eager,
+            is_embedding=not model_config.is_generation,
             prefix_granularity=prefix_granularity,
             max_num_seqs=server_args.max_num_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,
@@ -1370,6 +1375,11 @@ class ModelExecutor:
             name: view[rows]
             for name, view in self.input_buffers.ngram_model_kwargs(num_tokens).items()
         }
+        # Encoder-decoder cross-attention (Whisper) addresses its KV by pool
+        # slot, so every forward -- autotune, eager, captured -- hands the
+        # model its request pool indices.
+        ib = self.input_buffers
+        kwargs["req_pool_indices"] = ib.req_pool_indices_buf[:bs]
         if self.runtime_states.has_request_token_history:
             ib = self.input_buffers
             kwargs["request_token_history"] = (
@@ -1620,7 +1630,8 @@ class ModelExecutor:
     def _log_dp_sampling_route(self, bs: int, ctx: ForwardContext) -> None:
         runtime = self.dp_sampling_runtime_config
         if (
-            self.config.global_rank != 0
+            runtime is None
+            or self.config.global_rank != 0
             or not runtime.enabled
             or runtime.min_bs is None
             or runtime.topology is None
@@ -1688,6 +1699,11 @@ class ModelExecutor:
             self.drafter.prepare_target_forward(ctx)
 
         logits_output = self._run_target_forward(ctx)
+
+        if getattr(self.config, "is_embedding", False):
+            # Pooling forward: the model returned a PoolerOutput, not logits.
+            # Short-circuit before any sampling/NaN-guard that assumes tokens.
+            return PoolerForwardResult(embeddings=logits_output.embeddings)
 
         if self.config.pp_size > 1 and not self._pp_is_last_stage:
             # Mid-pipeline stage: the model returned the boundary bundle, not
@@ -2472,12 +2488,7 @@ class ModelExecutor:
                             else bs
                         )
                         forward_step_start = time.perf_counter()
-                    (
-                        output_tokens,
-                        output_lengths,
-                        output_logprobs,
-                        forward_logprobs,
-                    ) = self.forward_step(
+                    step_result = self.forward_step(
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
@@ -2507,6 +2518,27 @@ class ModelExecutor:
                         forward_step_ms = (
                             time.perf_counter() - forward_step_start
                         ) * 1000.0
+
+                # Embedding (pooling) serving: the forward produced one vector
+                # per request and sampled nothing. Ship the embeddings as the
+                # result, skipping the generative token / sampling / D2H path.
+                if isinstance(step_result, PoolerForwardResult):
+                    embeddings = step_result.embeddings
+                    copy_event = self.device_module.Event()
+                    copy_event.record()
+                    return ModelExecutionResult(
+                        output_tokens=None,
+                        output_lengths=None,
+                        output_logprobs=None,
+                        copy_event=copy_event,
+                        output_embeddings=embeddings,
+                    )
+                (
+                    output_tokens,
+                    output_lengths,
+                    output_logprobs,
+                    forward_logprobs,
+                ) = step_result
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
                 self._update_runtime_state(

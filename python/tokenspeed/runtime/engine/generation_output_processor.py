@@ -811,20 +811,20 @@ class OutputProcesser:
             forward_op.extend_prefix_lens,
             forward_op.extend_replay_lens,
         )
-        self.add_computed_length(
-            forward_op.request_ids,
-            forward_op.input_lengths,
-            forward_op.extend_prefix_lens,
-        )
-
         request_changes = []
         stream_out_rids = []
         stream_out_states = []
         embeddings = getattr(results, "output_embeddings", None)
+        input_lengths = forward_op.input_lengths
+        extend_prefix_lens = forward_op.extend_prefix_lens
         for i, rid in enumerate(forward_op.request_ids):
             request_state: RequestState = self.rid_to_state.get(rid)
             if request_state is None:
                 continue
+            # Whole-prompt prefill: the computed length is the prompt (an
+            # extend sets it, it does not accumulate), as the generative
+            # commit path sets it inline.
+            request_state.computed_length = input_lengths[i] + extend_prefix_lens[i]
             if not request_state.prefill_finished:
                 raise RuntimeError(
                     f"pooling request {rid} was scheduled as a partial prefill; "
@@ -865,6 +865,13 @@ class OutputProcesser:
         model_execution_results: ModelExecutionResult,
         is_prefill_instance: bool,
     ):
+        # Embedding (pooling) serving: the forward produced vectors, not
+        # tokens -- route to the embedding post-processing (one pooled vector
+        # per request) before any token/logprob path reads `output_tokens`.
+        if getattr(model_execution_results, "output_embeddings", None) is not None:
+            return self.post_process_embedding_forward_op(
+                forward_op, model_execution_results
+            )
         # Each read of a scheduler-binding vector copies all of it; read once.
         request_ids = forward_op.request_ids
         input_lengths = forward_op.input_lengths
