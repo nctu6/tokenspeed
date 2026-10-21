@@ -783,25 +783,29 @@ base-2 LSE; `gluon_qsa_sparse_attention_merge_gfx950` merges all splits of a
 ### gfx950 QSA indexer
 
 The `qsa_block_scores` and `qsa_block_topk_select` ops, which the `logits`
-solution of `qwen4_exp_qsa_block_topk` composes, select these Gluon kernels on
+algorithm of `qwen4_exp_qsa_block_topk` composes, select these Gluon kernels on
 gfx950. They return the same blocks as the portable Triton registrations; the
 selected ids come out in increasing order rather than by score.
 
-- `gluon_qsa_block_scores_gfx950` writes `sum_h relu(q_h . k)` for every
-  compressed block below each row's `complete_blocks` (`-inf` elsewhere).
+- `gluon_qsa_block_scores_gfx950` writes `sum_h relu(q_h . k)` for each valid
+  compressed block below each row's `complete_blocks`, leaving the tail
+  unwritten. Each request run stops at its current maximum frontier.
   A program owns 16 query rows (prefill) or 4 rows (decode) whose index heads
   form the 64- or 16-row MFMA M dimension, and loops over its share of
   128-block tiles, prefetching the next key tile. Rows of one request are
   contiguous; a tile spanning requests scores one request run at a time, so
   ragged batches need no query grouping. Keys are gathered with 64-bit
-  pointers (the compressed cache may exceed 2 GiB).
+  pointers (the compressed cache may exceed 2 GiB). Page ids, request ids and
+  complete-block counts accept int32 or int64. Query and page-table buffers
+  must fit within 2 GiB; their buffer-load offsets remain 32-bit.
 - `gluon_qsa_block_topk_select_gfx950` radix-selects the `topk` largest
   finite scores per row: four 8-bit passes build LDS-atomic histograms, then
   one pass writes the ids above the threshold and the first ids equal to it in
   increasing column order (ties keep the smaller id, like the portable
   selection). Rows with at most 4096 scores stay in registers; the chunk is a
   power-of-two bucket of the score width, and wider rows stream in 4096-score
-  chunks.
+  chunks. Supplied per-row lengths bound every scan and load; columns beyond
+  them may be uninitialized. Passing `None` scans the full score row.
 
 ### gfx1250 MLA decode
 
