@@ -1391,6 +1391,19 @@ The launcher resolves the row tile from the gathered row count and expert
 count unless the caller pins it. The kernels mask ragged M and N edges rather
 than peeling them, so a trailing partial tile loads only the rows that exist.
 
+Routes of up to 2048 rows build all metadata in one launch, as a stable
+counting sort by expert: the gather, scatter and gate rows match a stable
+argsort, and invalid ids sort last with a zero gate and count in no slice. Each
+program first builds the whole expert histogram with LDS atomics; one atomic
+per row also counts the rows before the program's chunk in its high 16 bits.
+`cdiv(rows, 64)` programs then place 64 rows each. A row lands after the rows
+of lower experts, the same-expert rows of earlier chunks, and the same-expert
+rows earlier in its chunk, counted with a 64 x 64 comparison tile. Five more
+programs write the slice offsets and the block offsets and schedule for one
+block size each. No program waits on another, so latency stays near one
+histogram and scan instead of one workgroup's serial pass over every row and
+block size.
+
 The large-batch router counts expert assignments in groups of at most 256
 experts, using four warps in the counting stage. This reduces LDS atomic
 contention when routing across many experts. The router counts duplicate

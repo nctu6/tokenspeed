@@ -431,6 +431,14 @@ def test_gfx1250_small_m_route_matches_expert_grouping(
     torch.cuda.synchronize()
 
     _assert_gfx1250_large_route(ids, weights, experts, route)
+    # Rows are stably sorted by expert, so the indices are bit-identical to
+    # the torch argsort route.
+    _, gather, scatter, gate = gfx1250_fused._route_from_topk(
+        weights, ids, experts, dtype=weights.dtype
+    )
+    assert torch.equal(route[1], gather)
+    assert torch.equal(route[2], scatter)
+    assert torch.equal(route[3], gate)
 
 
 def test_gfx1250_small_m_route_ignores_invalid_experts() -> None:
@@ -473,13 +481,12 @@ def test_gfx1250_small_m_route_ignores_invalid_experts() -> None:
 
 
 @pytest.mark.parametrize(
-    ("route_fn", "kernels", "zero_tail", "warm", "sweep"),
+    ("route_fn", "kernels", "warm", "sweep"),
     [
         # 33 to 64 tokens fill one 1024-gate extent: the EAGLE3 verify batches.
         pytest.param(
             gfx1250_fused._precomputed_topk_route_small_m_gfx1250,
             (gfx1250_fused._precomputed_topk_route_small_m_gfx1250_kernel,),
-            False,
             33,
             (40, 48, 57, 64),
             id="one_launch",
@@ -493,7 +500,6 @@ def test_gfx1250_small_m_route_ignores_invalid_experts() -> None:
                 gfx1250_fused._precomputed_topk_route_large_stage3_gfx1250_kernel,
                 gfx1250_fused._precomputed_topk_route_large_stage4_gfx1250_kernel,
             ),
-            True,
             129,
             (130, 160, 200, 250),
             id="staged",
@@ -503,7 +509,6 @@ def test_gfx1250_small_m_route_ignores_invalid_experts() -> None:
 def test_gfx1250_route_reuses_binaries_across_batch_sizes(
     route_fn: Callable,
     kernels: tuple,
-    zero_tail: bool,
     warm: int,
     sweep: tuple[int, ...],
 ) -> None:
@@ -515,7 +520,7 @@ def test_gfx1250_route_reuses_binaries_across_batch_sizes(
     def run(tokens: int) -> None:
         weights, ids = make_round_robin_topk(tokens, experts, topk)
         route = route_fn(weights, ids, experts)
-        _assert_gfx1250_large_route(ids, weights, experts, route, zero_tail=zero_tail)
+        _assert_gfx1250_large_route(ids, weights, experts, route)
 
     run(warm)
     with assert_no_triton_compile(*kernels):
@@ -528,8 +533,6 @@ def _assert_gfx1250_large_route(
     weights: torch.Tensor,
     experts: int,
     route,
-    *,
-    zero_tail: bool = True,
 ) -> None:
     metadata, gather, scatter, gate = route
     flat_ids = ids.reshape(-1)
@@ -566,8 +569,7 @@ def _assert_gfx1250_large_route(
         gate[:valid_count],
         flat_weights[valid_scatter.long()],
     )
-    if zero_tail:
-        assert torch.count_nonzero(gate[valid_count:]) == 0
+    assert torch.count_nonzero(gate[valid_count:]) == 0
 
     for block_size in metadata.block_sizes():
         expected_blocks = (expected_sizes + block_size - 1) // block_size
@@ -590,21 +592,18 @@ def _assert_gfx1250_large_route(
 
 
 @pytest.mark.parametrize(
-    ("route_fn", "zero_tail"),
+    "route_fn",
     [
         pytest.param(
-            gfx1250_fused._precomputed_topk_route_large_m_gfx1250, True, id="staged"
+            gfx1250_fused._precomputed_topk_route_large_m_gfx1250, id="staged"
         ),
-        # The one-launch route leaves rows past the valid count unwritten.
         pytest.param(
-            gfx1250_fused._precomputed_topk_route_small_m_gfx1250,
-            False,
-            id="one_launch",
+            gfx1250_fused._precomputed_topk_route_small_m_gfx1250, id="one_launch"
         ),
     ],
 )
 def test_gfx1250_route_handles_duplicates_invalid_ids_and_block64(
-    route_fn: Callable, zero_tail: bool
+    route_fn: Callable,
 ) -> None:
     if not is_cdna5():
         pytest.skip("gfx1250 is required for the CDNA5 fused route")
@@ -626,7 +625,7 @@ def test_gfx1250_route_handles_duplicates_invalid_ids_and_block64(
     route = route_fn(weights, ids, experts)
     torch.cuda.synchronize()
 
-    _assert_gfx1250_large_route(ids, weights, experts, route, zero_tail=zero_tail)
+    _assert_gfx1250_large_route(ids, weights, experts, route)
     block64_offsets = route[0].block_offs(64)
     expected64 = (route[0].slice_sizes + 63) // 64
     assert torch.equal(block64_offsets[1:] - block64_offsets[:-1], expected64)
@@ -658,12 +657,7 @@ def test_gfx1250_large_m_route_handles_duplicates_invalid_ids_and_block64(
     route = gfx1250_fused._precomputed_topk_route(weights, ids, experts)
     torch.cuda.synchronize()
 
-    one_launch = (
-        0 < tokens <= gfx1250_fused._SMALL_ROUTE_MAX_TOKENS
-        and tokens * topk <= gfx1250_fused._SMALL_ROUTE_MAX_GATES
-        and experts <= 1024
-    )
-    _assert_gfx1250_large_route(ids, weights, experts, route, zero_tail=not one_launch)
+    _assert_gfx1250_large_route(ids, weights, experts, route)
     block64_offsets = route[0].block_offs(64)
     expected64 = (route[0].slice_sizes + 63) // 64
     assert torch.equal(block64_offsets[1:] - block64_offsets[:-1], expected64)
