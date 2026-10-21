@@ -1207,6 +1207,19 @@ knobs are required with `--kvstore-storage-backend` and refused without it:
 | `--kvstore-prefetch-timeout-per-page-s` | The deadline's per-page term in seconds (0 for a fixed deadline). |
 | `--kvstore-prefetch-batch-pages` | Prefix pages per `batch_get_into` of a prefetch; the fetch stops at the first batch with a missing page (the reference engine uses 128). |
 
+L3 diagnostics are log-based and byte-denominated. `L3HostStore` logs every
+backup (PUT) and prefetch batch (GET) with key counts, successful keys,
+successful payload bytes, and call latency. It logs each `batch_exists`
+probe at debug level; cumulative exists/GET/PUT counters (calls, keys, ok
+keys, ok bytes, total seconds) are kept per store. Above that, the Host
+cache executor logs each completed backup with queue wait separated from
+actual PUT time plus the pending backup pages, bytes, and oldest pending
+age. The backlog includes completed PUTs awaiting their write-back
+acknowledgment. A slow PUT retains Host pages (and Device pages for pinned
+write-backs) until that acknowledgment, delaying admission despite bounded
+pools. Transferred volume is reported as bytes, never as an effective token
+hit rate.
+
 `--kvstore-storage-backend memory` is an in-process dict for tests only.
 CI exercises that Mooncake-compatible contract end-to-end (scheduler
 prefetch after `register_storage_keys` / Host eviction, and a CUDA

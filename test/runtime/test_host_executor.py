@@ -875,7 +875,9 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._ready_load_acks = []
         executor._prefetch_acks = []
         executor._backup_futures = []
+        executor._backup_stats = executor_module._BackupStats()
         executor._l3_workers = None
+        executor.host_storage.host_block_range = lambda group_index, block_id: (0, 64)
         executor.l3_store = Mock()
         executor._write_done = lambda op_id: op_id
         started = [threading.Event(), threading.Event()]
@@ -953,7 +955,7 @@ class GroupAwareWireTest(unittest.TestCase):
             self.assertEqual(poll_until_ready(), [12])
             self.assertEqual(executor.poll_results(), [])
             self.assertEqual(
-                [op_ids for _, op_ids, _ in executor._backup_futures], [[11]]
+                [ticket.op_ids for ticket in executor._backup_futures], [[11]]
             )
 
             release[1].set()
@@ -1601,7 +1603,17 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         future.result.side_effect = completed
         executor = SimpleNamespace(
             _ack_lock=lock,
-            _backup_futures=PendingBackups([(future, [7], [(0, 1, "h0", 0)])]),
+            _backup_futures=PendingBackups(
+                [
+                    module._BackupTicket(
+                        future=future,
+                        op_ids=[7],
+                        pages=[(0, 1, "h0", 0)],
+                        enqueued_at=0.0,
+                        payload_bytes=64,
+                    )
+                ]
+            ),
         )
         module.HostCacheExecutor._wait_l3_backups(executor)
         self.assertEqual(observed, ["done"])
@@ -1609,6 +1621,63 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "backup failed"):
             module.HostCacheExecutor._wait_l3_backups(executor)
         self.assertFalse(lock.locked())
+
+    def test_shutdown_waits_for_backup_tickets_and_only_backs_up_write_acks(self):
+        module = _load_executor_module_without_triton(force_isolated=True)
+        executor = module.HostCacheExecutor.__new__(module.HostCacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._completions = Mock()
+        executor._completions.drop_all.return_value = [
+            module._Ack(kind=module._AckKind.SNAPSHOT, op_ids=[6], backup_pages=[]),
+            module._Ack(
+                kind=module._AckKind.WRITE_BACK,
+                op_ids=[7],
+                backup_pages=[(0, 1, "h0", 0)],
+            ),
+        ]
+        future = Mock()
+        executor._backup_futures = [
+            module._BackupTicket(
+                future=future,
+                op_ids=[8],
+                pages=[(0, 2, "h1", 0)],
+                enqueued_at=0.0,
+                payload_bytes=64,
+            )
+        ]
+        executor._l3_workers = Mock()
+        workers = executor._l3_workers
+        executor._l3_prefetch_lane = Mock()
+        prefetch_lane = executor._l3_prefetch_lane
+        executor._prefetch_jobs = {9: Mock()}
+        executor._prefetch_acks = [(9, 1)]
+        executor._backup_to_storage = Mock()
+        executor.l3_store = Mock()
+
+        executor.shutdown()
+
+        executor._backup_to_storage.assert_called_once_with([(0, 1, "h0", 0)])
+        future.result.assert_called_once_with()
+        workers.shutdown.assert_called_once_with(wait=True)
+        prefetch_lane.shutdown.assert_called_once_with(wait=True)
+        self.assertEqual(executor._backup_futures, [])
+        self.assertEqual(executor._prefetch_jobs, {})
+        self.assertEqual(executor._prefetch_acks, [])
+        self.assertIsNone(executor._l3_workers)
+        self.assertIsNone(executor._l3_prefetch_lane)
+        executor.l3_store.close.assert_called_once_with()
+
+    def test_backup_ticket_requires_timing_fields(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import _BackupTicket
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        signature = inspect.signature(_BackupTicket)
+        for name in ("future", "op_ids", "pages", "enqueued_at", "payload_bytes"):
+            self.assertIs(signature.parameters[name].default, inspect.Parameter.empty)
+        with self.assertRaises(TypeError):
+            _BackupTicket(Mock(), [7], [(0, 1, "h0", 0)])
 
     def test_storage_pages_list_the_kept_hashed_rows_by_local_host_id(self):
         try:
@@ -1641,6 +1710,7 @@ class L3FlatKvExecutorTest(unittest.TestCase):
                 HostCacheExecutor,
                 _Ack,
                 _AckKind,
+                _BackupStats,
             )
             from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
         except (ImportError, ModuleNotFoundError) as exc:
@@ -1662,7 +1732,11 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor._ready_load_acks = []
         executor._prefetch_acks = []
         executor._backup_futures = []
+        executor._backup_stats = _BackupStats()
         executor._l3_workers = None
+        executor.host_storage = SimpleNamespace(
+            host_block_range=lambda group_index, block_id: (0, 64)
+        )
         executor.l3_store = Mock()
         executor.l3_store.backup.side_effect = backup
         finish = Mock()
@@ -1680,6 +1754,14 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         self.assertEqual(first, [])
         self.assertTrue(started.wait(timeout=2))
         executor.l3_store.backup.assert_called_once_with([(0, 1, "h0", 0)])
+        # While the PUT is gated the backlog reports the pending page, its
+        # payload bytes, and a growing oldest-pending age.
+        time.sleep(0.05)
+        backlog = executor.l3_backup_backlog()
+        self.assertEqual(backlog.pending_tasks, 1)
+        self.assertEqual(backlog.pending_pages, 1)
+        self.assertEqual(backlog.pending_bytes, 64)
+        self.assertGreaterEqual(backlog.oldest_pending_seconds, 0.04)
         release.set()
         deadline = time.monotonic() + 2
         second = []
@@ -1691,6 +1773,23 @@ class L3FlatKvExecutorTest(unittest.TestCase):
                 time.sleep(0.01)
             self.assertEqual(len(second), 1)
             self.assertEqual(int(second[0].op_id), 7)
+            # The WriteBackDone lands only after the PUT completed, and the
+            # diagnostics carry the payload bytes and the queue/PUT split.
+            stats = executor._backup_stats
+            self.assertEqual(stats.completed, 1)
+            self.assertEqual(stats.failed, 0)
+            self.assertEqual(stats.completed_bytes, 64)
+            self.assertEqual(len(stats.recent), 1)
+            completion = stats.recent[0]
+            self.assertEqual(completion.pages, 1)
+            self.assertEqual(completion.payload_bytes, 64)
+            self.assertFalse(completion.failed)
+            self.assertGreaterEqual(completion.put_seconds, 0.04)
+            backlog = executor.l3_backup_backlog()
+            self.assertEqual(backlog.pending_tasks, 0)
+            self.assertEqual(backlog.pending_pages, 0)
+            self.assertEqual(backlog.pending_bytes, 0)
+            self.assertEqual(backlog.oldest_pending_seconds, 0.0)
         finally:
             workers = executor._l3_workers
             if workers is not None:
@@ -1702,6 +1801,7 @@ class L3FlatKvExecutorTest(unittest.TestCase):
                 HostCacheExecutor,
                 _Ack,
                 _AckKind,
+                _BackupStats,
             )
             from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
         except (ImportError, ModuleNotFoundError) as exc:
@@ -1713,8 +1813,12 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor._ready_load_acks = []
         executor._prefetch_acks = []
         executor._backup_futures = []
+        executor._backup_stats = _BackupStats()
         executor._backup_poll_failed = False
         executor._l3_workers = None
+        executor.host_storage = SimpleNamespace(
+            host_block_range=lambda group_index, block_id: (0, 64)
+        )
         executor.l3_store = Mock()
         executor.l3_store.backup.return_value = [False]
         finish = Mock()
@@ -1745,6 +1849,118 @@ class L3FlatKvExecutorTest(unittest.TestCase):
             if workers is not None:
                 workers.shutdown(wait=True)
         self.assertTrue(failed)
+        # Every failed attempt is recorded with its timing; the retry keeps
+        # the ticket pending instead of acknowledging the write-back.
+        stats = executor._backup_stats
+        self.assertGreaterEqual(stats.failed, 1)
+        self.assertGreaterEqual(stats.retried, 1)
+        self.assertEqual(stats.completed, 0)
+        self.assertTrue(all(entry.failed for entry in stats.recent))
+        backlog = executor.l3_backup_backlog()
+        self.assertGreaterEqual(backlog.pending_tasks, 1)
+        self.assertGreaterEqual(backlog.pending_pages, 1)
+
+    def test_backup_diagnostics_separate_queue_wait_from_put_time(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import (
+                HostCacheExecutor,
+                _Ack,
+                _AckKind,
+                _BackupStats,
+            )
+            from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        first_put_started = threading.Event()
+        release_first_put = threading.Event()
+        put_calls = 0
+        put_lock = threading.Lock()
+
+        def backup(pages):
+            nonlocal put_calls
+            with put_lock:
+                put_calls += 1
+                index = put_calls
+            if index == 1:
+                first_put_started.set()
+                if not release_first_put.wait(timeout=10):
+                    raise TimeoutError("first L3 PUT was not released")
+            return [True] * len(pages)
+
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._completions = CompletionQueue()
+        executor._ready_load_acks = []
+        executor._prefetch_acks = []
+        executor._backup_futures = []
+        executor._backup_stats = _BackupStats()
+        executor._backup_poll_failed = False
+        executor._l3_workers = None
+        executor.host_storage = SimpleNamespace(
+            host_block_range=lambda group_index, block_id: (0, 64)
+        )
+        executor.l3_store = Mock()
+        executor.l3_store.backup.side_effect = backup
+        finish = Mock()
+        finish.query.return_value = True
+
+        def queue_ack(op_id, page):
+            executor._completions.push(
+                finish,
+                _Ack(
+                    kind=_AckKind.WRITE_BACK,
+                    op_ids=[op_id],
+                    backup_pages=[page],
+                ),
+            )
+            self.assertEqual(executor.poll_results(), [])
+
+        try:
+            # The single backup worker picks up the first ticket and blocks
+            # inside its PUT.
+            queue_ack(7, (0, 1, "h0", 0))
+            self.assertTrue(first_put_started.wait(timeout=10))
+
+            # The second ticket queues behind the busy worker; while PUT 1 is
+            # still gated, both are pending and the backlog reflects them.
+            queue_ack(8, (0, 2, "h1", 0))
+            time.sleep(0.15)
+            backlog = executor.l3_backup_backlog()
+            self.assertEqual(backlog.pending_tasks, 2)
+            self.assertEqual(backlog.pending_pages, 2)
+            self.assertEqual(backlog.pending_bytes, 128)
+            self.assertGreaterEqual(backlog.oldest_pending_seconds, 0.1)
+
+            # Release PUT 1; PUT 2 then runs without its own gate.
+            release_first_put.set()
+            events = []
+            deadline = time.monotonic() + 10
+            while len(events) < 2 and time.monotonic() < deadline:
+                events.extend(executor.poll_results())
+                if len(events) < 2:
+                    time.sleep(0.005)
+            self.assertEqual([int(event.op_id) for event in events], [7, 8])
+
+            stats = executor._backup_stats
+            self.assertEqual(stats.completed, 2)
+            self.assertEqual(stats.failed, 0)
+            self.assertEqual(stats.completed_bytes, 128)
+            completions = list(stats.recent)
+            self.assertEqual(len(completions), 2)
+            first, second = completions
+            # PUT 1 held the worker: its time is PUT time, not queue wait.
+            self.assertGreaterEqual(first.put_seconds, 0.1)
+            self.assertLess(first.queue_seconds, first.put_seconds)
+            # PUT 2 spent that hold queued; its own PUT ran unimpeded.
+            self.assertGreaterEqual(second.queue_seconds, 0.1)
+            self.assertLess(second.put_seconds, second.queue_seconds)
+            self.assertFalse(executor.consume_backup_poll_failure())
+        finally:
+            release_first_put.set()
+            workers = executor._l3_workers
+            if workers is not None:
+                workers.shutdown(wait=True)
 
     def test_load_with_every_row_owned_elsewhere_acks_without_h2d(self):
         try:
