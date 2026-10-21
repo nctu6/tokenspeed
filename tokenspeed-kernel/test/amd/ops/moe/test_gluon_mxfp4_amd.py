@@ -1100,6 +1100,64 @@ def test_dynamic_mxfp4_activation_moe_gfx1250_dsv41_shapes(
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
+def test_gfx1250_prefill_xcd_swizzle_covers_every_tile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prefill tiles' XCD swizzle must visit every tile exactly once.
+
+    The swizzle remaps program IDs over the routed tile count read on the
+    device, which here is not a multiple of the swizzle width. Remapping only
+    reorders tiles, so the output must match the unswizzled launch exactly.
+    """
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 MXFP4 MoE kernel")
+
+    generator = torch.Generator(device="cuda").manual_seed(20261012)
+    # Seven experts with ~57 rows each give 14 tiles per GEMM.
+    hidden_size, intermediate_size, num_experts, top_k, num_tokens = (
+        512,
+        256,
+        7,
+        2,
+        200,
+    )
+    raw = make_mxfp4_moe_weights(num_experts, hidden_size, intermediate_size, generator)
+    module = _make_static_fp8_moe_module(
+        raw, preprocess_gluon_mxfp4_gfx1250_moe_weights
+    )
+    hidden_states = torch.randn(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_weights, topk_ids = make_round_robin_topk(num_tokens, num_experts, top_k)
+
+    def run() -> torch.Tensor:
+        return _gfx1250_static_moe(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            module.w13_weight_triton_tensor,
+            module.w2_weight_triton_tensor,
+            w13_mx_scale=module.w13_precision_config.b_mx_scale,
+            w2_mx_scale=module.w2_precision_config.b_mx_scale,
+            activation="situ",
+            activation_dtype="fp8",
+        )
+
+    swizzled = run()
+    for name in ("_PREFILL_GATE_UP_TILES", "_PREFILL_DOWN_TILES"):
+        tiles = getattr(gfx1250_fused, name)
+        assert tiles["xcd_swizzle"] > 1
+        monkeypatch.setattr(gfx1250_fused, name, {**tiles, "xcd_swizzle": 1})
+    unswizzled = run()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(unswizzled).item() > 0
+    torch.testing.assert_close(swizzled, unswizzled, rtol=0.0, atol=0.0)
+
+
 def _gfx1250_first_expert_matmul(
     module, hidden_states, topk_ids, topk_weights, num_experts, **overrides
 ):
