@@ -38,7 +38,7 @@ import pytest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
 
-from tokenspeed.cli._argsplit import OrchestratorOpts
+from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
 from tokenspeed.cli.serve_smg import (
     _DEFAULT_SMG_DISABLE_FLAGS,
     DEEPSEEK_V4_REASONING_PARSER,
@@ -50,6 +50,8 @@ from tokenspeed.cli.serve_smg import (
     INKLING_TOOL_CALL_PARSER,
     KIMI_K3_REASONING_PARSER,
     KIMI_K3_TOOL_CALL_PARSER,
+    MUSE_SPARK_GATEWAY_PARSER,
+    MUSE_SPARK_GRAMMAR_BACKEND,
     MUSE_SPARK_REASONING_PARSER,
     MUSE_SPARK_TOOL_CALL_PARSER,
     _add_metrics_port,
@@ -448,16 +450,23 @@ class _ModelFamily(NamedTuple):
     detector: Callable[[str | None], bool]
     reasoning_parser: str
     tool_call_parser: str
+    # Further ``--flag value`` pairs the family appends, after the parsers.
+    extra_engine_args: tuple[str, ...] = ()
+    extra_gateway_args: tuple[str, ...] = ()
 
+
+MUSE_SPARK_MODEL_ID = "meta-models/Muse-Spark-Open-816B-A42B"
 
 _MODEL_FAMILIES = (
     _ModelFamily(
         "muse_spark",
-        "meta-models/Muse-Spark-Open-816B-A42B",
+        MUSE_SPARK_MODEL_ID,
         _make_muse_spark_model_dir,
         _is_muse_spark_model,
         MUSE_SPARK_REASONING_PARSER,
         MUSE_SPARK_TOOL_CALL_PARSER,
+        extra_engine_args=("--grammar-backend", MUSE_SPARK_GRAMMAR_BACKEND),
+        extra_gateway_args=("--parser", MUSE_SPARK_GATEWAY_PARSER),
     ),
     _ModelFamily(
         "deepseek_v4",
@@ -503,6 +512,7 @@ def test_model_gets_default_parsers(tmp_path, family, from_local_config):
         model,
         "--reasoning-parser",
         family.reasoning_parser,
+        *family.extra_engine_args,
     ]
     # Order matters: the reasoning parser is appended before the tool parser.
     assert gateway_args == [
@@ -512,13 +522,27 @@ def test_model_gets_default_parsers(tmp_path, family, from_local_config):
         family.reasoning_parser,
         "--tool-call-parser",
         family.tool_call_parser,
+        *family.extra_gateway_args,
+    ]
+
+
+def _explicit(defaults: tuple[str, ...]) -> list[str]:
+    """The family's extra ``--flag value`` pairs with operator-chosen values."""
+    return [
+        token if token.startswith("--") else f"custom_{token}" for token in defaults
     ]
 
 
 @pytest.mark.parametrize("family", _MODEL_FAMILIES, ids=lambda f: f.name)
 def test_model_parser_defaults_preserve_explicit_values(tmp_path, family):
     model = family.make_model_dir(tmp_path)
-    engine_args = ["--model", model, "--reasoning-parser", "custom_reasoning"]
+    engine_args = [
+        "--model",
+        model,
+        "--reasoning-parser",
+        "custom_reasoning",
+        *_explicit(family.extra_engine_args),
+    ]
     gateway_args = [
         "--model",
         model,
@@ -526,6 +550,7 @@ def test_model_parser_defaults_preserve_explicit_values(tmp_path, family):
         "custom_reasoning",
         "--tool-call-parser",
         "custom_tools",
+        *_explicit(family.extra_gateway_args),
     ]
 
     assert _args_with_default_model_parsers(engine_args, gateway_args) == (
@@ -588,6 +613,123 @@ def test_deepseek_v4_default_reasoning_parser_survives_gateway_defaults():
     assert gateway_args.count("--reasoning-parser") == 1
     idx = gateway_args.index("--reasoning-parser")
     assert gateway_args[idx + 1] == DEEPSEEK_V4_REASONING_PARSER
+
+
+def test_muse_spark_explicit_gateway_parser_wins(tmp_path):
+    """An operator ``--parser`` stays; the ``muse`` names are still defaulted."""
+    model = _make_muse_spark_model_dir(tmp_path)
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model],
+        ["--model", model, "--parser", "legacy"],
+    )
+
+    assert gateway_args.count("--parser") == 1
+    assert _get_from_args(gateway_args, "--parser") == "legacy"
+    assert (
+        _get_from_args(gateway_args, "--reasoning-parser")
+        == MUSE_SPARK_REASONING_PARSER
+    )
+    assert (
+        _get_from_args(gateway_args, "--tool-call-parser")
+        == MUSE_SPARK_TOOL_CALL_PARSER
+    )
+    assert (
+        _get_from_args(engine_args, "--grammar-backend") == MUSE_SPARK_GRAMMAR_BACKEND
+    )
+
+
+def test_muse_spark_explicit_grammar_backend_wins(tmp_path):
+    """An operator ``--grammar-backend`` stays; the gateway still runs Symphony."""
+    model = _make_muse_spark_model_dir(tmp_path)
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model, "--grammar-backend", "none"],
+        ["--model", model],
+    )
+
+    assert engine_args.count("--grammar-backend") == 1
+    assert _get_from_args(engine_args, "--grammar-backend") == "none"
+    assert _get_from_args(gateway_args, "--parser") == MUSE_SPARK_GATEWAY_PARSER
+
+
+def test_muse_spark_defaults_survive_gateway_defaults():
+    _, gateway_args = _args_with_default_model_parsers(
+        ["--model", MUSE_SPARK_MODEL_ID],
+        ["--model", MUSE_SPARK_MODEL_ID],
+    )
+    gateway_args = _gateway_args_with_defaults(gateway_args)
+
+    assert gateway_args.count("--parser") == 1
+    assert _get_from_args(gateway_args, "--parser") == MUSE_SPARK_GATEWAY_PARSER
+    assert gateway_args.count("--reasoning-parser") == 1
+    assert (
+        _get_from_args(gateway_args, "--reasoning-parser")
+        == MUSE_SPARK_REASONING_PARSER
+    )
+
+
+def test_muse_spark_defaults_follow_split_argv_routing():
+    """``split_argv`` sends the operator's ``--grammar-backend`` to the engine and
+    ``--parser`` to the gateway; the Muse Spark defaults respect both there."""
+    split = split_argv(
+        [MUSE_SPARK_MODEL_ID, "--grammar-backend", "none", "--parser", "legacy"]
+    )
+    assert split.engine == [
+        "--model",
+        MUSE_SPARK_MODEL_ID,
+        "--grammar-backend",
+        "none",
+    ]
+    assert split.gateway == ["--model", MUSE_SPARK_MODEL_ID, "--parser", "legacy"]
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        split.engine, split.gateway
+    )
+
+    assert _get_from_args(engine_args, "--grammar-backend") == "none"
+    assert "--parser" not in engine_args
+    assert _get_from_args(gateway_args, "--parser") == "legacy"
+    assert "--grammar-backend" not in gateway_args
+
+
+def test_muse_spark_tree_drafting_skips_xgrammar_default(tmp_path):
+    """Tree drafting rejects every non-``none`` grammar backend at startup
+    (``ServerArgs._validate_tree_speculation``), so the xgrammar default steps
+    aside for it; the gateway still runs Symphony."""
+    model = _make_muse_spark_model_dir(tmp_path)
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        [
+            "--model",
+            model,
+            "--speculative-algorithm",
+            "EAGLE3",
+            "--speculative-eagle-topk",
+            "4",
+            "--speculative-num-draft-tokens",
+            "8",
+        ],
+        ["--model", model],
+    )
+
+    assert "--grammar-backend" not in engine_args
+    assert _get_from_args(gateway_args, "--parser") == MUSE_SPARK_GATEWAY_PARSER
+
+
+def test_muse_spark_chain_drafting_keeps_xgrammar_default(tmp_path):
+    """A chain draft (the default topk of 1) accepts structured output, so the
+    xgrammar default still applies."""
+    model = _make_muse_spark_model_dir(tmp_path)
+
+    engine_args, _ = _args_with_default_model_parsers(
+        ["--model", model, "--speculative-algorithm", "EAGLE3"],
+        ["--model", model],
+    )
+
+    assert (
+        _get_from_args(engine_args, "--grammar-backend") == MUSE_SPARK_GRAMMAR_BACKEND
+    )
 
 
 def _make_inkling_model_dir(tmp_path):
@@ -1265,6 +1407,50 @@ def test_run_smg_from_args_applies_deepseek_v4_parser_defaults(monkeypatch):
         DEEPSEEK_V4_REASONING_PARSER,
         "--tool-call-parser",
         DEEPSEEK_V4_TOOL_CALL_PARSER,
+    ]
+
+
+def test_run_smg_from_args_applies_muse_spark_defaults(monkeypatch):
+    captured = {}
+
+    async def fake_run_smg(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.print_logo", lambda: None)
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._check_serve_extra_installed", lambda: None
+    )
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._prewarm_hf_tokenizer", lambda _: None
+    )
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.run_smg", fake_run_smg)
+
+    from argparse import Namespace
+
+    from tokenspeed.cli.serve_smg import run_smg_from_args
+
+    with pytest.raises(SystemExit) as exc:
+        run_smg_from_args(Namespace(), [MUSE_SPARK_MODEL_ID])
+
+    assert exc.value.code == 0
+    assert captured["engine_args"] == [
+        "--model",
+        MUSE_SPARK_MODEL_ID,
+        "--reasoning-parser",
+        MUSE_SPARK_REASONING_PARSER,
+        "--grammar-backend",
+        MUSE_SPARK_GRAMMAR_BACKEND,
+    ]
+    assert captured["gateway_args"][:8] == [
+        "--model",
+        MUSE_SPARK_MODEL_ID,
+        "--reasoning-parser",
+        MUSE_SPARK_REASONING_PARSER,
+        "--tool-call-parser",
+        MUSE_SPARK_TOOL_CALL_PARSER,
+        "--parser",
+        MUSE_SPARK_GATEWAY_PARSER,
     ]
 
 

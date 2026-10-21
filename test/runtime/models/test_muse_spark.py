@@ -44,7 +44,7 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed_kernel.ops.residual import residual_gate_coefficients
 
-from tokenspeed.runtime.configs.model_config import is_multimodal_model
+from tokenspeed.runtime.configs.model_config import is_audio_model, is_multimodal_model
 from tokenspeed.runtime.configs.muse_spark_config import (
     FULL_ATTENTION,
     SLIDING_ATTENTION,
@@ -245,6 +245,10 @@ def _rmsnorm(values: torch.Tensor, eps: float) -> torch.Tensor:
 
 def test_muse_spark_architecture_is_multimodal() -> None:
     assert is_multimodal_model(["MuseSparkForConditionalGeneration"])
+
+
+def test_muse_spark_architecture_is_an_audio_model() -> None:
+    assert is_audio_model(["MuseSparkForConditionalGeneration"])
 
 
 def test_muse_spark_config_groups_the_attention_pattern_into_caches() -> None:
