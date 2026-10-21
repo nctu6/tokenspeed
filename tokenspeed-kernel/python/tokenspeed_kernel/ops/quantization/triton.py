@@ -19,7 +19,7 @@ from typing import Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -204,6 +204,107 @@ def fp8_quantize(
         **extra_kwargs,
     )
     return out
+
+
+# Dynamic per-token FP8 E4M3 activation quantization (compressed-tensors
+# FP8_DYNAMIC), by TRT-LLM's rule (perTokenQuantization with FP8 min scaling,
+# as its FP8 per-channel MoE quantizes its input): for a row with largest
+# magnitude amax, the dequant scale is max(amax / 448, 1 / (448 * 512)) and the
+# codes are RN(x * min(448 / amax, 448 * 512)), saturated to +-448; a zero row
+# quantizes to zeros. Both divisions are IEEE-rounded (div_rn), so every kernel
+# that inlines these helpers (the standalone quantizer below, the small-M FP8
+# GEMM's prologue, the RMSNorm epilogue) writes the same scales and codes.
+_FP8_E4M3_MAX = tl.constexpr(448.0)
+_FP8_TOKEN_MIN_SCALE = tl.constexpr(1.0 / (448.0 * 512.0))
+_FP8_TOKEN_MAX_MULTIPLIER = tl.constexpr(448.0 * 512.0)
+
+
+@triton.jit
+def fp8_token_scale(amax):
+    """FP32 dequant scale of a row (or rows) whose largest magnitude is ``amax``."""
+    return tl.maximum(tl.div_rn(amax, _FP8_E4M3_MAX), _FP8_TOKEN_MIN_SCALE)
+
+
+@triton.jit
+def fp8_token_multiplier(amax):
+    """FP32 quantization multiplier of a row whose largest magnitude is ``amax``."""
+    return tl.minimum(tl.div_rn(_FP8_E4M3_MAX, amax), _FP8_TOKEN_MAX_MULTIPLIER)
+
+
+@triton.jit
+def fp8_quantize_by_multiplier(x, multiplier):
+    """FP8 E4M3 codes of FP32 ``x`` times its quantization ``multiplier``."""
+    q = tl.clamp(x * multiplier, -_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+    return q.to(tl.float8e4nv)
+
+
+@triton.jit
+def _fp8_token_quantize_kernel(
+    x_ptr,
+    q_ptr,
+    scale_ptr,
+    K,
+    x_row_stride,
+    q_row_stride,
+    BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < K
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    x = tl.load(x_ptr + row * x_row_stride + cols, mask=mask, other=0.0)
+    x = x.to(tl.float32)
+    amax = tl.max(tl.abs(x), axis=0)
+    codes = fp8_quantize_by_multiplier(x, fp8_token_multiplier(amax))
+    tl.store(q_ptr + row * q_row_stride + cols, codes, mask=mask)
+    tl.store(scale_ptr + row, fp8_token_scale(amax))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def fp8_quantize_per_token(
+    x: torch.Tensor, enable_pdl: bool | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize the rows of ``x`` to FP8 E4M3 with one FP32 scale each, in one launch.
+
+    Args:
+        x: ``[M, K]`` BF16 or FP16 activations with a contiguous last axis.
+        enable_pdl: Launch with Programmatic Dependent Launch (Hopper+); None
+            takes the platform setting.
+
+    Returns:
+        ``(codes, scales)``: contiguous ``[M, K]`` FP8 E4M3 codes and FP32
+        ``[M, 1]`` dequant scales, ``x ~= codes * scales``.
+    """
+    if x.ndim != 2 or x.stride(-1) != 1:
+        raise ValueError(
+            f"x must be [M, K] with a contiguous last axis, got shape "
+            f"{tuple(x.shape)} stride {x.stride()}"
+        )
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"x must be BF16 or FP16, got {x.dtype}")
+    m, k = x.shape
+    codes = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+    if m == 0:
+        return codes, scales
+    block = triton.next_power_of_2(k)
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
+    _fp8_token_quantize_kernel[(m,)](
+        x,
+        codes,
+        scales,
+        k,
+        x.stride(0),
+        codes.stride(0),
+        BLOCK=block,
+        ENABLE_PDL=enable_pdl,
+        num_warps=min(max(block // 512, 1), 8),
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+    return codes, scales
 
 
 @triton.jit
@@ -501,6 +602,60 @@ def triton_quantize_fp8_with_scale(
         f"with group_size 32 or 128; got granularity={granularity!r}, "
         f"group_size={group_size}."
     )
+
+
+# Up to this many rows, fp8_quantize_per_token takes about a third of the
+# vendor token quantizer's time on GB200.
+_FP8_PER_TOKEN_MAX_M = 64
+
+
+@register_kernel(
+    "quantization",
+    "fp8_with_scale",
+    name="triton_quantize_fp8_per_token",
+    solution="triton",
+    # SM100 and newer, where the per-token FP8 GEMMs that take its output run.
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(10, 0),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={
+        "m_max": frozenset({_FP8_PER_TOKEN_MAX_M}),
+        "granularity": frozenset({"token"}),
+        "scale_encoding": frozenset({"float32"}),
+    },
+    priority=Priority.SPECIALIZED,
+)
+def triton_quantize_fp8_per_token(
+    x: torch.Tensor,
+    *,
+    granularity: str,
+    group_size: int | None,
+    scale_encoding: str,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``quantize_fp8(x, granularity="token")`` by ``fp8_quantize_per_token``.
+
+    Selected for a 2-D ``x`` of at most 64 rows (the ``m`` trait).
+
+    Args:
+        x: ``[M, K]`` BF16 or FP16 activations with a contiguous last axis.
+        granularity: Must be ``"token"``.
+        group_size: Must be None; a token is one group.
+        scale_encoding: Must be ``"float32"``.
+        enable_pdl: Launch with Programmatic Dependent Launch.
+
+    Returns:
+        FP8 E4M3 ``[M, K]`` codes and FP32 ``[M, 1]`` dequant scales.
+    """
+    if granularity != "token" or group_size is not None or scale_encoding != "float32":
+        raise ValueError(
+            "the per-token FP8 quantizer takes token granularity with float32 "
+            f"scales, got granularity={granularity!r}, group_size={group_size}, "
+            f"scale_encoding={scale_encoding!r}"
+        )
+    return fp8_quantize_per_token(x, enable_pdl=enable_pdl)
 
 
 @triton.jit
