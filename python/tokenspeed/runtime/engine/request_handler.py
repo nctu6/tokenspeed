@@ -502,7 +502,7 @@ class RequestHandler:
         objects remain and can be restored for incompatible weights.
         """
 
-        storage_backend = getattr(self.server_args, "kvstore_storage_backend", None)
+        storage_backend = self.server_args.kvstore_storage_backend
         if (
             storage_backend is None
             or not recv_req.flush_cache
@@ -521,7 +521,7 @@ class RequestHandler:
         as if they belonged to the new weights.
         """
 
-        storage_backend = getattr(self.server_args, "kvstore_storage_backend", None)
+        storage_backend = self.server_args.kvstore_storage_backend
         if storage_backend is None or recv_req.flush_cache:
             return True, ""
         version = resolve_l3_weight_version(
@@ -761,7 +761,7 @@ class RequestHandler:
             self.server_args.weight_version,
             _requested_weight_version(recv_req),
             flush_cache=recv_req.flush_cache,
-            storage_backend=getattr(self.server_args, "kvstore_storage_backend", None),
+            storage_backend=self.server_args.kvstore_storage_backend,
         )
         if version is None:
             return True, msg

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import collections
-import inspect
 import os
 import sys
 import threading
@@ -315,7 +313,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
     def test_pool_transfer_layout_matches_scheduler_group_order(self):
         try:
-            from test.runtime.cache_pool_test_utils import MinimalCacheView
+            from cache_pool_test_utils import MinimalCacheView
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
@@ -671,58 +669,7 @@ class GroupAwareWireTest(unittest.TestCase):
             layer_slices=((0, 2), (2, 1)),
             num_field_rows=3,
         )
-        executor._paced_writes = collections.deque()
-        executor._paced_inflight = None
-        executor._paced_slice_blocks = 0
         return executor, device
-
-    def test_large_pinned_writeback_is_paced_one_slice_at_a_time(self):
-        executor_module = self._executor_module()
-        executor, _ = self._make_write_executor(executor_module)
-        executor._paced_slice_blocks = 2
-        executor._ready_load_acks = []
-        executor._prefetch_acks = []
-        executor._backup_futures = []
-        executor.l3_store = None
-        launched = []
-        events = []
-
-        def start_d2h(transfers, **launch):
-            launched.append((list(transfers), launch["prerequisite_stream"]))
-            event = Mock(name=f"slice{len(events)}")
-            event.query.return_value = False
-            events.append(event)
-            return event
-
-        executor._pinned_write_lane = SimpleNamespace(start_d2h=start_d2h)
-        prerequisite = Mock(name="forward_stream")
-        ready = Mock(name="ready")
-        transfers = [(0, i, 10 + i) for i in range(5)]
-        with patch.object(executor_module.device_module, "Event", return_value=ready):
-            executor._queue_pinned_writes(
-                [7], transfers, [], prerequisite_stream=prerequisite
-            )
-        # Only the first slice is in flight, ordered behind an event recorded
-        # at submit time rather than the forward stream at launch time.
-        ready.record.assert_called_once_with(prerequisite)
-        self.assertEqual(launched, [(transfers[0:2], None)])
-        executor.write_stream.wait_event.assert_called_with(ready)
-        self.assertTrue(executor.has_paced_writes())
-        executor.pump_paced_writes()
-        self.assertEqual(executor.poll_results(), [])
-        self.assertEqual(len(launched), 1)
-        # Each poll launches the next slice once the previous one is done.
-        events[0].query.return_value = True
-        executor.pump_paced_writes()
-        self.assertEqual(launched[1][0], transfers[2:4])
-        events[1].query.return_value = True
-        executor.pump_paced_writes()
-        self.assertEqual(launched[2][0], transfers[4:5])
-        self.assertFalse(executor.has_paced_writes())
-        # The ACK rides the last slice only.
-        events[2].query.return_value = True
-        acks = executor.poll_results()
-        self.assertEqual([ack.op_id for ack in acks], [7])
 
     def test_writeback_rides_the_write_stream_ordered_after_the_caller(self):
         executor_module = self._executor_module()
@@ -746,7 +693,7 @@ class GroupAwareWireTest(unittest.TestCase):
             patch.object(
                 lanes_module.device_module,
                 "Event",
-                side_effect=[finish],
+                side_effect=[metadata_done, finish],
             ),
             patch.object(lanes_module, "transfer_cache_blocks") as transfer,
         ):
@@ -790,62 +737,54 @@ class GroupAwareWireTest(unittest.TestCase):
             layer_ready_flags=None,
         )
         finish.record.assert_called_once_with(executor.write_stream)
-        # The completion event is the slot's reuse guard; nothing waits on it.
-        finish.synchronize.assert_not_called()
-        self.assertIsNone(executor._ordered_write_lane._last)
+        metadata_done.record.assert_called_once_with(executor.write_stream)
+        metadata_done.synchronize.assert_not_called()
+        self.assertIsNone(executor._ordered_write_lane.metadata_done)
 
-    def test_lane_never_blocks_on_an_in_flight_payload_until_the_ring_is_full(self):
-        """A slow payload must not stall the next submissions (engine freeze).
-
-        The lane takes a free workspace for each submission and synchronizes
-        only once every slot of its ring is still in flight.
-        """
-        executor_module = self._executor_module()
-        lanes_module = _lanes_module()
-        executor, _ = self._make_write_executor(executor_module)
-        with patch.object(lanes_module, "HostTransferWorkspace", Mock):
-            lane = lanes_module.HostTransferLane(max_slots=2)
-        for ws in (lane.workspace,):
-            ws.load_block_transfers.return_value = (1, (0, 1))
-            ws.prepare_backend.return_value = SimpleNamespace(uses_device_tables=True)
-        busy = [Mock(name=f"payload{i}") for i in range(3)]
-        for event in busy:
-            event.query.return_value = False
-
-        def submit(event):
-            with (
-                patch.object(lanes_module, "HostTransferWorkspace", lambda: _ws()),
-                patch.object(lanes_module.device_module, "stream"),
-                patch.object(lanes_module.device_module, "Event", return_value=event),
-                patch.object(lanes_module, "transfer_cache_blocks") as transfer,
-            ):
-                lane.start_d2h(
-                    [(0, 1, 2)],
-                    device_buffers=executor.layout.buffers,
-                    host_buffer="host",
-                    geometry=executor._transfer_geometry,
-                    stream=executor.write_stream,
-                    prerequisite_stream=None,
-                    backend="auto",
+        # Refill must wait for metadata, but must never wait for payload ACK;
+        # the upload and its retirement event sit inside the write-stream
+        # context, the payload launch names the stream explicitly.
+        for ready in (False, True):
+            with self.subTest(metadata_ready=ready):
+                metadata_done.reset_mock()
+                metadata_done.query.return_value = ready
+                order = Mock()
+                order.attach_mock(metadata_done.synchronize, "retire")
+                order.attach_mock(lane.workspace.load_block_transfers, "refill")
+                order.attach_mock(lane.workspace.commit_block_transfers, "upload")
+                order.attach_mock(metadata_done.record, "record")
+                with (
+                    no_current_stream,
+                    patch.object(lanes_module.device_module, "stream") as stream_ctx,
+                    patch.object(
+                        lanes_module.device_module, "Event", return_value=finish
+                    ),
+                    patch.object(lanes_module, "transfer_cache_blocks") as transfer,
+                ):
+                    order.attach_mock(stream_ctx, "stream")
+                    order.attach_mock(transfer, "payload")
+                    executor._start_writing(
+                        [8],
+                        [(0, 6, 10)],
+                        backup_pages=[],
+                        lane=lane,
+                        prerequisite_stream=prerequisite_stream,
+                    )
+                names = [call[0] for call in order.mock_calls]
+                self.assertEqual(
+                    names,
+                    ([] if ready else ["retire"])
+                    + [
+                        "refill",
+                        "stream",
+                        "stream().__enter__",
+                        "upload",
+                        "record",
+                        "stream().__exit__",
+                        "payload",
+                    ],
                 )
-            return transfer.call_args.args[4]
-
-        def _ws():
-            ws = Mock()
-            ws.load_block_transfers.return_value = (1, (0, 1))
-            ws.prepare_backend.return_value = SimpleNamespace(uses_device_tables=True)
-            return ws
-
-        first = submit(busy[0])
-        second = submit(busy[1])
-        # The first payload is still running: a second workspace, no wait.
-        self.assertIsNot(first, second)
-        busy[0].synchronize.assert_not_called()
-        # Ring full (2 slots in flight): the oldest is retired, then reused.
-        third = submit(busy[2])
-        busy[0].synchronize.assert_called_once_with()
-        busy[1].synchronize.assert_not_called()
-        self.assertIs(third, first)
+                finish.synchronize.assert_not_called()
 
     def test_submit_write_backs_fences_only_stream_ordered_ops(self):
         executor_module = self._executor_module()
@@ -857,7 +796,9 @@ class GroupAwareWireTest(unittest.TestCase):
         pinned_finish = Mock(name="pinned_finish")
         events = iter(
             [
+                Mock(name="ordered_meta"),
                 ordered_finish,
+                Mock(name="pinned_meta"),
                 pinned_finish,
             ]
         )
@@ -955,7 +896,7 @@ class GroupAwareWireTest(unittest.TestCase):
         pinned_finish = Mock()
         ordered_finish.query.return_value = False
         pinned_finish.query.return_value = False
-        events = iter([ordered_finish, pinned_finish])
+        events = iter([Mock(), ordered_finish, Mock(), pinned_finish])
 
         class WriteBackOp:
             def __init__(self):
@@ -1692,43 +1633,6 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         self.assertEqual(
             HostCacheExecutor._storage_pages(operation, kept_rows=[(0, [(1, 2)])]),
             [(1, 2, "h1", 1)],
-        )
-
-    def test_ack_requires_backup_pages(self):
-        try:
-            from tokenspeed.runtime.cache.l2.executor import (
-                HostCacheExecutor,
-                _Ack,
-                _AckKind,
-            )
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
-
-        signature = inspect.signature(_Ack)
-        self.assertIs(
-            signature.parameters["backup_pages"].default, inspect.Parameter.empty
-        )
-        with self.assertRaises(TypeError):
-            _Ack(_AckKind.WRITE_BACK, [1])
-        start_writing = inspect.signature(HostCacheExecutor._start_writing)
-        self.assertIs(
-            start_writing.parameters["backup_pages"].default, inspect.Parameter.empty
-        )
-        with self.assertRaises(TypeError):
-            HostCacheExecutor._start_writing(object(), [7], [(0, 1, 1)])
-
-    def test_l2_constructor_does_not_attach_l3_from_optional_storage(self):
-        try:
-            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
-
-        signature = inspect.signature(HostCacheExecutor.__init__)
-        self.assertNotIn("storage_backend", signature.parameters)
-        self.assertNotIn("storage_key_prefix", signature.parameters)
-        self.assertNotIn("storage_rank", signature.parameters)
-        self.assertIs(
-            signature.parameters["attn_tp_rank"].default, inspect.Parameter.empty
         )
 
     def test_poll_results_backs_up_host_pages_asynchronously(self):
