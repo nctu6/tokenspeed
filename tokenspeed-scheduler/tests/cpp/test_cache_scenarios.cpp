@@ -2027,6 +2027,70 @@ TEST_F(ForcedRetractionSuite, EveryThirdPlanRetractsTheOldestQuiescentDecodingRe
     EXPECT_EQ(FindSnapshotStore(p7)->request_ids, std::vector<std::string>{"r1"});
 }
 
+// Regression: with KV cache events on, a retracted request resumes from a
+// prefix no longer than before. registerKvEventPrefixPages only ever grew
+// kv_event_hash_progress_, so after a retract/restore the stored hash chain
+// could be longer than the current prefix and registerKvEventPublication
+// aborted the scheduler ("the tail's parent page has its KV event hash").
+// The fix truncates the stale tail; this cycle must now survive and keep
+// publishing events.
+class ForcedRetractionKvEventsSuite : public ForcedRetractionSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = ForcedRetractionSuite::MakeConfig();
+        cfg.enable_kv_cache_events = true;
+        return cfg;
+    }
+};
+
+TEST_F(ForcedRetractionKvEventsSuite, RetractAndRestoreWithKvEventsDoesNotAbort) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+    Submit(MakeRequestSpec("r2", /*num_pages=*/2, /*start=*/101));
+    PlanOnce();  // plan 1: both prefill (r1 publishes its two prompt pages)
+    SendForwardDone("r1", {42});
+    SendForwardDone("r2", {142});
+    PlanOnce();  // plan 2: both decode
+    SendForwardDone("r1", {43});
+    SendForwardDone("r2", {143});
+
+    // Plan 3 force-retracts r1 (the oldest quiescent decode): it is
+    // suspended with its image while its progress chain stays registered.
+    const ExecutionPlan p3 = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    ASSERT_NE(FindSnapshotStore(p3), nullptr);
+    AckImageStores(p3);
+
+    // Plan 4 restores r1 from a prefix no longer than before. Before the fix
+    // the next boundary publication tripped the FatalCheck and aborted here.
+    const ExecutionPlan p4 = PlanOnce();
+    ASSERT_NE(FindRestore(p4), nullptr);
+    AckRestores(p4);
+
+    // Keep decoding; feed a forward result only to whoever this plan actually
+    // scheduled (a force-retracted request sits a round out), and keep going
+    // long enough that r1 crosses a page boundary after its restore and
+    // publishes again. The scheduler must stay alive through all of it.
+    std::int32_t tok = 200;
+    bool published_after_restore = false;
+    for (int step = 0; step < 12; ++step) {
+        const ExecutionPlan plan = PlanOnce();
+        if (!scheduler_->DrainKvEvents().empty()) {
+            published_after_restore = true;
+        }
+        const ForwardBatch* fb = FindForwardBatch(plan);
+        if (fb == nullptr) {
+            AckImageStores(plan);
+            AckRestores(plan);
+            continue;
+        }
+        for (const std::string& id : fb->request_ids) {
+            SendForwardDone(id, {tok++});
+        }
+    }
+    EXPECT_GT(scheduler_->RequestTokenSize("r1"), 0) << "r1 survived retract/restore with KV events on";
+    EXPECT_TRUE(published_after_restore) << "KV events keep publishing across the retract/restore cycle";
+}
+
 // ---------------------------------------------------------------------------
 // Cache retract: a blocked round picks the decoding request that frees the
 // most and has streamed least, releases every page and suspends it with its

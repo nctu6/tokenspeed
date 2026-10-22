@@ -318,6 +318,13 @@ void Scheduler::registerKvEventPrefixPages(const Request& request, std::span<con
     _assert(prefix_hashes.size() <= token_pages.size(), "KV event hashes exceed the request's complete pages");
 
     KvEventHashProgress& progress = kv_event_hash_progress_[request.Id()];
+    // A retracted request resumes from a prefix no longer than before, but
+    // block_hashes only ever grows here. Drop any stale tail beyond the
+    // current prefix so the chain matches prefix_hashes; the retained leading
+    // pages hash the same unchanged tokens, so they stay valid.
+    if (progress.block_hashes.size() > prefix_hashes.size()) {
+        progress.block_hashes.resize(prefix_hashes.size());
+    }
     for (std::size_t i = progress.block_hashes.size(); i < prefix_hashes.size(); ++i) {
         const std::optional<std::uint64_t> parent_hash =
             i == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes[i - 1]};
