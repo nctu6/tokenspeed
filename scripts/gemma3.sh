@@ -118,4 +118,10 @@ if [[ -n "$EXTRA_ARGS" ]]; then
     cmd+=($EXTRA_ARGS)
 fi
 
+if [[ -n "${EXTRA_SERVE_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206
+    _extra=($EXTRA_SERVE_ARGS)
+    cmd+=("${_extra[@]}")
+fi
+
 exec "${cmd[@]}"

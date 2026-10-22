@@ -38,7 +38,7 @@
 # Build with buildx for linux/amd64 and linux/arm64. The base image is a
 # multi-architecture manifest; prefer a native arm64 builder because QEMU
 # emulation can make native extension builds substantially slower.
-FROM lightseekorg/tokenspeed-runner:cu130-torch-2.13.0-flashinfer-0.6.18
+FROM lightseekorg/tokenspeed-runner:cu130-torch-2.14.0-flashinfer-0.6.18
 
 USER root
 
@@ -60,11 +60,13 @@ ARG VLLM_FLASH_ATTN_REPO="https://github.com/vllm-project/flash-attention"
 ARG VLLM_FLASH_ATTN_REF="main"
 
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
-# Kernel cuda.txt installs flashinfer-python==0.7.1rc2 (and upgrades torch to
-# 2.14). The runner base ships an older flashinfer-jit-cache 0.6.18 whose API
-# is incompatible (missing get_jit_cache_providers). Working host installs have
-# no jit-cache package at all -- uninstall it before the kernel build. Serve
-# scripts also export FLASHINFER_DISABLE_VERSION_CHECK=1; keep it for runtime.
+# Kernel cuda.txt pins flashinfer-python==0.7.2 and torch==2.14.0 (the base
+# image is already torch-2.14.0, so no torch upgrade during the build). The
+# runner base ships an older flashinfer-jit-cache 0.6.18 whose API is
+# incompatible (missing get_jit_cache_providers), and the 0.7.2 flashinfer the
+# kernel pulls does not need it; working host installs have no jit-cache
+# package at all -- uninstall it before the kernel build. Serve scripts also
+# export FLASHINFER_DISABLE_VERSION_CHECK=1; keep it for runtime.
 ENV FLASHINFER_DISABLE_VERSION_CHECK=1
 
 WORKDIR /workspace
