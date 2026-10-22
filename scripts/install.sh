@@ -813,8 +813,22 @@ if [[ "$FRESH" == "1" || "$KERNEL_WORK" == "1" || "$SMG_WORK" == "1" || "$FA2_WO
     "$PY" -m pip install setuptools wheel cmake ninja
 fi
 
+# A non-editable kernel wheel is built from a staging tree under
+# tokenspeed-kernel/python/build/. setuptools REUSES that tree across builds
+# and only ADDS/overwrites files -- it never prunes paths that disappeared
+# from the source. So a layout change (e.g. conv/triton/ the package becoming
+# conv/triton.py the module) leaves the stale package dir in build/lib, and
+# the next wheel bakes BOTH in; the stale package then shadows the module at
+# runtime (ImportError: cannot import name 'PAD_SLOT_ID'). Wipe the staging
+# tree (and egg-info) before every kernel source build so the wheel mirrors
+# the current source exactly.
+clean_kernel_build_tree() {
+    rm -rf tokenspeed-kernel/python/build tokenspeed-kernel/python/*.egg-info
+}
+
 # --- Build/install, in the Dockerfile's exact order --------------------------
 if [[ "$FRESH" == "1" ]]; then
+    clean_kernel_build_tree
     log "[1/5] Building tokenspeed-kernel from source, non-editable (arches: $CUDA_ARCH_LIST)"
     "$PY" -m pip install tokenspeed-kernel/python/ --no-build-isolation
 
@@ -824,6 +838,7 @@ if [[ "$FRESH" == "1" ]]; then
     log "[3/5] Installing the engine (python/, editable) -- pulls third-party deps (+diffusion)"
     "$PY" -m pip install -e "./python[diffusion]" --no-build-isolation
 
+    clean_kernel_build_tree
     log "[4/5] Reinstalling tokenspeed-kernel from source (non-editable, force, no-deps) so it wins"
     "$PY" -m pip install tokenspeed-kernel/python/ \
         --no-build-isolation --no-deps --force-reinstall
@@ -849,6 +864,7 @@ if [[ "$FRESH" == "1" ]]; then
 elif [[ "$KERNEL_WORK" == "1" ]]; then
     # Kernel-only rebuild: recompile and reinstall just the kernel, leaving
     # the editable engine/scheduler and every third-party dep untouched.
+    clean_kernel_build_tree
     log "REINSTALL_KERNEL=1: recompiling tokenspeed-kernel from source only"
     "$PY" -m pip install tokenspeed-kernel/python/ \
         --no-build-isolation --no-deps --force-reinstall
