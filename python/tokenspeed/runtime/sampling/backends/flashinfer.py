@@ -519,12 +519,17 @@ class FlashInferSamplingBackend(SamplingBackend):
         populated via _reset_slot."""
         if bs <= 0:
             return
-        if self.config.sampling_stream == "per-request":
-            if num_tokens_per_req == 1:
-                # Position-keyed direct draws need no prepared coins.
-                return
-            # Multi-token rejection still consumes the legacy coin buffers.
-            # Position-keyed accept/residual coins are not implemented yet.
+        # Single-token decode draws its randomness from seeds/offsets in the
+        # sampling kernel (batch stream) or position-keyed direct draws
+        # (per-request stream); neither reads _coins_buf. Those legacy coin
+        # buffers are consumed only by verify() on the multi-token
+        # speculative path. Filling them here for num_tokens_per_req == 1 is a
+        # per-request CPU RNG loop (one uniform_ per slot) whose result is
+        # never read -- pure overhead that at high concurrency (gemma C=512,
+        # ~60 slots/step) serializes the forward thread and stalls decode
+        # dispatch. Skip it unless a draft actually needs the coins.
+        if num_tokens_per_req == 1 and request_pool_indices is not None:
+            return
         self._refill_legacy_coins(
             num_tokens_per_req=num_tokens_per_req,
             bs=bs,
