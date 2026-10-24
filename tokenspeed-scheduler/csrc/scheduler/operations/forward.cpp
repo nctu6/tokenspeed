@@ -1352,9 +1352,18 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 }
             } else if (feedback.admission_failed) {
                 feedback.NoteCapacityBlocked(request);
-                if (resident) {
-                    return;
-                }
+                // Capacity back-pressure: once a prompt cannot be admitted for
+                // capacity, stop. The resident pass has always returned here;
+                // the Submitted pass now does too. Candidates are FIFO, so a
+                // later waiting prompt admitted over this blocked one would be
+                // unfair, and with the pool full it cannot fit either -- yet
+                // probing it still pays the full prefix-match cost
+                // (matchPrefixAtAdmission hashes the whole prompt and walks
+                // every cache group). At C=512 with a deep queue that probe
+                // storm over hundreds of blocked prompts dominated the plan
+                // build (~200 ms/round bursts). The blocked prompt is recorded
+                // as the capacity blocker so retraction/admission serve it next.
+                return;
             }
         }
     }
