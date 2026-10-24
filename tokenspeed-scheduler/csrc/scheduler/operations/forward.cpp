@@ -711,8 +711,21 @@ Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candid
         if (!request->IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>()) {
             continue;
         }
-        fallback = request;  // submission order; newest wins
-        if (request->ResultsInFlight() == 0 && !pdTransferInFlight(*request)) {
+        // Prefer the least-retracted victim so the empty-round retraction
+        // rotates across the batch instead of ping-ponging the same few
+        // residents in and out of host. With short generations
+        // (max_new_tokens below safe_steps) every resident is reserve-exempt
+        // and the headroom escalation never grows a reserve, so without this
+        // rotation the newest-wins rule re-picks the same requests every empty
+        // round -- observed at gemma-4 C=512 as ~10 retractions of one request
+        // while the pool sits at ratio 1.00. Ties break toward the newest
+        // (later submission order), preserving the original preference.
+        if (fallback == nullptr || request->RetractionCount() <= fallback->RetractionCount()) {
+            fallback = request;
+        }
+        if (request->ResultsInFlight() == 0 && !pdTransferInFlight(*request) &&
+            (fallback_quiescent == nullptr ||
+             request->RetractionCount() <= fallback_quiescent->RetractionCount())) {
             fallback_quiescent = request;
         }
     }
@@ -933,6 +946,23 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         // decode in place) before it drops any exemption, and pays for that
         // scan only on the rare round that reaches the last resort.
         const bool blocker_is_stuck_resident = blocker->IsAnyOf<fsm::Decoding, fsm::PrefillDone>();
+        // Thrash damper for the exempt-dropping last resort (the empty-round
+        // retraction): if a victim from a previous round is still Restoring,
+        // its copy-back is in flight and will return pages and let a decode
+        // advance when it lands. Stacking another reserve-exempt host
+        // retraction on top of it only ping-pongs the same residents in and
+        // out of host -- observed at gemma-4 C=512 as the same requests
+        // retracted up to ~10x each with the pool pinned at ratio 1.00.
+        // Waiting for the in-flight restore keeps liveness (that restore is
+        // guaranteed progress) while cutting the churn. Only the last resort
+        // is gated; ordinary capacity retraction (blocker not a stuck
+        // resident) never drops an exemption and is unaffected.
+        if (blocker_is_stuck_resident &&
+            std::ranges::any_of(requests_, [](const std::unique_ptr<Request>& r) {
+                return r->Is<fsm::Restoring>();
+            })) {
+            return;
+        }
         const VictimChoice choice = chooseVictim(candidates, blocker_is_stuck_resident);
         Request* victim = choice.victim;
         if (victim == nullptr) {

@@ -69,6 +69,7 @@ public:
         return std::min(RemainingNewTokens(), safe_steps * (1 + retraction_count_));
     }
     void NoteRetracted() { ++retraction_count_; }
+    std::int32_t RetractionCount() const { return retraction_count_; }
 
     // True when the last admission's headroom already covers every token
     // this request could still generate. Retracting such a request is pure
