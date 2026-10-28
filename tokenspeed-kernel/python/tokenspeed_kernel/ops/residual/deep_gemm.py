@@ -54,6 +54,12 @@ if platform.is_hopper_plus:
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            # DeepGEMM tf32_hc_prenorm_gemm cubin covers datacenter Blackwell
+            # (SM100-SM103) and Hopper only; it asserts "Unsupported
+            # architecture" on SM120 (workstation Blackwell, e.g. RTX PRO 6000).
+            # Cap the window so SM120 falls through to the portable Triton
+            # mhc kernel. Mirrors the SM100-SM103 window used elsewhere.
+            max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
@@ -103,6 +109,12 @@ if platform.is_hopper_plus:
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            # DeepGEMM tf32_hc_prenorm_gemm cubin covers datacenter Blackwell
+            # (SM100-SM103) and Hopper only; it asserts "Unsupported
+            # architecture" on SM120 (workstation Blackwell, e.g. RTX PRO 6000).
+            # Cap the window so SM120 falls through to the portable Triton
+            # mhc kernel. Mirrors the SM100-SM103 window used elsewhere.
+            max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
