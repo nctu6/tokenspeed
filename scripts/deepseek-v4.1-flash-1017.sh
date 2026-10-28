@@ -52,8 +52,10 @@
 #                        go to host RAM (UVA), freeing HBM. Required to fit TP=4 on
 #                        96 GiB cards. Set empty/0 to keep them GPU-sharded.
 #   ENGRAM_HOST_TABLE_LAYOUT default: sharded (auto|shared|sharded; used when ENGRAM_HOST_TABLE on).
-#   LANGUAGE_MODEL_ONLY  default: 1 on sm120/sm121, else empty. 1 = --language-model-only
-#                        (drop the vision tower; text-only serving).
+#   LANGUAGE_MODEL_ONLY  default: empty = MULTIMODAL (text+image), the default.
+#                        Set 1 for text-only (adds --language-model-only, drops
+#                        the vision tower; slightly less memory). Multimodal TP=4
+#                        is verified on sm120 (~85 GB/GPU; vision uses triton_attn).
 #   ALLOW_TP2_OOM        default: empty. 1 = bypass the TP=2 weight-fit guard and
 #                        attempt TP=2 anyway (expected CUDA OOM on <128 GiB cards).
 #   VENV_DIR             default: ./.venv
@@ -211,13 +213,17 @@ ENABLE_AUTO_TOOL_CHOICE="${ENABLE_AUTO_TOOL_CHOICE:-}"
 #   On-GPU weight that CANNOT be offloaded (no weight/expert CPU-offload exists):
 #   ~307 GB total, dominated by ~296 GB MXFP4 experts -> ~77 GB/GPU at TP=4 (fits),
 #   ~154 GB/GPU at TP=2 (does NOT fit 96 GiB; see deepseek-v4.1-flash-1017-research.md).
+# Multimodal (text+image) is the DEFAULT. Verified on sm120 TP=4: the vision
+# weights are tiny (~0.8 GB), the encoder uses the portable triton_attn backend,
+# and it fits alongside the host-offloaded Engram tables (~85 GB/GPU).
+# To serve TEXT-ONLY (slightly less memory), set LANGUAGE_MODEL_ONLY=1, which
+# adds --language-model-only and drops the vision tower.
 if [[ "${_CUDA_ARCH}" == "sm120" || "${_CUDA_ARCH}" == "sm121" ]]; then
     ENGRAM_HOST_TABLE="${ENGRAM_HOST_TABLE-1}"
-    LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY-1}"
 else
     ENGRAM_HOST_TABLE="${ENGRAM_HOST_TABLE-}"
-    LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY-}"
 fi
+LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY-}"   # empty = multimodal (default)
 ENGRAM_HOST_TABLE_LAYOUT="${ENGRAM_HOST_TABLE_LAYOUT:-sharded}"
 
 # Hosts with broken NVLS multicast need these; default off for other hosts.
