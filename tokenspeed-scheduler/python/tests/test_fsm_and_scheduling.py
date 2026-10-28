@@ -400,8 +400,12 @@ class TestPrefillFirst:
         # Layout is prefill-first/decode-second (ForwardBatch::stable_partition).
         assert op.request_ids == ["r1", "r0"]
         assert op.num_extends() == 1
-        # r0 decode = 1 token; r1 prefill chunk takes the remaining 15.
-        assert op.input_lengths == [15, 1]
+        # r0 decode = 1 token. r1 is a long prefill (32 > mixed_long_chunk_ =
+        # max_scheduled_tokens/2 = 8), so prefillBudgetFor caps its chunk to 8
+        # while decodes share the round (770d2b60): decodes do not wait on a
+        # full long-context prefill forward. Decode is still scheduled, never
+        # starved.
+        assert op.input_lengths == [8, 1]
 
     def test_max_batch_size_limits_scheduled_requests(self):
         """max_batch_size caps the number of requests per plan."""

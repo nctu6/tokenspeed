@@ -1101,9 +1101,13 @@ void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> co
         return;
     }
     for (const CacheGroup& group : groups_) {
-        if (group.Spec().attn_kind == AttnKind::kState) {
-            continue;
-        }
+        // A State checkpoint is published by its natural point and keyed by the
+        // last page's chain hash, not by a slot that a later admission hits on
+        // the Device, so it has no reuse signal to defer against: a deferred
+        // State store would never flush. State groups therefore store eagerly
+        // regardless of the page write policy; only the ordinary page groups
+        // below honour the deferred (reuse / reuse_pressure) policy.
+        const bool is_state = group.Spec().attn_kind == AttnKind::kState;
         // A tail hash holds fewer blocks than a page; Contains filters.
         for (CacheKey& key : keysForGroup(content_hashes, group.Id())) {
             if (!group.Index().Contains(pool_, key)) {
@@ -1112,7 +1116,7 @@ void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> co
             // A finished request's pages follow the write policy too: under a
             // deferred policy they wait for a reuse hit (or pressure) instead of
             // being copied the moment the request ends.
-            if (host_write_policy_ == HostWritePolicy::kEager) {
+            if (is_state || host_write_policy_ == HostWritePolicy::kEager) {
                 pending_stores_.push_back(StoreCandidate{.key = std::move(key)});
             } else {
                 deferStore(std::move(key));

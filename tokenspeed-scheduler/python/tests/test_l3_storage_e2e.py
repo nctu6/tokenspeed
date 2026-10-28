@@ -400,7 +400,11 @@ def test_l3_unregister_storage_keys_removes_stale_remote_hit() -> None:
     assert _find_op(plan, ts.Cache.LoadBackOp) is None
 
 
-def test_l3_writeback_carries_object_keys() -> None:
+def test_l3_writeback_carries_object_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    # nctu6 94963a34 made the host write policy on-reuse by default; this
+    # test exercises the eager write-back/image path, so select it
+    # explicitly (previously implicit when eager was the default).
+    monkeypatch.setenv("TOKENSPEED_KVSTORE_WRITE_POLICY", "eager")
     scheduler = ts.Scheduler(
         _l3_config(
             num_device_pages=32, num_host_pages=32, with_swa=True, min_prefetch_pages=1
@@ -422,7 +426,13 @@ def test_l3_writeback_carries_object_keys() -> None:
     scheduler.next_execution_plan()
 
 
-def test_l3_host_eviction_still_prefetches_registered_prefix() -> None:
+def test_l3_host_eviction_still_prefetches_registered_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # nctu6 94963a34 made the host write policy on-reuse by default; this
+    # test exercises the eager write-back/image path, so select it
+    # explicitly (previously implicit when eager was the default).
+    monkeypatch.setenv("TOKENSPEED_KVSTORE_WRITE_POLICY", "eager")
     """Host eviction keeps Mooncake objects; submit-time register restores the shadow."""
 
     cfg = _l3_config(

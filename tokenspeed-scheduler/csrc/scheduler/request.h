@@ -102,7 +102,12 @@ public:
     // past its declared budget. An undeclared budget (max_new_tokens == 0)
     // is never covered.
     bool DeclaredBudgetCoveredByInFlight() const {
-        return max_new_tokens_ > 0 && RemainingNewTokens() <= ResultsInFlight();
+        // Requires at least one forward in flight: with nothing out, no future
+        // token is covered, so a request whose remaining budget is zero still
+        // needs one step to emit its final token and release its pages (a
+        // just-restored request at its last step, remaining == 0, in flight ==
+        // 0). The <= handles the overlap case where several forwards are out.
+        return max_new_tokens_ > 0 && ResultsInFlight() > 0 && RemainingNewTokens() <= ResultsInFlight();
     }
     // The budget that was still open when the current admission was granted:
     // stamped by the admission events (a first chunk, a restore), frozen for

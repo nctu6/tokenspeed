@@ -89,7 +89,13 @@ def _ack_write_backs(scheduler, plan, host_rows: dict[str, int]) -> None:
             _ack(scheduler, event)
 
 
-def test_image_splits_into_l2_prefix_and_blob_and_waits_for_both_acks() -> None:
+def test_image_splits_into_l2_prefix_and_blob_and_waits_for_both_acks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # nctu6 94963a34 made the host write policy on-reuse by default; this
+    # test exercises the eager write-back/image path, so select it
+    # explicitly (previously implicit when eager was the default).
+    monkeypatch.setenv("TOKENSPEED_KVSTORE_WRITE_POLICY", "eager")
     scheduler = ts.Scheduler(_make_config())
     request_ids = ("a", "b", "c", "d")
     # a: two full pages plus a one-token tail; the others one page each.
@@ -219,7 +225,13 @@ def test_image_splits_into_l2_prefix_and_blob_and_waits_for_both_acks() -> None:
     assert len(set(row)) == len(row)
 
 
-def test_finish_while_retracted_releases_the_pins_at_the_acks() -> None:
+def test_finish_while_retracted_releases_the_pins_at_the_acks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # nctu6 94963a34 made the host write policy on-reuse by default; this
+    # test exercises the eager write-back/image path, so select it
+    # explicitly (previously implicit when eager was the default).
+    monkeypatch.setenv("TOKENSPEED_KVSTORE_WRITE_POLICY", "eager")
     scheduler = ts.Scheduler(_make_config())
     request_ids = ("a", "b", "c", "d")
     scheduler.submit_requests(
