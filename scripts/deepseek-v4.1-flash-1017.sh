@@ -22,7 +22,8 @@
 #
 # Matched baseline knobs (override via env):
 #   MODEL_PATH           default: deepseek-ai/DeepSeek-V4.1-Flash-1017
-#   SERVED_MODEL_NAME    default: test
+#   SERVED_MODEL_NAME    default: test. SPACE-separated for multiple names
+#                        (e.g. "DeepSeek-V4.1-Flash-1017 test"); NOT comma-separated.
 #   HOST_PORT            default: 8977
 #   TENSOR_PARALLEL_SIZE default: 4  (set 2 for TP=2; must match CUDA_DEVICES count)
 #   CUDA_DEVICES         default: arch/TP-aware (0..TP-1); override to pin GPUs
@@ -274,18 +275,33 @@ export CUDA_VISIBLE_DEVICES="$CUDA_DEVICES"
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 export HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN:-}"
 
-if [[ ! -x "$VENV_DIR/bin/tokenspeed" && ! -f "$VENV_DIR/bin/activate" ]]; then
-    echo "ERROR: venv not found at $VENV_DIR. Run ./scripts/install.sh first (or set VENV_DIR)." >&2
+# Activate a venv if one is present; otherwise fall back to a tokenspeed that
+# is already on PATH (the container / system-python case, e.g. the Docker
+# image installs the stack system-wide with no .venv). Only error when neither
+# a venv nor an on-PATH tokenspeed exists.
+if [[ -f "$VENV_DIR/bin/activate" ]]; then
+    # shellcheck disable=SC1091
+    source "$VENV_DIR/bin/activate"
+elif [[ -x "$VENV_DIR/bin/tokenspeed" ]]; then
+    export PATH="$VENV_DIR/bin:$PATH"
+elif command -v tokenspeed >/dev/null 2>&1; then
+    echo "[deepseek-v4.1-flash-1017] no venv at $VENV_DIR; using tokenspeed on PATH: $(command -v tokenspeed)" >&2
+else
+    echo "ERROR: no venv at $VENV_DIR and no \"tokenspeed\" on PATH. Run ./scripts/install.sh, set VENV_DIR, or use an image with tokenspeed installed." >&2
     exit 1
 fi
-# shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
 
 echo "[deepseek-v4.1-flash-1017] arch=${_CUDA_ARCH:-unknown} gpu_mem=${_GPU_MEM_MIB:-unknown}MiB moe_policy=${_MOE_POLICY} CUDA_DEVICES=${CUDA_DEVICES} TP=${TENSOR_PARALLEL_SIZE} moe_backend=${MOE_BACKEND} expert_parallel=${ENABLE_EXPERT_PARALLEL} dspark=${ENABLE_DSPARK} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS} MAX_NUM_SEQS=${MAX_NUM_SEQS} gpu_mem_util=${GPU_MEMORY_UTILIZATION:-engine_default} reasoning=${REASONING_PARSER:-none} tool_parser=${TOOL_CALL_PARSER:-none} auto_tool_choice=${ENABLE_AUTO_TOOL_CHOICE:-off} engram_host_table=${ENGRAM_HOST_TABLE:-off} lm_only=${LANGUAGE_MODEL_ONLY:-off} model=${MODEL_PATH}" >&2
 
+# --served-model-name is nargs="+": SPACE-separated names, each its own argv
+# item (NOT comma-separated -- a comma becomes part of a single literal name).
+# e.g. SERVED_MODEL_NAME="DeepSeek-V4.1-Flash-1017 test" advertises both.
+# shellcheck disable=SC2206
+_served_names=($SERVED_MODEL_NAME)
+
 cmd=(
     tokenspeed serve "$MODEL_PATH"
-    --served-model-name "$SERVED_MODEL_NAME"
+    --served-model-name "${_served_names[@]}"
     --host 0.0.0.0
     --port "$HOST_PORT"
     --trust-remote-code
