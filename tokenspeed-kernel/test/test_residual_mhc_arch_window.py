@@ -44,11 +44,11 @@ def _cap() -> CapabilityRequirement:
 @pytest.mark.parametrize(
     ("major", "minor", "admitted"),
     [
-        (9, 0, True),    # Hopper H100/H200
-        (10, 0, True),   # datacenter Blackwell B200
-        (10, 3, True),   # datacenter Blackwell B300 (window top)
+        (9, 0, True),  # Hopper H100/H200
+        (10, 0, True),  # datacenter Blackwell B200
+        (10, 3, True),  # datacenter Blackwell B300 (window top)
         (12, 0, False),  # workstation Blackwell RTX PRO 6000 -> excluded
-        (8, 0, False),   # Ampere, below the floor
+        (8, 0, False),  # Ampere, below the floor
     ],
 )
 def test_deep_gemm_mhc_window_admits_only_sm90_to_sm103(
@@ -99,9 +99,9 @@ def test_registry_picks_triton_mhc_on_sm120_not_deep_gemm(
     for mode in ("mhc_mixes", "mhc_pre"):
         specs = reg.get_for_operator("residual", mode, platform=sm120_platform)
         solutions = {s.solution for s in specs}
-        assert "deep_gemm" not in solutions, (
-            f"{mode}: deep_gemm must be filtered out on SM120, got {solutions}"
-        )
-        assert "triton" in solutions, (
-            f"{mode}: portable triton must remain on SM120, got {solutions}"
-        )
+        assert (
+            "deep_gemm" not in solutions
+        ), f"{mode}: deep_gemm must be filtered out on SM120, got {solutions}"
+        assert (
+            "triton" in solutions
+        ), f"{mode}: portable triton must remain on SM120, got {solutions}"
