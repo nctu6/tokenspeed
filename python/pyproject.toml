@@ -66,6 +66,9 @@ dependencies = [
     "python-multipart",
     "pyzmq",
     "requests",
+    # signal.resample_poly: ASR upload resampling (entrypoints/asr_http.py),
+    # streamed diffusion audio (diffusion/music3_stream.py).
+    "scipy",
     "setproctitle",
     "tiktoken",
     "torch",
