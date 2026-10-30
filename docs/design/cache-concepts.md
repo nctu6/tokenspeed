@@ -469,8 +469,8 @@ implements `SlotStateExporter` (`execution/slot_state.py`) by listing its
 per-slot rows once (`slot_state_rows`); the export, the import, and the size
 derive from that list. Every node of an attention tree is its own exporter
 (`slot_state_exporters` flattens the tree), and `ModelExecutor` lists
-`RuntimeStates`, the attention nodes, the drafter, and the sampling backend
-in blob order. The Host
+`RuntimeStates`, the attention nodes, the drafter, the sampling backend, and
+any owners the model lists itself (below) in blob order. The Host
 cache executor measures them **once**, at construction (`SlotStateLayout`:
 sizes are fixed for its lifetime), so a store or restore only slices the
 arena row at the recorded offsets and never re-measures an owner on the
@@ -488,6 +488,20 @@ unclaimed and the first forward prepares it from the request's own
 parameters, as the unretracted request's would have. Token-derived rows —
 the committed-token history and the n-gram tail — are not imaged; they are
 reseeded from the control plane's token list as on any slot handoff.
+A model may own such state too: Whisper's cross-attention KV
+(`CrossAttentionCache`, `models/whisper.py`) is a per-slot buffer outside the
+cache groups, written once from the encoder and read by every step, and is a
+request-keyed exporter whose prepared marker says the slot's rows were encoded
+for the imaged request. A model lists its own owners through one generic
+hook, `SlotStateModel.slot_state_exporters()` (`execution/slot_state.py`):
+`ModelExecutor` reads it once at construction and appends those owners after
+the sampling backend, so a model that implements no hook contributes nothing
+and every other model's blob layout is unchanged. No model class is named in
+the executor. The cross-KV image is the whole encoder output's K/V for every
+decoder layer — 245.8 MB per slot on large-v3 — so it dominates
+`blob_bytes`, and the pinned arena of
+`(--retraction-snapshot-max-requests + 1) × blob_bytes` is about 4.2 GB at 16
+retractable requests; lower `--retraction-snapshot-max-requests` to bound it.
 `test/runtime/test_slot_state.py` constructs these owners (and a
 `ModelExecutor` over them) and enumerates every tensor they or their runtime
 components allocate with a slot-sized dimension, failing when one is neither

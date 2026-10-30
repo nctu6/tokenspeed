@@ -297,6 +297,11 @@ class MultimodalForwardContext:
     """
 
     mm_inputs: list[MultimodalInputs | None]
+    # The batch's request ids and request-pool slots, in batch order (the
+    # same lists ``mm_inputs`` is aligned with). Host values, so a model can
+    # key per-slot state by request without reading a device tensor.
+    request_ids: list[str]
+    request_pool_indices: list[int]
     extend_prefix_lens: list[int]
     extend_seq_lens: list[int]
     # The forward token bound, which caps each encoder call; a larger item runs alone.
@@ -373,6 +378,8 @@ def multimodal_context_for_forward(forward_op, rid_to_state, max_encoder_tokens:
 
     return MultimodalForwardContext(
         mm_inputs=mm_inputs,
+        request_ids=list(forward_op.request_ids),
+        request_pool_indices=list(forward_op.request_pool_indices),
         extend_prefix_lens=list(forward_op.extend_prefix_lens),
         extend_seq_lens=list(forward_op.input_lengths[:num_extends]),
         max_encoder_tokens=max_encoder_tokens,

@@ -74,7 +74,10 @@ from tokenspeed.runtime.execution.prefill_graph import (
 )
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
-from tokenspeed.runtime.execution.slot_state import SlotStateExporter
+from tokenspeed.runtime.execution.slot_state import (
+    SlotStateExporter,
+    model_slot_state_exporters,
+)
 from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
@@ -558,6 +561,13 @@ class ModelExecutor:
         self.device = config.device
         self.config = config
         self.model_runner = model_runner
+        # Per-slot state the model owns itself (``SlotStateModel``), imaged
+        # after the runtime's owners; empty for every model that keeps none.
+        self.model_slot_state_exporters: tuple[SlotStateExporter, ...] = ()
+        if model_runner is not None:
+            self.model_slot_state_exporters = model_slot_state_exporters(
+                model_runner.model
+            )
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
@@ -2012,9 +2022,11 @@ class ModelExecutor:
 
         The runtime states, every node of the target attention tree, the
         nodes of the draft tree not already listed (a draft Inkling wrapper
-        owns its own ring; a shared node is listed once), the drafter and the
+        owns its own ring; a shared node is listed once), the drafter, the
         sampling backend (its per-request scalars, penalty history and coin
-        generator). The Host cache executor lays these out once
+        generator), then the owners the model lists itself
+        (``SlotStateModel``; Whisper's cross-attention KV, none for most
+        models). The Host cache executor lays these out once
         (``SlotStateLayout``):
         each contributes a fixed-size segment, exported on a retraction
         store from the exporters' tensors on ``execution_stream`` (the caller
@@ -2034,6 +2046,7 @@ class ModelExecutor:
         if self.drafter is not None:
             exporters.append(self.drafter)
         exporters.append(self.sampling_backend)
+        exporters.extend(self.model_slot_state_exporters)
         return tuple(exporters)
 
     def copy_cache_pages(self, pairs: Mapping[str, Sequence[Sequence[int]]]) -> None:

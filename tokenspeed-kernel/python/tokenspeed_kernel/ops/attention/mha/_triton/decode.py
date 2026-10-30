@@ -37,9 +37,12 @@ _GROUPED_BLOCK_H = 16
 #   * host:   MAX_KV_SPLITS sizes the stage-1 grid and the partial buffers. It
 #             depends only on static shapes (total_q, head counts) and the SM
 #             count, so it is a constant for every captured batch size.
-#   * device: per-request num_kv_splits from the actual KV length, computed
-#             with torch elementwise ops (no host sync, nothing frozen into a
-#             graph from cache_seqlens).
+#   * device: per-request split count from the actual KV length, computed by
+#             stage 1 and stage 2 themselves from cache_seqlens
+#             (``_num_kv_splits``: no host sync, no extra launch, nothing
+#             frozen into a graph). The host passes only the mode's bounds
+#             ``[split_lo, split_hi]``; ``decode_num_kv_splits`` is the same
+#             formula in torch, kept as the reference.
 # --------------------------------------------------------------------------
 
 # Legacy behaviour: grid/buffers sized for 4 splits but every request uses 1.
@@ -97,9 +100,15 @@ _TRITON_DECODE_SPLIT_MIN_TOKENS = _env_pos_int(
 # Diagnostic/sweep knob: stage-1 CTAs to aim for, in multiples of the SM count.
 _TRITON_DECODE_TARGET_WAVES = _env_pos_int("TOKENSPEED_TRITON_DECODE_TARGET_WAVES", 2)
 # Grouped (GQA) stage-1 launch shape; 0 keeps the built-in choice. Sweep knobs.
-_GROUPED_BLOCK_N_ENV = int(os.environ.get("TOKENSPEED_TRITON_DECODE_GROUPED_BLOCK_N", "0") or 0)
-_GROUPED_WARPS_ENV = int(os.environ.get("TOKENSPEED_TRITON_DECODE_GROUPED_WARPS", "0") or 0)
-_GROUPED_STAGES_ENV = int(os.environ.get("TOKENSPEED_TRITON_DECODE_GROUPED_STAGES", "0") or 0)
+_GROUPED_BLOCK_N_ENV = int(
+    os.environ.get("TOKENSPEED_TRITON_DECODE_GROUPED_BLOCK_N", "0") or 0
+)
+_GROUPED_WARPS_ENV = int(
+    os.environ.get("TOKENSPEED_TRITON_DECODE_GROUPED_WARPS", "0") or 0
+)
+_GROUPED_STAGES_ENV = int(
+    os.environ.get("TOKENSPEED_TRITON_DECODE_GROUPED_STAGES", "0") or 0
+)
 # Batch invariance: MAX no longer depends on batch size, so a request's split
 # count (hence its reduction order) depends only on its own length.
 _BATCH_INVARIANT = _env_truthy("VLLM_BATCH_INVARIANT")
@@ -144,11 +153,12 @@ def decode_num_kv_splits(
     max_kv_splits: int,
     split_min_tokens: int,
 ) -> torch.Tensor:
-    """Device-side per-request split count from the actual attended length.
+    """Per-request split count from the actual attended length (reference).
 
     ``clamp(cdiv(eff_len, split_min_tokens), 1, max_kv_splits)`` where
-    ``eff_len`` is clipped to the sliding window. Pure elementwise torch ops:
-    no host sync, safe inside CUDA graph capture.
+    ``eff_len`` is clipped to the sliding window. The kernels compute the
+    same value in ``_num_kv_splits``; this torch form is the reference the
+    tests check them against.
     """
     eff_len = cache_seqlens
     if window_left >= 0:
@@ -172,21 +182,21 @@ def _sm_count(device: torch.device) -> int:
 def _resolve_kv_splits(
     q: torch.Tensor,
     num_kv_heads: int,
-    cache_seqlens: torch.Tensor,
-    window_left: int,
-) -> tuple[int, torch.Tensor]:
-    """Return ``(max_kv_splits, num_kv_splits)`` for the current mode."""
-    batch = cache_seqlens.shape[0]
+) -> tuple[int, int, int]:
+    """Return ``(max_kv_splits, split_lo, split_hi)`` for the current mode.
+
+    ``max_kv_splits`` sizes the grid and the partial buffers; each request
+    then runs ``clamp(cdiv(eff_len, split_min_tokens), split_lo, split_hi)``
+    splits, computed in the kernels (``_num_kv_splits``).
+    """
     mode = _TRITON_DECODE_KV_SPLITS
     # AMD stays on the legacy split policy until it is validated there.
     if mode == "auto" and current_platform().is_amd:
         mode = "legacy"
     if mode == "legacy":
-        num_kv_splits = torch.ones((batch,), dtype=torch.int32, device=q.device)
-        return _LEGACY_MAX_KV_SPLITS, num_kv_splits
+        return _LEGACY_MAX_KV_SPLITS, 1, 1
     if isinstance(mode, int):
-        num_kv_splits = torch.full((batch,), mode, dtype=torch.int32, device=q.device)
-        return mode, num_kv_splits
+        return mode, mode, mode
     max_kv_splits = decode_max_kv_splits(
         q.shape[0],
         q.shape[1],
@@ -196,13 +206,7 @@ def _resolve_kv_splits(
         target_waves=_TRITON_DECODE_TARGET_WAVES,
         batch_invariant=_BATCH_INVARIANT,
     )
-    if max_kv_splits == 1:
-        num_kv_splits = torch.ones((batch,), dtype=torch.int32, device=q.device)
-    else:
-        num_kv_splits = decode_num_kv_splits(
-            cache_seqlens, window_left, max_kv_splits, _TRITON_DECODE_SPLIT_MIN_TOKENS
-        )
-    return max_kv_splits, num_kv_splits
+    return max_kv_splits, 1, max_kv_splits
 
 
 @triton.jit
@@ -212,6 +216,26 @@ def tanh(x):
 
 
 @triton.jit
+def _num_kv_splits(
+    cache_seqlens,
+    cur_batch,
+    split_lo,
+    split_hi,
+    WINDOW_LEFT: tl.constexpr,
+    SPLIT_MIN_TOKENS: tl.constexpr,
+):
+    """``decode_num_kv_splits`` for one request, from its full cache length
+    (not the per-query-row length), so every row of a request and both
+    stages agree on the split count."""
+    eff_len = tl.load(cache_seqlens + cur_batch)
+    if WINDOW_LEFT >= 0:
+        eff_len = tl.minimum(eff_len, WINDOW_LEFT + 1)
+    # eff_len >= 0, so truncating division is the floor of the torch form.
+    splits = (eff_len + (SPLIT_MIN_TOKENS - 1)) // SPLIT_MIN_TOKENS
+    return tl.minimum(tl.maximum(splits, split_lo), split_hi)
+
+
+@triton.jit(do_not_specialize=["split_lo", "split_hi"])
 def _fwd_kernel_stage1(
     Q,
     K_Buffer,
@@ -221,7 +245,8 @@ def _fwd_kernel_stage1(
     cache_seqlens,
     Att_Out,
     Att_Lse,
-    num_kv_splits,
+    split_lo,
+    split_hi,
     stride_qbs,
     stride_qh,
     stride_buf_kbs,
@@ -242,6 +267,7 @@ def _fwd_kernel_stage1(
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
+    SPLIT_MIN_TOKENS: tl.constexpr,
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
@@ -268,7 +294,9 @@ def _fwd_kernel_stage1(
         tl.minimum(cache_len, WINDOW_LEFT + 1) if WINDOW_LEFT >= 0 else cache_len
     )
     kv_start_offset = cache_len - cur_batch_seq_len
-    kv_splits = tl.load(num_kv_splits + cur_batch)
+    kv_splits = _num_kv_splits(
+        cache_seqlens, cur_batch, split_lo, split_hi, WINDOW_LEFT, SPLIT_MIN_TOKENS
+    )
 
     off_q = cur_q * stride_qbs + cur_head * stride_qh + offs_d
 
@@ -367,7 +395,8 @@ def _decode_att_m_fwd(
     att_lse,
     page_table,
     cache_seqlens,
-    num_kv_splits,
+    split_lo,
+    split_hi,
     max_kv_splits,
     page_table_stride_b,
     page_size,
@@ -410,7 +439,8 @@ def _decode_att_m_fwd(
         cache_seqlens,
         att_out,
         att_lse,
-        num_kv_splits,
+        split_lo,
+        split_hi,
         q.stride(0),
         q.stride(1),
         k_buffer.stride(0),
@@ -429,6 +459,7 @@ def _decode_att_m_fwd(
         BLOCK_DV=BLOCK_DV,
         BLOCK_N=BLOCK,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
+        SPLIT_MIN_TOKENS=_TRITON_DECODE_SPLIT_MIN_TOKENS,
         logit_cap=logit_cap,
         num_warps=num_warps,
         num_stages=2,
@@ -437,7 +468,7 @@ def _decode_att_m_fwd(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["split_lo", "split_hi"])
 def _fwd_grouped_kernel_stage1(
     Q,
     K_Buffer,
@@ -447,7 +478,8 @@ def _fwd_grouped_kernel_stage1(
     cache_seqlens,
     Att_Out,
     Att_Lse,
-    num_kv_splits,
+    split_lo,
+    split_hi,
     stride_qbs,
     stride_qh,
     stride_buf_kbs,
@@ -471,6 +503,7 @@ def _fwd_grouped_kernel_stage1(
     BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
+    SPLIT_MIN_TOKENS: tl.constexpr,
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
@@ -504,7 +537,9 @@ def _fwd_grouped_kernel_stage1(
         tl.minimum(cache_len, WINDOW_LEFT + 1) if WINDOW_LEFT >= 0 else cache_len
     )
     kv_start_offset = cache_len - cur_batch_seq_len
-    kv_splits = tl.load(num_kv_splits + cur_batch)
+    kv_splits = _num_kv_splits(
+        cache_seqlens, cur_batch, split_lo, split_hi, WINDOW_LEFT, SPLIT_MIN_TOKENS
+    )
 
     offs_q = cur_q * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
 
@@ -627,7 +662,8 @@ def _decode_grouped_att_m_fwd(
     att_lse,
     page_table,
     cache_seqlens,
-    num_kv_splits,
+    split_lo,
+    split_hi,
     max_kv_splits,
     page_table_stride_b,
     page_size,
@@ -694,7 +730,8 @@ def _decode_grouped_att_m_fwd(
         cache_seqlens,
         att_out,
         att_lse,
-        num_kv_splits,
+        split_lo,
+        split_hi,
         q.stride(0),
         q.stride(1),
         k_buffer.stride(0),
@@ -716,6 +753,7 @@ def _decode_grouped_att_m_fwd(
         BLOCK_N=BLOCK,
         BLOCK_H=BLOCK_H,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
+        SPLIT_MIN_TOKENS=_TRITON_DECODE_SPLIT_MIN_TOKENS,
         logit_cap=logit_cap,
         num_warps=num_warps,
         num_stages=num_stages,
@@ -725,13 +763,14 @@ def _decode_grouped_att_m_fwd(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["split_lo", "split_hi"])
 def _fwd_kernel_stage2(
     Mid_O,
     Mid_O_1,
     O,
     cache_seqlens,
-    num_kv_splits,
+    split_lo,
+    split_hi,
     sink_ptr,
     stride_mid_ob,
     stride_mid_oh,
@@ -741,6 +780,7 @@ def _fwd_kernel_stage2(
     MAX_SEQLEN_Q: tl.constexpr,
     MAX_KV_SPLITS: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
+    SPLIT_MIN_TOKENS: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
@@ -759,7 +799,9 @@ def _fwd_kernel_stage2(
     cur_batch_seq_len = (
         tl.minimum(cache_len, WINDOW_LEFT + 1) if WINDOW_LEFT >= 0 else cache_len
     )
-    kv_splits = tl.load(num_kv_splits + cur_batch)
+    kv_splits = _num_kv_splits(
+        cache_seqlens, cur_batch, split_lo, split_hi, WINDOW_LEFT, SPLIT_MIN_TOKENS
+    )
 
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lv
@@ -811,7 +853,8 @@ def _decode_softmax_reducev_fwd(
     o,
     v_buffer,
     cache_seqlens,
-    num_kv_splits,
+    split_lo,
+    split_hi,
     max_kv_splits,
     max_seqlen_q,
     window_left,
@@ -835,7 +878,8 @@ def _decode_softmax_reducev_fwd(
         lse,
         o,
         cache_seqlens,
-        num_kv_splits,
+        split_lo,
+        split_hi,
         sinks,
         logits.stride(0),
         logits.stride(1),
@@ -845,6 +889,7 @@ def _decode_softmax_reducev_fwd(
         MAX_SEQLEN_Q=max_seqlen_q,
         MAX_KV_SPLITS=MAX_KV_SPLITS,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
+        SPLIT_MIN_TOKENS=_TRITON_DECODE_SPLIT_MIN_TOKENS,
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,
         WINDOW_LEFT=window_left,
@@ -864,7 +909,8 @@ def decode_attention_fwd_normal(
     cache_seqlens,
     attn_logits,
     attn_lse,
-    num_kv_splits,
+    split_lo,
+    split_hi,
     max_kv_splits,
     max_seqlen_q,
     page_table_stride_b,
@@ -882,7 +928,8 @@ def decode_attention_fwd_normal(
         attn_lse,
         page_table,
         cache_seqlens,
-        num_kv_splits,
+        split_lo,
+        split_hi,
         max_kv_splits,
         page_table_stride_b,
         page_size,
@@ -898,7 +945,8 @@ def decode_attention_fwd_normal(
         o,
         v_buffer,
         cache_seqlens,
-        num_kv_splits,
+        split_lo,
+        split_hi,
         max_kv_splits,
         max_seqlen_q,
         window_left,
@@ -915,7 +963,8 @@ def decode_attention_fwd_grouped(
     cache_seqlens,
     attn_logits,
     attn_lse,
-    num_kv_splits,
+    split_lo,
+    split_hi,
     max_kv_splits,
     max_seqlen_q,
     page_table_stride_b,
@@ -933,7 +982,8 @@ def decode_attention_fwd_grouped(
         attn_lse,
         page_table,
         cache_seqlens,
-        num_kv_splits,
+        split_lo,
+        split_hi,
         max_kv_splits,
         page_table_stride_b,
         page_size,
@@ -949,7 +999,8 @@ def decode_attention_fwd_grouped(
         o,
         v_buffer,
         cache_seqlens,
-        num_kv_splits,
+        split_lo,
+        split_hi,
         max_kv_splits,
         max_seqlen_q,
         window_left,
@@ -966,7 +1017,8 @@ def decode_attention_fwd(
     cache_seqlens,
     attn_logits,
     attn_lse,
-    num_kv_splits,
+    split_lo,
+    split_hi,
     max_kv_splits,
     max_seqlen_q,
     page_table_stride_b,
@@ -993,7 +1045,8 @@ def decode_attention_fwd(
             cache_seqlens,
             attn_logits,
             attn_lse,
-            num_kv_splits,
+            split_lo,
+            split_hi,
             max_kv_splits,
             max_seqlen_q,
             page_table_stride_b,
@@ -1014,7 +1067,8 @@ def decode_attention_fwd(
             cache_seqlens,
             attn_logits,
             attn_lse,
-            num_kv_splits,
+            split_lo,
+            split_hi,
             max_kv_splits,
             max_seqlen_q,
             page_table_stride_b,
@@ -1047,9 +1101,7 @@ def _triton_mha_decode_with_kvcache_impl(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     out = torch.empty_like(q)
-    max_kv_splits, num_kv_splits = _resolve_kv_splits(
-        q, k_cache.shape[2], cache_seqlens, window_left
-    )
+    max_kv_splits, split_lo, split_hi = _resolve_kv_splits(q, k_cache.shape[2])
     attn_logits = torch.empty(
         q.shape[0],
         q.shape[1],
@@ -1074,7 +1126,8 @@ def _triton_mha_decode_with_kvcache_impl(
         cache_seqlens,
         attn_logits,
         attn_lse,
-        num_kv_splits,
+        split_lo,
+        split_hi,
         max_kv_splits,
         max_seqlen_q,
         page_table.stride(0),

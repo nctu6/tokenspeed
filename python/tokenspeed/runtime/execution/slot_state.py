@@ -27,7 +27,9 @@ next step's inputs, the drafter's stash, a recurrent ring, a partial index
 pool -- must travel with the pages or the continuation is not exact. Each
 owner of such state implements :class:`SlotStateExporter`; the model executor
 concatenates the owners into one blob per slot and the snapshot executor keeps
-a pinned arena of those blobs.
+a pinned arena of those blobs. The owners are the runtime's (runtime states,
+attention backends, drafter, sampling backend) plus any a model lists itself
+through :class:`SlotStateModel`.
 
 Token-derived rows are deliberately NOT part of the image: the request's
 committed-token history and the n-gram tail are reseeded from the control
@@ -118,6 +120,29 @@ class SlotStateExporter(Protocol):
         windows) claim the slot, so its next prologue does not treat the
         restored rows as a stale occupant's.
         """
+
+
+@runtime_checkable
+class SlotStateModel(Protocol):
+    """A model that owns per-slot state outside the cache groups itself.
+
+    Most per-slot state lives in the runtime (runtime states, attention
+    backends, drafters, sampling backends). A model whose layers keep
+    slot-indexed device state of their own -- Whisper's cross-attention KV,
+    written once per request by the encoder -- lists its owners here, and the
+    model executor appends them to the blob like any other owner. A model
+    that does not implement this contributes nothing.
+    """
+
+    def slot_state_exporters(self) -> tuple[SlotStateExporter, ...]:
+        """The model's own slot-state owners, in a fixed order."""
+
+
+def model_slot_state_exporters(model) -> tuple[SlotStateExporter, ...]:
+    """``model``'s own slot-state owners; empty for a model that has none."""
+    if isinstance(model, SlotStateModel):
+        return tuple(model.slot_state_exporters())
+    return ()
 
 
 def aligned_slot_state_bytes(nbytes: int) -> int:

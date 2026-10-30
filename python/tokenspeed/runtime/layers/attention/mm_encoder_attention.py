@@ -39,8 +39,10 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 from tokenspeed_kernel.platform import current_platform
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from tokenspeed.runtime.distributed import utils as dist_utils
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -53,9 +55,6 @@ from tokenspeed.runtime.layers.rotary_embedding import apply_rotary_pos_emb_nati
 from tokenspeed.runtime.utils import add_prefix, round_up
 
 logger = logging.getLogger(__name__)
-
-# One-shot guard for the cross-attention dtype normalization diagnostic.
-_cross_attn_warned_dtype = False
 
 _platform = current_platform()
 _is_nvidia = _platform.is_nvidia
@@ -217,61 +216,43 @@ def vision_attn_fa4(
     return result[0] if isinstance(result, tuple) else result
 
 
-def cross_attn_varlen(
+def vision_attn_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
+    cu_seqlens: torch.Tensor | None,
+    bsz: int,
+    seq_len: int,
     softmax_scale: float | None = None,
+    **_: Any,
 ) -> torch.Tensor:
-    """Encoder-decoder cross-attention: q and kv have different lengths.
+    """PyTorch SDPA (its flash kernel) over ``bsz`` sequences of ``seq_len`` rows.
 
-    The three ``vision_attn_*`` backends above are self-attention shaped --
-    they pass one ``cu_seqlens`` for both sides because q_len == kv_len. A
-    Whisper decoder step has one query row per request against a fixed
-    encoder output, so the two sides differ and need separate cumulative
-    lengths. ``flash_attn_varlen_func`` already takes both.
-
-    ``k``/``v`` must be contiguous and in batch order. On sm_120 there is no
-    alternative: every indexed KV read this kernel offers is closed there --
-    ``page_table`` is refused outright ("Paged KV not supported on SM 12.0"),
-    ``gather_kv_indices`` needs ``qv``, and ``flash_attn_with_kvcache`` is an
-    unregistered placeholder. Measured 2026-08-21; re-probe before assuming
-    the caller still has to materialise the gather.
+    Serves the dense layout only: the tower passes ``x`` as
+    ``[bsz, seq_len, embed_dim]``, every sequence the same length, and
+    ``cu_seqlens`` is either None or those ``bsz`` sequences' boundaries.
+    SDPA reads ``[bsz, heads, seq_len, head_dim]`` strided views of the
+    packed rows (no copy) and has no varlen entry, so a packed varlen batch
+    (``x`` as ``[1, total, embed_dim]`` with more than one sequence in
+    ``cu_seqlens``) is refused rather than attended as one sequence. Whisper's
+    encoder is the user: a fixed 1500-frame window per request, where this
+    kernel takes about half the time of ``triton_attn`` on SM120.
     """
-    # ``flash_attn_varlen_func`` requires q/k/v in one dtype. Whisper can land
-    # fp16 decoder queries against bf16 encoder keys; normalize to the query
-    # dtype rather than aborting.
-    if q.dtype != k.dtype or k.dtype != v.dtype:
-        global _cross_attn_warned_dtype
-        target = q.dtype if q.dtype in (torch.float16, torch.bfloat16) else k.dtype
-        if not _cross_attn_warned_dtype:
-            _cross_attn_warned_dtype = True
-            logger.info(
-                "cross_attn_varlen normalized q=%s k=%s v=%s -> %s",
-                q.dtype,
-                k.dtype,
-                v.dtype,
-                target,
-            )
-        q, k, v = (t.to(target) for t in (q, k, v))
-    result = flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        softmax_scale=softmax_scale,
-        causal=False,
+    if cu_seqlens is not None and cu_seqlens.shape[0] != bsz + 1:
+        raise ValueError(
+            "the sdpa multimodal encoder attention backend serves equal-length "
+            f"batches ([bsz, seq_len, dim] input); got {cu_seqlens.shape[0] - 1} "
+            f"packed sequences in a batch of {bsz}. Use another "
+            "--mm-attention-backend for this tower."
+        )
+    heads, head_dim = q.shape[-2:]
+    qb, kb, vb = (
+        t.view(bsz, seq_len, heads, head_dim).transpose(1, 2) for t in (q, k, v)
     )
-    return result[0] if isinstance(result, tuple) else result
-
+    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+        output = F.scaled_dot_product_attention(qb, kb, vb, scale=softmax_scale)
+    return output.transpose(1, 2).reshape(bsz * seq_len, heads, head_dim)
 
 
 def vision_attn_flashinfer_cudnn(
@@ -356,6 +337,7 @@ _BACKENDS: dict[str, Callable[..., torch.Tensor]] = {
     "fa3": vision_attn_fa3,
     "fa4": vision_attn_fa4,
     "flashinfer_cudnn": vision_attn_flashinfer_cudnn,
+    "sdpa": vision_attn_sdpa,
 }
 
 

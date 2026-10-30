@@ -530,6 +530,7 @@ def test_model_executor_lists_every_owner_once_and_the_layout_is_fixed():
     states = _runtime_states(draft_probs=True, trees=False, history=False)
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.runtime_states = states
+    executor.model_slot_state_exporters = ()
     # A composite tree is flattened: the wrapper and its leaf are separate
     # segments, each imaging its own rows.
     executor.attn_backend = _inkling()
@@ -661,6 +662,7 @@ def test_every_owner_a_constructed_executor_lists_is_complete():
     states = _runtime_states(draft_probs=True, trees=True, history=True)
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.runtime_states = states
+    executor.model_slot_state_exporters = ()
     executor.attn_backend = _inkling()
     executor.draft_attn_backend = _inkling()
     executor.drafter = _eagle(states)
@@ -770,3 +772,350 @@ def test_sampling_offsets_recompute_after_restore_to_another_slot(cls):
     frontier[8] = 1025
     restored.extend_lengths = None
     assert backend._prepare_sampling_offsets(restored)[8].item() == 1026
+
+
+# ----------------------------------------------------------------------
+# Preservation: a non-Whisper executor's blob is byte-identical to the one before
+# Whisper's cross KV became slot state (expected layouts observed on that code).
+# ----------------------------------------------------------------------
+
+
+def _mtp_executor() -> ModelExecutor:
+    """Target Inkling tree, MTP drafter sharing it, FlashInfer-full sampling."""
+    states = _runtime_states(draft_probs=True, trees=False, history=False)
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.runtime_states = states
+    executor.model_slot_state_exporters = ()
+    executor.attn_backend = _inkling()
+    executor.draft_attn_backend = executor.attn_backend
+    executor.drafter = _mtp(states)
+    executor.sampling_backend = _sampling_backend(FlashInferFullSamplingBackend)
+    return executor
+
+
+def _eagle_executor() -> ModelExecutor:
+    """Distinct target and draft Inkling trees, Eagle drafter, Triton-full sampling."""
+    states = _runtime_states(draft_probs=True, trees=True, history=True)
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.runtime_states = states
+    executor.model_slot_state_exporters = ()
+    executor.attn_backend = _inkling()
+    executor.draft_attn_backend = _inkling()
+    executor.drafter = _eagle(states)
+    executor.sampling_backend = _sampling_backend(TritonFullSamplingBackend)
+    return executor
+
+
+def _plain_executor() -> ModelExecutor:
+    """A dense LLM: stateless leaf, no drafter, greedy sampling."""
+    states = _runtime_states(draft_probs=False, trees=False, history=False)
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.runtime_states = states
+    executor.model_slot_state_exporters = ()
+    executor.attn_backend = _Leaf()
+    executor.draft_attn_backend = None
+    executor.drafter = None
+    executor.sampling_backend = _sampling_backend(GreedySamplingBackend)
+    return executor
+
+
+def _blob_record(executor: ModelExecutor) -> tuple[list, int, str]:
+    """The executor's blob layout and the sha256 of one seeded slot image."""
+    import hashlib
+
+    exporters = executor.slot_state_exporters()
+    layout = SlotStateLayout(exporters)
+    segments = [
+        (type(owner).__name__, begin, end) for owner, begin, end in layout.segments
+    ]
+    executor.sampling_backend.prepare_step(["r2"], [2], [_sampling_params("r2")])
+    torch.manual_seed(1)
+    _randomize([row for owner in exporters for row in owner.slot_state_rows(2)])
+    image = torch.zeros(layout.nbytes, dtype=torch.uint8)
+    layout.export(2, image, None, request_id="r2")
+    digest = hashlib.sha256(image.numpy().tobytes()).hexdigest()
+    return segments, layout.nbytes, digest
+
+
+# (segments, nbytes, sha256 of the slot-2 image) per executor, recorded on F.
+_RECORDED_BLOBS = {
+    "mtp": (
+        [
+            ("RuntimeStates", 0, 656),
+            ("InklingAttnBackend", 656, 832),
+            ("_Leaf", 832, 832),
+            ("Mtp", 832, 896),
+            ("FlashInferFullSamplingBackend", 896, 6288),
+        ],
+        6288,
+        "e1687bc19b77fe34cdccaf276813a737c4f30f0075e210dbef2497c5a6b4347f",
+    ),
+    "eagle": (
+        [
+            ("RuntimeStates", 0, 672),
+            ("InklingAttnBackend", 672, 848),
+            ("_Leaf", 848, 848),
+            ("InklingAttnBackend", 848, 1024),
+            ("_Leaf", 1024, 1024),
+            ("Eagle", 1024, 1040),
+            ("TritonFullSamplingBackend", 1040, 1376),
+        ],
+        1376,
+        "76da900930377f7934f303342aa00b2447a20e71c3b0e9511395acb878ece62e",
+    ),
+    "plain": (
+        [
+            ("RuntimeStates", 0, 144),
+            ("_Leaf", 144, 144),
+            ("GreedySamplingBackend", 144, 144),
+        ],
+        144,
+        "82394803c62847d6ead5831577204a0001c3e032c2cefc848510600b20cc2436",
+    ),
+}
+_EXECUTORS = {"mtp": _mtp_executor, "eagle": _eagle_executor, "plain": _plain_executor}
+
+
+@pytest.mark.parametrize("name", sorted(_EXECUTORS))
+def test_non_whisper_executor_blob_is_byte_identical_to_the_pre_fix_one(name):
+    """**Validates: Requirements 3.4, 3.5** (Property 2, slot-state layout)."""
+    segments, nbytes, digest = _blob_record(_EXECUTORS[name]())
+    print(f"{name}: segments={segments} nbytes={nbytes} sha256={digest}")
+    assert (segments, nbytes, digest) == _RECORDED_BLOBS[name]
+
+
+def test_model_owned_exporters_follow_the_runtime_owners_in_the_blob():
+    """**Validates: Requirements 3.4, 3.7.** A model's own owners (Whisper's
+    cross KV) are appended after the runtime's: the runtime segments keep the
+    offsets a model without slot state has, and the model's rows round-trip
+    through the executor's layout."""
+    from tokenspeed.runtime.models.whisper import CrossAttentionCache
+
+    cross = CrossAttentionCache(
+        num_slots=POOL_ROWS,
+        num_layers=2,
+        encoder_len=6,
+        kv_heads=2,
+        head_dim=4,
+        page_size=4,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+    plain_segments, plain_nbytes, _ = _RECORDED_BLOBS["plain"]
+    executor = _plain_executor()
+    executor.model_slot_state_exporters = (cross,)
+    exporters = executor.slot_state_exporters()
+    assert exporters[-1] is cross
+    layout = SlotStateLayout(exporters)
+    segments = [
+        (type(owner).__name__, begin, end) for owner, begin, end in layout.segments
+    ]
+    assert segments[:-1] == plain_segments
+    assert segments[-1] == (
+        "CrossAttentionCache",
+        plain_nbytes,
+        plain_nbytes + cross.slot_state_bytes(),
+    )
+
+    torch.manual_seed(3)
+    _randomize(cross.slot_state_rows(2))
+    expected = [row.clone() for row in cross.slot_state_rows(2)]
+    cross.claim_slot(2, "r2")
+    image = torch.zeros(layout.nbytes, dtype=torch.uint8)
+    layout.export(2, image, None, request_id="r2")
+    layout.import_(7, image, None, request_id="r2")
+    assert all(torch.equal(a, b) for a, b in zip(cross.slot_state_rows(7), expected))
+    assert cross.owner_of(7) == "r2"
+
+
+# ----------------------------------------------------------------------
+# Whisper's cross-attention KV: a model-owned, request-keyed owner.
+# ----------------------------------------------------------------------
+
+# Small enough to stay off the slot domain: padded_len 8 (2 pages of 4),
+# 12 KV boundaries, 2 layers, 2 heads of 4.
+CROSS_ENCODER_LEN = 6
+
+
+def _cross_cache():
+    from tokenspeed.runtime.models.whisper import CrossAttentionCache
+
+    return CrossAttentionCache(
+        num_slots=POOL_ROWS,
+        num_layers=2,
+        encoder_len=CROSS_ENCODER_LEN,
+        kv_heads=2,
+        head_dim=4,
+        page_size=4,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+
+
+def _whisper_executor(cross) -> ModelExecutor:
+    """A Whisper deployment's executor: plain runtime owners plus the model's
+    cross-attention cache, listed through the generic model hook."""
+    executor = _plain_executor()
+    executor.model_slot_state_exporters = (cross,)
+    return executor
+
+
+def test_cross_attention_cache_slot_state_is_complete():
+    """**Validates: Requirement 3.7.** Every slot-sized tensor of the cross
+    cache is exported (K, V) or declared: the page table is rewritten by every
+    forward, the lengths and page offsets are the same for every slot."""
+    cross = _cross_cache()
+    _assert_slot_state_complete(cross, exporter=cross, slot_domains={POOL_ROWS})
+    per_slot = _per_slot_tensors(cross, {POOL_ROWS})
+    assert {"k", "v", "page_table", "cache_seqlens"} <= set(per_slot)
+    # The declared constant rows really are identical for every slot.
+    for name in type(cross).constant_slot_state:
+        tensor = vars(cross)[name]
+        if name in per_slot:
+            assert torch.all(tensor == tensor[0]), name
+    # A slot-sized buffer added without an exporter is caught.
+    cross.rogue_per_slot = torch.zeros(POOL_ROWS, 3, dtype=torch.int32)
+    with pytest.raises(AssertionError, match="rogue_per_slot"):
+        _assert_slot_state_complete(cross, exporter=cross, slot_domains={POOL_ROWS})
+
+
+def test_every_owner_a_whisper_executor_lists_is_complete():
+    """**Validates: Requirements 3.4, 3.7.** The owners a Whisper executor
+    lists for the blob -- the runtime's and the model's cross KV -- each cover
+    every slot-sized tensor they hold."""
+    cross = _cross_cache()
+    exporters = _whisper_executor(cross).slot_state_exporters()
+    assert exporters[-1] is cross
+    for owner in exporters:
+        assert isinstance(owner, SlotStateExporter)
+        _assert_slot_state_complete(owner, exporter=owner, slot_domains={POOL_ROWS})
+
+
+def test_cross_attention_cache_round_trip_restores_rows_and_claims_the_slot():
+    """**Validates: Requirement 3.7.** A slot prepared for the victim images
+    the marker and its encoder rows; the restore into another slot writes the
+    rows there and claims it for the victim. Nothing else moves."""
+    cross = _cross_cache()
+    torch.manual_seed(5)
+    _randomize([cross.k, cross.v])
+    cross.claim_slot(3, RESTORED)
+    cross.claim_slot(9, "req-stale")
+    expected = [row.clone() for row in cross.slot_state_rows(3)]
+    k_before, v_before = cross.k.clone(), cross.v.clone()
+
+    image = torch.full((cross.slot_state_bytes(),), 0xEE, dtype=torch.uint8)
+    cross.export_slot_state(3, image, None, request_id=RESTORED)
+    assert read_prepared_marker(image)
+    for row in cross.slot_state_rows(3):
+        row.zero_()
+    cross.import_slot_state(9, image, None, request_id=RESTORED)
+
+    assert all(torch.equal(a, b) for a, b in zip(cross.slot_state_rows(9), expected))
+    assert cross.owner_of(9) == RESTORED
+    # Only slot 9's written rows changed (slot 3 was wiped by the test): the
+    # padding rows and every other slot keep their bytes.
+    others = [s for s in range(POOL_ROWS) if s not in (3, 9)]
+    for now, before in ((cross.k, k_before), (cross.v, v_before)):
+        assert torch.equal(now[:, others], before[:, others])
+        assert torch.equal(
+            now[:, 9, CROSS_ENCODER_LEN:], before[:, 9, CROSS_ENCODER_LEN:]
+        )
+
+
+@pytest.mark.parametrize("previous_occupant", [None, "req-previous"])
+def test_cross_attention_cache_images_an_unowned_slot_as_nobodys(previous_occupant):
+    """**Validates: Requirement 3.7.** A victim retracted before its audio was
+    encoded into its slot (the slot is nobody's, or a previous occupant's)
+    images the marker alone; the restore copies nothing and leaves the new
+    slot unowned, so the request's next extend encodes its own audio."""
+    cross = _cross_cache()
+    torch.manual_seed(6)
+    _randomize([cross.k, cross.v])
+    if previous_occupant is not None:
+        cross.claim_slot(3, previous_occupant)
+    cross.claim_slot(9, "req-stale")
+    dst_rows = [row.clone() for row in cross.slot_state_rows(9)]
+
+    image = torch.full((cross.slot_state_bytes(),), 0xEE, dtype=torch.uint8)
+    cross.export_slot_state(3, image, None, request_id="req-victim")
+    assert not read_prepared_marker(image)
+    assert torch.all(image[PREPARED_MARKER_BYTES:] == 0xEE), "no payload imaged"
+    cross.import_slot_state(9, image, None, request_id="req-victim")
+
+    assert cross.owner_of(9) is None
+    assert all(torch.equal(a, b) for a, b in zip(cross.slot_state_rows(9), dst_rows))
+    assert cross.owner_of(3) == previous_occupant, "export does not change ownership"
+
+
+def _audio_context(requests: list[tuple[str, int]], prefix_lens: list[int]):
+    """An extend's multimodal context: one audio window per ``(rid, slot)``."""
+    from tokenspeed.runtime.multimodal.inputs import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalForwardContext,
+        MultimodalInputs,
+    )
+
+    return MultimodalForwardContext(
+        mm_inputs=[
+            MultimodalInputs(
+                mm_items=[
+                    MultimodalDataItem(
+                        modality=Modality.AUDIO,
+                        feature=torch.full((2, 4), float(index)),
+                    )
+                ]
+            )
+            for index in range(len(requests))
+        ],
+        request_ids=[rid for rid, _ in requests],
+        request_pool_indices=[slot for _, slot in requests],
+        extend_prefix_lens=list(prefix_lens),
+        extend_seq_lens=[1] * len(requests),
+        max_encoder_tokens=4096,
+    )
+
+
+def _to_encode(cross, requests, prefix_lens) -> list[tuple[str, int]]:
+    """The ``(rid, slot)`` pairs the model's extend would run the encoder for."""
+    from tokenspeed.runtime.models.whisper import _audio_features_to_encode
+
+    features, slots, rids = _audio_features_to_encode(
+        _audio_context(requests, prefix_lens), cross
+    )
+    assert (features is None) == (not slots)
+    if features is not None:
+        assert len(features) == len(slots)
+    return list(zip(rids, slots))
+
+
+def test_cross_attention_encodes_a_request_iff_its_slot_is_not_its_own():
+    """**Validates: Requirement 3.7.** Ownership, not the prefix length,
+    decides whether an extend runs the encoder: a fresh request encodes; a
+    continuation of the slot's owner skips it at any prefix; a new request
+    in a slot a finished one encoded re-encodes even with a prefix hit (no
+    finish event releases the slot -- the different request id is the
+    signal); a restored image claims its slot, a not-prepared one leaves it
+    for the next extend to encode."""
+    cross = _cross_cache()
+    # Fresh admits encode.
+    assert _to_encode(cross, [("a", 2), ("b", 5)], [0, 0]) == [("a", 2), ("b", 5)]
+    for rid, slot in (("a", 2), ("b", 5)):
+        cross.claim_slot(slot, rid)  # what encode_audio records
+    # Their continuations (chunked prefill, recompute into the same slot) do not.
+    assert _to_encode(cross, [("a", 2), ("b", 5)], [4, 0]) == []
+    # "a" finished; "c" lands in slot 2 with a prefix hit: it does not own it.
+    assert _to_encode(cross, [("c", 2), ("b", 5)], [3, 7]) == [("c", 2)]
+    cross.claim_slot(2, "c")
+    # "b" is resumed by recompute into slot 2, now "c"'s: it encodes again.
+    assert _to_encode(cross, [("b", 2)], [6]) == [("b", 2)]
+
+    # A snapshot of "b" (slot 5) restored into slot 7 claims slot 7 for "b".
+    image = torch.empty((cross.slot_state_bytes(),), dtype=torch.uint8)
+    cross.export_slot_state(5, image, None, request_id="b")
+    cross.import_slot_state(7, image, None, request_id="b")
+    assert _to_encode(cross, [("b", 7)], [6]) == []
+    # A victim whose audio never ran here restores as nobody's and encodes.
+    cross.export_slot_state(4, image, None, request_id="d")
+    cross.import_slot_state(8, image, None, request_id="d")
+    assert _to_encode(cross, [("d", 8)], [2]) == [("d", 8)]

@@ -1318,6 +1318,8 @@ def test_image_mask_survives_input_clamp(buffers, prefix, length, image_rows):
     assert ((ids >= 0) & (ids < VOCAB_SIZE)).all()
     context = MultimodalForwardContext(
         mm_inputs=[None, mm_inputs, None],
+        request_ids=list(states),
+        request_pool_indices=[1, 2, 3],
         extend_prefix_lens=[0, prefix],
         extend_seq_lens=[2, length],
         max_encoder_tokens=32,

@@ -11,6 +11,25 @@ On CDNA4, ordinary GEMM dispatch admits the measured single-row
 Callers that publish directly into a collective buffer pass that buffer as
 `out` to the same `mv` operation.
 
+## Skinny dense BF16 (`triton_mm_bf16_skinny`, NVIDIA SM120)
+
+Dense BF16 `mm` with 1 to 16 rows (a decode step) on SM120 selects
+`triton_mm_bf16_skinny` over `torch_mm`. Each CTA owns 16 weight rows and
+streams them once over K (tile 128, or 256 for K >= 4096); the activation rows
+pad to one 16-row `tl.dot` tile, so every M up to 16 runs the same binary (M
+and the row strides are runtime arguments without specialization; N and K
+are the model's static widths). Products accumulate in FP32, the bias is added
+before the single rounding. Traits: `m` 1..16, N a multiple of 16, K a
+multiple of 128, unit inner strides, `NK` weight layout, BF16 output, and a
+2-D A (`a_ndim`: `mm` takes `m` from `A.shape[0]`, which is not the row count
+of a batched N-D A).
+
+Measured on an RTX PRO 6000 (SM120) over the 6 x 32 bias projections of a
+whisper-large-v3 decode step (1.47 GB of weights, one CUDA graph): cuBLAS
+1.58 ms at M = 1 (GEMV) and 2.00-2.01 ms at M = 2..16 (16x16-tile tensor-core
+GEMM); this kernel 1.41 ms at every M. Other architectures keep their
+existing choice; it is not measured there.
+
 ## Per-token/per-channel FP8
 
 Per-channel FP8 projections use FP8 E4M3 weights with FP32 scales per output

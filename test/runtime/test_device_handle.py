@@ -1170,6 +1170,7 @@ def _mm_inputs(positions=None, delta=None):
 def _forward_op(num_extends=1):
     return SimpleNamespace(
         request_ids=["r0"],
+        request_pool_indices=[1],
         num_extends=lambda: num_extends,
         extend_prefix_lens=[0],
         input_lengths=[4],

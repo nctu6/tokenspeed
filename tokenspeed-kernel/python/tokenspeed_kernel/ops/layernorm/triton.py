@@ -1837,7 +1837,9 @@ def qk_rmsnorm_rope_neox(
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     v: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> (
+    tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
     """Per-head RMSNorm of q/k (+ optional weightless v) and neox RoPE on q/k.
 
     ``q``/``k``/``v`` are ``[tokens, heads, head_dim]`` (or flat last-dim)
@@ -1978,3 +1980,99 @@ def rmsnorm_residual_rmsnorm(
         num_warps=8 if block >= 4096 else 4,
     )
     return y, z
+
+
+@triton.jit
+def _triton_add_layernorm_kernel(
+    x_ptr,
+    residual_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_ptr,
+    residual_out_ptr,
+    stride_x,
+    stride_residual,
+    stride_out,
+    stride_residual_out,
+    eps,
+    N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+):
+    """One row: ``s = residual + x`` rounded to x's dtype (stored), then
+    LayerNorm of ``s`` in FP32 with weight and bias, rounded once."""
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < N
+    x = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0)
+    if HAS_RESIDUAL:
+        r = tl.load(residual_ptr + row * stride_residual + cols, mask=mask, other=0.0)
+        # The eager ``residual + x`` adds in FP32 and rounds to the dtype.
+        x = (x.to(tl.float32) + r.to(tl.float32)).to(x.dtype)
+        tl.store(residual_out_ptr + row * stride_residual_out + cols, x, mask=mask)
+    s = x.to(tl.float32)
+    mean = tl.sum(s, 0) / N
+    centered = tl.where(mask, s - mean, 0.0)
+    var = tl.sum(centered * centered, 0) / N
+    rstd = 1.0 / tl.sqrt(var + eps)
+    w = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(bias_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    y = centered * rstd * w + b
+    tl.store(
+        out_ptr + row * stride_out + cols, y.to(out_ptr.dtype.element_ty), mask=mask
+    )
+
+
+@register_kernel(
+    "layernorm",
+    "add_layernorm",
+    name="triton_add_layernorm",
+    solution="triton",
+    signatures=format_signatures(
+        "x", "dense", {torch.bfloat16, torch.float16, torch.float32}
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_add_layernorm(
+    x: torch.Tensor,
+    residual: torch.Tensor | None,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Residual add + LayerNorm in one launch; see
+    ``tokenspeed_kernel.ops.layernorm.add_layernorm``."""
+    if x.ndim != 2 or x.stride(-1) != 1:
+        raise ValueError("add_layernorm takes a [rows, width] x with unit inner stride")
+    rows, width = x.shape
+    if weight.shape != (width,) or bias.shape != (width,):
+        raise ValueError(f"add_layernorm needs [{width}] weight and bias")
+    if residual is not None and (residual.shape != x.shape or residual.stride(-1) != 1):
+        raise ValueError("add_layernorm residual must match x with unit inner stride")
+    out = torch.empty_like(x, memory_format=torch.contiguous_format)
+    residual_out = (
+        torch.empty_like(x, memory_format=torch.contiguous_format)
+        if residual is not None
+        else x
+    )
+    if rows == 0:
+        return out, residual_out
+    block = triton.next_power_of_2(width)
+    _triton_add_layernorm_kernel[(rows,)](
+        x,
+        residual if residual is not None else x,
+        weight.contiguous(),
+        bias.contiguous(),
+        out,
+        residual_out,
+        x.stride(0),
+        residual.stride(0) if residual is not None else 0,
+        out.stride(0),
+        residual_out.stride(0),
+        eps,
+        N=width,
+        BLOCK_N=block,
+        HAS_RESIDUAL=residual is not None,
+        num_warps=min(max(block // 256, 1), 8),
+    )
+    return out, residual_out

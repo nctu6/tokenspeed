@@ -84,6 +84,8 @@ def _ctx(
 ) -> MultimodalForwardContext:
     return MultimodalForwardContext(
         mm_inputs=[MultimodalInputs(mm_items=items) for items in items_per_request],
+        request_ids=[f"r{i}" for i in range(len(items_per_request))],
+        request_pool_indices=list(range(1, len(items_per_request) + 1)),
         extend_prefix_lens=prefixes,
         extend_seq_lens=seqs,
         max_encoder_tokens=max_encoder_tokens,

@@ -1069,6 +1069,28 @@ class ModelConfig:
             # Cross-attention KV is a per-slot buffer outside the paged arena.
             # +1 mirrors the scheduler's padding slot.
             self.hf_config.cross_attn_slots = int(server_args.max_num_seqs) + 1
+            # The decoder's self-attention KV depends on the encoder input
+            # through cross-attention, but the prefix key is the decoder
+            # prompt alone (no placeholder tokens carry the input's hash), so
+            # two requests with the same prompt and different inputs would
+            # share self-attention pages. Forced, like the embedding case.
+            if server_args.enable_prefix_caching:
+                logger.info(
+                    "Encoder-decoder model: disabling prefix caching. The "
+                    "decoder prompt does not identify the encoder input, so "
+                    "a prefix hit could reuse another request's KV."
+                )
+                server_args.enable_prefix_caching = False
+            # The Host tier indexes the same prompt-only keys (a retraction's
+            # L2 leg adopts an entry already canonical under its key), and
+            # ServerArgs refuses KVStore without prefix caching. Retraction
+            # images then ride the request-private snapshot pool alone.
+            if server_args.enable_kvstore:
+                logger.info(
+                    "Encoder-decoder model: disabling the KVStore; its Host "
+                    "index is keyed by the decoder prompt alone."
+                )
+                server_args.enable_kvstore = False
 
         if self.pooling_config is not None:
             # Deferred to here, not to where pooling_config is resolved: the
@@ -1208,8 +1230,6 @@ class ModelConfig:
         return (
             self.model_profile is not None and self.model_profile.request_token_history
         )
-
-
 
     def _clamp_prefill_budget_to_context(self, server_args: ServerArgs) -> None:
         """Cap the per-step prefill budget at what the request pool can hold.
@@ -1500,7 +1520,6 @@ def _get_and_verify_dtype(
             logger.warning(f"Casting {config_dtype!s} to {torch_dtype!s}.")
 
     return torch_dtype
-
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,22 @@
 # whisper-large-v3 — TokenSpeed support WIP
 
+> **Historical bring-up notes (2026-10-07).** The performance fix
+> (`whisper_analysis.md`, spec `whisper-performance-fix`) replaced several
+> paths described below; the module docstring of
+> `python/tokenspeed/runtime/models/whisper.py` is the current design:
+>
+> - Cross-attention no longer goes through `cross_attn_varlen` or a per-step
+>   gather/padded copy. It reads the per-slot buffer in place through the
+>   paged MHA ops (one slot-indexed read for decode and extend, eager and
+>   graph). `cross_attn_varlen` and the `cross_attn_path` override are gone.
+> - Prefill CUDA graphs are no longer disabled for encoder-decoder models:
+>   the decoder is the captured stack, the encoder runs in the multimodal
+>   seam (`docs/design/unified_path.md`, "Prefill graphs for encoder-decoder
+>   models"), with its own per-request-count encoder graph.
+> - Cross KV is a `SlotStateExporter` and travels with retraction snapshots;
+>   prefix caching and the KVStore are forced off for encoder-decoder models.
+> - `scripts/whisper-large-v3.sh` defaults to `MAX_NUM_SEQS=16` (not 4).
+
 **Status:** smoke PASS both hosts; one commit pending/ done. Branch `nctu6` (was tip `0461b8e7`).
 **Goal:** load + serve openai/whisper-large-v3 on both hosts (sm120 and
 sm90); smoke `POST /v1/audio/transcriptions` on GPU 6, TP=1.

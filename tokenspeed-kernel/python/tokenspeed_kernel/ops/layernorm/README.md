@@ -69,3 +69,23 @@ two kernels agree byte for byte on `q_out` and `k_out`. Tests:
 `test/nvidia/ops/layernorm/test_beam_norms_cuda.py` (NVIDIA SM100 to SM103: the
 bytes). No
 timing claim is made for the fused kernel in this record.
+
+# `layernorm.add_layernorm` operator
+
+`add_layernorm(x, residual, weight, bias, *, eps) -> (normed, new_residual)`
+is the pre-norm block boundary of a LayerNorm model (Whisper's decoder):
+`new_residual = residual + x`, `normed = layer_norm(new_residual, weight, bias,
+eps)`, in one launch of `triton_add_layernorm` (portable Triton, one program
+per row). The sum is formed in FP32 and rounded to `x`'s dtype, as the eager
+add rounds it, and is stored as the new residual stream bit for bit equal to
+the eager sum; the norm reads that rounded sum and computes mean and variance
+(two passes over the row held in registers) and the affine in FP32, rounding
+once. Against `torch.nn.functional.layer_norm` on the same sum it differs by at
+most one output ulp (FP32 rounding of the statistics). `residual=None`
+normalizes `x` alone and returns `x` as the stream. Inputs are `[rows, width]`
+with a unit inner stride (row strides are free); the row count only sizes the
+grid, so it never recompiles. Tests: `test/ops/layernorm/test_add_layernorm.py`.
+
+On an RTX PRO 6000 (SM120), the 96 boundaries of a whisper-large-v3 decode
+step in one CUDA graph take 0.13-0.15 ms against 0.38-0.40 ms for the eager
+add plus `nn.LayerNorm`.

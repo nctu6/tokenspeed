@@ -664,6 +664,49 @@ idle ranks join its draft collectives with empty rows. A round with no
 decodes performs no draft forward. Decode graph warmup and capture use the
 same uniform padded decode counts as their target batches.
 
+### Prefill graphs for encoder-decoder models
+
+An encoder-decoder model is not a second prefill path. It fits the inner-stack
+contract every causal LM meets (`text_and_inner_model`): the text model
+exposes `.model` (the captured stack, with `.embed_tokens`),
+`.logits_processor`, `.lm_head` and `prepare_model_kwargs`; the stack is
+called as `model(input_ids, positions, ctx, **kwargs)`, starts from
+`input_embeds` and returns `(hidden, aux)`. Whisper's decoder is the stack
+(its checkpoint names stay, the contract's are read-only aliases), and its
+encoder plus the cross-KV write run in the existing `multimodal_input_embeds`
+seam, eagerly before the graph, returning `None` because nothing is merged
+into the decoder's input embeddings. Position embeddings that depend only on
+`positions` are computed inside the stack, so the graph reads them from the
+static positions buffer.
+
+The seam itself may replay a graph, through the multimodal encoder-graph
+facility every tower uses (`make_encoder_cudagraph_wrappers`, installed by
+`MultimodalRuntime.install_encoder_graphs` before the KV cache is sized, gated
+by `TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH`), not through the prefill graph.
+Whisper's encoder pass has one shape per request count (a fixed window in,
+`encoder_len` rows per request out), so its runner captures the encoder and
+the cross-KV write per request count, exactly and without padding, over
+persistent feature and slot-index buffers. The eager and graphed runners are
+one class: both stage a pass's inputs into those buffers by non-blocking
+copies, then one runs the pass and the other replays it. A replay reads no
+live batch state, so it needs no break; it is outside the prefill graph
+because the request count it is keyed by (fresh audio in the step) is not the
+token bucket. The point is host time: the eager encoder's ~430 launches take
+as long to enqueue as the GPU takes to run them, which leaves the decoder's
+breaks queued behind it.
+
+Cross-attention is a sequence-mixing op like self-attention, so it is a
+`break_point`: its read depends on the live batch (slots, request count,
+query boundaries), and a break reads those from the live context on every
+replay. Request-pool slots reach the stack the way they reach the eager
+forward, through `prepare_model_kwargs`; the prefill graph passes the whole
+persistent `req_pool_indices` buffer (`[>= bs]`), because the capture's
+`[:bs]` view would freeze the dummy batch's request count, and the break
+slices it by the live `ctx.bs`. The first layer's break rewrites the
+model's persistent read tables (page table, query boundaries) once per
+forward; every layer's break reads views of them. A model whose
+`prepare_model_kwargs` does not ask for the slots never sees them.
+
 ### Prefill requests without generated outputs
 
 The original execution batch and cache metadata always contain every request.

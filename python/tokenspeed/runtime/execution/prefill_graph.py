@@ -288,7 +288,17 @@ class NarrowingPrefillModel(Protocol):
 def text_and_inner_model(
     model: torch.nn.Module | None,
 ) -> tuple[torch.nn.Module | None, torch.nn.Module | None]:
-    """The text model under a causal-LM wrapper, and the stack under that."""
+    """The text model under a causal-LM wrapper, and the stack under that.
+
+    The inner-stack contract a prefill capture drives: the text model has
+    ``.model`` (the stack, with ``.embed_tokens``), ``.logits_processor`` and
+    ``.lm_head``, and optionally ``prepare_model_kwargs`` to pick the stack's
+    kwargs. The stack is called as ``model(input_ids, positions, ctx,
+    **kwargs)`` starting from ``input_embeds`` and returns ``(hidden, aux)``.
+    An encoder-decoder model (Whisper) fits it with its decoder as the stack
+    and its encoder in the ``multimodal_input_embeds`` seam
+    (``docs/design/unified_path.md``).
+    """
     text_model = model.language_model if hasattr(model, "language_model") else model
     return text_model, getattr(text_model, "model", None)
 
@@ -513,7 +523,13 @@ class PrefillGraph:
         self._engaged_logged: set[str] = set()
         # Replay/eager accounting for extend+mixed forwards, logged every
         # _STATS_EVERY forwards so graph coverage is visible in the server log.
-        self._stats = {"replay": 0, "mixed_replay": 0, "eager": 0, "real": 0, "padded": 0}
+        self._stats = {
+            "replay": 0,
+            "mixed_replay": 0,
+            "eager": 0,
+            "real": 0,
+            "padded": 0,
+        }
         # Aux-capture mode baked into the graphs; mismatched live forwards run eager.
         self._captured_hidden_mode = None
         # One owner for ordinary and attention-containing captures. None is the
@@ -1021,7 +1037,17 @@ class PrefillGraph:
         }
         prepare_kwargs = getattr(self.text_model, "prepare_model_kwargs", None)
         if prepare_kwargs is not None:
-            model_kwargs = prepare_kwargs(self._ctx, input_ids, model_kwargs)
+            # The model picks its stack's kwargs from what the eager forward
+            # is offered (ModelExecutor._model_input_kwargs), including the
+            # request-pool slots. They are the WHOLE persistent buffer
+            # (``[>= bs]``): the capture's ``[:bs]`` would freeze the dummy
+            # batch's request count, so a break that reads them slices by
+            # the live ``ctx.bs`` (encoder-decoder cross-attention does).
+            model_kwargs = prepare_kwargs(
+                self._ctx,
+                input_ids,
+                {**model_kwargs, "req_pool_indices": ib.req_pool_indices_buf},
+            )
         return input_ids, positions, model_kwargs
 
     def _run_encoder(self, num_tokens: int) -> NarrowedRowState:

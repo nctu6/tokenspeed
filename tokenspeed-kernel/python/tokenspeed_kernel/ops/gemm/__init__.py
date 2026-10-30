@@ -172,6 +172,7 @@ _KERNELS_WITH_FUSED_BIAS: frozenset[str] = frozenset(
     {
         "torch_bmm",
         "torch_mm",
+        "triton_mm_bf16_skinny",
         "triton_mm_fp8_scaled",
     }
 )
@@ -703,6 +704,9 @@ def mm(
         "k": K,
         "b_layout": b_layout,
         "a_inner_stride_one": A.stride(-1) == 1,
+        # ``m`` counts rows only for a 2-D A; a kernel bounding m declares
+        # a_ndim {2} so batched-row callers keep the general kernels.
+        "a_ndim": A.ndim,
         "a_scales_inner_stride_one": (A_scales is None or A_scales.stride(-1) == 1),
         "b_inner_stride_one": B.stride(-1) == 1,
         "b_scales_inner_stride_one": (B_scales is None or B_scales.stride(-1) == 1),

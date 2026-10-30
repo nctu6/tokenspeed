@@ -124,6 +124,8 @@ class TestQwen3OmniMultimodalEmbedder:
         )
         ctx = MultimodalForwardContext(
             mm_inputs=[MultimodalInputs(mm_items=[audio, video])],
+            request_ids=["r0"],
+            request_pool_indices=[1],
             extend_prefix_lens=[0],
             extend_seq_lens=[2],
             max_encoder_tokens=8192,

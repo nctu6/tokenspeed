@@ -290,7 +290,44 @@ def gated_rmsnorm(
     )
 
 
+def add_layernorm(
+    x: torch.Tensor,
+    residual: torch.Tensor | None,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    *,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """LayerNorm (with weight and bias) of ``residual + x``, one launch.
+
+    The pre-norm block boundary ``h = residual + x; y = layer_norm(h)``:
+    the sum is rounded to ``x``'s dtype as the eager add rounds it, and the
+    norm runs in FP32 on that rounded sum, like ``torch.nn.LayerNorm``.
+
+    Args:
+        x: ``[rows, width]`` sublayer output, unit inner stride.
+        residual: Residual stream shaped like ``x``, or ``None`` to normalize
+            ``x`` alone (the first block of a stack).
+        weight: ``[width]`` LayerNorm weight.
+        bias: ``[width]`` LayerNorm bias.
+        eps: Epsilon added to the variance.
+
+    Returns:
+        ``(normed, new_residual)``: the normalized rows (contiguous, ``x``'s
+        dtype) and the sum ``residual + x`` (``x`` itself when ``residual``
+        is ``None``).
+    """
+    kernel = select_kernel(
+        "layernorm",
+        "add_layernorm",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={},
+    )
+    return kernel(x, residual, weight, bias, eps)
+
+
 __all__ = [
+    "add_layernorm",
     "add_rmsnorm",
     "affine_rmsnorm",
     "gated_residual_combine_norm",

@@ -145,35 +145,30 @@ def test_resolve_modes_cpu(monkeypatch) -> None:
     monkeypatch.setattr(dec, "_sm_count", lambda device: 188)
     monkeypatch.setattr(dec, "current_platform", lambda: SimpleNamespace(is_amd=False))
 
+    # (max_kv_splits, split_lo, split_hi): the kernels clamp each request's
+    # cdiv(eff_len, split_min_tokens) into [split_lo, split_hi].
     _patch(monkeypatch, "legacy")
-    m, n = dec._resolve_kv_splits(q, 4, lens, -1)
-    assert m == 4 and n.tolist() == [1, 1, 1, 1] and n.dtype == torch.int32
+    assert dec._resolve_kv_splits(q, 4) == (4, 1, 1)
 
     _patch(monkeypatch, 6)
-    m, n = dec._resolve_kv_splits(q, 4, lens, -1)
-    assert m == 6 and n.tolist() == [6] * 4
+    assert dec._resolve_kv_splits(q, 4) == (6, 6, 6)
 
     _patch(monkeypatch, "auto")
-    m, n = dec._resolve_kv_splits(q, 4, lens, -1)
-    assert m == _max(4, 32, 4, 188) == 16
-    assert n.tolist() == [1, 2, 16, 16]
-    m, n = dec._resolve_kv_splits(q, 4, lens, 1023)
-    assert n.tolist() == [1, 2, 4, 4]
+    assert dec._resolve_kv_splits(q, 4) == (_max(4, 32, 4, 188), 1, 16)
+    assert _max(4, 32, 4, 188) == 16
+    assert dec.decode_num_kv_splits(lens, -1, 16, 256).tolist() == [1, 2, 16, 16]
+    assert dec.decode_num_kv_splits(lens, 1023, 16, 256).tolist() == [1, 2, 4, 4]
 
     # Batch-invariant: MAX pinned to the cap, splits by length only.
     _patch(monkeypatch, "auto", cap=8, bi=True)
     big_q = torch.empty(512, 32, 8)
-    big_lens = torch.full((512,), 26000, dtype=torch.int32)
-    m, n = dec._resolve_kv_splits(big_q, 4, big_lens, -1)
-    assert m == 8 and n.unique().tolist() == [8]
-    m1, n1 = dec._resolve_kv_splits(q[:1], 4, lens[3:], -1)
-    assert m1 == 8 and n1.tolist() == [8]
+    assert dec._resolve_kv_splits(big_q, 4) == (8, 1, 8)
+    assert dec._resolve_kv_splits(q[:1], 4) == (8, 1, 8)
 
     # AMD: auto falls back to legacy.
     monkeypatch.setattr(dec, "current_platform", lambda: SimpleNamespace(is_amd=True))
     _patch(monkeypatch, "auto")
-    m, n = dec._resolve_kv_splits(q, 4, lens, -1)
-    assert m == 4 and n.tolist() == [1, 1, 1, 1]
+    assert dec._resolve_kv_splits(q, 4) == (4, 1, 1)
 
 
 @pytest.mark.parametrize(
@@ -440,8 +435,55 @@ def test_auto_actually_splits_long_context(monkeypatch) -> None:
     )
     with monkeypatch.context() as m:
         _patch(m, "auto")
-        mx, n = dec._resolve_kv_splits(q, k_cache.shape[2], cache_seqlens, -1)
-    assert mx == 16 and n.tolist() == [16]
+        assert dec._resolve_kv_splits(q, k_cache.shape[2]) == (16, 1, 16)
+    assert dec.decode_num_kv_splits(cache_seqlens, -1, 16, 256).tolist() == [16]
+
+
+@requires_cuda
+@pytest.mark.parametrize("nq,nkv,head_dim", [(32, 4, 512), (20, 20, 64)])
+@pytest.mark.parametrize("window_left", [-1, 1023])
+@pytest.mark.parametrize("seqlen_q", [1, 4])
+def test_in_kernel_split_count_matches_reference(
+    monkeypatch, nq, nkv, head_dim, window_left, seqlen_q
+) -> None:
+    """The kernels' in-kernel split count is ``decode_num_kv_splits``.
+
+    A request's reduction order depends only on its split count, so its
+    auto-mode output must equal, bit for bit, the fixed-N run with N the
+    reference count for its length (fixed N clamps every request to N).
+    Lengths cover every count from 1 to 16 at split_min_tokens=256.
+    """
+    lens = [1, 255, 256, 257, 700, 1024, 1500, 2049, 3000, 4095, 4097, 26000]
+    cache_lens = [max(n, seqlen_q) for n in lens]
+    q, k_cache, v_cache, page_table, cache_seqlens = _build(
+        cache_lens, nq, nkv, head_dim, 64, torch.bfloat16, seqlen_q, seed=3
+    )
+
+    def fn():
+        return dec._triton_mha_decode_with_kvcache_impl(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            max_seqlen_k=32768,
+            max_seqlen_q=seqlen_q,
+            window_left=window_left,
+            softmax_scale=1.0 / math.sqrt(head_dim),
+        )
+
+    # At 12 requests auto's MAX would drop below 16; the batch-invariant
+    # switch pins it to the cap (16) without changing the per-request rule.
+    auto = _run(monkeypatch, "auto", True, fn)
+    expected = dec.decode_num_kv_splits(cache_seqlens, window_left, 16, 256).tolist()
+    assert len(set(expected)) > 3, expected
+    for n in sorted(set(expected)):
+        fixed = _run(monkeypatch, n, False, fn)
+        for b, splits in enumerate(expected):
+            if splits != n:
+                continue
+            rows = slice(b * seqlen_q, (b + 1) * seqlen_q)
+            assert torch.equal(auto[rows], fixed[rows]), (b, cache_lens[b], n)
 
 
 @requires_cuda

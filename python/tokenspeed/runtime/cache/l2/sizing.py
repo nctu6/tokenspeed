@@ -39,7 +39,9 @@ group that never publishes (a replayable sliding group) -- page counts the
 scheduler's ``CapacityModel`` answers, folded to LCM blocks by the same
 model, so no page arithmetic lives here. The slot-state arena
 (``max_retracted_requests + 1`` x blob bytes: slots number from 1) is a
-separate allocation on top of the pool.
+separate allocation on top of the pool. It is usually small, but a model that
+owns large per-slot state makes it the larger cost: Whisper's cross-attention
+KV is 245.8 MB of every blob on large-v3 (``models/whisper.py``).
 """
 
 from __future__ import annotations

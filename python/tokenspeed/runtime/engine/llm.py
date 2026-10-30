@@ -26,7 +26,10 @@ work via ``asyncio.run_coroutine_threadsafe``; streaming callers
 consume results through a ``queue.Queue`` with three-valued
 semantics (normal item / terminal sentinel / exception) so
 exceptions propagate to the caller thread instead of getting
-swallowed by the driver loop.
+swallowed by the driver loop. Streaming callers that run on another
+event loop (an ASGI server's) use the same protocol through an
+``asyncio.Queue`` owned by their loop, fed with
+``call_soon_threadsafe``, so they never await the bridge's loop.
 
 Bridging at this layer — rather than maintaining a separate sync
 IPC client — keeps ``AsyncLLM`` single-producer and the scheduler
@@ -35,9 +38,10 @@ blocking API to callers that cannot own an event loop themselves.
 """
 
 import asyncio
+import concurrent.futures
 import queue
 import threading
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
 from tokenspeed.runtime.engine.async_llm import AsyncLLM
@@ -105,36 +109,109 @@ class LLM:
           * terminal → ``q.put(_STREAM_END)``
           * exception → ``q.put(exc)`` then ``q.put(_STREAM_END)``
 
-        The drain coroutine is fire-and-forget on the bg loop. If the
-        caller abandons the iterator early (e.g. ``break`` out of the
-        ``for`` loop) the drain will keep running to completion and
-        push items into a queue nobody reads — that is acceptable for
-        finite ``generate_request`` streams, which is the only kind
-        ``AsyncLLM`` emits today.
+        Safe to consume from any thread other than the bg loop's own,
+        e.g. a Starlette threadpool worker behind a ``StreamingResponse``.
+
+        If the caller stops before the stream ends (``break``, ``close()``,
+        or the generator being garbage-collected after a client
+        disconnect), the drain task is cancelled. ``CancelledError`` then
+        reaches ``AsyncLLM._wait_one_response``, whose ``finally`` sends
+        ``AbortReq`` to the scheduler, so the request does not keep
+        decoding for nobody. The cancel is scheduled, not awaited: closing
+        may happen on an event-loop thread (GC) that must not block.
         """
         q: queue.Queue[Any] = queue.Queue()
+        drain = self._start_drain(obj, q.put)
+
+        ended = False
+        try:
+            while True:
+                item = q.get()
+                if item is _STREAM_END:
+                    ended = True
+                    return
+                if isinstance(item, BaseException):
+                    ended = True
+                    raise item
+                yield item
+        finally:
+            if not ended:
+                # Consumer left early: cancel the drain so the request is
+                # aborted (see the docstring).
+                drain.cancel()
+
+    async def generate_stream_async(self, obj: GenerateReqInput) -> AsyncIterator[dict]:
+        """:meth:`generate_stream` for a consumer on another event loop.
+
+        For an ASGI server's loop (e.g. a ``StreamingResponse`` body): each
+        output is handed to the consumer's loop with ``call_soon_threadsafe``
+        into an ``asyncio.Queue`` that loop owns, so the consumer never
+        awaits the bridge's loop and no worker thread is parked per stream or
+        woken per output. Iterating :meth:`generate_stream` from a threadpool
+        instead costs two thread handoffs per output; with many concurrent
+        streams those handoffs contend for the GIL with the rest of the
+        process. Measured on the Whisper ASR endpoint at 16 concurrent
+        streams: the time from upload to engine entry of each request was
+        80 ms with the threadpool relay and 18 ms with this one (14 ms
+        non-streamed).
+
+        Same three-valued protocol and early-close semantics as
+        :meth:`generate_stream`: leaving early (``aclose()``, the consumer
+        task being cancelled, or the generator being finalized) cancels the
+        drain, which aborts the request. Must not be consumed on the bridge's
+        own loop.
+        """
+        loop = asyncio.get_running_loop()
+        if loop is self._loop:
+            raise RuntimeError(
+                "generate_stream_async must be consumed on a loop other than "
+                "the LLM bridge's own; await AsyncLLM.generate_request there"
+            )
+        q: asyncio.Queue[Any] = asyncio.Queue()
+
+        def put(item: Any) -> None:
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, item)
+            except RuntimeError:
+                # The consumer's loop closed: nobody is left to read.
+                pass
+
+        drain = self._start_drain(obj, put)
+
+        ended = False
+        try:
+            while True:
+                item = await q.get()
+                if item is _STREAM_END:
+                    ended = True
+                    return
+                if isinstance(item, BaseException):
+                    ended = True
+                    raise item
+                yield item
+        finally:
+            if not ended:
+                drain.cancel()
+
+    def _start_drain(
+        self, obj: GenerateReqInput, put: Callable[[Any], None]
+    ) -> concurrent.futures.Future:
+        """Drive ``generate_request(obj)`` on the bridge's loop, handing every
+        output to ``put``, then any exception, then :data:`_STREAM_END`."""
 
         async def _drain() -> None:
             pending_exc: BaseException | None = None
             try:
                 async for item in self.async_llm.generate_request(obj):
-                    q.put(item)
+                    put(item)
             except BaseException as exc:  # noqa: BLE001 — propagate anything
                 pending_exc = exc
             finally:
                 if pending_exc is not None:
-                    q.put(pending_exc)
-                q.put(_STREAM_END)
+                    put(pending_exc)
+                put(_STREAM_END)
 
-        asyncio.run_coroutine_threadsafe(_drain(), self._loop)
-
-        while True:
-            item = q.get()
-            if item is _STREAM_END:
-                return
-            if isinstance(item, BaseException):
-                raise item
-            yield item
+        return asyncio.run_coroutine_threadsafe(_drain(), self._loop)
 
     def shutdown(self) -> None:
         """Stop the bg event loop and join the thread.

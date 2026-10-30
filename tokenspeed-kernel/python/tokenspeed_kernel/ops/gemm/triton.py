@@ -38,6 +38,11 @@ from tokenspeed_kernel.ops.gemm._triton.gemv import (
     triton_rowcta_gemv,
 )
 from tokenspeed_kernel.ops.gemm._triton.mxfp4 import triton_mm_mxfp4
+from tokenspeed_kernel.ops.gemm._triton.skinny import (
+    SKINNY_BLOCK_M,
+    SKINNY_BLOCK_N,
+    mm_bf16_skinny,
+)
 from tokenspeed_kernel.ops.quantization.triton import mxfp4_quantize
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -553,6 +558,85 @@ register_kernel(
     },
     priority=Priority.SPECIALIZED,
 )(triton_rowcta_gemv)
+
+
+# ===-----------------------------------------------------------------------===#
+# Dense BF16, decode-sized M: Triton skinny GEMM (NVIDIA SM120)
+# ===-----------------------------------------------------------------------===#
+
+
+@register_kernel(
+    "gemm",
+    "mm",
+    name="triton_mm_bf16_skinny",
+    solution="triton",
+    # Measured on SM120 only, where cuBLAS serves M = 1 with a GEMV at about
+    # 0.93 TB/s and M = 2..16 with a 16x16-tile tensor-core GEMM at about
+    # 0.73 TB/s; this kernel streams the weight once at about 1.04 TB/s for
+    # every M up to 16 (whisper-large-v3 decoder projections, README).
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(12, 0),
+        max_arch_version=ArchVersion(12, 0),
+    ),
+    signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
+    traits={
+        "m_min": frozenset({1}),
+        "m_max": frozenset({SKINNY_BLOCK_M}),
+        "n_align": frozenset({SKINNY_BLOCK_N}),
+        "k_align": frozenset({128}),
+        "a_inner_stride_one": frozenset({True}),
+        "a_ndim": frozenset({2}),
+        "b_inner_stride_one": frozenset({True}),
+        # Dense BF16 B is the [N, K] weight (A @ B.T, as torch_mm computes);
+        # mm labels a square one "KN" because B.shape[0] == K, so both labels
+        # are the same operand here.
+        "b_layout": frozenset({"NK", "KN"}),
+        "out_dtype": frozenset({torch.bfloat16}),
+        "out_inner_stride_one": frozenset({True}),
+    },
+    priority=Priority.SPECIALIZED,
+)
+def triton_mm_bf16_skinny(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    block_size: list[int] | None = None,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Dense BF16 ``A @ B.T (+ bias)`` for 1 to 16 rows; see ``_triton/skinny.py``.
+
+    Args:
+        A: ``[M, K]`` BF16 activations, ``1 <= M <= 16``.
+        B: ``[N, K]`` BF16 weight.
+        A_scales: Must be None (dense).
+        B_scales: Must be None (dense).
+        out_dtype: Must be BF16.
+        alpha: Must be None.
+        block_size: Must be None.
+        bias: Optional ``[N]`` bias, fused before the single rounding.
+        out: Optional ``[M, N]`` output buffer.
+
+    Returns:
+        ``[M, N]`` BF16 tensor.
+    """
+    if (
+        A_scales is not None
+        or B_scales is not None
+        or alpha is not None
+        or block_size is not None
+        or out_dtype != torch.bfloat16
+    ):
+        raise ValueError(
+            "triton_mm_bf16_skinny is a dense BF16 GEMM: no scales, alpha or "
+            "block_size, BF16 output"
+        )
+    return mm_bf16_skinny(A, B, bias, out)
 
 
 def _fp32_rowcta_k_fits(m: int, n: int, k: int) -> bool:
