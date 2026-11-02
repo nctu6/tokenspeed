@@ -27,9 +27,12 @@ Multi-GPU layouts (vLLM-flag-shaped knobs):
 * ``--tensor-parallel-size 2`` / ``--num-gpus 2`` with USP=1 → HF ModularPipeline
   **device_split** (conditioner on ``cuda:1``, DiT+VAEs on ``cuda:0``).
 * ``--ulysses-degree/--usp N`` (and/or ``--ring``) → TokenSpeed **ulysses**
-  residency: torchrun N ranks, each holds a DiT replica on ``cuda:LOCAL_RANK``,
-  Diffusers Context Parallel shards attention sequence (see ``diffusion/ulysses.py``).
-  Not a vendored omni USP tree. Weight-TP stays fail-closed (no H3 ``_tp_plan``).
+  residency: torchrun N ranks, everything resident (no per-request swaps):
+  each rank holds a DiT replica (AdaLN projections memoized, weights on the
+  host) on ``cuda:LOCAL_RANK``; rank 0's truncated text encoder is split over
+  all GPUs. One waiting request runs with Diffusers Context Parallel over all
+  ranks; N waiting requests run one per rank (see ``_run_dispatch``).
+  Weight-TP stays fail-closed (no H3 ``_tp_plan``).
 * One GPU / USP=1 without split → full auto CPU offload on ``cuda:0``.
 """
 
@@ -44,9 +47,9 @@ from typing import Any
 
 from tokenspeed.runtime.diffusion.config import (
     AUDIO_SIGMA_SHIFT,
-    H3Config,
     SUPPORTED_FPS,
     VIDEO_SIGMA_SHIFT,
+    H3Config,
     frames_for_duration,
     resolve_diffusion_checkpoint,
 )
@@ -55,6 +58,10 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 __all__ = ["H3Pipeline", "H3GenerateRequest", "H3GenerateResult"]
+
+# AdaLN memo budget per GPU. One 50-step t2va schedule is ~1.4 GiB, so this
+# holds a few distinct schedules before LRU eviction.
+ADALN_MEMO_MAX_BYTES = 4 * 2**30
 
 
 @dataclass
@@ -108,6 +115,10 @@ class H3Pipeline:
         self.model_path = resolve_diffusion_checkpoint(config.model_path)
         self._pipe = None
         self._usp_world = usp_world
+        # Set by the resident ulysses layout (_load_ulysses) only.
+        self._cp = None
+        self._adaln_table = None
+        self._clip_decode = None
         self._load()
 
     def _dtype(self):
@@ -242,25 +253,49 @@ class H3Pipeline:
         )
 
     def _load_ulysses(self, *, workflow: str | None, dtype) -> None:
-        """Leader text-encode + all-rank DiT Ulysses (Diffusers Context Parallel).
+        """Resident multi-GPU layout: nothing moves between host and GPU per request.
 
-        Each rank holds a DiT/VAE **replica** on ``cuda:LOCAL_RANK``. Only rank 0
-        also loads the conditioner (``before_encode`` + ``text_encoder``). Generate
-        broadcasts encoded conditioning so followers never run the 66GB TE — that
-        was the dual-rank encode race that wedged the first Ulysses collective.
+        * Every rank holds a DiT + VAE replica on ``cuda:LOCAL_RANK``. The DiT's
+          per-block AdaLN projections (26 GB) are replaced by an exact memo
+          (``adaln_memo.py``) whose weights stay in pinned host memory.
+        * Rank 0 also owns the conditioner. Its Qwen3-VL text encoder is
+          truncated to the layers ``hidden_states[50]`` needs and split in
+          contiguous layer ranges across all ranks' GPUs (``residency.py``).
+        * One waiting request runs with Diffusers Context Parallel across all
+          ranks; ``world_size`` waiting requests run one per rank with CP off
+          (see ``_run_dispatch``). The DiT replicas serve both.
         """
         import torch
-        from diffusers import ComponentsManager, ModularPipeline
+        from diffusers import ModularPipeline
         from diffusers.modular_pipelines import SequentialPipelineBlocks
 
-        from tokenspeed.runtime.diffusion.ulysses import enable_dit_context_parallel
+        from tokenspeed.runtime.diffusion.adaln_memo import (
+            AdaLNMemoTable,
+            install_adaln_memo,
+        )
+        from tokenspeed.runtime.diffusion.residency import (
+            split_text_encoder,
+            truncate_text_encoder,
+        )
+        from tokenspeed.runtime.diffusion.ulysses import (
+            _iter_h3_transformers,
+            enable_dit_context_parallel,
+        )
+        from tokenspeed.runtime.diffusion.vae_parallel import ClipParallelVideoDecode
 
         world = self._usp_world
         if world is None:
             raise RuntimeError(
                 "residency=ulysses requires init_ulysses_world before H3Pipeline load"
             )
-        local = f"cuda:{world.local_rank}" if torch.cuda.is_available() else "cpu"
+        if self.config.enable_cpu_offload:
+            raise ValueError(
+                "residency=ulysses keeps every component resident on the GPUs; "
+                "pass --no-cpu-offload (CPU offload would swap weights per request)"
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError("residency=ulysses needs CUDA GPUs")
+        local = f"cuda:{world.local_rank}"
         blocks = ModularPipeline.from_pretrained(self.model_path)
         wf = workflow or "t2va"
         try:
@@ -278,16 +313,6 @@ class H3Pipeline:
         ]
         cond_dict = {name: flow.sub_blocks.pop(name) for name in cond_names}
 
-        # One ComponentsManager per rank so auto CPU offload sees both the
-        # leader conditioner (text_encoder) and DiT/VAEs — separate managers
-        # cannot evict each other's VRAM and OOMs ~96 GiB sm120 cards.
-        shared_mgr = ComponentsManager()
-        if self.config.enable_cpu_offload and local.startswith("cuda"):
-            shared_mgr.enable_auto_cpu_offload(
-                device=local,
-                memory_reserve_margin=self.config.memory_reserve_margin,
-            )
-
         conditioner = None
         if world.is_leader:
             if not cond_dict:
@@ -300,15 +325,28 @@ class H3Pipeline:
                 if len(cond_dict) > 1
                 else next(iter(cond_dict.values()))
             )
-            conditioner = cond_blocks.init_pipeline(
-                self.model_path, components_manager=shared_mgr
+            conditioner = cond_blocks.init_pipeline(self.model_path)
+            conditioner.load_components(dtype=dtype)  # host memory
+            text_encoder = conditioner.text_encoder
+            kept = truncate_text_encoder(
+                text_encoder, int(conditioner.text_encoder_layer)
             )
-            conditioner.load_components(dtype=dtype)
+            devices = [f"cuda:{i}" for i in range(world.world_size)]
+            split_text_encoder(text_encoder, devices)
+            logger.info(f"h3 load: text encoder {kept} decoder layers over {devices}")
 
-        rest = flow.init_pipeline(self.model_path, components_manager=shared_mgr)
-        rest.load_components(dtype=dtype)
+        rest = flow.init_pipeline(self.model_path)
+        rest.load_components(dtype=dtype)  # host memory
         self._apply_audio_shift(rest)
-        enabled = enable_dit_context_parallel(
+        self._adaln_table = AdaLNMemoTable(max_bytes=ADALN_MEMO_MAX_BYTES)
+        for dit in _iter_h3_transformers(rest):
+            install_adaln_memo(dit, self._adaln_table)
+        rest.to(local)
+        torch.cuda.empty_cache()
+        # Under CP every rank holds the same final latents: split the video
+        # decode's temporal clips across ranks instead of decoding N times.
+        self._clip_decode = ClipParallelVideoDecode(rest.vae, group=None)
+        self._cp = enable_dit_context_parallel(
             rest,
             ulysses_degree=world.ulysses_degree,
             ring_degree=world.ring_degree,
@@ -316,12 +354,9 @@ class H3Pipeline:
         )
         self._pipe = ("ulysses", conditioner, rest)
         logger.info(
-            "h3 load: ulysses residency on %s rank=%s/%s transformers_cp=%s conditioner=%s",
-            local,
-            world.rank,
-            world.world_size,
-            enabled,
-            ("+".join(cond_names) if world.is_leader else "follower"),
+            f"h3 load: resident ulysses on {local} rank={world.rank}/{world.world_size} "
+            f"conditioner={'+'.join(cond_names) if world.is_leader else 'follower'} "
+            f"mem_allocated={torch.cuda.memory_allocated(local) / 2**30:.1f} GiB"
         )
 
     def _apply_audio_shift(self, pipe) -> None:
@@ -354,7 +389,9 @@ class H3Pipeline:
         task = (extra.pop("task", None) or req.task or "t2va").lower()
         duration = float(extra.pop("duration", req.duration))
         fps = int(extra.pop("fps", req.fps) or SUPPORTED_FPS)
-        num_frames = int(extra.pop("num_frames", 0) or frames_for_duration(duration, fps))
+        num_frames = int(
+            extra.pop("num_frames", 0) or frames_for_duration(duration, fps)
+        )
         steps = int(extra.pop("num_inference_steps", req.num_inference_steps))
         seed = req.seed if req.seed is not None else extra.pop("seed", None)
 
@@ -424,52 +461,155 @@ class H3Pipeline:
         return refs
 
     def generate(self, req: H3GenerateRequest) -> H3GenerateResult:
-        return self._generate_local(req)
-
-    def generate_from_payload(self, payload: dict) -> H3GenerateResult | None:
-        """Worker entry: rebuild request from a broadcast payload."""
-        req = _request_from_payload(payload)
-        result = self._generate_local(req)
-        # Non-leader ranks participate in CP collectives but discard the MP4.
-        if self._usp_world is not None and not self._usp_world.is_leader:
-            return None
-        return result
-
-    def _generate_local(self, req: H3GenerateRequest) -> H3GenerateResult:
+        """Single-process residencies (single / device_split). Caller serializes."""
+        if self._pipe[0] == "ulysses":
+            raise RuntimeError("residency=ulysses dispatches through generate_batch")
         call_kwargs, seed, num_frames = self._build_call_kwargs(req)
-        kind = self._pipe[0]
-        if kind == "single":
-            pipe = self._pipe[1]
-            results = pipe(**call_kwargs)
-        elif kind == "ulysses":
-            results = self._generate_ulysses(call_kwargs)
+        if self._pipe[0] == "single":
+            results = self._pipe[1](**call_kwargs)
         else:
             conditioner, rest = self._pipe[1], self._pipe[2]
             # Conditioner: prompt + refs/keyframes (+ geometry for before_encode).
             # Rest: VAE-encode refs, denoise, decode.
-            cond_keys = {
-                "prompt",
-                "image",
-                "last_image",
-                "references",
-                "height",
-                "width",
-                "num_frames",
-            }
-            cond_kwargs = {k: v for k, v in call_kwargs.items() if k in cond_keys}
-            rest_kwargs = {k: v for k, v in call_kwargs.items() if k not in cond_keys}
+            cond_kwargs, rest_kwargs = _split_call_kwargs(call_kwargs)
             state = conditioner(**cond_kwargs)
             results = rest(state=state, **rest_kwargs)
+        return self._result_from_outputs(results, req, seed, num_frames)
 
+    @property
+    def data_parallel_width(self) -> int:
+        """How many requests one dispatch can take (``generate_batch``)."""
+        return self._usp_world.world_size if self._usp_world is not None else 1
+
+    def generate_batch(
+        self, reqs: list[H3GenerateRequest]
+    ) -> list[H3GenerateResult | Exception]:
+        """Rank 0 (ulysses): run one dispatch of 1 or ``world_size`` requests.
+
+        Returns one entry per request: its result, or the exception it raised.
+        """
+        from tokenspeed.runtime.diffusion.ulysses import CMD_GENERATE, leader_signal
+
+        world = self._usp_world
+        if world is None or not world.is_leader:
+            raise RuntimeError("generate_batch runs on the ulysses leader only")
+        dispatch = {"requests": [self.request_payload(r) for r in reqs]}
+        leader_signal(CMD_GENERATE, dispatch, group=world.control_group)
+        return self._run_dispatch(dispatch)
+
+    def run_worker_dispatch(self, dispatch: dict) -> None:
+        """Non-leader ranks: the worker side of ``generate_batch``."""
+        self._run_dispatch(dispatch)
+
+    def _run_dispatch(
+        self, dispatch: dict
+    ) -> list[H3GenerateResult | Exception] | None:
+        """Every rank: one dispatch on the resident ulysses layout.
+
+        1 request -> Context Parallel across all ranks (lowest latency).
+        ``world_size`` requests -> CP off, rank r runs request r (throughput).
+        Rank 0 text-encodes every request and broadcasts the CPU conditioning;
+        each rank rebuilds its state on its own GPU (rank 0 included, so every
+        rank runs the same path).
+        """
+        import torch
+
+        from tokenspeed.runtime.diffusion.ulysses import (
+            broadcast_pyobject,
+            gather_pyobject,
+            pipeline_state_from_payload,
+            pipeline_state_to_payload,
+        )
+
+        world = self._usp_world
+        group = world.control_group
+        reqs = [_request_from_payload(p) for p in dispatch["requests"]]
+        count = len(reqs)
+        if count not in (1, world.world_size):
+            raise ValueError(
+                f"a dispatch takes 1 or {world.world_size} requests, got {count}"
+            )
+        context_parallel = count == 1
+        mine = 0 if context_parallel else world.rank
+        conditioner, rest = self._pipe[1], self._pipe[2]
+
+        # 1. Conditioning: rank 0 encodes, one broadcast. An encode error is
+        # broadcast too so no rank waits on a collective that never comes.
+        encoded: dict[str, Any] | None = None
+        if world.is_leader:
+            try:
+                with torch.no_grad():
+                    payloads = []
+                    for req in reqs:
+                        call_kwargs, _, _ = self._build_call_kwargs(req)
+                        cond_kwargs, _ = _split_call_kwargs(call_kwargs)
+                        payloads.append(
+                            pipeline_state_to_payload(conditioner(**cond_kwargs))
+                        )
+                encoded = {"payloads": payloads, "error": None}
+            except Exception as exc:  # noqa: BLE001 - relayed to every rank
+                logger.exception("h3 dispatch: conditioning failed")
+                encoded = {"payloads": None, "error": f"{type(exc).__name__}: {exc}"}
+        encoded = broadcast_pyobject(encoded, src=0, group=group)
+        if encoded["error"] is not None:
+            return [RuntimeError(encoded["error"])] * count if world.is_leader else None
+
+        # 2. Denoise + decode on the resident replicas.
+        self._cp.set_enabled(context_parallel)
+        self._clip_decode.enabled = context_parallel
+        req = reqs[mine]
+        call_kwargs, seed, num_frames = self._build_call_kwargs(req)
+        _, rest_kwargs = _split_call_kwargs(call_kwargs)
+        state = pipeline_state_from_payload(
+            encoded["payloads"][mine], device=f"cuda:{world.local_rank}"
+        )
+        if context_parallel:
+            # A CP failure on one rank leaves the others inside a collective;
+            # it is not recoverable here, so let it propagate.
+            outputs = rest(state=state, **rest_kwargs)
+            if not world.is_leader:
+                return None
+            return [self._result_from_outputs(outputs, req, seed, num_frames)]
+
+        try:
+            outputs = rest(state=state, **rest_kwargs)
+            own: H3GenerateResult | str = self._result_from_outputs(
+                outputs, req, seed, num_frames
+            )
+        except Exception as exc:  # noqa: BLE001 - reported per request
+            logger.exception(f"h3 dispatch: request {mine} failed")
+            own = f"{type(exc).__name__}: {exc}"
+        gathered = gather_pyobject(own, dst=0, group=group)
+        if not world.is_leader:
+            return None
+        return [
+            r if isinstance(r, H3GenerateResult) else RuntimeError(r) for r in gathered
+        ]
+
+    def _result_from_outputs(
+        self, results, req: H3GenerateRequest, seed, num_frames: int
+    ) -> H3GenerateResult:
         videos = results["videos"]
         audio = results["audio"]
         rate = int(results["sampling_rate"])
         video0 = videos[0] if isinstance(videos, (list, tuple)) else videos
-        audio0 = audio[0] if isinstance(audio, (list, tuple)) and hasattr(audio[0], "shape") else audio
+        audio0 = (
+            audio[0]
+            if isinstance(audio, (list, tuple)) and hasattr(audio[0], "shape")
+            else audio
+        )
 
         mp4 = self._mux_mp4(video0, audio0, rate, fps=req.fps or SUPPORTED_FPS)
-        height = int(getattr(video0, "shape", [0, 0, 0])[-3]) if hasattr(video0, "shape") else req.height
-        width = int(getattr(video0, "shape", [0, 0, 0])[-2]) if hasattr(video0, "shape") else req.width
+        height = (
+            int(getattr(video0, "shape", [0, 0, 0])[-3])
+            if hasattr(video0, "shape")
+            else req.height
+        )
+        width = (
+            int(getattr(video0, "shape", [0, 0, 0])[-2])
+            if hasattr(video0, "shape")
+            else req.width
+        )
         # PIL list fallback
         if isinstance(video0, list) and video0:
             im = video0[0]
@@ -506,74 +646,7 @@ class H3Pipeline:
     def shutdown(self) -> None:
         self._pipe = None
 
-    def _generate_ulysses(self, call_kwargs: dict[str, Any]):
-        """Leader-only text encode, broadcast conditioning, all-rank denoise/decode."""
-        from tokenspeed.runtime.diffusion.ulysses import (
-            barrier,
-            broadcast_pyobject,
-            pipeline_state_from_payload,
-            pipeline_state_to_payload,
-        )
-
-        world = self._usp_world
-        if world is None:
-            raise RuntimeError("ulysses generate without usp_world")
-        conditioner, rest = self._pipe[1], self._pipe[2]
-        cond_keys = {
-            "prompt",
-            "image",
-            "last_image",
-            "references",
-            "height",
-            "width",
-            "num_frames",
-        }
-        rest_kwargs = {k: v for k, v in call_kwargs.items() if k not in cond_keys}
-
-        # Align ranks before encode so followers wait on the broadcast, not on DiT A2A.
-        barrier()
-        local = f"cuda:{world.local_rank}"
-        import torch
-
-        # Phase VRAM: DiT↔CPU before TE encode, TE↔CPU before denoise. Shared
-        # ComponentsManager auto-offload alone left DiT resident across requests
-        # and OOMd the next Ref2VA encode (wide refs) on ~140 GiB cards.
-        try:
-            rest.to("cpu")
-        except Exception:
-            pass
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        barrier()
-        if world.is_leader:
-            if conditioner is None:
-                raise RuntimeError("ulysses leader missing conditioner pipeline")
-            cond_kwargs = {k: v for k, v in call_kwargs.items() if k in cond_keys}
-            state = conditioner(**cond_kwargs)
-            enc_payload = pipeline_state_to_payload(state)
-            try:
-                conditioner.to("cpu")
-            except Exception:
-                pass
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        else:
-            state = None
-            enc_payload = None
-        enc_payload = broadcast_pyobject(enc_payload, src=0)
-        if enc_payload is None:
-            raise RuntimeError("ulysses conditioning broadcast returned None")
-        # Leader keeps the live encode state (float embeds on CUDA, int tags on CPU).
-        # Followers rebuild: float tensors → local CUDA; integer layout tags stay CPU.
-        if not world.is_leader:
-            state = pipeline_state_from_payload(enc_payload, device=local)
-        # Same seed on every rank → identical prepare_latents before CP shards.
-        results = rest(state=state, **rest_kwargs)
-        barrier()
-        return results
-
     def request_payload(self, req: H3GenerateRequest) -> dict:
-
         """Picklable snapshot for USP broadcast (paths, not open handles)."""
         return {
             "prompt": req.prompt,
@@ -590,6 +663,28 @@ class H3Pipeline:
             "reference_uploads": list(req.reference_uploads or []),
             "extra_params": dict(req.extra_params or {}),
         }
+
+
+# Inputs only the conditioner (before_encode + text_encoder) consumes.
+_CONDITIONER_ONLY_KEYS = frozenset({"prompt", "image", "last_image", "references"})
+# Output geometry: before_encode (fl2va/ref2va) reads it, and the denoise-side
+# blocks (PrepareLatents / layout) read it too. The t2va conditioner has no
+# before_encode, so geometry it ignores never reaches the state; it must be
+# passed to the rest pipeline as well or the DiT falls back to its default
+# 1344x768 canvas whatever the request asked for.
+_GEOMETRY_KEYS = frozenset({"height", "width", "num_frames"})
+
+
+def _split_call_kwargs(
+    call_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split one ModularPipeline call into (conditioner kwargs, rest kwargs)."""
+    cond_keys = _CONDITIONER_ONLY_KEYS | _GEOMETRY_KEYS
+    cond_kwargs = {k: v for k, v in call_kwargs.items() if k in cond_keys}
+    rest_kwargs = {
+        k: v for k, v in call_kwargs.items() if k not in _CONDITIONER_ONLY_KEYS
+    }
+    return cond_kwargs, rest_kwargs
 
 
 def _request_from_payload(payload: dict) -> H3GenerateRequest:

@@ -30,6 +30,11 @@ Design (TokenSpeed-native, not a vLLM-Omni dump):
   that Diffusers builds; TokenSpeed already has matching A2A helpers in
   ``runtime/distributed/comm_ops.py`` (``all_to_all_transpose`` /
   ``all_to_all_head_scatter``) for future TokenSpeed-owned processors.
+* **Dispatch degree** is a per-dispatch parameter of the same path: one waiting
+  request runs across all ranks with CP on; ``world_size`` waiting requests
+  run one per rank with CP off (``DitContextParallel``). Commands and CPU
+  payloads travel on a gloo control group, so idle workers never sit inside an
+  NCCL collective.
 
 Weight-TP is separate: H3's Diffusers ``_tp_plan`` is empty today, so
 ``--text-encoder-tp-size`` / DiT weight-TP stay fail-closed. Multi-GPU
@@ -51,8 +56,12 @@ logger = get_colorful_logger(__name__)
 __all__ = [
     "UlyssesWorld",
     "init_ulysses_world",
+    "DitContextParallel",
     "enable_dit_context_parallel",
     "broadcast_pyobject",
+    "gather_pyobject",
+    "leader_signal",
+    "worker_loop",
     "is_usp_worker",
     "usp_world_size",
     "maybe_reexec_torchrun",
@@ -73,6 +82,9 @@ class UlyssesWorld:
     local_rank: int
     ulysses_degree: int
     ring_degree: int
+    # Gloo group for leader -> worker commands and CPU payloads. Workers block on
+    # it between requests; NCCL would hit its watchdog timeout while idle.
+    control_group: Any
 
     @property
     def is_leader(self) -> bool:
@@ -85,10 +97,13 @@ def usp_world_size(ulysses_degree: int, ring_degree: int = 1) -> int:
 
 def is_usp_worker() -> bool:
     """True when this process is a non-leader torchrun worker."""
-    if usp_world_size(
-        int(os.environ.get("TOKENSPEED_H3_ULYSSES", "1")),
-        int(os.environ.get("TOKENSPEED_H3_RING", "1")),
-    ) <= 1:
+    if (
+        usp_world_size(
+            int(os.environ.get("TOKENSPEED_H3_ULYSSES", "1")),
+            int(os.environ.get("TOKENSPEED_H3_RING", "1")),
+        )
+        <= 1
+    ):
         return False
     try:
         import torch.distributed as dist
@@ -142,7 +157,9 @@ def _find_torchrun() -> str:
     )
 
 
-def init_ulysses_world(ulysses_degree: int, ring_degree: int = 1) -> UlyssesWorld | None:
+def init_ulysses_world(
+    ulysses_degree: int, ring_degree: int = 1
+) -> UlyssesWorld | None:
     """Initialize NCCL + return world metadata. ``None`` when degree product is 1."""
     world = usp_world_size(ulysses_degree, ring_degree)
     if world <= 1:
@@ -175,13 +192,21 @@ def init_ulysses_world(ulysses_degree: int, ring_degree: int = 1) -> UlyssesWorl
             f"ulysses_degree={ulysses_degree} * ring_degree={ring_degree} = {world}. "
             f"Launch with torchrun --nproc_per_node={world}."
         )
-    local_rank = int(os.environ.get("LOCAL_RANK", rank % max(1, torch.cuda.device_count())))
+    local_rank = int(
+        os.environ.get("LOCAL_RANK", rank % max(1, torch.cuda.device_count()))
+    )
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
 
     # Stash for worker detection without importing config.
     os.environ["TOKENSPEED_H3_ULYSSES"] = str(ulysses_degree)
     os.environ["TOKENSPEED_H3_RING"] = str(ring_degree)
+
+    from datetime import timedelta
+
+    # Workers wait on this group for the next request for as long as the
+    # server is idle, so its timeout is effectively unbounded.
+    control_group = dist.new_group(backend="gloo", timeout=timedelta(days=365))
 
     logger.info(
         "h3 usp: rank=%s/%s local_rank=%s ulysses=%s ring=%s",
@@ -197,27 +222,71 @@ def init_ulysses_world(ulysses_degree: int, ring_degree: int = 1) -> UlyssesWorl
         local_rank=local_rank,
         ulysses_degree=int(ulysses_degree),
         ring_degree=int(ring_degree),
+        control_group=control_group,
     )
+
+
+class DitContextParallel:
+    """Switch Diffusers Context Parallel on/off on the DiTs between dispatches.
+
+    The DiT replicas stay where they are; only the sequence-sharding hooks and
+    the attention processors' parallel config change. ``enabled=True`` runs one
+    request across every rank (Ulysses, lowest latency); ``enabled=False`` lets
+    each rank run its own request (data parallel, highest throughput).
+    """
+
+    def __init__(self, transformers: list[Any]):
+        # enable_parallelism resolved each DiT's mesh into dit._parallel_config.
+        self.transformers = transformers
+        self.parallel_configs = [dit._parallel_config for dit in transformers]
+        self.plans = [dit._cp_plan for dit in transformers]
+        self.enabled = True
+
+    def set_enabled(self, enabled: bool) -> None:
+        if enabled == self.enabled:
+            return
+        from diffusers.hooks.context_parallel import (
+            apply_context_parallel,
+            remove_context_parallel,
+        )
+        from diffusers.models.attention import AttentionModuleMixin
+
+        for dit, config, plan in zip(
+            self.transformers, self.parallel_configs, self.plans
+        ):
+            for sub in dit.modules():
+                if isinstance(sub, AttentionModuleMixin):
+                    sub.processor._parallel_config = config if enabled else None
+            if enabled:
+                apply_context_parallel(dit, config.context_parallel_config, plan)
+            else:
+                remove_context_parallel(dit, plan)
+        self.enabled = enabled
 
 
 def enable_dit_context_parallel(
     module: Any,
     *,
     ulysses_degree: int,
-    ring_degree: int = 1,
-    attention_backend: str | None = None,
+    ring_degree: int,
+    attention_backend: str | None,
     ulysses_anything: bool = True,
-) -> int:
+) -> DitContextParallel:
     """Enable Diffusers Context Parallel on every MiniMax-H3 DiT under ``module``.
 
-    Returns how many transformers were enabled. Safe to call with degree product
-    1 (no-op). Requires an initialized process group when enabling.
+    Returns the controller that toggles it per dispatch. Requires an
+    initialized process group and a CP degree product > 1.
     """
     world = usp_world_size(ulysses_degree, ring_degree)
     if world <= 1 or module is None:
-        return 0
+        raise ValueError(
+            "enable_dit_context_parallel needs ulysses*ring > 1 and a pipeline"
+        )
 
-    from diffusers.models._modeling_parallel import ContextParallelConfig, ParallelConfig
+    from diffusers.models._modeling_parallel import (
+        ContextParallelConfig,
+        ParallelConfig,
+    )
 
     transformers = list(_iter_h3_transformers(module))
     if not transformers:
@@ -240,54 +309,28 @@ def enable_dit_context_parallel(
     cp = ContextParallelConfig(
         ulysses_degree=int(ulysses_degree),
         ring_degree=int(ring_degree),
-        ulysses_anything=bool(ulysses_anything and ulysses_degree > 1 and ring_degree == 1),
+        ulysses_anything=bool(
+            ulysses_anything and ulysses_degree > 1 and ring_degree == 1
+        ),
         ring_anything=bool(ring_degree > 1 and ulysses_degree == 1),
     )
     parallel = ParallelConfig(context_parallel_config=cp)
 
-    enabled = 0
+    # No per-forward barrier: the conditioning broadcast already aligns the
+    # ranks before denoise, and in data-parallel dispatch the ranks run
+    # independent requests (a barrier there could pair unrelated steps).
     for dit in transformers:
         if attention_backend:
             _set_attention_backend(dit, attention_backend)
         else:
             _ensure_cp_attention_backend(dit)
         dit.enable_parallelism(config=parallel)
-        _wrap_forward_barrier(dit)
-        enabled += 1
         logger.info(
-            "h3 usp: enable_parallelism on %s (ulysses=%s ring=%s anything=%s)",
-            dit.__class__.__name__,
-            ulysses_degree,
-            ring_degree,
-            cp.ulysses_anything or cp.ring_anything,
+            f"h3 usp: enable_parallelism on {dit.__class__.__name__} "
+            f"(ulysses={ulysses_degree} ring={ring_degree} "
+            f"anything={cp.ulysses_anything or cp.ring_anything})"
         )
-    return enabled
-
-
-def _wrap_forward_barrier(dit: Any) -> None:
-    """Barrier before DiT forward so all ranks enter CP collectives together.
-
-    Must preserve ``forward``'s signature: denoise builds ``layout_kwargs`` via
-    ``inspect.signature(transformer.forward).parameters`` (token_tags,
-    position_ids, …). A bare ``*args, **kwargs`` wrapper empties that set and
-    Diffusers calls forward without the packed-layout tensors.
-    """
-    import functools
-
-    import torch.distributed as dist
-
-    if getattr(dit, "_ts_usp_barrier_wrapped", False):
-        return
-    orig = dit.forward
-
-    @functools.wraps(orig)
-    def _forward(*args, **kwargs):
-        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-            dist.barrier()
-        return orig(*args, **kwargs)
-
-    dit.forward = _forward  # type: ignore[method-assign]
-    dit._ts_usp_barrier_wrapped = True
+    return DitContextParallel(transformers)
 
 
 def _iter_h3_transformers(root: Any):
@@ -333,21 +376,24 @@ def _ensure_cp_attention_backend(dit: Any) -> None:
     except Exception:
         return
     supported = set(_AttentionBackendRegistry._supports_context_parallel)
-    # Prefer flash / native flash when present; fall back to native.
+    # cuDNN SDPA first: on sm120 at H3 shapes ([1, 8k-31k, 28-56, 128] bf16,
+    # unmasked) it is 7-9% faster than the SDPA flash kernel and 2x FA4-CuTe
+    # (tmp microbench, minimax-h3-analysis.md). Then flash variants, then math.
     preferred = [
+        "_native_cudnn",
         "flash",
-        "flash_hub",
         "_native_flash",
         "native",
-        "_native_cudnn",
     ]
     for name in preferred:
         if name in supported:
             try:
                 dit.set_attention_backend(name)
-                return
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - try the next backend
+                logger.info(f"h3 usp: attention backend {name} unavailable: {exc}")
                 continue
+            logger.info(f"h3 usp: attention backend {name}")
+            return
     # Last resort: leave default; enable_parallelism will raise with the list.
 
 
@@ -360,23 +406,33 @@ def _set_attention_backend(dit: Any, name: str) -> None:
         ) from exc
 
 
-def broadcast_pyobject(obj: Any, *, src: int = 0) -> Any:
-    """Broadcast a picklable Python object from ``src`` to every rank."""
+def broadcast_pyobject(obj: Any, *, src: int, group: Any) -> Any:
+    """Broadcast a picklable Python object from ``src`` to every rank of ``group``."""
     import torch.distributed as dist
 
     if not dist.is_initialized() or dist.get_world_size() == 1:
         return obj
     payload = [obj if dist.get_rank() == src else None]
-    dist.broadcast_object_list(payload, src=src)
+    dist.broadcast_object_list(payload, src=src, group=group)
     return payload[0]
 
 
-def barrier() -> None:
+def gather_pyobject(obj: Any, *, dst: int, group: Any) -> list[Any] | None:
+    """Gather one picklable object per rank on ``dst`` (others get ``None``)."""
+    import torch.distributed as dist
+
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return [obj]
+    out = [None] * dist.get_world_size() if dist.get_rank() == dst else None
+    dist.gather_object(obj, out, dst=dst, group=group)
+    return out
+
+
+def barrier(group: Any) -> None:
     import torch.distributed as dist
 
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-        dist.barrier()
-
+        dist.barrier(group=group)
 
 
 def pipeline_state_to_payload(state: Any) -> dict[str, Any]:
@@ -426,7 +482,7 @@ def _move_value_to_device(value: Any, device: torch.device) -> Any:
 
 
 def pipeline_state_from_payload(payload: dict[str, Any], *, device: str) -> Any:
-    """Rebuild ``PipelineState`` for a follower rank.
+    """Rebuild a ``PipelineState`` on ``device`` from a CPU payload.
 
     Floating-point tensors (e.g. ``prompt_embeds``) move onto ``device``.
     Integer layout tags (e.g. ``text_token_tags``) stay on CPU so Diffusers
@@ -449,31 +505,26 @@ CMD_GENERATE = "generate"
 CMD_SHUTDOWN = "shutdown"
 
 
-def leader_signal(cmd: str, payload: Any | None = None) -> Any:
-    """Rank-0 helper: publish a worker command (and optional payload)."""
+def leader_signal(cmd: str, payload: Any | None, *, group: Any) -> None:
+    """Rank-0 helper: publish a worker command and its payload."""
     import torch.distributed as dist
 
     if not dist.is_initialized() or dist.get_world_size() == 1:
-        return payload
-    broadcast_pyobject(cmd, src=0)
-    if cmd == CMD_GENERATE:
-        return broadcast_pyobject(payload, src=0)
-    return None
+        return
+    broadcast_pyobject((cmd, payload), src=0, group=group)
 
 
-def worker_loop(generate_fn) -> None:
-    """Non-leader ranks: wait for generate/shutdown commands from rank 0."""
+def worker_loop(dispatch_fn, *, group: Any) -> None:
+    """Non-leader ranks: run each dispatch rank 0 publishes until shutdown."""
     import torch.distributed as dist
 
     assert dist.is_initialized()
     while True:
-        cmd = broadcast_pyobject(None, src=0)
+        cmd, payload = broadcast_pyobject(None, src=0, group=group)
         if cmd == CMD_SHUTDOWN:
             logger.info("h3 usp worker: shutdown")
             break
         if cmd == CMD_GENERATE:
-            payload = broadcast_pyobject(None, src=0)
-            generate_fn(payload)
-            barrier()
+            dispatch_fn(payload)
             continue
-        logger.warning("h3 usp worker: unknown cmd %r", cmd)
+        logger.warning(f"h3 usp worker: unknown cmd {cmd!r}")

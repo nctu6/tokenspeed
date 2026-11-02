@@ -25,14 +25,17 @@
 #   TENSOR_PARALLEL_SIZE default: equal to NUM_GPUS (vLLM-shaped; maps to num_gpus)
 #   MODEL_VARIANT / TASK_TYPE  default: fl2va  (fl2va | ref2va | t2va | all)
 #   DTYPE                default: bfloat16
-#   ENABLE_CPU_OFFLOAD   default: 1 (ComponentsManager auto offload)
+#   ENABLE_CPU_OFFLOAD   default: 1 (ComponentsManager auto offload); 0 with USP>1
+#                        (ulysses residency is fully resident and rejects offload)
 #   VENV_DIR             default: ./.venv
 #   TOKENSPEED_CUDA_ARCH override detected arch (e.g. sm120 / sm90 / 12.0 / 9.0)
 #
 # Arch notes (2-GPU, devices 6,7):
 #   sm90  (H200 ~141 GiB): default device_split (text_encoder@cuda:1 / rest@cuda:0)
 #   sm120 (PRO 6000 ~96 GiB): same; keep short-edge smoke canvases small
-#   ULYSSES_DEGREE/USP>1 enables TokenSpeed ulysses residency (Diffusers CP); text-encoder-TP still rejected
+#   ULYSSES_DEGREE/USP>1 enables TokenSpeed ulysses residency: everything resident,
+#   1 request -> Diffusers CP over all GPUs, N waiting -> one request per GPU.
+#   Recommended for throughput and latency: ULYSSES_DEGREE=2. text-encoder-TP still rejected
 #
 # Recommended invoke:
 #   CUDA_DEVICES=6,7 ./scripts/minimax-h3.sh
@@ -141,10 +144,15 @@ MODEL_VARIANT="${MODEL_VARIANT:-${TASK_TYPE:-fl2va}}"
 TASK_TYPE="${TASK_TYPE:-$MODEL_VARIANT}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-$NUM_GPUS}"
 DTYPE="${DTYPE:-bfloat16}"
-ENABLE_CPU_OFFLOAD="${ENABLE_CPU_OFFLOAD:-1}"
 # DiT Context Parallel (TokenSpeed ulysses residency). Default 1 = device_split path.
 ULYSSES_DEGREE="${ULYSSES_DEGREE:-${USP:-1}}"
 RING_DEGREE="${RING_DEGREE:-1}"
+# ulysses residency keeps everything resident and rejects CPU offload.
+if [[ "${ULYSSES_DEGREE}" -gt 1 || "${RING_DEGREE}" -gt 1 ]]; then
+    ENABLE_CPU_OFFLOAD="${ENABLE_CPU_OFFLOAD:-0}"
+else
+    ENABLE_CPU_OFFLOAD="${ENABLE_CPU_OFFLOAD:-1}"
+fi
 VENV_DIR="${VENV_DIR:-$REPO_ROOT/.venv}"
 
 case "${TASK_TYPE}" in
