@@ -27,7 +27,7 @@ Request contract (JSON body, OpenAI speech-shaped):
 * ``instructions`` -- music description (genre / BPM / vocals / arrangement)
 * ``seed`` -- optional int
 * ``response_format`` -- ``wav`` only (mp3/opus rejected)
-* TokenSpeed extras: ``audio_duration`` (seconds upper bound), 
+* TokenSpeed extras: ``audio_duration`` (seconds upper bound),
   ``num_inference_steps``, ``max_new_tokens`` (AR frames at 25 fps)
 
 Unsupported TTS knobs (``voice``, ``speed``, ``temperature``) are rejected
@@ -56,6 +56,7 @@ import time
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from tokenspeed.runtime.diffusion.music3_config import (
@@ -103,6 +104,21 @@ def parse_music3_argv(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--memory-reserve-margin", default="8GB")
     parser.add_argument("--residency", default="auto")
     parser.add_argument(
+        "--acoustic-dtype",
+        required=True,
+        choices=("float32", "bfloat16"),
+        help="flow-matching DiT / vocoder precision (float32 = fp32 + TF32, the reference)",
+    )
+    parser.add_argument("--ar-kv-cache-gib", type=float, default=24.0)
+    parser.add_argument("--max-batch-songs", type=int, default=16)
+    parser.add_argument("--max-window-batch", type=int, default=4)
+    parser.add_argument(
+        "--no-acoustic-on-ar-device",
+        action="store_true",
+        default=False,
+        help="do not run an overflow acoustic replica on the AR GPU",
+    )
+    parser.add_argument(
         "--output-sample-rate",
         type=int,
         default=REFERENCE_SAMPLE_RATE,
@@ -110,7 +126,9 @@ def parse_music3_argv(argv: list[str]) -> argparse.Namespace:
         "set 44100 for Diffusers native)",
     )
     # Ignore video/H3-only flags so a shared launcher can pass a superset.
-    parser.add_argument("--task-type", "--model-variant", dest="task_type", default=None)
+    parser.add_argument(
+        "--task-type", "--model-variant", dest="task_type", default=None
+    )
     parser.add_argument("--ulysses-degree", "--usp", type=int, default=None)
     parser.add_argument("--ring", type=int, default=None)
     parser.add_argument("--text-encoder-tp-size", type=int, default=None)
@@ -186,7 +204,9 @@ def _request_from_body(body: dict[str, Any]) -> Music3GenerateRequest:
                 "MiniMax-Music3 streaming requires response_format 'wav' or 'pcm'"
             )
     elif fmt_l not in {"wav"}:
-        raise ValueError("MiniMax-Music3 only supports response_format='wav' when not streaming")
+        raise ValueError(
+            "MiniMax-Music3 only supports response_format='wav' when not streaming"
+        )
 
     audio_duration = body.get("audio_duration")
     max_new_tokens = body.get("max_new_tokens")
@@ -205,20 +225,38 @@ def _request_from_body(body: dict[str, Any]) -> Music3GenerateRequest:
     return Music3GenerateRequest(
         lyrics=lyrics,
         prompt=prompt,
-        audio_duration=float(audio_duration) if audio_duration is not None else DEFAULT_AUDIO_DURATION_S,
+        audio_duration=(
+            float(audio_duration)
+            if audio_duration is not None
+            else DEFAULT_AUDIO_DURATION_S
+        ),
         num_inference_steps=int(steps),
         seed=seed,
         max_new_tokens=int(max_new_tokens) if max_new_tokens is not None else None,
-        extra_params={k: v for k, v in body.items() if k not in {
-            "input", "instructions", "model", "response_format", "format",
-            "audio_duration", "num_inference_steps", "seed", "max_new_tokens",
-            "voice", "speed", "stream", "stream_format",
-        }},
+        extra_params={
+            k: v
+            for k, v in body.items()
+            if k
+            not in {
+                "input",
+                "instructions",
+                "model",
+                "response_format",
+                "format",
+                "audio_duration",
+                "num_inference_steps",
+                "seed",
+                "max_new_tokens",
+                "voice",
+                "speed",
+                "stream",
+                "stream_format",
+            }
+        },
         stream=want_stream,
         stream_format=stream_format,
         response_format=fmt_l,
     )
-
 
 
 def create_app(pipeline: Music3Pipeline, served_model_name: str) -> FastAPI:
@@ -319,7 +357,9 @@ def create_app(pipeline: Music3Pipeline, served_model_name: str) -> FastAPI:
             )
 
         try:
-            result = pipeline.generate(req)
+            # Blocking (engine job or the single-layout Diffusers call): keep
+            # it off the event loop so other requests and /health proceed.
+            result = await run_in_threadpool(pipeline.generate, req)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:
@@ -356,6 +396,12 @@ def serve(argv: list[str], *, host: str | None = None, port: int | None = None) 
         enable_cpu_offload=not args.no_cpu_offload,
         residency=args.residency,
         output_sample_rate=int(args.output_sample_rate),
+        acoustic_dtype=args.acoustic_dtype,
+        ar_kv_cache_gib=float(args.ar_kv_cache_gib),
+        max_batch_songs=int(args.max_batch_songs),
+        max_window_batch=int(args.max_window_batch),
+        enforce_eager=bool(args.enforce_eager),
+        acoustic_on_ar_device=not args.no_acoustic_on_ar_device,
     )
     # Fail closed early on bad residency knobs.
     residency = config.resolve_residency()

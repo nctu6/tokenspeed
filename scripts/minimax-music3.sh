@@ -25,9 +25,12 @@
 #   NUM_GPUS             default: 2 (must match CUDA_DEVICES count)
 #   TENSOR_PARALLEL_SIZE default: equal to NUM_GPUS (vLLM-shaped; maps to num_gpus)
 #   DTYPE                default: bfloat16
-#   ENABLE_CPU_OFFLOAD   default: 1 (ComponentsManager auto offload)
+#   ENABLE_CPU_OFFLOAD   default: 0 with NUM_GPUS>=2 (resident engine), else 1
 #   OUTPUT_SAMPLE_RATE   default: 32000 (reference servers; use 44100 for native)
-#   RESIDENCY            default: auto (device_split when NUM_GPUS>=2)
+#   RESIDENCY            default: auto (device_split when NUM_GPUS>=2: batched AR
+#                        engine on the first GPU, streamed acoustic on the second)
+#   ACOUSTIC_DTYPE       default: float32 (fp32 + TF32, as checkpoint / vLLM-Omni);
+#                        bfloat16 downcasts the DiT and vocoder
 #   VENV_DIR             default: ./.venv
 #   TOKENSPEED_CUDA_ARCH override detected arch (e.g. sm120 / sm90 / 12.0 / 9.0)
 #
@@ -152,9 +155,16 @@ CUDA_DEVICES="${CUDA_DEVICES:-6,7}"
 NUM_GPUS="${NUM_GPUS:-2}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-$NUM_GPUS}"
 DTYPE="${DTYPE:-bfloat16}"
-ENABLE_CPU_OFFLOAD="${ENABLE_CPU_OFFLOAD:-1}"
 OUTPUT_SAMPLE_RATE="${OUTPUT_SAMPLE_RATE:-32000}"
 RESIDENCY="${RESIDENCY:-auto}"
+ACOUSTIC_DTYPE="${ACOUSTIC_DTYPE:-float32}"
+# The 2-GPU engine (device_split) is fully resident and rejects CPU offload;
+# the 1-GPU Diffusers layout offloads by default to fit small cards.
+if [[ "${NUM_GPUS}" -ge 2 && "${RESIDENCY}" != "single" ]]; then
+    ENABLE_CPU_OFFLOAD="${ENABLE_CPU_OFFLOAD:-0}"
+else
+    ENABLE_CPU_OFFLOAD="${ENABLE_CPU_OFFLOAD:-1}"
+fi
 VENV_DIR="${VENV_DIR:-$REPO_ROOT/.venv}"
 
 _NDEV="$(awk -F',' '{print NF}' <<<"$CUDA_DEVICES")"
@@ -200,9 +210,12 @@ cmd=(
     --dtype "$DTYPE"
     --residency "$RESIDENCY"
     --output-sample-rate "$OUTPUT_SAMPLE_RATE"
+    --acoustic-dtype "$ACOUSTIC_DTYPE"
 )
 if [[ "$ENABLE_CPU_OFFLOAD" == "0" ]]; then
     cmd+=(--no-cpu-offload)
 fi
+# Extra serve flags pass through, e.g. ./scripts/minimax-music3.sh --enforce-eager
+cmd+=("$@")
 
 exec "${cmd[@]}"

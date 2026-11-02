@@ -51,21 +51,49 @@ DEFAULT_AUDIO_DURATION_S = 30.0
 DEFAULT_NUM_INFERENCE_STEPS = 30
 
 
+ACOUSTIC_DTYPES = ("float32", "bfloat16")
+
+
 @dataclass(frozen=True)
 class Music3Config:
     """Serve-time knobs for one MiniMax-Music3 process."""
 
     model_path: str
+    # Flow-matching DiT / condition encoder / vocoder precision. The checkpoint
+    # ships them in fp32; "float32" runs fp32 with TF32 matmuls (the vLLM-Omni
+    # reference), "bfloat16" downcasts. Changes the audio, so no default.
+    acoustic_dtype: str
     served_model_name: str = "test"
     num_gpus: int = 1
+    # Global / local LM dtype (the checkpoint ships them in bf16).
     dtype: str = "bfloat16"
     memory_reserve_margin: str = "8GB"
     enable_cpu_offload: bool = True
-    # device_split: semantic_generator on cuda:1, denoise+decode on cuda:0
-    # when num_gpus>=2. Auto picks split when num_gpus>=2.
+    # device_split: batched AR engine on cuda:0, acoustic engine on cuda:1
+    # (both resident, CPU offload rejected). single: Diffusers pipeline on
+    # cuda:0 (optional CPU offload for small GPUs). Auto picks device_split
+    # when num_gpus>=2.
     residency: str = "auto"  # auto | single | device_split
     # WAV sample rate written to clients. None / 0 → Diffusers native 44100.
     output_sample_rate: int = REFERENCE_SAMPLE_RATE
+    # device_split engine sizing.
+    ar_kv_cache_gib: float = 24.0
+    max_batch_songs: int = 16
+    # Windows per DiT batch. fp32 windows are compute-bound (batching does not
+    # raise throughput), so a small cap mainly lets both acoustic workers
+    # share the ready windows instead of one worker taking them all.
+    max_window_batch: int = 4
+    # Also run an acoustic replica on the AR device as overflow capacity
+    # (only while the dedicated acoustic device is busy).
+    acoustic_on_ar_device: bool = True
+    # False = CUDA-graph the AR frame step (--enforce-eager turns it off).
+    enforce_eager: bool = False
+
+    def __post_init__(self):
+        if self.acoustic_dtype not in ACOUSTIC_DTYPES:
+            raise ValueError(
+                f"acoustic_dtype={self.acoustic_dtype!r} must be one of {ACOUSTIC_DTYPES}"
+            )
 
     def resolve_residency(self) -> str:
         mode = (self.residency or "auto").lower()

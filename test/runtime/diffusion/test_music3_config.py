@@ -131,10 +131,20 @@ def test_speech_rejects_voice_and_temperature():
 def test_residency_auto_split():
     from tokenspeed.runtime.diffusion.music3_config import Music3Config
 
-    assert Music3Config(model_path="x", num_gpus=1).resolve_residency() == "single"
-    assert Music3Config(model_path="x", num_gpus=2).resolve_residency() == "device_split"
+    def config(**kw):
+        return Music3Config(model_path="x", acoustic_dtype="float32", **kw)
+
+    assert config(num_gpus=1).resolve_residency() == "single"
+    assert config(num_gpus=2).resolve_residency() == "device_split"
     with pytest.raises(ValueError):
-        Music3Config(model_path="x", num_gpus=1, residency="device_split").resolve_residency()
+        config(num_gpus=1, residency="device_split").resolve_residency()
+
+
+def test_acoustic_dtype_is_validated():
+    from tokenspeed.runtime.diffusion.music3_config import Music3Config
+
+    with pytest.raises(ValueError, match="acoustic_dtype"):
+        Music3Config(model_path="x", acoustic_dtype="fp16")
 
 
 def test_speech_stream_false_still_ok():
