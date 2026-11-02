@@ -29,10 +29,10 @@ import queue
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable
 
 from tokenspeed.runtime.diffusion.pipeline import H3GenerateRequest, H3GenerateResult
 from tokenspeed.runtime.utils import get_colorful_logger
