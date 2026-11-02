@@ -589,17 +589,8 @@ class H3Pipeline:
     def _result_from_outputs(
         self, results, req: H3GenerateRequest, seed, num_frames: int
     ) -> H3GenerateResult:
-        videos = results["videos"]
-        audio = results["audio"]
-        rate = int(results["sampling_rate"])
-        video0 = videos[0] if isinstance(videos, (list, tuple)) else videos
-        audio0 = (
-            audio[0]
-            if isinstance(audio, (list, tuple)) and hasattr(audio[0], "shape")
-            else audio
-        )
-
-        mp4 = self._mux_mp4(video0, audio0, rate, fps=req.fps or SUPPORTED_FPS)
+        video0, audio0, rate = single_clip_outputs(results)
+        mp4 = mux_mp4(video0, audio0, rate, fps=req.fps or SUPPORTED_FPS)
         height = (
             int(getattr(video0, "shape", [0, 0, 0])[-3])
             if hasattr(video0, "shape")
@@ -623,26 +614,6 @@ class H3Pipeline:
             seed=seed,
         )
 
-    def _mux_mp4(self, video, audio, sample_rate: int, fps: int) -> bytes:
-        """Encode H.264 + AAC into one MP4 byte string."""
-        from diffusers.utils.export_utils import encode_video
-
-        with tempfile.TemporaryDirectory(prefix="ts-h3-") as tmp:
-            out = os.path.join(tmp, "out.mp4")
-            try:
-                encode_video(
-                    video,
-                    fps=fps,
-                    output_path=out,
-                    audio=audio,
-                    audio_sample_rate=sample_rate,
-                )
-            except TypeError:
-                # Older diffusers may not take audio=; write video then try pyav mux.
-                encode_video(video, fps=fps, output_path=out)
-            with open(out, "rb") as handle:
-                return handle.read()
-
     def shutdown(self) -> None:
         self._pipe = None
 
@@ -663,6 +634,43 @@ class H3Pipeline:
             "reference_uploads": list(req.reference_uploads or []),
             "extra_params": dict(req.extra_params or {}),
         }
+
+
+def single_clip_outputs(results) -> tuple[Any, Any, int]:
+    """Pick the one generated clip out of a batched H3 pipeline output.
+
+    Returns ``(video, audio, sampling_rate)`` with the batch axis removed:
+    ``video`` as ``encode_video`` takes it, ``audio`` as ``(2, num_samples)``.
+    The pipeline returns the soundtrack as ``(1, 2, num_samples)``; handing
+    that 3-D tensor to ``encode_video`` makes diffusers >= 0.42 read it as
+    mono (it flattens any shape containing a 1), doubling the audio length.
+    """
+    videos = results["videos"]
+    video = videos[0] if isinstance(videos, (list, tuple)) else videos
+    audio = results["audio"][0]
+    if getattr(audio, "ndim", None) != 2 or audio.shape[0] != 2:
+        raise ValueError(
+            "MiniMax-H3 soundtrack must be stereo (2, num_samples) per clip, got "
+            f"{tuple(getattr(audio, 'shape', ()))}"
+        )
+    return video, audio, int(results["sampling_rate"])
+
+
+def mux_mp4(video, audio, sample_rate: int, fps: int) -> bytes:
+    """Encode one clip as H.264 + AAC into an MP4 byte string."""
+    from diffusers.utils.export_utils import encode_video
+
+    with tempfile.TemporaryDirectory(prefix="ts-h3-") as tmp:
+        out = os.path.join(tmp, "out.mp4")
+        encode_video(
+            video,
+            fps=fps,
+            output_path=out,
+            audio=audio,
+            audio_sample_rate=sample_rate,
+        )
+        with open(out, "rb") as handle:
+            return handle.read()
 
 
 # Inputs only the conditioner (before_encode + text_encoder) consumes.
