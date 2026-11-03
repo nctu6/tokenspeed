@@ -3191,7 +3191,9 @@ class ServerArgs:
             help="Backend for standard 128x128 block-FP8 dense linears. "
             "trtllm_cutedsl requires Blackwell and preserves checkpoint FP8 "
             "weights and FP32 scales without requantization. "
-            "deepgemm requires Hopper and preserves FP32 scales. "
+            "deepgemm requires Hopper, or SM120 with a DeepGEMM build that has "
+            "SM120 kernels (auto already selects it there), and preserves FP32 "
+            "scales. "
             "Other quantization formats and routed experts are unchanged.",
         )
         parser.add_argument(

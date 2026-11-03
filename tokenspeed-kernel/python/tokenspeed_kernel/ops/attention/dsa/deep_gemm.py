@@ -26,6 +26,7 @@ from tokenspeed_kernel.ops.attention.dsa.triton import (
     combine_topk_weights,
     local_topk_to_global_slots,
     mark_forced_initial_local_logits,
+    triton_topk_from_logits,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import (
@@ -37,6 +38,10 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.thirdparty.deepgemm import (
+    SM120_ARCH_MAJOR,
+    deepgemm_supports_sm120,
+)
 
 platform = current_platform()
 
@@ -183,6 +188,18 @@ if platform.is_hopper_plus:
     import deep_gemm
     import trtllm_kernel  # noqa: F401
 
+    # DeepGEMM builds without SM120 kernels fail every indexer call there
+    # ("Unsupported architecture"), so they stop below SM120.
+    _DEEP_GEMM_CAPABILITY = CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 0),
+        max_arch_version=None if deepgemm_supports_sm120() else ArchVersion(10, 3),
+        vendors=frozenset({"nvidia"}),
+    )
+    # TRT-LLM's prefill top-k ships no SM120 kernel image
+    # (cudaErrorNoKernelImageForDevice), so SM120 selects over the same
+    # compressed logits with the portable Triton radix top-k.
+    _USE_TRTLLM_PREFILL_TOPK = platform.arch_version.major != SM120_ARCH_MAJOR
+
     def _deep_gemm_paged_mqa_plan(
         *,
         page_size: int,
@@ -227,10 +244,7 @@ if platform.is_hopper_plus:
         "dsa_plan",
         name="deep_gemm_dsa_plan",
         solution="deep_gemm",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
+        capability=_DEEP_GEMM_CAPABILITY,
         signatures=frozenset({format_signature()}),
         traits={
             "page_size": frozenset({64}),
@@ -256,10 +270,7 @@ if platform.is_hopper_plus:
         name="deep_gemm_dsa_decode_topk",
         solution="deep_gemm",
         features=_TOPK_FEATURES,
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
+        capability=_DEEP_GEMM_CAPABILITY,
         signatures=frozenset(
             {
                 format_signature(
@@ -434,10 +445,7 @@ if platform.is_hopper_plus:
         name="deep_gemm_dsa_prefill_topk",
         solution="deep_gemm",
         features=_PREFILL_TOPK_FEATURES,
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
+        capability=_DEEP_GEMM_CAPABILITY,
         signatures=frozenset(
             {
                 format_signature(
@@ -586,13 +594,23 @@ if platform.is_hopper_plus:
                 tile_out = out[start:end]
                 _row_invariant_topk(logits, tile_lens, tile_out, topk)
                 tile_out.masked_fill_(tile_out >= tile_lens.view(-1, 1), -1)
-            else:
+            elif _USE_TRTLLM_PREFILL_TOPK:
                 torch.ops.trtllm.indexer_topk_prefill(
                     logits.contiguous(),
                     local_starts_i32[start:end],
                     candidate_lens[start:end].to(torch.int32).contiguous(),
                     out[start:end],
                     int(topk),
+                )
+            else:
+                # Same local offsets (and -1 padding) as the TRT-LLM kernel
+                out[start:end].copy_(
+                    triton_topk_from_logits(
+                        logits,
+                        int(topk),
+                        seq_lens=candidate_lens[start:end],
+                        enable_pdl=pdl_enabled(),
+                    )
                 )
         valid = out >= 0
         out.copy_(torch.where(valid, out + row_starts.unsqueeze(1), out))
@@ -607,9 +625,7 @@ if platform.is_hopper_plus:
         name="deep_gemm_dsa_index_candidates",
         solution="deep_gemm",
         priority=Priority.PERFORMANT,
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0), vendors=frozenset({"nvidia"})
-        ),
+        capability=_DEEP_GEMM_CAPABILITY,
         signatures=frozenset(
             {
                 format_signature(

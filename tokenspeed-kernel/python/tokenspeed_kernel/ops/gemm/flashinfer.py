@@ -41,6 +41,10 @@ from tokenspeed_kernel.signature import (
     format_signatures,
     tensor_format,
 )
+from tokenspeed_kernel.thirdparty.deepgemm import (
+    SM120_ARCH_MAJOR,
+    deepgemm_supports_sm120,
+)
 
 platform = current_platform()
 _fp8_dtype = torch.float8_e4m3fn
@@ -138,8 +142,15 @@ if gemm_fp8_nt_groupwise is not error_fn:
         "mm",
         name="flashinfer_mm_fp8_blockscale",
         solution="flashinfer",
+        # SM120 hands this contract to DeepGEMM when its build has SM120 kernels
+        # (``deepgemm_sm120_mm_fp8_blockscale``, faster on decode shapes).
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
+            max_arch_version=(
+                ArchVersion(SM120_ARCH_MAJOR - 1, 9)
+                if deepgemm_supports_sm120()
+                else None
+            ),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=_MXFP8_FORMAT_SIGNATURES,

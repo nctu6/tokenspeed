@@ -20,7 +20,33 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
+from tokenspeed_kernel.platform import prepare_cuda_toolkit_env
+
+# Compute capability major of workstation Blackwell (RTX PRO 6000 / RTX 50).
+SM120_ARCH_MAJOR = 12
+
+
+@functools.cache
+def deepgemm_supports_sm120() -> bool:
+    """Whether the installed DeepGEMM has SM120 FP8 GEMM and MQA-logits kernels.
+
+    Builds with SM120 kernels report it through ``get_supported_arch_majors``;
+    older builds have no such API and fail SM120 calls at runtime with
+    "Unsupported architecture", so they must not be selected there.
+    """
+    prepare_cuda_toolkit_env()
+    try:
+        import deep_gemm
+    except ImportError:
+        return False
+    try:
+        supported = deep_gemm.get_supported_arch_majors()
+    except AttributeError:
+        return False
+    return SM120_ARCH_MAJOR in supported
 
 
 def block_fp8_mm(

@@ -40,6 +40,7 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.thirdparty.deepgemm import deepgemm_supports_sm120
 
 platform = current_platform()
 logger = logging.getLogger(__name__)
@@ -498,9 +499,13 @@ if platform.is_hopper_plus:
         name="deep_gemm_deepep_fp8_moe_apply",
         solution="deep_gemm",
         weight_preprocessor=deep_gemm_deepep_fp8_moe_weights,
+        # DeepGEMM builds without SM120 kernels stop below SM120
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=(
+                None if deepgemm_supports_sm120() else ArchVersion(10, 3)
+            ),
         ),
         signatures=format_signatures(
             "x",

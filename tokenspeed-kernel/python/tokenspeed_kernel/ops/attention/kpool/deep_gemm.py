@@ -33,6 +33,7 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.thirdparty.deepgemm import deepgemm_supports_sm120
 
 
 def _kpool_cache_views(
@@ -64,8 +65,10 @@ if current_platform().is_hopper_plus:
         "kpool_prefill_topk",
         name="deep_gemm_kpool_prefill_topk",
         solution="deep_gemm",
+        # Same window as the DSA DeepGEMM leaves it runs on
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=None if deepgemm_supports_sm120() else ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
@@ -108,7 +111,7 @@ if current_platform().is_hopper_plus:
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run planned KPool prefill with DeepGEMM scoring and TRT-LLM top-k."""
+        """Run planned KPool prefill with DeepGEMM scoring and the DSA prefill top-k."""
         del positions, query_start_loc, index_block_table, chunk_pools
         if not apply_relu:
             raise ValueError("DeepGEMM KPool prefill requires apply_relu=True")
