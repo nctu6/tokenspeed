@@ -19,6 +19,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
+# The Dockerfile builds smg/ and DeepGEMM/ from source; populate the submodules
+# (DeepGEMM recursively, for its cutlass + deep_jit) so a fresh clone does not
+# silently fall back to the published wheels.
+# Only empty checkouts are initialized, so local submodule edits are kept.
+if [[ ! -f smg/bindings/python/pyproject.toml ]]; then
+  git submodule update --init --recursive smg
+fi
+if [[ ! -f DeepGEMM/setup.py || ! -d DeepGEMM/third-party/cutlass/include \
+      || ! -d DeepGEMM/third-party/deep_jit/include ]]; then
+  git submodule update --init --recursive DeepGEMM
+fi
+if [[ ! -f DeepGEMM/setup.py || ! -d DeepGEMM/third-party/cutlass/include \
+      || ! -d DeepGEMM/third-party/deep_jit/include ]]; then
+  echo "ERROR: DeepGEMM/ (with its third-party submodules) is not populated" >&2
+  exit 1
+fi
+DEEPGEMM_COMMIT="$(git -C DeepGEMM rev-parse --short=8 HEAD)"
+
 COMMIT="$(git rev-parse --short=8 HEAD)"
 BUILD_TZ="${BUILD_TZ:-Asia/Taipei}"
 DATE="${BUILD_DATE:-$(TZ="${BUILD_TZ}" date +%Y%m%d)}"
@@ -45,6 +63,7 @@ echo "Building ${IMAGE}"
 echo "  Dockerfile: docker/Dockerfile.nvidia.unieai"
 echo "  context:    ${REPO_ROOT}"
 echo "  commit:     ${COMMIT}"
+echo "  DeepGEMM:   ${DEEPGEMM_COMMIT}"
 echo "  date:       ${DATE} (${BUILD_TZ})"
 
 docker build \

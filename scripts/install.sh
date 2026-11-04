@@ -66,6 +66,14 @@
 # Building the gateway needs a Rust toolchain, protoc, and maturin -- install.sh
 # installs them if missing.
 #
+# DeepGEMM is a git submodule too (DeepGEMM/, with its own cutlass + deep_jit
+# submodules). It carries the SM120 FP8 GEMM / MQA-logits kernels the published
+# tokenspeed-deepgemm wheel lacks, so it is built from that source and REPLACES
+# the wheel (both install the `deep_gemm` import package). The engine install
+# re-pulls the pinned wheel through tokenspeed-kernel's requirements, so this
+# step runs after the engine/kernel steps. Force a rebuild after editing it:
+#   REINSTALL_DEEPGEMM=1 ./scripts/install.sh  (or: ./scripts/install.sh --force-deepgemm)
+#
 # VENV SELECTION. If a venv is ALREADY active, this script installs INTO it
 # instead of creating a second one. "Active" is detected from the interpreter
 # (sys.prefix != sys.base_prefix), so it works both when the venv was entered
@@ -112,6 +120,8 @@ REINSTALL_KERNEL="${REINSTALL_KERNEL:-0}"
 # REINSTALL_SMG forces just the smg gateway (Rust) to rebuild from local source
 # -- use after editing smg/ (e.g. the best_of+stream validator fix).
 REINSTALL_SMG="${REINSTALL_SMG:-0}"
+# REINSTALL_DEEPGEMM forces DeepGEMM to rebuild from the DeepGEMM/ submodule.
+REINSTALL_DEEPGEMM="${REINSTALL_DEEPGEMM:-0}"
 # REINSTALL_FA2 forces a rebuild of the (opt-in) vllm_flash_attn FA2 path.
 # BUILD_FA2 opts into building it at all -- it is OFF by default because it is
 # an optional prefill speedup whose upstream package can shadow the FA4
@@ -127,6 +137,7 @@ for arg in "$@"; do
         --force) REINSTALL=1 ;;
         --force-kernel) REINSTALL_KERNEL=1 ;;
         --force-smg) REINSTALL_SMG=1 ;;
+        --force-deepgemm) REINSTALL_DEEPGEMM=1 ;;
         --force-fa2) REINSTALL_FA2=1 ;;
         --with-fa2) BUILD_FA2=1 ;;
         --force-diffusion) REINSTALL_DIFFUSION=1 ;;
@@ -171,6 +182,22 @@ if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/n
         git submodule update --init --recursive smg || \
             err "git submodule update --init smg failed; the smg gateway will not be built from source."
     fi
+    # DeepGEMM needs its own cutlass + deep_jit submodules, hence --recursive.
+    if grep -q '\[submodule "DeepGEMM"\]' .gitmodules 2>/dev/null \
+        && [[ ! -f DeepGEMM/setup.py || ! -d DeepGEMM/third-party/cutlass/include \
+              || ! -d DeepGEMM/third-party/deep_jit/include ]]; then
+        log "Initializing the DeepGEMM submodule (git submodule update --init --recursive DeepGEMM)"
+        git submodule update --init --recursive DeepGEMM || \
+            err "git submodule update --init DeepGEMM failed; DeepGEMM will not be built from source."
+    fi
+fi
+
+# DeepGEMM source is optional: present it, we build it (SM120 kernels);
+# absent, the environment keeps the published tokenspeed-deepgemm wheel.
+HAVE_DEEPGEMM_SRC=0
+if [[ -f DeepGEMM/setup.py && -d DeepGEMM/third-party/cutlass/include \
+      && -d DeepGEMM/third-party/deep_jit/include ]]; then
+    HAVE_DEEPGEMM_SRC=1
 fi
 
 # The smg gateway source is optional: present it, we build the local gateway
@@ -271,8 +298,13 @@ export TOKENSPEED_KERNEL_BACKEND=cuda
 # are needed by parts of the build. Skipped automatically if apt-get is absent
 # (e.g. non-Debian host) or if we lack privileges -- install these yourself then.
 install_system_deps() {
+    local _sys_pkgs=(libssl-dev libopenmpi-dev libnuma1 pkg-config)
+    # DeepGEMM's deep_jit includes <elfutils/libdwfl.h> at build time.
+    if [[ "${DEEPGEMM_WORK:-0}" == "1" ]]; then
+        _sys_pkgs+=(libdw-dev)
+    fi
     if ! command -v apt-get >/dev/null 2>&1; then
-        log "apt-get not found; skipping system deps. Ensure these are present: libssl-dev libopenmpi-dev libnuma1 pkg-config"
+        log "apt-get not found; skipping system deps. Ensure these are present: ${_sys_pkgs[*]}"
         return 0
     fi
     local SUDO=""
@@ -280,7 +312,7 @@ install_system_deps() {
         if command -v sudo >/dev/null 2>&1; then
             SUDO="sudo"
         else
-            log "not root and no sudo; skipping system deps. Ensure these are present: libssl-dev libopenmpi-dev libnuma1 pkg-config"
+            log "not root and no sudo; skipping system deps. Ensure these are present: ${_sys_pkgs[*]}"
             return 0
         fi
     fi
@@ -289,7 +321,6 @@ install_system_deps() {
     # half-configured nvidia-dkms for a kernel that was purged) any apt-get
     # install can abort under `set -e` even though nothing here needs
     # installing. FORCE_SYSTEM_DEPS=1 keeps the old always-run-apt behaviour.
-    local _sys_pkgs=(libssl-dev libopenmpi-dev libnuma1 pkg-config)
     _sys_deps_present() {
         local p st
         for p in "${_sys_pkgs[@]}"; do
@@ -302,14 +333,11 @@ install_system_deps() {
         skip "System dependencies already installed (${_sys_pkgs[*]}); skipping apt (FORCE_SYSTEM_DEPS=1 to run apt anyway)"
         return 0
     fi
-    log "Installing system dependencies (libssl-dev libopenmpi-dev libnuma1 pkg-config)"
+    log "Installing system dependencies (${_sys_pkgs[*]})"
     # ADDON: tolerate apt failures caused by unrelated packages, as long as the
     # packages WE need end up installed. The apt path itself is unchanged.
     if ! { $SUDO apt-get update && $SUDO apt-get install -y --no-install-recommends \
-        libssl-dev \
-        libopenmpi-dev \
-        libnuma1 \
-        pkg-config; }; then
+        "${_sys_pkgs[@]}"; }; then
         if command -v dpkg-query >/dev/null 2>&1 && _sys_deps_present; then
             err "apt-get reported an error (likely an unrelated broken dpkg/DKMS package), but ${_sys_pkgs[*]} are installed; continuing."
             err "Inspect with: sudo dpkg --audit; sudo apt-get check"
@@ -662,6 +690,20 @@ build_and_install_smg() {
 # Dockerfile's vllm-flash-attention step.
 VLLM_FLASH_ATTN_REPO="${VLLM_FLASH_ATTN_REPO:-https://github.com/vllm-project/flash-attention}"
 VLLM_FLASH_ATTN_REF="${VLLM_FLASH_ATTN_REF:-main}"
+# --- DeepGEMM from the DeepGEMM/ submodule ----------------------------------
+# Replaces the published tokenspeed-deepgemm wheel, which owns the same
+# `deep_gemm` import package and would otherwise shadow (or be shadowed by)
+# the source build. Kernels are JIT-compiled at runtime, so the build is a
+# single host extension and needs no CUDA_ARCH_LIST.
+build_and_install_deepgemm() {
+    log "Removing published DeepGEMM wheels that own the deep_gemm package"
+    "$PY" -m pip uninstall -y tokenspeed-deepgemm deep_gemm deep-gemm >/dev/null 2>&1 || true
+    rm -rf DeepGEMM/build DeepGEMM/dist DeepGEMM/*.egg-info
+    log "Building + installing DeepGEMM from DeepGEMM/ (non-editable, no deps)"
+    # DG_FORCE_BUILD=1: never fetch the upstream prebuilt wheel (no SM120 kernels).
+    DG_FORCE_BUILD=1 MAX_JOBS="$MAX_JOBS" "$PY" -m pip install ./DeepGEMM --no-build-isolation --no-deps
+}
+
 build_and_install_vllm_flash_attn() {
     if ! command -v git >/dev/null 2>&1; then
         err "git not found; cannot build vllm_flash_attn from source. Install git and re-run, or the sm_120 FA2 prefill path stays on the Triton fallback."
@@ -778,6 +820,17 @@ if [[ "$HAVE_SMG_SRC" == "1" ]]; then
     fi
 fi
 
+# DeepGEMM: build from the submodule on a fresh/forced install, when forced
+# alone, when it is not installed yet, or when the published wheel came back
+# (a dependency reinstall re-pulls tokenspeed-deepgemm).
+DEEPGEMM_WORK=0
+if [[ "$HAVE_DEEPGEMM_SRC" == "1" ]]; then
+    if [[ "$FRESH" == "1" || "$REINSTALL_DEEPGEMM" == "1" ]] \
+        || ! have_dist deep_gemm || have_dist tokenspeed-deepgemm; then
+        DEEPGEMM_WORK=1
+    fi
+fi
+
 # vllm_flash_attn (sm_120 FA2): OPT-IN ONLY. This is an optional prefill
 # speedup, not required to serve -- prefill falls back to the Triton
 # prefill kernel when it is absent. It is deliberately NOT built on a plain or
@@ -791,15 +844,15 @@ if [[ "$BUILD_FA2" == "1" || "$REINSTALL_FA2" == "1" ]]; then
     FA2_WORK=1
 fi
 
-if [[ "$FRESH" == "1" || "$KERNEL_WORK" == "1" || "$SMG_WORK" == "1" || "$FA2_WORK" == "1" ]]; then
+if [[ "$FRESH" == "1" || "$KERNEL_WORK" == "1" || "$SMG_WORK" == "1" || "$FA2_WORK" == "1" || "$DEEPGEMM_WORK" == "1" ]]; then
     # System build deps and the pip build front-ends are only needed when we
     # actually compile. Skipping them on a no-op run keeps it fast and offline.
     install_system_deps
     # ADDON: resolve CUDA_HOME/nvcc (and optionally apt-install userspace toolkit)
-    # before any source build. Fatal only when the CUDA kernel is going to be
-    # compiled; smg/FA2-only runs just warn.
+    # before any source build. Fatal only when the CUDA kernel or DeepGEMM is
+    # going to be built (both need CUDA_HOME); smg/FA2-only runs just warn.
     if ! ensure_cuda_home; then
-        if [[ "$FRESH" == "1" || "$KERNEL_WORK" == "1" ]]; then
+        if [[ "$FRESH" == "1" || "$KERNEL_WORK" == "1" || "$DEEPGEMM_WORK" == "1" ]]; then
             exit 1
         fi
     fi
@@ -870,6 +923,16 @@ elif [[ "$KERNEL_WORK" == "1" ]]; then
         --no-build-isolation --no-deps --force-reinstall
 fi
 
+# --- DeepGEMM (SM120 kernels) from the DeepGEMM/ submodule --------------------
+# After the engine/kernel steps, which can re-pull the pinned wheel.
+if [[ "$DEEPGEMM_WORK" == "1" ]]; then
+    build_and_install_deepgemm
+elif [[ "$HAVE_DEEPGEMM_SRC" == "1" ]]; then
+    skip "DeepGEMM already installed from source. Rebuild after editing DeepGEMM/ with: REINSTALL_DEEPGEMM=1 ./scripts/install.sh"
+else
+    skip "DeepGEMM/ source not present; keeping the published tokenspeed-deepgemm wheel (no SM120 kernels)"
+fi
+
 # --- smg gateway (Rust) from local source ------------------------------------
 # Independent of the kernel branches: rebuild the OpenAI gateway (+ proto +
 # servicer) from smg/ so the best_of+stream fix is in effect. Skipped when the
@@ -923,15 +986,36 @@ fi
 # Editable-install note: `md.files()` may return None (or omit source paths) for
 # an `-e` install, so fall back to locating the package via its top-level import
 # path (metadata origin / __init__) without importing it.
-if [[ "$FRESH" != "1" && "$KERNEL_WORK" != "1" && "$SMG_WORK" != "1" && "$FA2_WORK" != "1" ]]; then
+if [[ "$DEEPGEMM_WORK" == "1" ]]; then
+    log "Verifying the DeepGEMM source build won (metadata inspection, no import)"
+    "$PY" - <<'PY'
+import importlib.metadata as md
+import pathlib
+import sys
+
+try:
+    md.version("tokenspeed-deepgemm")
+    sys.exit("ERROR: the published tokenspeed-deepgemm wheel is still installed.")
+except md.PackageNotFoundError:
+    pass
+ver = md.version("deep_gemm")
+print("installed deep_gemm:", ver)
+init = next((f for f in md.files("deep_gemm") or [] if f.as_posix() == "deep_gemm/__init__.py"), None)
+if init is None or "get_supported_arch_majors" not in pathlib.Path(init.locate()).read_text():
+    sys.exit("ERROR: installed deep_gemm lacks get_supported_arch_majors (no SM120 kernels).")
+print("deep_gemm source build + SM120 API OK")
+PY
+fi
+
+if [[ "$FRESH" != "1" && "$KERNEL_WORK" != "1" && "$SMG_WORK" != "1" && "$FA2_WORK" != "1" && "$DEEPGEMM_WORK" != "1" ]]; then
     log "Done. No build was needed. Activate with:  source \"$VENV_DIR/bin/activate\""
     exit 0
 fi
 
 # The kernel verification below only makes sense when a kernel build happened;
-# an smg-only or FA2-only run has nothing to verify there.
+# an smg-, FA2- or DeepGEMM-only run has nothing to verify there.
 if [[ "$FRESH" != "1" && "$KERNEL_WORK" != "1" ]]; then
-    log "Done (gateway/FA2 rebuilt). Activate with:  source \"$VENV_DIR/bin/activate\""
+    log "Done (gateway/FA2/DeepGEMM rebuilt). Activate with:  source \"$VENV_DIR/bin/activate\""
     exit 0
 fi
 

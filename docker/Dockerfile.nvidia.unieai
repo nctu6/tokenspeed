@@ -29,11 +29,16 @@
 #      flash_attn.cute, so building it by default only wastes compile time.
 #      When enabled, the collision guard backs it out and restores
 #      tokenspeed-fa4 so flash_attn.cute survives.
+#   4. DeepGEMM is built from the DeepGEMM/ submodule (SM120 FP8 GEMM and
+#      MQA-logits kernels) and replaces the published tokenspeed-deepgemm
+#      wheel, mirroring install.sh. Its kernels are JIT-compiled at runtime,
+#      so the build is one host extension and ignores CUDA_ARCH_LIST.
 #
 # This file is SELF-CONTAINED: everything it installs lives in this repo's own
 # build context (`COPY . /workspace`), so the image builds from a plain checkout
-# with no out-of-tree sources. Keep smg/ populated in the context (submodule
-# init'd) so the gateway is rebuilt from source.
+# with no out-of-tree sources. Keep smg/ and DeepGEMM/ populated in the context
+# (`git submodule update --init --recursive`; docker/unieai.nvidia.sh does it)
+# so the gateway and DeepGEMM are rebuilt from source.
 #
 # Build with buildx for linux/amd64 and linux/arm64. The base image is a
 # multi-architecture manifest; prefer a native arm64 builder because QEMU
@@ -72,10 +77,13 @@ ENV FLASHINFER_DISABLE_VERSION_CHECK=1
 WORKDIR /workspace
 
 # libnuma1 is required at runtime by torch_memory_saver, a TokenSpeed
-# dependency. Install system dependencies before copying sources to preserve
+# dependency. libdw-dev provides the elfutils header DeepGEMM's deep_jit
+# includes at build time (libdw.so.1 is dlopen'd only for JIT error stack
+# traces). Install system dependencies before copying sources to preserve
 # this cache layer across source-only changes.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
+        libdw-dev \
         libssl-dev \
         libopenmpi-dev \
         libnuma1 \
@@ -121,6 +129,20 @@ RUN python3 -m pip install cmake ninja && \
     python3 -m pip install tokenspeed-scheduler/ --no-deps --force-reinstall && \
     python3 -m pip install "torchao>=0.10.0" && \
     python3 -m pip install "diffusers>=0.40.0" av imageio-ffmpeg soundfile
+
+# DeepGEMM from the DeepGEMM/ submodule, after the engine/kernel installs that
+# re-pull the pinned tokenspeed-deepgemm wheel. That wheel owns the same
+# `deep_gemm` import package, so it is removed first. Without DeepGEMM/ in the
+# context the published wheel stays (no SM120 kernels).
+RUN if [ -f DeepGEMM/setup.py ] && [ -d DeepGEMM/third-party/cutlass/include ] \
+        && [ -d DeepGEMM/third-party/deep_jit/include ]; then \
+        python3 -m pip uninstall -y tokenspeed-deepgemm deep_gemm deep-gemm || true && \
+        rm -rf DeepGEMM/build DeepGEMM/dist DeepGEMM/*.egg-info && \
+        DG_FORCE_BUILD=1 MAX_JOBS=${MAX_JOBS} CUDA_HOME=/usr/local/cuda \
+        python3 -m pip install ./DeepGEMM --no-build-isolation --no-deps ; \
+    else \
+        echo "DeepGEMM/ source not present in build context; keeping the published tokenspeed-deepgemm wheel" ; \
+    fi
 
 # Optional (WITH_FA2=1): build vLLM's FlashAttention fork from source against
 # this image's torch so the extension ABI matches. Clone with submodules
@@ -228,6 +250,18 @@ for dist in ("diffusers", "av", "imageio-ffmpeg", "soundfile"):
     except md.PackageNotFoundError:
         sys.exit(f"ERROR: diffusion dep missing: {dist}")
 print("diffusion deps OK")
+# DeepGEMM: the source build (SM120 kernels) must have replaced the wheel when
+# its source was in the context.
+if pathlib.Path("/workspace/DeepGEMM/setup.py").is_file():
+    try:
+        md.version("tokenspeed-deepgemm")
+        sys.exit("ERROR: published tokenspeed-deepgemm wheel still installed")
+    except md.PackageNotFoundError:
+        pass
+    dg_init = next(f for f in md.files("deep_gemm") if f.as_posix() == "deep_gemm/__init__.py")
+    if "get_supported_arch_majors" not in pathlib.Path(dg_init.locate()).read_text():
+        sys.exit("ERROR: installed deep_gemm lacks get_supported_arch_majors (no SM120 kernels)")
+    print("deep_gemm source build OK:", md.version("deep_gemm"))
 import importlib.util
 if importlib.util.find_spec("flash_attn") is None:
     sys.exit("ERROR: flash_attn (FA4 tokenspeed-fa4) missing")
