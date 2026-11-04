@@ -68,11 +68,14 @@
 #
 # DeepGEMM is a git submodule too (DeepGEMM/, with its own cutlass + deep_jit
 # submodules). It carries the SM120 FP8 GEMM / MQA-logits kernels the published
-# tokenspeed-deepgemm wheel lacks, so it is built from that source and REPLACES
-# the wheel (both install the `deep_gemm` import package). The engine install
-# re-pulls the pinned wheel through tokenspeed-kernel's requirements, so this
-# step runs after the engine/kernel steps. Force a rebuild after editing it:
-#   REINSTALL_DEEPGEMM=1 ./scripts/install.sh  (or: ./scripts/install.sh --force-deepgemm)
+# tokenspeed-deepgemm wheel lacks. This is AUTOMATIC: on an SM120 GPU (detected
+# from the hardware) it is built from source and REPLACES the wheel (both
+# install the `deep_gemm` import package); on any other GPU the wheel is kept,
+# because the source build only helps SM120. No flag is needed. The engine
+# install re-pulls the pinned wheel through tokenspeed-kernel's requirements,
+# so this step runs after the engine/kernel steps. Force it on any GPU (or an
+# off-box SM120 build) with:
+#   ./scripts/install.sh --force-deepgemm   (or REINSTALL_DEEPGEMM=1, FORCE_SM120=1)
 #
 # VENV SELECTION. If a venv is ALREADY active, this script installs INTO it
 # instead of creating a second one. "Active" is detected from the interpreter
@@ -169,6 +172,48 @@ for d in python tokenspeed-kernel/python tokenspeed-scheduler; do
     fi
 done
 
+# --- SM120 (consumer/workstation Blackwell) auto-detection -------------------
+# The published tokenspeed-deepgemm wheel has no SM120 FP8 GEMM / MQA-logits
+# kernels, so on an SM120 GPU we build DeepGEMM from the submodule instead
+# (faster dense decode + the DeepSeek V3.2 indexer). On any other GPU the
+# source build buys nothing, so we keep the pinned wheel. This is decided
+# automatically from the hardware -- the user passes no flag. --force-deepgemm
+# still forces the source build on any GPU for debugging.
+#
+# Detection order (first that answers wins): the device compute capability from
+# nvidia-smi, else torch's view of device 0. A build host with no visible GPU
+# (common in CI) returns "unknown" and we leave DeepGEMM on the wheel; override
+# with --force-deepgemm or FORCE_SM120=1 when building for SM120 off-box.
+# HAVE_SM120_GPU: 1 (SM120), 0 (not SM120 / no GPU visible). FORCE_SM120=1
+# forces 1. Detection is from nvidia-smi here (it runs before the venv is
+# resolved, so torch is not importable yet); detect_sm120_gpu is re-tried with
+# torch's view once $PY exists, for hosts without nvidia-smi.
+HAVE_SM120_GPU="${FORCE_SM120:-0}"
+SM120_DETECTED="$HAVE_SM120_GPU"  # "", 0, or 1 once a probe has answered
+detect_sm120_gpu() {
+    [[ "$HAVE_SM120_GPU" == "1" ]] && return 0
+    local cap=""
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        # "12.0" for RTX PRO 6000 / RTX 50-series; take device 0.
+        cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' || true)"
+    fi
+    if [[ -z "$cap" && -n "${PY:-}" && -x "${PY:-}" ]]; then
+        cap="$("$PY" - <<'PY' 2>/dev/null || true
+import torch
+if torch.cuda.is_available():
+    major, minor = torch.cuda.get_device_capability(0)
+    print(f"{major}.{minor}")
+PY
+)"
+    fi
+    [[ -n "$cap" ]] && SM120_DETECTED=1  # a probe answered; treat as conclusive
+    # SM120 family is major 12 (12.0 workstation, 12.x consumer).
+    [[ "$cap" == 12.* ]]
+}
+if detect_sm120_gpu; then
+    HAVE_SM120_GPU=1
+fi
+
 # The smg gateway is tracked as a git submodule (see .gitmodules). If this is a
 # git checkout and the submodule has not been populated yet (fresh `git clone`
 # without --recurse-submodules leaves smg/ empty), initialize it so the gateway
@@ -182,18 +227,24 @@ if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/n
         git submodule update --init --recursive smg || \
             err "git submodule update --init smg failed; the smg gateway will not be built from source."
     fi
-    # DeepGEMM needs its own cutlass + deep_jit submodules, hence --recursive.
-    if grep -q '\[submodule "DeepGEMM"\]' .gitmodules 2>/dev/null \
+    # DeepGEMM is built from source only where it helps: an SM120 GPU, or a
+    # forced/off-box SM120 build. Elsewhere the pinned wheel is kept, so we do
+    # not pull its cutlass + deep_jit submodules. --recursive because it needs
+    # them. No-op when DeepGEMM/ is already populated (rsync'd tree).
+    if [[ "$HAVE_SM120_GPU" == "1" || "$REINSTALL_DEEPGEMM" == "1" ]] \
+        && grep -q '\[submodule "DeepGEMM"\]' .gitmodules 2>/dev/null \
         && [[ ! -f DeepGEMM/setup.py || ! -d DeepGEMM/third-party/cutlass/include \
               || ! -d DeepGEMM/third-party/deep_jit/include ]]; then
-        log "Initializing the DeepGEMM submodule (git submodule update --init --recursive DeepGEMM)"
+        log "SM120 GPU detected (or forced): initializing the DeepGEMM submodule (git submodule update --init --recursive DeepGEMM)"
         git submodule update --init --recursive DeepGEMM || \
             err "git submodule update --init DeepGEMM failed; DeepGEMM will not be built from source."
     fi
 fi
 
-# DeepGEMM source is optional: present it, we build it (SM120 kernels);
-# absent, the environment keeps the published tokenspeed-deepgemm wheel.
+# DeepGEMM source build is for SM120 only. We build from the submodule when the
+# source is present AND (an SM120 GPU is detected OR the source build is forced
+# with --force-deepgemm / REINSTALL_DEEPGEMM=1 / FORCE_SM120=1). On any other
+# GPU the environment keeps the published tokenspeed-deepgemm wheel.
 HAVE_DEEPGEMM_SRC=0
 if [[ -f DeepGEMM/setup.py && -d DeepGEMM/third-party/cutlass/include \
       && -d DeepGEMM/third-party/deep_jit/include ]]; then
@@ -820,11 +871,23 @@ if [[ "$HAVE_SMG_SRC" == "1" ]]; then
     fi
 fi
 
-# DeepGEMM: build from the submodule on a fresh/forced install, when forced
-# alone, when it is not installed yet, or when the published wheel came back
-# (a dependency reinstall re-pulls tokenspeed-deepgemm).
+# nvidia-smi may be absent on the build host (torch sees the GPU but the CLI is
+# not installed). Now that $PY is resolved, re-probe via torch if the early
+# nvidia-smi probe was inconclusive, so SM120 is still auto-detected there.
+if [[ "$HAVE_SM120_GPU" != "1" && "$SM120_DETECTED" != "1" ]]; then
+    if detect_sm120_gpu; then
+        HAVE_SM120_GPU=1
+    fi
+fi
+
+# DeepGEMM source build: ONLY on SM120 (auto-detected) or when forced. The
+# published wheel has no SM120 kernels, so on SM120 we replace it from source;
+# on every other GPU the wheel is the right answer and we leave it alone.
+# Within that gate, (re)build on a fresh/forced install, when the source build
+# is not installed yet, or when the published wheel came back (a dependency
+# reinstall re-pulls tokenspeed-deepgemm, shadowing the source build).
 DEEPGEMM_WORK=0
-if [[ "$HAVE_DEEPGEMM_SRC" == "1" ]]; then
+if [[ "$HAVE_DEEPGEMM_SRC" == "1" && ( "$HAVE_SM120_GPU" == "1" || "$REINSTALL_DEEPGEMM" == "1" ) ]]; then
     if [[ "$FRESH" == "1" || "$REINSTALL_DEEPGEMM" == "1" ]] \
         || ! have_dist deep_gemm || have_dist tokenspeed-deepgemm; then
         DEEPGEMM_WORK=1
@@ -927,8 +990,10 @@ fi
 # After the engine/kernel steps, which can re-pull the pinned wheel.
 if [[ "$DEEPGEMM_WORK" == "1" ]]; then
     build_and_install_deepgemm
+elif [[ "$HAVE_DEEPGEMM_SRC" == "1" && "$HAVE_SM120_GPU" == "1" ]]; then
+    skip "DeepGEMM already installed from source (SM120). Rebuild after editing DeepGEMM/ with: REINSTALL_DEEPGEMM=1 ./scripts/install.sh"
 elif [[ "$HAVE_DEEPGEMM_SRC" == "1" ]]; then
-    skip "DeepGEMM already installed from source. Rebuild after editing DeepGEMM/ with: REINSTALL_DEEPGEMM=1 ./scripts/install.sh"
+    skip "No SM120 GPU detected; keeping the published tokenspeed-deepgemm wheel (the source build only helps SM120). Force with: ./scripts/install.sh --force-deepgemm"
 else
     skip "DeepGEMM/ source not present; keeping the published tokenspeed-deepgemm wheel (no SM120 kernels)"
 fi

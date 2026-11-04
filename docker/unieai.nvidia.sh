@@ -19,23 +19,33 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-# The Dockerfile builds smg/ and DeepGEMM/ from source; populate the submodules
+# The Dockerfile builds smg/ and DeepGEMM/ from source. Populate the submodules
 # (DeepGEMM recursively, for its cutlass + deep_jit) so a fresh clone does not
-# silently fall back to the published wheels.
-# Only empty checkouts are initialized, so local submodule edits are kept.
+# silently fall back to the published wheels. This is automatic: the user runs
+# the script with no flags. Only empty checkouts are initialized, so local
+# submodule edits are kept.
+#
+# The UnieAI NVIDIA image targets SM120 (it compiles 12.0a) alongside Hopper
+# and datacenter Blackwell, so the DeepGEMM source build (its kernels JIT at
+# runtime and cover arch 9/10/12) is always the right choice here -- no
+# hardware detection is needed at build time.
 if [[ ! -f smg/bindings/python/pyproject.toml ]]; then
   git submodule update --init --recursive smg
 fi
 if [[ ! -f DeepGEMM/setup.py || ! -d DeepGEMM/third-party/cutlass/include \
       || ! -d DeepGEMM/third-party/deep_jit/include ]]; then
-  git submodule update --init --recursive DeepGEMM
+  git submodule update --init --recursive DeepGEMM || true
 fi
 if [[ ! -f DeepGEMM/setup.py || ! -d DeepGEMM/third-party/cutlass/include \
       || ! -d DeepGEMM/third-party/deep_jit/include ]]; then
-  echo "ERROR: DeepGEMM/ (with its third-party submodules) is not populated" >&2
-  exit 1
+  # Could not populate DeepGEMM (e.g. offline, or not a git checkout). The
+  # image build then keeps the published tokenspeed-deepgemm wheel (no SM120
+  # kernels) rather than failing the whole build.
+  echo "WARNING: DeepGEMM/ is not populated; the image will keep the published tokenspeed-deepgemm wheel (no SM120 kernels)." >&2
+  DEEPGEMM_COMMIT="(not built; wheel kept)"
+else
+  DEEPGEMM_COMMIT="$(git -C DeepGEMM rev-parse --short=8 HEAD)"
 fi
-DEEPGEMM_COMMIT="$(git -C DeepGEMM rev-parse --short=8 HEAD)"
 
 COMMIT="$(git rev-parse --short=8 HEAD)"
 BUILD_TZ="${BUILD_TZ:-Asia/Taipei}"
