@@ -23,7 +23,7 @@ from __future__ import annotations
 import functools
 
 import torch
-from tokenspeed_kernel.platform import prepare_cuda_toolkit_env
+from tokenspeed_kernel.platform import pdl_enabled, prepare_cuda_toolkit_env
 
 # Compute capability major of workstation Blackwell (RTX PRO 6000 / RTX 50).
 SM120_ARCH_MAJOR = 12
@@ -58,6 +58,12 @@ def block_fp8_mm(
 ) -> torch.Tensor:
     """Adapt canonical FP32 scales without rounding them to UE8M0."""
     import deep_gemm
+
+    # DeepGEMM's launch mode is process-wide. Keep it aligned with the engine's
+    # PDL setting (as the DSA / MoE leaves do), so dense GEMMs overlap their
+    # prologue with the previous kernel instead of breaking the PDL chain.
+    if deep_gemm.get_pdl() != pdl_enabled():
+        deep_gemm.set_pdl(pdl_enabled())
 
     m, k = a.shape
     n = b.shape[0]
