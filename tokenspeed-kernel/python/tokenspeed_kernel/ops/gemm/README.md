@@ -73,3 +73,26 @@ required layout without UE8M0 rounding (on SM120 the kernel reads the
 activation scales in place, so no transpose runs). Conversion is part of each call,
 including graph capture; no persistent weight cache is created. Unsupported
 forced calls fail explicitly. It does not claim batch-invariant numerics.
+
+## Block-scaled MXFP4 DeepGEMM (SM120)
+
+SM120 (RTX PRO 6000) also exposes the DeepGEMM block-scaled MXFP4 GEMM, which
+has no counterpart among the other NVIDIA leaves (the Triton MXFP4 `mm` is
+AMD-only). Two leaves register, both only when the installed DeepGEMM build has
+SM120 kernels (`deep_gemm.get_supported_arch_majors()` contains 12):
+
+- `deepgemm_sm120_mm_mxfp4` (op `mm`): packed E2M1 activations `A[M,K/2]` and
+  weights `B[N,K/2]` as `uint8`, with raw UE8M0 per-32 scales
+  `A_scales[M,K/32]` / `B_scales[N,K/32]`. Requires contiguous 2-D operands,
+  BF16 output, N divisible by 64, and K divisible by 128.
+- `deepgemm_sm120_mxfp4_linear` (op `mxfp4_linear`, `weight_layout="linear"`):
+  the op the dense MXFP4 linear layer calls. Weights stay in checkpoint order;
+  the activation is quantized to MXFP4 per call, then the GEMM runs. Both leaves
+  are `SPECIALIZED` priority, so `auto` selects them on SM120.
+
+Raw UE8M0 scale bytes are widened to the exact FP32 value `2^(e-127)` and packed
+MN-major and TMA-aligned before the call, which reads the exponent back. Packed
+operands are tagged `int8` (`kPackedFP4`). This packing is part of each call,
+including graph capture; no persistent weight-scale cache is created. Validated
+on SM120 to match the reference to about 1e-6, and the underlying MXFP4 GEMM
+leads FlashInfer by about 1.33x geomean across the swept projection shapes.
