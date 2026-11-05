@@ -85,14 +85,25 @@ SM120 kernels (`deep_gemm.get_supported_arch_majors()` contains 12):
   weights `B[N,K/2]` as `uint8`, with raw UE8M0 per-32 scales
   `A_scales[M,K/32]` / `B_scales[N,K/32]`. Requires contiguous 2-D operands,
   BF16 output, N divisible by 64, and K divisible by 128.
-- `deepgemm_sm120_mxfp4_linear` (op `mxfp4_linear`, `weight_layout="linear"`):
-  the op the dense MXFP4 linear layer calls. Weights stay in checkpoint order;
-  the activation is quantized to MXFP4 per call, then the GEMM runs. Both leaves
-  are `SPECIALIZED` priority, so `auto` selects them on SM120.
+- `deepgemm_sm120_mxfp4_linear` (op `mxfp4_linear`, weight layout
+  `deepgemm_sm120`): the op the dense MXFP4 linear layer calls. The weight keeps
+  checkpoint order; `prepare_mxfp4_linear` packs its UE8M0 scales once into the
+  int32 MN-major form DeepGEMM reads (four K-group bytes per word, MN aligned to
+  4). Each call quantizes the activation with
+  `mxfp4_quantize_mn_major_scales`, which writes the packed bytes and the scales
+  in that same layout directly, then runs the GEMM. No scale is widened or
+  repacked per call. Both leaves are `SPECIALIZED` priority, so `auto` selects
+  them on SM120.
 
-Raw UE8M0 scale bytes are widened to the exact FP32 value `2^(e-127)` and packed
-MN-major and TMA-aligned before the call, which reads the exponent back. Packed
-operands are tagged `int8` (`kPackedFP4`). This packing is part of each call,
-including graph capture; no persistent weight-scale cache is created. Validated
-on SM120 to match the reference to about 1e-6, and the underlying MXFP4 GEMM
-leads FlashInfer by about 1.33x geomean across the swept projection shapes.
+The `mm` leaf takes raw `uint8` scales `[MN, K/32]` and packs them per call with
+`pack_ue8m0_scales`; callers that reuse a weight should prefer `mxfp4_linear`.
+Packed operands are tagged `int8` (`kPackedFP4`) when passed to DeepGEMM.
+
+Measured on an RTX PRO 6000 as a whole `mxfp4_linear` (activation quantization
+included) against FlashInfer's best `mm_fp4` backend plus its own activation
+quantization, in a CUDA graph over weights larger than L2, across the
+DeepSeek-V3 TP8 dense linears at M = 1..4096: the leaf is faster on 52 of 63
+shapes, about 1.15x geomean. It loses by up to 13% at some decode shapes of the
+7168-wide projections (`o_proj`, `dense down`, M <= 128) and at `q_b` M = 256
+(0.83x). The raw GEMM alone leads by about 1.33x, so the gap is the activation
+quantization in front of it.
