@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.quantization.triton import mxfp4_quantize
+from tokenspeed_kernel.ops.quantization.triton import mxfp4_quantize_mn_major_scales
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -41,7 +41,12 @@ from tokenspeed_kernel.thirdparty.deepgemm import (
     block_fp8_mm,
     block_mxfp4_mm,
     deepgemm_supports_sm120,
+    pack_ue8m0_scales,
 )
+
+# Weight in checkpoint order, UE8M0 scales packed for DeepGEMM (see
+# ``pack_ue8m0_scales``) instead of the checkpoint ``[N, K/32]`` bytes.
+MXFP4_LINEAR_DEEPGEMM_SM120_LAYOUT = "deepgemm_sm120"
 
 _SIGNATURES = format_signatures(
     ("a", "b"),
@@ -190,6 +195,49 @@ _MXFP4_TRAITS = {
 }
 
 
+def _require_sm120_mxfp4() -> None:
+    platform = Platform.get()
+    if not (
+        platform.is_nvidia
+        and platform.arch_version.major == SM120_ARCH_MAJOR
+        and deepgemm_supports_sm120()
+    ):
+        raise ValueError("DeepGEMM MXFP4 GEMM requires SM120 with SM120 kernels")
+
+
+def _check_mxfp4_operands(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out_dtype: torch.dtype,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """Validate packed-E2M1 A[M,K/2], B[N,K/2] and return the BF16 [M,N] output."""
+    if A.dtype != torch.uint8 or B.dtype != torch.uint8:
+        raise ValueError("DeepGEMM MXFP4 GEMM requires packed uint8 operands")
+    if A.ndim != 2 or B.ndim != 2 or not A.is_contiguous() or not B.is_contiguous():
+        raise ValueError(
+            "DeepGEMM MXFP4 GEMM requires contiguous 2D A[M,K/2], B[N,K/2]"
+        )
+    m, k_half = A.shape
+    n, kb_half = B.shape
+    if m < 1 or n < 1 or k_half != kb_half or n % 64 or (k_half * 2) % 128:
+        raise ValueError("DeepGEMM MXFP4 GEMM requires matching K, N%64=0 and K%128=0")
+    if out_dtype != torch.bfloat16:
+        raise ValueError("DeepGEMM MXFP4 GEMM produces BF16 output")
+    if out is None:
+        return torch.empty((m, n), device=A.device, dtype=out_dtype)
+    if (
+        tuple(out.shape) != (m, n)
+        or out.dtype != out_dtype
+        or out.device != A.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "DeepGEMM MXFP4 out must be contiguous BF16 [M,N] on the device"
+        )
+    return out
+
+
 def _run_deepgemm_mm_mxfp4(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -201,32 +249,15 @@ def _run_deepgemm_mm_mxfp4(
     block_size: list[int] | None,
     out: torch.Tensor | None,
 ) -> torch.Tensor:
-    """SM120 MXFP4 GEMM: packed-E2M1 [M,K/2] @ [N,K/2].T with UE8M0 per-32 scales."""
-    platform = Platform.get()
-    if not (
-        platform.is_nvidia
-        and platform.arch_version.major == SM120_ARCH_MAJOR
-        and deepgemm_supports_sm120()
-    ):
-        raise ValueError("DeepGEMM MXFP4 GEMM requires SM120 with SM120 kernels")
+    """SM120 MXFP4 GEMM: packed-E2M1 [M,K] @ [N,K].T with raw UE8M0 per-32 scales."""
+    _require_sm120_mxfp4()
     if alpha is not None:
         raise ValueError("DeepGEMM MXFP4 GEMM does not take alpha")
-    if A.dtype != torch.uint8 or B.dtype != torch.uint8:
-        raise ValueError("DeepGEMM MXFP4 GEMM requires packed uint8 operands")
     if A_scales is None or B_scales is None:
         raise ValueError("DeepGEMM MXFP4 GEMM requires A and B scales")
-    if A.ndim != 2 or B.ndim != 2 or not A.is_contiguous() or not B.is_contiguous():
-        raise ValueError(
-            "DeepGEMM MXFP4 GEMM requires contiguous 2D A[M,K/2], B[N,K/2]"
-        )
-    m, k_half = A.shape
-    n, kb_half = B.shape
-    k = k_half * 2
-    if m < 1 or n < 1 or k_half != kb_half or n % 64 or k % 128:
-        raise ValueError("DeepGEMM MXFP4 GEMM requires matching K, N%64=0 and K%128=0")
-    if out_dtype != torch.bfloat16:
-        raise ValueError("DeepGEMM MXFP4 GEMM produces BF16 output")
-    for scale, mn in ((A_scales, m), (B_scales, n)):
+    out = _check_mxfp4_operands(A, B, out_dtype, out)
+    k = A.shape[1] * 2
+    for scale, mn in ((A_scales, A.shape[0]), (B_scales, B.shape[0])):
         if (
             scale.dtype != torch.uint8
             or tuple(scale.shape) != (mn, k // 32)
@@ -235,18 +266,32 @@ def _run_deepgemm_mm_mxfp4(
             raise ValueError(
                 "DeepGEMM MXFP4 GEMM requires uint8 UE8M0 [MN, K/32] scales"
             )
-    if out is None:
-        out = torch.empty((m, n), device=A.device, dtype=out_dtype)
-    elif (
-        tuple(out.shape) != (m, n)
-        or out.dtype != out_dtype
-        or out.device != A.device
-        or not out.is_contiguous()
+    return block_mxfp4_mm(
+        A, B, pack_ue8m0_scales(A_scales), pack_ue8m0_scales(B_scales), out
+    )
+
+
+def _run_deepgemm_mxfp4_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """``mxfp4(x) @ W.T``; ``weight_scale`` is packed at prepare time."""
+    _require_sm120_mxfp4()
+    n, k = weight.shape[0], weight.shape[1] * 2
+    if (
+        weight_scale.dtype != torch.int32
+        or tuple(weight_scale.shape) != (n, k // 128)
+        or weight_scale.device != weight.device
     ):
         raise ValueError(
-            "DeepGEMM MXFP4 out must be contiguous BF16 [M,N] on the device"
+            "DeepGEMM MXFP4 linear requires weight scales packed by "
+            "prepare_mxfp4_linear"
         )
-    return block_mxfp4_mm(A, B, A_scales, B_scales, out)
+    x_fp4, x_scale = mxfp4_quantize_mn_major_scales(x)
+    out = _check_mxfp4_operands(x_fp4, weight, x.dtype, out)
+    return block_mxfp4_mm(x_fp4, weight, x_scale, weight_scale, out)
 
 
 # The SM120 build reads the canonical FP32 scales directly (no transpose), and
@@ -335,8 +380,8 @@ if current_platform().is_hopper_plus and deepgemm_supports_sm120():
         )
 
     # Dense MXFP4 linear (dynamic MXFP4 activations), the op the MXFP4 dense layer
-    # calls. Weights stay in checkpoint order ("linear" layout); the activation is
-    # quantized per call, then the SM120 block-scaled GEMM runs.
+    # calls. The weight scale is packed once at prepare time; the activation is
+    # quantized per call straight into the packed scale layout.
     _MXFP4_LINEAR_SCALE = ScaleFormat(
         storage_dtype=torch.uint8, granularity="block", block_shape=(32,)
     )
@@ -356,7 +401,7 @@ if current_platform().is_hopper_plus and deepgemm_supports_sm120():
             max_arch_version=ArchVersion(SM120_ARCH_MAJOR, 9),
         ),
         signatures=frozenset({_MXFP4_LINEAR_SIGNATURE}),
-        traits={"weight_layout": frozenset({"linear"})},
+        traits={"weight_layout": frozenset({MXFP4_LINEAR_DEEPGEMM_SM120_LAYOUT})},
         priority=Priority.SPECIALIZED,
     )
     def deepgemm_sm120_mxfp4_linear(
@@ -367,14 +412,4 @@ if current_platform().is_hopper_plus and deepgemm_supports_sm120():
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``mxfp4(x) @ W.T`` on SM120: quantize x to MXFP4, then the GEMM."""
-        x_fp4, x_scale = mxfp4_quantize(x)
-        return _run_deepgemm_mm_mxfp4(
-            x_fp4,
-            weight,
-            x_scale,
-            weight_scale,
-            x.dtype,
-            alpha=None,
-            block_size=None,
-            out=out,
-        )
+        return _run_deepgemm_mxfp4_linear(x, weight, weight_scale, out)

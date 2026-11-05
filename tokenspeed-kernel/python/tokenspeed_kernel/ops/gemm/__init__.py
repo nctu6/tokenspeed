@@ -991,7 +991,9 @@ class Mxfp4LinearWeight:
 
     Attributes:
         weight: Packed E2M1 ``[N, K/2]`` uint8 in ``layout`` order.
-        weight_scale: UE8M0 ``[N, K/32]`` uint8, one scale per 32 K values.
+        weight_scale: UE8M0 ``[N, K/32]`` uint8, one scale per 32 K values;
+            for the ``deepgemm_sm120`` layout, int32 ``[N, K/128]`` packed by
+            ``pack_ue8m0_scales``.
         layout: Weight layout the selected kernels read; the ``weight_layout``
             trait of their registrations.
     """
@@ -1015,7 +1017,17 @@ def _prepare_mxfp4_weight_layout(layout: str, weight: torch.Tensor) -> torch.Ten
         return weight
     if layout == MXFP4_LINEAR_MFMA_LAYOUT:
         return prepare_mxfp4_linear_mfma_weight(weight)
+    if layout == MXFP4_LINEAR_DEEPGEMM_SM120_LAYOUT:
+        return weight
     raise ValueError(f"unknown MXFP4 linear weight layout {layout!r}")
+
+
+def _prepare_mxfp4_weight_scale_layout(
+    layout: str, weight_scale: torch.Tensor
+) -> torch.Tensor:
+    if layout == MXFP4_LINEAR_DEEPGEMM_SM120_LAYOUT:
+        return pack_ue8m0_scales(weight_scale)
+    return weight_scale
 
 
 def prepare_mxfp4_linear(
@@ -1052,7 +1064,7 @@ def prepare_mxfp4_linear(
     (layout,) = KernelRegistry.get().get_by_name(kernel.name).traits["weight_layout"]
     return Mxfp4LinearWeight(
         weight=_prepare_mxfp4_weight_layout(layout, weight),
-        weight_scale=weight_scale,
+        weight_scale=_prepare_mxfp4_weight_scale_layout(layout, weight_scale),
         layout=layout,
     )
 
@@ -3731,6 +3743,10 @@ def kimi3_router_projection(
 import tokenspeed_kernel.numerics.torch.gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.deepgemm  # noqa: E402,F401
+from tokenspeed_kernel.ops.gemm.deepgemm import (  # noqa: E402
+    MXFP4_LINEAR_DEEPGEMM_SM120_LAYOUT,
+)
+from tokenspeed_kernel.thirdparty.deepgemm import pack_ue8m0_scales  # noqa: E402
 import tokenspeed_kernel.ops.gemm.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: E402,F401

@@ -83,6 +83,25 @@ def block_fp8_mm(
     return out
 
 
+def pack_ue8m0_scales(sf: torch.Tensor) -> torch.Tensor:
+    """Pack raw UE8M0 scale bytes ``[MN, K/32]`` for DeepGEMM's MXFP4 GEMM.
+
+    DeepGEMM reads four consecutive K-group bytes as one int32 word, MN-major,
+    with MN aligned up to a multiple of 4. The bytes are already UE8M0, so this
+    is a transposing copy.
+
+    Returns:
+        int32 ``[MN, K/128]`` with strides ``(1, align4(MN))``.
+    """
+    mn, groups = sf.shape
+    if groups % 4 != 0:
+        raise ValueError(f"UE8M0 scales need K divisible by 128, got {groups} groups")
+    aligned_mn = (mn + 3) // 4 * 4
+    packed = torch.zeros((groups // 4, aligned_mn), dtype=torch.int32, device=sf.device)
+    packed[:, :mn] = sf.contiguous().view(torch.int32).T
+    return packed.T[:mn]
+
+
 def block_mxfp4_mm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -90,27 +109,25 @@ def block_mxfp4_mm(
     b_scale: torch.Tensor,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    """MXFP4 GEMM d = a @ b.T on SM120: packed E2M1 a[M,K/2] / b[N,K/2] with
-    raw UE8M0 per-32 scales a_scale[M,K/32] / b_scale[N,K/32] (uint8 exponents).
+    """MXFP4 GEMM d = a @ b.T on SM120.
 
-    DeepGEMM consumes the scales as a MN-major, TMA-aligned, int32-packed UE8M0
-    tensor; its packer takes FP32 values and reads their exponent, so the raw
-    UE8M0 byte ``e`` is widened to the exact FP32 ``2^(e-127)`` first.
+    Args:
+        a: Packed E2M1 uint8 ``[M, K/2]``.
+        b: Packed E2M1 uint8 ``[N, K/2]``.
+        a_scale: UE8M0 scales ``[M, K/128]`` int32 packed as ``pack_ue8m0_scales``.
+        b_scale: UE8M0 scales ``[N, K/128]`` int32 packed as ``pack_ue8m0_scales``.
+        out: BF16 ``[M, N]`` destination.
     """
     import deep_gemm
 
     if deep_gemm.get_pdl() != pdl_enabled():
         deep_gemm.set_pdl(pdl_enabled())
 
-    def to_packed(sf: torch.Tensor) -> torch.Tensor:
-        # UE8M0 byte -> FP32 2^(e-127): place the exponent byte in the FP32 exponent field.
-        fp32 = (sf.to(torch.int32) << 23).view(torch.float32)
-        return deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(fp32)
-
-    # DeepGEMM tags packed FP4 operands as int8 (kPackedFP4 == torch.int8); the MXFP4 quantizer emits uint8.
+    # DeepGEMM tags packed FP4 operands as int8 (kPackedFP4 == torch.int8); the
+    # MXFP4 quantizer emits uint8.
     deep_gemm.fp8_fp4_gemm_nt(
-        (a.view(torch.int8), to_packed(a_scale)),
-        (b.view(torch.int8), to_packed(b_scale)),
+        (a.view(torch.int8), a_scale),
+        (b.view(torch.int8), b_scale),
         out,
         recipe=(1, 1, 32),
     )
