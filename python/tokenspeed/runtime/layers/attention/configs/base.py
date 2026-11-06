@@ -40,11 +40,11 @@ from typing import ClassVar, TypeVar
 import torch
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
-from tokenspeed.runtime.utils.server_args import ServerArgs
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
     split_groups_to_equal_depth,
 )
+from tokenspeed.runtime.utils.server_args import ServerArgs
 
 ComponentT = TypeVar("ComponentT", bound="AttnComponentSpec")
 
@@ -70,6 +70,27 @@ def is_block_drafter(speculative_algorithm: str | None, is_draft: bool) -> bool:
     return bool(is_draft and speculative_algorithm in ("DFLASH", "DSPARK"))
 
 
+def read_hf_layer_types(hf_config) -> tuple[str, ...]:
+    """The checkpoint's per-layer labels exactly as declared, without splitting.
+
+    ``cache_layer_types`` wins over ``layer_types``. A family that declares its
+    own cache groups (dots3-note) reads these instead of
+    :func:`resolve_cache_layer_types`, which relabels for slab packing.
+    """
+    # Gemma3ForConditionalGeneration keeps layer_types / cache_layer_types on
+    # ``text_config``, not the multimodal wrapper. Prefer top-level, then text.
+    text_config = getattr(hf_config, "text_config", None)
+
+    def _layer_types_from(cfg):
+        if cfg is None:
+            return None
+        return getattr(cfg, "cache_layer_types", None) or getattr(
+            cfg, "layer_types", None
+        )
+
+    return tuple(_layer_types_from(hf_config) or _layer_types_from(text_config) or ())
+
+
 def resolve_cache_layer_types(
     hf_config,
     *,
@@ -88,20 +109,7 @@ def resolve_cache_layer_types(
     full-history group whatever compute mask its layers apply: the label
     vector says so explicitly instead of losing the labels.
     """
-    # Gemma3ForConditionalGeneration keeps layer_types / cache_layer_types on
-    # ``text_config``, not the multimodal wrapper. Prefer top-level, then text.
-    text_config = getattr(hf_config, "text_config", None)
-
-    def _layer_types_from(cfg):
-        if cfg is None:
-            return None
-        return getattr(cfg, "cache_layer_types", None) or getattr(
-            cfg, "layer_types", None
-        )
-
-    layer_types = tuple(
-        _layer_types_from(hf_config) or _layer_types_from(text_config) or ()
-    )
+    layer_types = read_hf_layer_types(hf_config)
     if draft_block_decode:
         return (FULL_ATTENTION,) * num_layers
     if is_draft and layer_types and len(layer_types) != num_layers:
