@@ -35,8 +35,14 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.thirdparty.deepgemm import deepgemm_supports_sm120
 
 platform = current_platform()
+
+# DeepGEMM's tf32_hc_prenorm_gemm covers Hopper and SM100-SM103, and SM120 in
+# builds with SM120 kernels; older builds assert "Unsupported architecture" on
+# SM120, which then falls through to the portable Triton mHC kernel.
+_DEEP_GEMM_MHC_MAX_ARCH = None if deepgemm_supports_sm120() else ArchVersion(10, 3)
 
 if platform.is_hopper_plus:
     prepare_cuda_toolkit_env()
@@ -54,12 +60,7 @@ if platform.is_hopper_plus:
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
-            # DeepGEMM tf32_hc_prenorm_gemm cubin covers datacenter Blackwell
-            # (SM100-SM103) and Hopper only; it asserts "Unsupported
-            # architecture" on SM120 (workstation Blackwell, e.g. RTX PRO 6000).
-            # Cap the window so SM120 falls through to the portable Triton
-            # mhc kernel. Mirrors the SM100-SM103 window used elsewhere.
-            max_arch_version=ArchVersion(10, 3),
+            max_arch_version=_DEEP_GEMM_MHC_MAX_ARCH,
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
@@ -109,12 +110,7 @@ if platform.is_hopper_plus:
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
-            # DeepGEMM tf32_hc_prenorm_gemm cubin covers datacenter Blackwell
-            # (SM100-SM103) and Hopper only; it asserts "Unsupported
-            # architecture" on SM120 (workstation Blackwell, e.g. RTX PRO 6000).
-            # Cap the window so SM120 falls through to the portable Triton
-            # mhc kernel. Mirrors the SM100-SM103 window used elsewhere.
-            max_arch_version=ArchVersion(10, 3),
+            max_arch_version=_DEEP_GEMM_MHC_MAX_ARCH,
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
