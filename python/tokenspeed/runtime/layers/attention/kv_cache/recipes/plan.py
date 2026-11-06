@@ -935,11 +935,6 @@ def pack(
 
     for group_id in ordered_group_ids:
         count = packing[group_id]
-        if lcm_block_bytes % count:
-            raise ValueError(
-                f"cache group {group_id!r}: packing {count} does not partition "
-                f"LCM block size {lcm_block_bytes}"
-            )
         # A group wastes bytes only inside the planes it actually occupies: a
         # group's CacheBlock never touches a plane no field of its places a
         # payload on. Measure the padding over those planes, not the whole
@@ -954,6 +949,13 @@ def pack(
         occupied_bytes = sum(
             plane_bytes[plane_id] for plane_id in group_plane_bytes[group_id]
         )
+        if occupied_bytes % count:
+            # The parent is the sum of its planes, so a group need only
+            # partition the planes it occupies, not the whole parent.
+            raise ValueError(
+                f"cache group {group_id!r}: packing {count} does not partition "
+                f"its planes ({occupied_bytes} bytes)"
+            )
         stride = occupied_bytes // count
         padding_fraction = (stride - raw_by_group[group_id]) / raw_by_group[group_id]
         if padding_fraction > max_padding_fraction:
