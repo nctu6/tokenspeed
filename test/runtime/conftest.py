@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 
+
 def _reap_launched_processes() -> None:
     """Kill every process this pytest run spawned (servers, schedulers)."""
     try:
@@ -37,6 +38,66 @@ def pytest_configure(config):
 
 def pytest_unconfigure(config):
     _reap_launched_processes()
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _restore_process_global_state():
+    """Undo what a test module leaves in process-wide state.
+
+    ``global_server_args_dict`` and the MoE backend globals: harnesses that
+    build a model in-process set the ``mapping`` and pin ``MOE_BACKEND``, and
+    later modules read them back as their own topology and backend.
+
+    Environment: ``Engine`` and some harnesses export variables for their
+    workers (``INKLING_TORCH_MOE``, ``TOKENSPEED_MAMBA_SSM_DTYPE``, TF32 and
+    PDL switches) that later modules would otherwise inherit.
+
+    Logging: an in-process ``Engine`` runs ``configure_logger``, which sets the
+    root and every ``tokenspeed`` logger to the engine's ``log_level``, and the
+    default that ``get_colorful_logger`` reads. That is right for a server, but
+    in a pytest process it hides the records later modules assert on.
+    """
+    import logging
+
+    from tokenspeed.runtime.layers.moe import utils as moe_utils
+    from tokenspeed.runtime.utils import common
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    environ = dict(os.environ)
+    server_args = dict(global_server_args_dict)
+    moe_globals = (
+        "ALL2ALL_BACKEND",
+        "MOE_BACKEND",
+        "DEEPEP_MODE",
+        "DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER",
+    )
+    moe_config = {name: getattr(moe_utils, name) for name in moe_globals}
+    root = logging.getLogger()
+    root_level = root.level
+    root_handlers = list(root.handlers)
+    prefix, level = common.LOG_PREFIX, common.LOG_LEVEL
+    levels = {
+        name: (logger.level, [(h, h.level) for h in logger.handlers])
+        for name, logger in logging.Logger.manager.loggerDict.items()
+        if isinstance(logger, logging.Logger) and "tokenspeed" in name
+    }
+    yield
+    os.environ.clear()
+    os.environ.update(environ)
+    global_server_args_dict.clear()
+    global_server_args_dict.update(server_args)
+    for name, value in moe_config.items():
+        setattr(moe_utils, name, value)
+    root.setLevel(root_level)
+    root.handlers[:] = root_handlers
+    common.LOG_PREFIX, common.LOG_LEVEL = prefix, level
+    for name, logger in list(logging.Logger.manager.loggerDict.items()):
+        if isinstance(logger, logging.Logger) and "tokenspeed" in name:
+            # A logger first created inside the module starts unset.
+            logger_level, handlers = levels.get(name, (logging.NOTSET, []))
+            logger.setLevel(logger_level)
+            for handler, handler_level in handlers:
+                handler.setLevel(handler_level)
 
 
 requires_cuda = pytest.mark.skipif(
