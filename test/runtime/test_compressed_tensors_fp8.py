@@ -765,6 +765,12 @@ def test_hopper_dequantizes_at_load_and_says_so(
     assert seen == [(layer, x, None)]
 
 
+# The cuBLASLt per-tensor FP8 GEMM registers at import only on a real SM100
+# family GPU; the synthetic platform switch cannot add it afterwards.
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="the vendor per-tensor FP8 GEMM registers only on SM100-family GPUs",
+)
 @pytest.mark.parametrize("arch", [(10, 0), (10, 3)])
 def test_the_unscaled_linear_runs_a_vendor_gemm_with_unit_scales(
     platform, monkeypatch, arch

@@ -1322,9 +1322,17 @@ def test_sharded_state_load_prepares_fp8_scales_from_loaded_state(
     torch.testing.assert_close(model.proj(x)[0], source.proj(x)[0], rtol=0, atol=0)
 
 
+def _has_prepacked_mxfp8_gemm() -> bool:
+    from tokenspeed_kernel.ops.gemm.flashinfer import has_flashinfer_mxfp8
+
+    return torch.cuda.is_available() and has_flashinfer_mxfp8()
+
+
+# Prepared weight scales exist only for the FlashInfer MXFP8 GEMM (SM100 family);
+# elsewhere the projection keeps the canonical scales and prepares nothing.
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not current_platform().is_blackwell_plus,
-    reason="requires Blackwell MXFP8",
+    not _has_prepacked_mxfp8_gemm(),
+    reason="requires the FlashInfer prepacked MXFP8 GEMM",
 )
 @torch.inference_mode()
 def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):

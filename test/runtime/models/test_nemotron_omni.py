@@ -627,6 +627,14 @@ def test_audio_feature_encodes_every_clip_of_every_item_in_order():
     assert torch.equal(out, expected)
 
 
+# ReLU2 (non-gated) experts run only on the TRT-LLM kernels, which target the
+# SM100 family; other GPUs have no MoE kernel for them.
+requires_relu2_moe_kernel = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="ReLU2 MoE kernels exist only for SM100-family GPUs",
+)
+
+
 def _mtp_omni_config() -> NemotronHOmniConfig:
     """A small Nemotron-H Omni config whose language model has one MTP layer."""
     llm = dict(
@@ -649,6 +657,7 @@ def _mtp_omni_config() -> NemotronHOmniConfig:
     return NemotronHOmniConfig(llm_config=llm)
 
 
+@requires_relu2_moe_kernel
 def test_mtp_draft_reads_the_language_model_mtp_tensors():
     from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
 
@@ -670,6 +679,7 @@ def test_mtp_draft_reads_the_language_model_mtp_tensors():
     assert torch.all(draft.enorm.weight == 2)
 
 
+@requires_relu2_moe_kernel
 def test_kv_cache_scales_reach_the_language_model_and_its_mtp_head():
     from tokenspeed_kernel.ops.attention.prologue import FP8TensorScales
 

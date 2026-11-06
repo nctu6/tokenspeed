@@ -811,6 +811,15 @@ def test_mtp_head_refuses_patterns_its_narrowing_cannot_serve(blocks: list[str])
         NemotronHForCausalLMNextN(config, Mapping(rank=0, world_size=1))
 
 
+# ReLU2 (non-gated) experts run only on the TRT-LLM kernels, which target the
+# SM100 family; other GPUs have no MoE kernel for them.
+requires_relu2_moe_kernel = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="ReLU2 MoE kernels exist only for SM100-family GPUs",
+)
+
+
+@requires_relu2_moe_kernel
 @pytest.mark.parametrize("mtp_quantized", [False, True])
 def test_mtp_head_follows_the_checkpoint_quantization(mtp_quantized: bool):
     """Nemotron 3 Super's export names no MTP module and left the head in BF16;
@@ -1215,6 +1224,7 @@ def test_static_per_tensor_checkpoint_runs_a_merged_projection(
     assert torch.equal(out_prequantized, out)
 
 
+@requires_relu2_moe_kernel
 def test_mtp_head_takes_its_checkpoint_kv_cache_scales_at_startup_only(
     tmp_path, monkeypatch
 ):

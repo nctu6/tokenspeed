@@ -1611,6 +1611,13 @@ class TestCacheGroupRouterRebindTest:
             assert (leaf._prefix_history) is None
 
 
+# The leaf builds FlashInfer MLA wrappers, whose kernels target SM90/SM100.
+_requires_flashmla_arch = pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] not in (9, 10),
+    reason="FlashMLA kernels are built for SM90/SM100 only",
+)
+
+
 class TestPagedLeafRebindTest:
     """Every leaf forgets the per-forward and per-graph state it annotates as optional.
 
@@ -1727,6 +1734,7 @@ class TestPagedLeafRebindTest:
     @pytest.mark.skipif(
         not (torch.version.hip is None), reason=("FlashInfer wrappers are NVIDIA-only")
     )
+    @_requires_flashmla_arch
     def test_flashmla_leaf_forgets_the_previous_forward(self):
         from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
             FlashMLABackend,
@@ -1765,6 +1773,7 @@ class TestPagedLeafRebindTest:
     @pytest.mark.skipif(
         not (torch.version.hip is None), reason=("FlashInfer wrappers are NVIDIA-only")
     )
+    @_requires_flashmla_arch
     def test_flashmla_leaf_forgets_the_tile_keepalives(self):
         from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
             FlashMLABackend,
