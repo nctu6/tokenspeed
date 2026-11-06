@@ -118,6 +118,17 @@ def test_attention_prefix_and_decode_match_cold_prefill(
     monkeypatch.setitem(
         global_server_args_dict, "deepseek_v4_indexer_prefill_max_logits_mb", 32
     )
+    # The cold, warm and decode passes project 578, 65 and 1 rows. With the
+    # default bf16 split-K reduction (cuBLAS on SM120 picks it for these
+    # shapes) about half of the bf16 projection outputs change with the row
+    # count, which flips ~8% of the FP8 query/cache elements and moves the
+    # attention output by ~2.4% although every attention kernel is within 0.2%
+    # of a float32 reference on identical inputs. Reduce in fp32 so the
+    # comparison below measures the cache prefix and decode paths, not GEMM
+    # batch variance (batch-invariant GEMMs are opt-in via ``numerics``).
+    monkeypatch.setattr(
+        torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction", False
+    )
     config = Dots3NoteConfig.from_pretrained(checkpoint)
     torch.manual_seed(42)
     previous_dtype = torch.get_default_dtype()
