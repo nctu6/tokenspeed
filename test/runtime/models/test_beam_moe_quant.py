@@ -87,6 +87,21 @@ NVFP4_ROUTED = "flashinfer_trtllm_nvfp4_routed_moe_apply"
 FP8 = torch.float8_e4m3fn
 
 
+# These build Beam's vendor MoE with intermediate size 64 per partition, which
+# only the SM100-SM103 TRT-LLM launcher accepts; elsewhere the kernels need 128
+# (and Beam leaves its vendor MoE off, see ``beam_default_moe_backend``).
+def _vendor_ispp_alignment() -> int:
+    from tokenspeed_kernel.ops.moe.flashinfer import TRTLLM_UNQUANT_ISPP_ALIGNMENT
+
+    return TRTLLM_UNQUANT_ISPP_ALIGNMENT
+
+
+requires_ispp64_launcher = pytest.mark.skipif(
+    not torch.cuda.is_available() or _vendor_ispp_alignment() != 64,
+    reason="needs the SM100-SM103 TRT-LLM launcher's 64-wide intermediate size",
+)
+
+
 @pytest.fixture(autouse=True)
 def nvidia_platform():
     """These vendor policy and launch tests exercise the NVIDIA path on CPU."""
@@ -131,6 +146,7 @@ def test_the_backend_selects_the_moe_class(server, backend, expected):
     assert beam.beam_moe_class() is expected
 
 
+@requires_ispp64_launcher
 def test_vendor_routes_take_the_routed_scale_once(server):
     """On Beam's routes the vendor layer's route epilogue folds the routed
     scale into the FP32 weights, once (TopK applies none): the Triton layer's
@@ -156,6 +172,7 @@ def test_vendor_routes_take_the_routed_scale_once(server):
     )
 
 
+@requires_ispp64_launcher
 def test_kernel_routed_layer_refuses_a_non_finite_checkpoint_bias(server):
     server("flashinfer_trtllm", kernel_routing=True)
     layer = _moe()
@@ -293,6 +310,7 @@ def test_the_model_refuses_an_expert_layout_it_cannot_serve(
         _model(mapping=mapping, config=_config(**EP_GRID))
 
 
+@requires_ispp64_launcher
 def test_ep8_rank_hands_global_routes_and_its_expert_offset_to_the_kernel(
     server, monkeypatch
 ):
@@ -316,6 +334,7 @@ def test_ep8_rank_hands_global_routes_and_its_expert_offset_to_the_kernel(
     assert torch.equal(topk_weights, weights.to(torch.bfloat16))
 
 
+@requires_ispp64_launcher
 def test_ep8_ranks_load_only_their_experts_and_check_the_whole_checkpoint(
     server, monkeypatch
 ):
@@ -340,6 +359,7 @@ def test_ep8_ranks_load_only_their_experts_and_check_the_whole_checkpoint(
     assert owners["model.layers.1.mlp.experts.37.down_proj.weight"] == [1]
 
 
+@requires_ispp64_launcher
 @pytest.mark.parametrize(
     "defect,error",
     [
@@ -903,6 +923,7 @@ def _assert_experts_hold(experts, tensors):
         )
 
 
+@requires_ispp64_launcher
 def test_nvfp4_expert_tensors_load_unchanged(server):
     server("flashinfer_trtllm")
     tensors = nvfp4_checkpoint()

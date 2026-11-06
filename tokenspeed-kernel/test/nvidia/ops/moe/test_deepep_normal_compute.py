@@ -23,8 +23,8 @@ GEMMs, unpermute. Runs the same tensor layouts the DeepEP FP8 apply kernel
 builds, minus the all-to-all legs, against a dequantized torch reference.
 
 Scales are rounded to UE8M0 (powers of two) because that is the only 1D1D scale
-format DeepGEMM accepts on Blackwell; on Hopper it merely costs a little
-precision, so one test body covers both.
+format DeepGEMM accepts on SM100; the expert-compute bodies follow that UE8M0
+pipeline and run only where DeepGEMM requires it.
 """
 
 from __future__ import annotations
@@ -43,6 +43,17 @@ if not torch.cuda.is_available() or not current_platform().is_hopper_plus:
     pytest.skip("NVIDIA Hopper or newer required", allow_module_level=True)
 
 import deep_gemm  # noqa: E402
+from tokenspeed_kernel.ops.moe._deep_gemm.ue8m0 import (  # noqa: E402
+    deep_gemm_requires_ue8m0,
+)
+
+# These bodies build the UE8M0 pipeline (packed int32 activation and weight
+# scales, per-row recipe) that production runs where DeepGEMM reads UE8M0
+# (SM100). SM90/SM120 run the FP32 block-scale pipeline instead.
+requires_ue8m0_contract = pytest.mark.skipif(
+    not deep_gemm_requires_ue8m0(),
+    reason="this device's DeepGEMM runs the FP32 block-scale DeepEP pipeline",
+)
 
 _BLOCK = 128
 
@@ -140,6 +151,7 @@ def test_fused_silu_block_quant_fills_mn_major_scales():
     )
 
 
+@requires_ue8m0_contract
 def test_normal_mode_expert_compute_matches_dequantized_reference(enable_pdl):
     torch.manual_seed(0)
     num_recv, hidden, ispp, top_k, num_local_experts = 96, 512, 256, 4, 4
@@ -285,6 +297,11 @@ def test_requantization_makes_scales_ue8m0_and_preserves_values():
 def test_deepep_weight_preprocessor_packs_scales_once_for_both_modes():
     """The per-forward GEMMs should receive ready-to-use B scale layouts."""
     import tokenspeed_kernel.ops.moe.deep_ep as deepep_fp8
+    from tokenspeed_kernel.ops.moe._deep_gemm.ue8m0 import deep_gemm_requires_ue8m0
+
+    # Only UE8M0 devices (SM100) pack the B scales; SM90/SM120 keep FP32 blocks.
+    if not deep_gemm_requires_ue8m0():
+        pytest.skip("this device's DeepGEMM reads FP32 block scales")
 
     torch.manual_seed(0)
     experts, hidden, ispp = 3, 512, 256

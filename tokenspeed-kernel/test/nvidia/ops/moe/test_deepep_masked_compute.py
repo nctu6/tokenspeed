@@ -37,6 +37,17 @@ if not torch.cuda.is_available() or not current_platform().is_hopper_plus:
     pytest.skip("NVIDIA Hopper or newer required", allow_module_level=True)
 
 import deep_gemm  # noqa: E402
+from tokenspeed_kernel.ops.moe._deep_gemm.ue8m0 import (  # noqa: E402
+    deep_gemm_requires_ue8m0,
+)
+
+# These bodies build the UE8M0 pipeline (packed int32 activation and weight
+# scales, per-row recipe) that production runs where DeepGEMM reads UE8M0
+# (SM100). SM90/SM120 run the FP32 block-scale pipeline instead.
+requires_ue8m0_contract = pytest.mark.skipif(
+    not deep_gemm_requires_ue8m0(),
+    reason="this device's DeepGEMM runs the FP32 block-scale DeepEP pipeline",
+)
 from deep_gemm.utils import (  # noqa: E402
     get_mn_major_tma_aligned_packed_ue8m0_tensor,
 )
@@ -174,6 +185,7 @@ def test_sparse_and_full_launch_mappings_match_exactly():
         assert torch.equal(sparse_scales[expert, :valid], full_scales[expert, :valid])
 
 
+@requires_ue8m0_contract
 def test_low_latency_expert_compute_matches_dequantized_reference(enable_pdl):
     torch.manual_seed(0)
     experts, capacity, hidden, ispp = 4, 128, 512, 256

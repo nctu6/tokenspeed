@@ -205,6 +205,12 @@ def test_l2norm_row_count():
 
 def test_mxfp4_mm_row_count():
     from tokenspeed_kernel.ops.gemm._triton import mxfp4 as gemm
+    from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.registry import KernelRegistry
+
+    spec = KernelRegistry.get().get_by_name("triton_mm_mxfp4")
+    if spec is None or not spec.capability.satisfied_by(current_platform()):
+        pytest.skip("the Triton MXFP4 mm is not offered on this GPU")
 
     n, k = 64, 256
     a = torch.randint(0, 256, (1500, k // 2), dtype=torch.uint8, device=DEVICE)

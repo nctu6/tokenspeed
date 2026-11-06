@@ -314,7 +314,14 @@ def test_mha_extend_with_kvcache(
     num_kv_heads: int,
     require,
 ) -> None:
-    require("attention", "mha_extend_with_kvcache", solution, dtype, "q")
+    require(
+        "attention",
+        "mha_extend_with_kvcache",
+        solution,
+        dtype,
+        "q",
+        traits={"head_dim": head_dim},
+    )
 
     batch_size = 4
     page_size = 64

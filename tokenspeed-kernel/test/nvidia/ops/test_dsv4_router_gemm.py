@@ -26,10 +26,20 @@ from tokenspeed_kernel import compile_monitor
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
 from tokenspeed_kernel.ops.gemm.cute_dsl import ll_bf16_router_supported
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_router
 
 if not (torch.cuda.is_available() and current_platform().is_nvidia):
     pytest.skip("requires NVIDIA GPU", allow_module_level=True)
+
+# The CUDA router leaf serves the SM90-SM10x window; elsewhere (e.g. SM120)
+# inputs the CuTe router cannot take fall back to torch.mm instead.
+_CUDA_ROUTER = KernelRegistry.get().get_by_name("cuda_dsv3_dsv4_linear_fp32")
+requires_cuda_router = pytest.mark.skipif(
+    _CUDA_ROUTER is None
+    or not _CUDA_ROUTER.capability.satisfied_by(current_platform()),
+    reason="the CUDA router leaf is not offered on this GPU",
+)
 
 
 @pytest.mark.parametrize(
@@ -74,6 +84,7 @@ def test_shared_router_accuracy_and_graph(tokens, hidden, experts, pdl):
         pdl_enabled(original_pdl)
 
 
+@requires_cuda_router
 @pytest.mark.parametrize(
     "tokens,weight_dtype", [(33, torch.bfloat16), (8, torch.float32)]
 )
@@ -87,6 +98,7 @@ def test_unsupported_inputs_keep_cuda_dispatch(tokens, weight_dtype):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@requires_cuda_router
 def test_missing_cute_dependency_keeps_cuda_fallback(monkeypatch):
     x = torch.randn(16, 5120, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(384, 5120, device="cuda", dtype=torch.bfloat16)
@@ -98,6 +110,7 @@ def test_missing_cute_dependency_keeps_cuda_fallback(monkeypatch):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@requires_cuda_router
 def test_serving_fallback_preserves_captured_router(monkeypatch):
     if torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("requires SM90 or newer")

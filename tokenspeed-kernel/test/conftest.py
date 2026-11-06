@@ -23,6 +23,7 @@ from __future__ import annotations
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -45,15 +46,23 @@ from utils import make_sample_specs
 
 
 @pytest.fixture
-def require() -> Callable[[str, str, str, torch.dtype, str], None]:
+def require() -> Callable[..., None]:
     def _require(
         family: str,
         mode: str,
         solution: str,
         dtype: torch.dtype,
         dtype_role: str,
+        *,
+        traits: dict[str, Any] | None = None,
     ) -> None:
+        """Skip unless ``solution`` serves the operator here.
+
+        ``traits`` (e.g. ``{"head_dim": 64}``) also requires the leaf's declared
+        traits to admit the case; ``None`` checks the format only.
+        """
         from tokenspeed_kernel.platform import current_platform
+        from tokenspeed_kernel.selection import spec_matches_traits
 
         specs = [
             spec
@@ -64,6 +73,7 @@ def require() -> Callable[[str, str, str, torch.dtype, str], None]:
                 solution=solution,
             )
             if spec.format_signatures_for_storage_dtype(dtype, dtype_role)
+            and (traits is None or spec_matches_traits(spec, traits))
         ]
         if not specs:
             pytest.skip(f"{family}.{mode} solution {solution!r} is not registered")
