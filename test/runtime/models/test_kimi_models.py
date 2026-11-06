@@ -26,13 +26,12 @@ import os
 import subprocess
 import sys
 import time
+from test.runtime.launch_guard import launch_skip_reason
 
 import pytest
 import requests
 
 from tokenspeed.runtime.utils.process import kill_process_tree
-
-from test.runtime.launch_guard import launch_skip_reason
 
 MODEL = os.environ.get("KIMI_K25_MODEL", "nvidia/Kimi-K2.5-NVFP4")
 QUANTIZATION = os.environ.get("KIMI_K25_QUANTIZATION", "nvfp4")
@@ -258,11 +257,12 @@ MESH_CASES = {
 
 class TestKimiK25:
 
+    # A plain (non-unittest) class: pytest runs setup_class, never setUpClass.
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         reason = launch_skip_reason(MODEL, min_gpus=WORLD_SIZE)
         if reason is not None:
-            raise unittest.SkipTest(reason)
+            pytest.skip(reason)
 
     def _require_draft(self, draft: str):
         reason = launch_skip_reason(draft, min_gpus=WORLD_SIZE)

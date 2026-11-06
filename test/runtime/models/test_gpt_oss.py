@@ -19,13 +19,12 @@ import os
 import subprocess
 import sys
 import time
+from test.runtime.launch_guard import launch_skip_reason
 
 import pytest
 import requests
 
 from tokenspeed.runtime.utils.process import kill_process_tree
-
-from test.runtime.launch_guard import launch_skip_reason
 
 MODEL = os.environ.get("GPT_OSS_MODEL", "openai/gpt-oss-120b")
 WORLD_SIZE = int(os.environ.get("GPT_OSS_WORLD_SIZE", "4"))
@@ -197,11 +196,12 @@ MESH_CASES = {
 
 class TestGptOss:
 
+    # A plain (non-unittest) class: pytest runs setup_class, never setUpClass.
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         reason = launch_skip_reason(MODEL, min_gpus=WORLD_SIZE)
         if reason is not None:
-            raise unittest.SkipTest(reason)
+            pytest.skip(reason)
 
     def _run_quality_checks(self, case: MeshCase):
         port = _next_server_port()
