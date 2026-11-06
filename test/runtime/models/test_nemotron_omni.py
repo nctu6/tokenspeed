@@ -230,7 +230,7 @@ def test_radio_video_pairs_frames_and_repeats_an_odd_last_frame():
     _assert_close_bf16(out, torch.cat(refs))
 
 
-def test_radio_video_runs_tubelets_in_bounded_passes_bit_for_bit():
+def test_radio_video_runs_tubelets_in_bounded_passes_like_one_pass():
     model = _radio(final_norm=False)
     # Three 4x6 tubelets: passes of two, then one.
     frames, rows, cols = 5, 4, 6
@@ -239,7 +239,10 @@ def test_radio_video_runs_tubelets_in_bounded_passes_bit_for_bit():
         passes = model.embed_video(patches, frames, rows, cols)
         model.video_patches_per_pass = frames * rows * cols
         whole = model.embed_video(patches, frames, rows, cols)
-    assert torch.equal(passes, whole)
+    # Pass size changes the GEMM row count, and cuBLAS picks a different kernel
+    # (so a different bf16 rounding) per row count on some GPUs such as SM120.
+    # Bounding the pass must still not change the result beyond that rounding.
+    _assert_close_bf16(passes, whole.float())
 
 
 SOUND_CONFIG = {
