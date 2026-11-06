@@ -95,6 +95,11 @@ SM120 kernels (`deep_gemm.get_supported_arch_majors()` contains 12):
   repacked per call. Both leaves are `SPECIALIZED` priority, so `auto` selects
   them on SM120.
 
+`deepgemm_sm120_mxfp4_swiglu_linear` (op `mxfp4_swiglu_linear`) serves gated MLPs
+whose gate_up projection stacks the gate rows over the up rows: the same linear,
+then `silu_and_mul` over its BF16 output. Both linear leaves declare `n_align=64`
+and `k_align=128`, so selection rejects shapes the GEMM cannot tile.
+
 The `mm` leaf takes raw `uint8` scales `[MN, K/32]` and packs them per call with
 `pack_ue8m0_scales`; callers that reuse a weight should prefer `mxfp4_linear`.
 Packed operands are tagged `int8` (`kPackedFP4`) when passed to DeepGEMM.
