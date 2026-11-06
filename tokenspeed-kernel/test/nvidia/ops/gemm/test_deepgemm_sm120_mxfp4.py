@@ -80,7 +80,8 @@ def test_packed_scale_quantizer_does_not_recompile_across_batch_sizes() -> None:
     for m in (1, 17):  # warm both integer-specialization classes of M
         mxfp4_quantize_mn_major_scales(_random_activations(m, k, torch.bfloat16))
     with assert_no_triton_compile(_mxfp4_quantize_mn_major_kernel):
-        for m in (1, 2, 7, 16, 33, 96, 257, 1000):
+        # Small grids launch with PDL, large ones as a plain kernel.
+        for m in (1, 2, 7, 16, 33, 96, 257, 1000, 4096, 5000):
             mxfp4_quantize_mn_major_scales(_random_activations(m, k, torch.bfloat16))
 
 

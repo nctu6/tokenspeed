@@ -1170,6 +1170,7 @@ def _mxfp4_quantize_mn_major_kernel(
     x_row_stride,
     out_row_stride,
     BLOCK_M: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -1177,6 +1178,12 @@ def _mxfp4_quantize_mn_major_kernel(
     m_mask = offs_m < M
     offs_g = tl.arange(0, 4)
     offs_e = tl.arange(0, 32)
+    # Wait for the producer of x, then let the GEMM that consumes the output
+    # launch and prefetch its weights while we run. It waits for our completion
+    # before reading the activations and scales.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     offs_k = pid_k * 128 + offs_g[:, None] * 32 + offs_e[None, :]
     x = tl.load(
         x_ptr + offs_m[:, None, None] * x_row_stride + offs_k[None, :, :],
@@ -1194,6 +1201,36 @@ def _mxfp4_quantize_mn_major_kernel(
     # laid out MN-major with ``aligned_m`` words per K block.
     sf_offs = (pid_k * aligned_m + offs_m[:, None]) * 4 + offs_g[None, :]
     tl.store(sf_ptr + sf_offs, scale_byte, mask=m_mask[:, None])
+
+
+# Largest quantizer grid launched with PDL. A bigger grid runs as a plain kernel:
+# its blocks, launched while the previous GEMM is finishing, wait on that GEMM
+# and take SMs from it (up to 18% slower at M = 4096, K = 7168). Measured on RTX
+# PRO 6000 (188 SMs) with the SM120 MXFP4 GEMM as the consumer.
+_MXFP4_QUANT_PDL_MAX_BLOCKS = 1024
+
+# (dtype, device index) pairs whose PDL and plain variants are both compiled.
+_mn_major_variants_compiled: set[tuple[torch.dtype, int]] = set()
+
+
+def _launch_mn_major_quantize(
+    x: torch.Tensor, out: torch.Tensor, sf: torch.Tensor, pdl: bool
+) -> None:
+    m, k = x.shape
+    block_m = 8
+    _mxfp4_quantize_mn_major_kernel[(triton.cdiv(m, block_m), k // 128)](
+        x,
+        out,
+        sf.view(torch.uint8),
+        m,
+        sf.shape[1],
+        x.stride(0),
+        out.stride(0),
+        BLOCK_M=block_m,
+        ENABLE_PDL=pdl,
+        num_warps=4,
+        **({"launch_pdl": True} if pdl else {}),
+    )
 
 
 def mxfp4_quantize_mn_major_scales(
@@ -1221,18 +1258,21 @@ def mxfp4_quantize_mn_major_scales(
     out = torch.empty((m, k // 2), dtype=torch.uint8, device=x.device)
     # Rows beyond M in the alignment padding are never read into the output.
     sf = torch.empty((k // 128, aligned_m), dtype=torch.int32, device=x.device)
-    block_m = 8
-    _mxfp4_quantize_mn_major_kernel[(triton.cdiv(m, block_m), k // 128)](
-        x,
-        out,
-        sf.view(torch.uint8),
-        m,
-        aligned_m,
-        x.stride(0),
-        out.stride(0),
-        BLOCK_M=block_m,
-        num_warps=4,
+    use_pdl = pdl_enabled() and triton.cdiv(m, 8) * (k // 128) <= (
+        _MXFP4_QUANT_PDL_MAX_BLOCKS
     )
+    if pdl_enabled():
+        # The PDL and plain launches are separate binaries; compile both on the
+        # first call so a later batch size never compiles one mid-serving.
+        key = (x.dtype, x.device.index)
+        if key not in _mn_major_variants_compiled:
+            _mn_major_variants_compiled.add(key)
+            probe = x[:1, :128].contiguous()
+            probe_out = torch.empty((1, 64), dtype=torch.uint8, device=x.device)
+            probe_sf = torch.empty((1, 4), dtype=torch.int32, device=x.device)
+            for pdl in (True, False):
+                _launch_mn_major_quantize(probe, probe_out, probe_sf, pdl)
+    _launch_mn_major_quantize(x, out, sf, use_pdl)
     return out, sf.T[:m]
 
 
