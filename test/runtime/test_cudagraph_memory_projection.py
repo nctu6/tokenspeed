@@ -580,6 +580,65 @@ def test_the_boot_step_measures_releases_rebuilds_then_publishes() -> None:
     ]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="allocates a CUDA arena")
+def test_releasing_the_cache_pool_returns_the_probe_arena_bytes() -> None:
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+    from tokenspeed.runtime.layers.attention.kv_cache.factory import (
+        create_cache_arena,
+        create_cache_pool,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+        prepare_cache_setup,
+    )
+
+    layers = 2
+    spec = MHAConfig(
+        backend_name="mha",
+        num_attention_heads=8,
+        num_kv_heads=8,
+        head_dim=128,
+        attn_tp_size=1,
+    )
+    config = AttnConfig(
+        device="cuda",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        prefix_granularity=16,
+        context_len=4096,
+        max_bs=8,
+        components=(spec,),
+    )
+    setup = prepare_cache_setup(
+        family="mha",
+        server_args=SimpleNamespace(max_total_tokens=4096, kv_offload_config=None),
+        model_config=SimpleNamespace(num_attention_layers=layers),
+        attn_config=config,
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=config.cache_cell_size() * layers * 4096,
+        probe_batch_rows=None,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+    arena = create_cache_arena(setup.spec, device="cuda", enable_memory_saver=False)
+    pool = create_cache_pool(setup.spec, config, arena, num_layers=layers, rank=0)
+    torch.cuda.synchronize()
+    held = torch.cuda.memory_allocated()
+    arena_bytes = arena.buffer.untyped_storage().nbytes()
+    assert arena_bytes > 0
+
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.token_to_kv_pool = pool
+    ModelExecutor.release_cache_pool(executor)
+
+    # The rebuild that follows is sized from a profile without this arena, so
+    # its bytes must be back with the allocator even while views remain.
+    assert arena.buffer.untyped_storage().nbytes() == 0
+    assert torch.cuda.memory_allocated() <= held - arena_bytes
+
+
 @pytest.mark.parametrize(
     "profiled, reserve, expected",
     [

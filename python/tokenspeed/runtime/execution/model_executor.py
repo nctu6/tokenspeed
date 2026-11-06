@@ -889,6 +889,16 @@ class ModelExecutor:
         workspace_pool(self.device).unfreeze()
         gc.collect()
 
+    def release_cache_pool(self) -> None:
+        """Free the bound cache arena ahead of a rebind, after release_graphs.
+
+        The replacement arena is sized from a memory profile taken before this
+        one was allocated, so this one has to go first. The draft pool views
+        the same arena, so this releases it too.
+        """
+        self.token_to_kv_pool.arena.release()
+        torch.cuda.empty_cache()
+
     def set_cache_pool(
         self,
         token_to_kv_pool: CachePool,
