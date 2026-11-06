@@ -22,6 +22,7 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from test.runtime.models.inkling_fixtures import inkling_attention_backend
 from test.runtime.test_inkling_reference_parity import (
     _build_replica,
     _has_blackwell,
@@ -194,7 +195,7 @@ class _Harness:
         self.text = text
         self.device = device
         spec = MHAConfig(
-            backend_name="fa4",
+            backend_name=inkling_attention_backend(),
             num_attention_heads=text.num_attention_heads,
             num_kv_heads=text.num_key_value_heads,
             head_dim=text.head_dim,

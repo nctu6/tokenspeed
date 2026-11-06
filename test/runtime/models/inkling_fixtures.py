@@ -27,6 +27,14 @@ def has_blackwell() -> bool:
     return torch.cuda.get_device_capability()[0] >= 10
 
 
+def inkling_attention_backend() -> str:
+    """The MHA backend the Inkling tests run: FA4 where its relative-position
+    kernels exist (SM100 family), else the portable Triton ones (SM120)."""
+    import torch
+
+    return "fa4" if torch.cuda.get_device_capability()[0] == 10 else "triton"
+
+
 def truncate_text_config(text, num_layers: int = NUM_TEST_LAYERS):
     """Truncate a loaded Inkling text config to its first ``num_layers`` layers.
 

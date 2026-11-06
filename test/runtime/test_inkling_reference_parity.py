@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from test.runtime.models.inkling_fixtures import (  # noqa: E402
     INKLING_BF16,
     NUM_TEST_EXPERTS,
+    inkling_attention_backend,
     load_inkling_config,
     truncation_hf_overrides,
 )
@@ -219,7 +220,7 @@ class TestInklingReferenceParity:
             model=INKLING_BF16,
             hf_overrides=truncation_hf_overrides(),
             load_format="dummy",
-            attention_backend="fa4",
+            attention_backend=inkling_attention_backend(),
             enable_prefix_caching=False,
             disable_kvstore=True,
             enforce_eager=True,
