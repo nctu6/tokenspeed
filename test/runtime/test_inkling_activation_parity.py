@@ -1,7 +1,8 @@
 """Inkling per-layer ACTIVATION parity: real kernel stack vs torch reference.
 
-Runs the Inkling model in-process through the real backends (FA4 score_mod
-attention over the paged KV cache, ops/conv sconv kernels, Triton
+Runs the Inkling model in-process through the real backends (relative-
+position MHA over the paged KV cache: FA4 score_mod on SM100, Triton
+elsewhere; ops/conv sconv kernels, Triton
 silu_and_mul) with hand-built forward metadata, and compares the hidden
 states after EVERY decoder layer — prefill and rolling decode steps —
 against the independent pure-torch reference on identical dummy weights.
@@ -11,7 +12,8 @@ divergence to the exact layer and phase where it first appears, and leaves
 no room for compensating errors.
 
 Runs on the released config (layer-truncated, experts shrunk; see
-``inkling_fixtures``) with dummy weights. Requires Blackwell (FA4).
+``inkling_fixtures``) with dummy weights. Requires Blackwell (SM100 or
+SM120).
 """
 
 import gc
@@ -432,7 +434,7 @@ class _Harness:
 
 
 @pytest.mark.skipif(
-    not (_has_blackwell()), reason=("Inkling parity needs a Blackwell GPU (FA4)")
+    not (_has_blackwell()), reason=("Inkling parity needs a Blackwell GPU")
 )
 class TestInklingActivationParity:
     @classmethod

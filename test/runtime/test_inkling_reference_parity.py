@@ -17,7 +17,8 @@ masking, scale 1/head_dim, gate/shared-sink MoE, dense MLP, muP divide, and
 the padded-vocab mask.
 
 Runs on the released config (layer-truncated, experts shrunk; see
-``inkling_fixtures``) with dummy weights. Requires Blackwell (FA4).
+``inkling_fixtures``) with dummy weights. Requires Blackwell (SM100 or
+SM120; see ``inkling_attention_backend``).
 """
 
 import os
@@ -195,7 +196,7 @@ def _reference_forward(model, text, input_ids: list[int]) -> torch.Tensor:
 
 
 @pytest.mark.skipif(
-    not (_has_blackwell()), reason=("Inkling parity needs a Blackwell GPU (FA4)")
+    not (_has_blackwell()), reason=("Inkling parity needs a Blackwell GPU")
 )
 class TestInklingReferenceParity:
     @classmethod

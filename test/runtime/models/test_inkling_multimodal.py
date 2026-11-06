@@ -13,7 +13,7 @@ exercise exactly that engine surface:
   MultimodalInputs(...))`` through ``engine.llm.generate`` — the same
   low-level API the SMG gRPC servicer uses (``_build_generate_req``).
 
-The e2e needs a Blackwell GPU (FA4); unit tests need any CUDA GPU (runtime
+The e2e needs a Blackwell GPU (see ``inkling_attention_backend``); unit tests need any CUDA GPU (runtime
 RMSNorm kernels are GPU-only).
 
 Run:
@@ -335,7 +335,7 @@ class TestInklingHMLPPatchEncoder:
 
 
 @pytest.mark.skipif(
-    not (_has_blackwell()), reason=("Inkling e2e needs a Blackwell GPU (FA4)")
+    not (_has_blackwell()), reason=("Inkling e2e needs a Blackwell GPU")
 )
 class TestInklingMultimodalE2E:
     """Engine-only e2e with synthetic features (no gateway).
