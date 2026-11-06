@@ -217,8 +217,10 @@ from one first bound to that pool:
   graphs record the buffers a publish drops, and eager kernels cache
   pointers they allocated inside a capture, such as FlashInfer's trtllm-gen
   MoE runner and Qwen4-Exp's uniform index bundles), unfreezes the device-
-  global workspace pool the executor froze before capturing, rebinds the
-  trees, re-runs `bind_cache_groups` and the initialization sequence above,
+  global workspace pool the executor froze before capturing, frees the probe
+  arena (`release_cache_pool`: the serving arena is sized from a memory
+  profile taken before the probe arena existed, so both cannot be resident
+  at once), rebinds the trees, re-runs `bind_cache_groups` and the initialization sequence above,
   freezes the workspace again and captures again.
 * The KV budget reserves what the graphs will cost: a probe binds the
   smallest arena the family can run on (refused, with the numbers, when the
