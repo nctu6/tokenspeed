@@ -1102,8 +1102,11 @@ def test_input_logprobs_are_gathered_from_prefill_rows_of_a_mixed_batch():
 
     # Two prompt chunks (2 + 1 rows) then the three sampled rows.
     assert seen == [2, 1, 3]
-    logits = hidden @ weight.T
-    expected = torch.log_softmax(logits[:3].float(), dim=-1)[
+    # The reference runs the same per-chunk GEMMs: under TF32 (cuBLAS reads
+    # NVIDIA_TF32_OVERRIDE, which Engine exports) a 2-row and a 6-row product
+    # round differently, so only the row selection is exact, not the row count.
+    logits = torch.cat((hidden[0:2] @ weight.T, hidden[2:3] @ weight.T))
+    expected = torch.log_softmax(logits.float(), dim=-1)[
         torch.arange(3, device=device), torch.tensor([1, 2, 3], device=device)
     ]
     torch.testing.assert_close(out.input_token_logprobs, expected, rtol=0, atol=0)
