@@ -137,6 +137,9 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         def release_graphs(self):
             events.append(("release", self.generation))
 
+        def release_cache_pool(self):
+            events.append(("release pool", self.generation))
+
         def set_cache_pool(self, target, draft):
             self.generation += 1
             events.append(("rebind", self.generation, target, draft))
@@ -225,6 +228,9 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         probe_index = events.index(("capture", 0, 5))
         rebind_index = events.index(("rebind", 1, "target2", "draft2"))
         assert probe_index < rebind_index
+        # The probe arena is freed after its graphs and before the rebuild.
+        release_pool_index = events.index(("release pool", 0))
+        assert events.index(("release", 0)) < release_pool_index < rebind_index
         if has_draft and not prefill_only:
             assert events.index(("warmup", 0, (1,), False)) < probe_index
         if expected_rewarm:
