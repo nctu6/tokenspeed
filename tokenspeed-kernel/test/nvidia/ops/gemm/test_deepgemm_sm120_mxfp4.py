@@ -24,7 +24,11 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.gemm import mxfp4_linear, prepare_mxfp4_linear
+from tokenspeed_kernel.ops.gemm import (
+    mxfp4_linear,
+    mxfp4_swiglu_linear,
+    prepare_mxfp4_linear,
+)
 from tokenspeed_kernel.ops.quantization.triton import (
     _mxfp4_quantize_mn_major_kernel,
     mxfp4_quantize,
@@ -120,3 +124,42 @@ def test_deepgemm_mxfp4_linear_matches_dequantized_reference(
         _dequantize(x_packed, x_scale, k) @ _dequantize(weight, weight_scale, k).T
     )
     torch.testing.assert_close(out.float(), reference, rtol=2e-2, atol=2e-2)
+
+
+@requires_sm120_deepgemm
+@pytest.mark.parametrize(("m", "n", "k"), [(1, 1024, 7168), (64, 512, 2048)])
+def test_deepgemm_mxfp4_swiglu_linear_matches_dequantized_reference(
+    m: int, n: int, k: int
+) -> None:
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight, weight_scale = mxfp4_quantize(
+        torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    )
+    prepared = prepare_mxfp4_linear(
+        weight, weight_scale, swiglu=True, solution="deepgemm"
+    )
+
+    out = mxfp4_swiglu_linear(x, prepared)
+
+    x_packed, x_scale = mxfp4_quantize(x)
+    gate_up = (
+        _dequantize(x_packed, x_scale, k) @ _dequantize(weight, weight_scale, k).T
+    ).to(torch.bfloat16)
+    gate, up = gate_up.float().chunk(2, dim=1)
+    assert out.shape == (m, n // 2)
+    torch.testing.assert_close(
+        out.float(), torch.nn.functional.silu(gate) * up, rtol=2e-2, atol=2e-2
+    )
+
+
+@requires_sm120_deepgemm
+@pytest.mark.parametrize(("n", "k"), [(4096, 64), (4096, 192), (96, 512)])
+def test_deepgemm_mxfp4_linear_is_not_selected_for_unsupported_shapes(
+    n: int, k: int
+) -> None:
+    weight, weight_scale = mxfp4_quantize(
+        torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    )
+    with pytest.raises(Exception, match="(?i)no .*kernel|not found|matching"):
+        prepare_mxfp4_linear(weight, weight_scale, swiglu=False, solution="deepgemm")

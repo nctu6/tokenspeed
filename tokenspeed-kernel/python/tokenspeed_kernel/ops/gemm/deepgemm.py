@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.activation import silu_and_mul
 from tokenspeed_kernel.ops.quantization.triton import mxfp4_quantize_mn_major_scales
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -390,6 +391,13 @@ if current_platform().is_hopper_plus and deepgemm_supports_sm120():
         weight=tensor_format("mxfp4", torch.uint8, scale=_MXFP4_LINEAR_SCALE),
     )
 
+    # The GEMM tiles N by 64 and K by 128.
+    _MXFP4_LINEAR_TRAITS = {
+        "weight_layout": frozenset({MXFP4_LINEAR_DEEPGEMM_SM120_LAYOUT}),
+        "n_align": frozenset({64}),
+        "k_align": frozenset({128}),
+    }
+
     @register_kernel(
         "gemm",
         "mxfp4_linear",
@@ -401,7 +409,7 @@ if current_platform().is_hopper_plus and deepgemm_supports_sm120():
             max_arch_version=ArchVersion(SM120_ARCH_MAJOR, 9),
         ),
         signatures=frozenset({_MXFP4_LINEAR_SIGNATURE}),
-        traits={"weight_layout": frozenset({MXFP4_LINEAR_DEEPGEMM_SM120_LAYOUT})},
+        traits=_MXFP4_LINEAR_TRAITS,
         priority=Priority.SPECIALIZED,
     )
     def deepgemm_sm120_mxfp4_linear(
@@ -413,3 +421,32 @@ if current_platform().is_hopper_plus and deepgemm_supports_sm120():
     ) -> torch.Tensor:
         """``mxfp4(x) @ W.T`` on SM120: quantize x to MXFP4, then the GEMM."""
         return _run_deepgemm_mxfp4_linear(x, weight, weight_scale, out)
+
+    @register_kernel(
+        "gemm",
+        "mxfp4_swiglu_linear",
+        name="deepgemm_sm120_mxfp4_swiglu_linear",
+        solution="deepgemm",
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(SM120_ARCH_MAJOR, 0),
+            max_arch_version=ArchVersion(SM120_ARCH_MAJOR, 9),
+        ),
+        signatures=frozenset({_MXFP4_LINEAR_SIGNATURE}),
+        traits=_MXFP4_LINEAR_TRAITS,
+        priority=Priority.SPECIALIZED,
+    )
+    def deepgemm_sm120_mxfp4_swiglu_linear(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``silu(gate) * up`` of ``mxfp4(x) @ W.T`` with stacked [gate; up] rows."""
+        gate_up = _run_deepgemm_mxfp4_linear(x, weight, weight_scale, None)
+        if out is None:
+            out = torch.empty(
+                (x.shape[0], weight.shape[0] // 2), dtype=x.dtype, device=x.device
+            )
+        return silu_and_mul(gate_up, out)
