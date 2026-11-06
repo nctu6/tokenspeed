@@ -184,7 +184,9 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     monkeypatch.setattr(
         device,
         "current_platform",
-        lambda: SimpleNamespace(is_nvidia=False, restore_stack_limit=nullcontext),
+        lambda: SimpleNamespace(
+            is_nvidia=False, is_cdna4=False, restore_stack_limit=nullcontext
+        ),
     )
     monkeypatch.setattr(
         scheduler_utils,
@@ -542,7 +544,9 @@ def test_forward_profile_range_preserves_real_batch_metadata_and_result(mode):
         assert metadata["input_lengths"] == [1]
     else:
         assert metadata["request_ids"] == ["new-\\request", 'old-"雪']
-        assert metadata["input_lengths"] == [7, 1]
+        # A long prefill beside a decode is capped at half the reference chunk
+        # (budget 8 -> 4), not the 7 tokens the budget leaves.
+        assert metadata["input_lengths"] == [4, 1]
     inner = next(event for event in profiler.events() if event.name == "cpu_model_work")
     assert inner.thread == ranges[0].thread
     assert inner.time_range.start >= ranges[0].time_range.start

@@ -332,7 +332,7 @@ def _create_config_pool(config):
 
     setup = prepare_cache_setup(
         family="mha",
-        server_args=SimpleNamespace(max_total_tokens=512),
+        server_args=SimpleNamespace(max_total_tokens=512, kv_offload_config=None),
         model_config=SimpleNamespace(num_attention_layers=LAYERS),
         attn_config=config,
         draft_model_config=None,

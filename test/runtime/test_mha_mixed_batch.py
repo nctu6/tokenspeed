@@ -107,7 +107,7 @@ def _init(backend, *, lengths, queries, prefixes, mode, tables=None):
 @pytest.mark.parametrize("width,block_draft", [(1, False), (16, False), (16, True)])
 @pytest.mark.parametrize("queries,prefixes", [([1], [0]), ([63, 65], [0, 512])])
 @pytest.mark.parametrize("decodes", [1, 2, 4, 8])
-def test_mixed_metadata_covers_every_query_and_preserves_request_order(
+def test_mixed_metadata_splits_the_extend_prefix_from_the_decode_suffix(
     width, block_draft, queries, prefixes, decodes
 ):
     backend = _backend(width=width, is_draft=block_draft, block_decode=block_draft)
@@ -119,22 +119,27 @@ def test_mixed_metadata_covers_every_query_and_preserves_request_order(
         prefixes=prefixes,
         mode=ForwardMode.MIXED,
     )
-    expected_queries = queries + [width] * decodes
+    num_extends = len(queries)
     expected_cu = [0]
     expected_kv_cu = [0]
-    for q, length in zip(expected_queries, lengths):
+    for q, length in zip(queries, lengths):
         expected_cu.append(expected_cu[-1] + q)
         expected_kv_cu.append(expected_kv_cu[-1] + length)
-    assert metadata.extend_seq_lens.tolist() == expected_queries
-    assert metadata.extend_seq_lens_cpu == expected_queries
+    # The extend metadata covers the leading prefill requests only; the decode
+    # requests that follow keep their own paged view, one query row each.
+    assert metadata.extend_seq_lens.tolist() == queries
+    assert metadata.extend_seq_lens_cpu == queries
     assert metadata.cu_extend_seq_lens.tolist() == expected_cu
     assert metadata.cu_extend_seq_lens_cpu == expected_cu
     assert metadata.cu_seqlens_kv.tolist() == expected_kv_cu
-    assert metadata.extend_prefix_lens.tolist() == prefixes + [513] * decodes
-    assert metadata.seq_lens.tolist() == lengths
-    assert metadata.max_extend_seq_len == max(expected_queries)
+    assert metadata.extend_prefix_lens.tolist() == prefixes
+    assert metadata.seq_lens.tolist() == lengths[:num_extends]
+    assert metadata.max_extend_seq_len == max(queries)
     assert metadata.is_mixed
-    assert metadata.page_table.shape[0] == len(lengths)
+    assert metadata.page_table.shape[0] == num_extends
+    decode = backend.mixed_decode_metadata
+    assert decode.seq_lens.tolist() == lengths[num_extends:]
+    assert decode.page_table.shape[0] == decodes
 
 
 def test_round_transitions_keep_decode_storage_and_old_extend_metadata_independent():
@@ -148,6 +153,7 @@ def test_round_transitions_keep_decode_storage_and_old_extend_metadata_independe
         prefixes=[0],
         mode=ForwardMode.MIXED,
     )
+    assert backend.mixed_decode_metadata.seq_lens.tolist() == [529]
     backend.refresh_decode_metadata(
         2,
         2,
@@ -166,8 +172,10 @@ def test_round_transitions_keep_decode_storage_and_old_extend_metadata_independe
     assert second.cu_extend_seq_lens_cpu == [0, 1]
     assert second.extend_prefix_lens.tolist() == [65]
     assert not second.is_mixed
-    assert first.cu_extend_seq_lens_cpu == [0, 65, 81]
-    assert first.extend_prefix_lens.tolist() == [0, 513]
+    assert first.cu_extend_seq_lens_cpu == [0, 65]
+    assert first.extend_prefix_lens.tolist() == [0]
+    # A later extend round leaves no mixed decode view behind.
+    assert backend.mixed_decode_metadata is None
     assert backend.forward_decode_metadata.seq_lens.tolist() == [530, 66]
 
 
@@ -260,21 +268,23 @@ def test_router_refreshes_both_real_leaves_and_padded_writes_across_mixed_rounds
         )
         all_queries = queries + [width] * (bs - num_extends)
         cumulative_queries = [0]
-        for count in all_queries:
+        for count in queries:
             cumulative_queries.append(cumulative_queries[-1] + count)
         for gid, page_size in groups.items():
             metadata = leaves[gid].forward_extend_metadata
             assert metadata.is_mixed
-            assert metadata.seq_lens.tolist() == lengths
-            assert metadata.extend_seq_lens.tolist() == all_queries
-            assert metadata.extend_seq_lens_cpu == all_queries
+            decode = leaves[gid].mixed_decode_metadata
+            assert metadata.seq_lens.tolist() == lengths[:num_extends]
+            assert decode.seq_lens.tolist() == lengths[num_extends:]
+            assert metadata.extend_seq_lens.tolist() == queries
+            assert metadata.extend_seq_lens_cpu == queries
             assert metadata.cu_extend_seq_lens.tolist() == cumulative_queries
             assert metadata.cu_extend_seq_lens_cpu == cumulative_queries
-            assert metadata.extend_prefix_lens.tolist() == prefixes + [
-                length - width for length in lengths[num_extends:]
-            ]
+            assert metadata.extend_prefix_lens.tolist() == prefixes
             ratio = 16 // page_size
-            expected_tables = torch.zeros_like(metadata.page_table)
+            expected_tables = torch.zeros(
+                (bs, metadata.page_table.shape[1]), dtype=torch.int32
+            )
             for request, blocks in enumerate(tables[gid].tolist()):
                 expanded = [
                     block * ratio + offset
@@ -284,7 +294,8 @@ def test_router_refreshes_both_real_leaves_and_padded_writes_across_mixed_rounds
                 expected_tables[request, : len(expanded)] = torch.tensor(
                     expanded, dtype=torch.int32
                 )
-            assert torch.equal(metadata.page_table, expected_tables)
+            assert torch.equal(metadata.page_table, expected_tables[:num_extends])
+            assert torch.equal(decode.page_table, expected_tables[num_extends:])
             # Resolve directly from scheduler block IDs, independently of
             # kernel-page expansion. Both groups must preserve slot identity.
             expected_prefill, expected_decode = [], []
@@ -469,8 +480,9 @@ def test_block_draft_mixed_to_decode_refreshes_all_owners_and_reordered_slots(
             5 if gid == "draft_attention" else 6,
             1,
         )
-        assert leaf.forward_extend_metadata.extend_seq_lens.tolist() == [3, 16, 16]
-        assert leaf.forward_extend_metadata.extend_prefix_lens.tolist() == [16, 32, 64]
+        assert leaf.forward_extend_metadata.extend_seq_lens.tolist() == [3]
+        assert leaf.forward_extend_metadata.extend_prefix_lens.tolist() == [16]
+        assert leaf.mixed_decode_metadata.seq_lens.tolist() == [48, 80]
     target = runner.attn_backend
     for gid in target.group_ids:
         padded = target.padded_write_locations(layers[gid], ForwardMode.MIXED, 64)
@@ -661,16 +673,18 @@ def _cached_attention_cpu(
 
 
 @pytest.mark.parametrize("window", [-1, 2])
-@pytest.mark.parametrize("width", [1, 16])
 @pytest.mark.parametrize("heads", [(12, 2, 1), (48, 8, 8)])
 def test_mixed_forward_keeps_decode_history_and_drops_only_padding(
-    monkeypatch, window, width, heads
+    monkeypatch, window, heads
 ):
+    # A mixed round runs one query per decode request.
+    width = 1
     backend = _backend(width=width, heads=heads)
     # Some registry solutions can prefer fresh-prefill without cache. Mixed
     # decode rows must still consume their history even when prefills are fresh.
     monkeypatch.setattr(backend, "plan", lambda **kwargs: {"extend_mode": "postwrite"})
     monkeypatch.setattr(mha, "mha_extend_with_kvcache", _cached_attention_cpu)
+    monkeypatch.setattr(mha, "mha_decode_with_kvcache", _cached_decode_cpu)
     layer = PagedAttention(
         backend.tp_q_head_num,
         128,

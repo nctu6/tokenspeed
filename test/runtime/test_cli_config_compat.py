@@ -109,7 +109,7 @@ class TestCLIConfigCompat:
 
         assert server_args.model == expected
         assert server_args.tokenizer == expected
-        assert server_args.served_model_name == expected
+        assert server_args.served_model_name == [expected]
 
     def test_model_redirect_file_io_error(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TOKENSPEED_MODEL_REDIRECT_PATH", str(tmp_path))
@@ -1085,7 +1085,7 @@ class TestCLIConfigCompat:
         assert (sa.model) == ("deepseek-ai/DeepSeek-V3.1")
         assert (sa.attn_tp_size) == (8)
         assert sa.enable_expert_parallel
-        assert (sa.served_model_name) == ("ds31")
+        assert sa.served_model_name == ["ds31"]
 
     def test_data_parallel_size_arg(self):
         args = self._parse_args(["--model", "test/model", "--data-parallel-size", "2"])

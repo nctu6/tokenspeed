@@ -736,14 +736,13 @@ class TestGroupAwareWireTest:
         )
         return executor, device
 
-    def test_writeback_rides_the_write_stream_ordered_after_the_caller(self, subtests):
+    def test_writeback_rides_the_write_stream_ordered_after_the_caller(self):
         executor_module = self._executor_module()
         lanes_module = _lanes_module()
         executor, device = self._make_write_executor(executor_module)
         lane = executor._pinned_write_lane
         prerequisite_stream = object()
         finish = Mock()
-        metadata_done = Mock()
         # Every stream the executor touches is one the caller named; the
         # thread's current stream is never consulted.
         no_current_stream = patch.object(
@@ -758,7 +757,7 @@ class TestGroupAwareWireTest:
             patch.object(
                 lanes_module.device_module,
                 "Event",
-                side_effect=[metadata_done, finish],
+                side_effect=[finish],
             ),
             patch.object(lanes_module, "transfer_cache_blocks") as transfer,
         ):
@@ -802,53 +801,38 @@ class TestGroupAwareWireTest:
             layer_ready_flags=None,
         )
         finish.record.assert_called_once_with(executor.write_stream)
-        metadata_done.record.assert_called_once_with(executor.write_stream)
-        metadata_done.synchronize.assert_not_called()
-        assert (executor._ordered_write_lane.metadata_done) is None
 
-        # Refill must wait for metadata, but must never wait for payload ACK;
-        # the upload and its retirement event sit inside the write-stream
-        # context, the payload launch names the stream explicitly.
-        for ready in (False, True):
-            with subtests.test(metadata_ready=ready):
-                metadata_done.reset_mock()
-                metadata_done.query.return_value = ready
-                order = Mock()
-                order.attach_mock(metadata_done.synchronize, "retire")
-                order.attach_mock(lane.workspace.load_block_transfers, "refill")
-                order.attach_mock(lane.workspace.commit_block_transfers, "upload")
-                order.attach_mock(metadata_done.record, "record")
-                with (
-                    no_current_stream,
-                    patch.object(lanes_module.device_module, "stream") as stream_ctx,
-                    patch.object(
-                        lanes_module.device_module, "Event", return_value=finish
-                    ),
-                    patch.object(lanes_module, "transfer_cache_blocks") as transfer,
-                ):
-                    order.attach_mock(stream_ctx, "stream")
-                    order.attach_mock(transfer, "payload")
-                    executor._start_writing(
-                        [8],
-                        [(0, 6, 10)],
-                        backup_pages=[],
-                        lane=lane,
-                        prerequisite_stream=prerequisite_stream,
-                    )
-                names = [call[0] for call in order.mock_calls]
-                assert (names) == (
-                    ([] if ready else ["retire"])
-                    + [
-                        "refill",
-                        "stream",
-                        "stream().__enter__",
-                        "upload",
-                        "record",
-                        "stream().__exit__",
-                        "payload",
-                    ]
-                )
-                finish.synchronize.assert_not_called()
+        # A second submission refills the free slot's tables, uploads them on
+        # the write stream, and never waits for the previous payload's ACK;
+        # the payload launch names the stream explicitly.
+        order = Mock()
+        order.attach_mock(finish.synchronize, "retire")
+        order.attach_mock(lane.workspace.load_block_transfers, "refill")
+        order.attach_mock(lane.workspace.commit_block_transfers, "upload")
+        finish.query.return_value = True
+        with (
+            no_current_stream,
+            patch.object(lanes_module.device_module, "stream") as stream_ctx,
+            patch.object(lanes_module.device_module, "Event", return_value=finish),
+            patch.object(lanes_module, "transfer_cache_blocks") as transfer,
+        ):
+            order.attach_mock(stream_ctx, "stream")
+            order.attach_mock(transfer, "payload")
+            executor._start_writing(
+                [8],
+                [(0, 6, 10)],
+                backup_pages=[],
+                lane=lane,
+                prerequisite_stream=prerequisite_stream,
+            )
+        assert [call[0] for call in order.mock_calls] == [
+            "refill",
+            "stream",
+            "stream().__enter__",
+            "upload",
+            "stream().__exit__",
+            "payload",
+        ]
 
     def test_submit_write_backs_fences_only_stream_ordered_ops(self):
         executor_module = self._executor_module()
@@ -858,14 +842,7 @@ class TestGroupAwareWireTest:
         prerequisite = object()
         ordered_finish = Mock(name="ordered_finish")
         pinned_finish = Mock(name="pinned_finish")
-        events = iter(
-            [
-                Mock(name="ordered_meta"),
-                ordered_finish,
-                Mock(name="pinned_meta"),
-                pinned_finish,
-            ]
-        )
+        events = iter([ordered_finish, pinned_finish])
 
         class WriteBackOp:
             def __init__(self):
@@ -957,7 +934,7 @@ class TestGroupAwareWireTest:
         pinned_finish = Mock()
         ordered_finish.query.return_value = False
         pinned_finish.query.return_value = False
-        events = iter([Mock(), ordered_finish, Mock(), pinned_finish])
+        events = iter([ordered_finish, pinned_finish])
 
         class WriteBackOp:
             def __init__(self):

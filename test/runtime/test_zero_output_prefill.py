@@ -589,7 +589,10 @@ def test_idle_graph_grammar_enqueues_an_identity_completion(pending):
     idle(
         executor,
         SimpleNamespace(
-            global_num_tokens=[0, 1], global_batch_size=[0, 1], all_decode_or_idle=True
+            global_num_tokens=[0, 1],
+            global_batch_size=[0, 1],
+            global_num_decodes=[0, 1],
+            all_decode_or_idle=True,
         ),
     )
     assert step.called
@@ -685,6 +688,12 @@ def test_drafter_future_inputs_keep_original_request_rows():
         drafter=SimpleNamespace(
             prepare_target_forward=lambda ctx: None, run=lambda **kwargs: draft_tokens
         ),
+        # No KV offloading: both cache hooks are the base backend's no-ops.
+        attn_backend=SimpleNamespace(
+            prepare_cache_batch=lambda request_slots, *, num_extends, stream: None,
+            writeback_accepted_kv=lambda accept_lengths: None,
+        ),
+        device_module=SimpleNamespace(current_stream=lambda: None),
         config=SimpleNamespace(pp_size=1),
         nan_guard=NanGuard(4, "cpu"),
         runtime_states=SimpleNamespace(
@@ -758,10 +767,13 @@ def test_layout_and_decoder_metadata_agree_on_current_prefill_target(
     )
     backend = SimpleNamespace(
         device="cpu",
+        # No KV parallelism: a single rank plans every request.
+        kvp_size=1,
         spec_num_tokens=2,
         spec=SimpleNamespace(sliding_window_tokens=2, max_query_tokens=32),
         _swa_plans={},
         _prepared_selections={},
+        _local_decode_selections={},
         _decode_schedules={},
         _index_geometry={},
         sparse_topk={},

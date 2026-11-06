@@ -359,7 +359,12 @@ def loop_methods():
         for node in ast.parse(path.read_text()).body
         if isinstance(node, ast.ClassDef) and node.name == "EventLoop"
     )
-    names = {"event_loop", "_drain_in_flight", "_get_forward_op"}
+    names = {
+        "event_loop",
+        "_drain_in_flight",
+        "_get_forward_op",
+        "_should_commit_head",
+    }
     methods = [
         node
         for node in cls.body
@@ -468,6 +473,10 @@ def test_prefetch_convergence_precedes_the_rounds_cache_poll(
         _drain_in_flight=lambda pending: loop_methods["_drain_in_flight"](
             loop, pending
         ),
+        _commit_dispatched_extend_now=False,
+        _should_commit_head=lambda in_flight, depth, forward_op: loop_methods[
+            "_should_commit_head"
+        ](loop, in_flight, depth, forward_op),
         _epd_hooks=SimpleNamespace(
             drain_ready_embeddings=Mock(), assert_embeddings_received=Mock()
         ),

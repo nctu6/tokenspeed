@@ -506,6 +506,10 @@ def test_logits_gather_state_spans_the_vocab_of_a_transposed_quantized_head(
         return "ag-state"
 
     monkeypatch.setattr(logits_processor_module, "create_state", _create_state)
+    # The multicast probe reads the host's interconnect; this test is about sizing.
+    monkeypatch.setattr(
+        type(processor), "_tp_group_multicast_reachable", lambda self: True
+    )
     monkeypatch.setattr(
         logits_processor_module.pg_manager,
         "get_process_group",
