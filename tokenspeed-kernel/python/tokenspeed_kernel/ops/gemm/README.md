@@ -102,8 +102,12 @@ Packed operands are tagged `int8` (`kPackedFP4`) when passed to DeepGEMM.
 Measured on an RTX PRO 6000 as a whole `mxfp4_linear` (activation quantization
 included) against FlashInfer's best `mm_fp4` backend plus its own activation
 quantization, in a CUDA graph over weights larger than L2, across the
-DeepSeek-V3 TP8 dense linears at M = 1..4096: the leaf is faster on 52 of 63
-shapes, about 1.15x geomean. It loses by up to 13% at some decode shapes of the
-7168-wide projections (`o_proj`, `dense down`, M <= 128) and at `q_b` M = 256
-(0.83x). The raw GEMM alone leads by about 1.33x, so the gap is the activation
-quantization in front of it.
+DeepSeek-V3 TP8 dense linears at M = 1..4096: the leaf is faster on 60 of 63
+shapes, about 1.23x geomean. The three losses are `q_b` M = 256 (0.90x, the GEMM
+itself is slower there) and M = 1 of `o_proj` and `dense down` (0.97x).
+
+The activation quantizer runs as a PDL producer for the GEMM: it triggers the
+dependent launch right after its own wait, so the GEMM prefetches weights while
+it runs (the GEMM waits for the quantizer before reading activations). Grids
+above 1024 blocks launch as a plain kernel instead, because PDL-launched blocks
+that wait on the previous GEMM take its SMs (up to 18% slower at M = 4096).
