@@ -14,6 +14,7 @@ Runs on the released config (layer-truncated, experts shrunk; see
 ``inkling_fixtures``) with dummy weights. Requires Blackwell (FA4).
 """
 
+import gc
 import os
 import sys
 from types import SimpleNamespace
@@ -438,6 +439,14 @@ class TestInklingActivationParity:
     def setup_class(cls):
         os.environ["INKLING_TORCH_MOE"] = "1"  # experts as plain parameters
         cls.model, cls.text = _build_replica()
+
+    @classmethod
+    def teardown_class(cls):
+        # The replica's weights must not outlive the class: later tests in the
+        # same process size their engine's KV budget from the free GPU memory.
+        del cls.model
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def _compare(self, phase, got_states, ref_states, positions):
         report = []

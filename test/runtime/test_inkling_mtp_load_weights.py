@@ -16,6 +16,7 @@ Needs any CUDA GPU (weight copies only, no kernels); CI runs it on the
 Blackwell runners alongside the other Inkling suites.
 """
 
+import gc
 import os
 import sys
 
@@ -152,6 +153,14 @@ class TestInklingMTPLoadWeights:
         }
         cls.loaded = cls.model.load_weights(iter(cls.ckpt_with_noise.items()))
         cls.params = dict(cls.model.named_parameters())
+
+    @classmethod
+    def teardown_class(cls):
+        # Free the head's weights so later tests in the same process keep the
+        # GPU memory their engines size the KV budget from.
+        del cls.model, cls.params, cls.ckpt, cls.ckpt_with_noise
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def test_structure_full_attention_dense_mlp(self):
         from tokenspeed.runtime.models.inkling import InklingDenseMLP
@@ -304,6 +313,12 @@ class TestInklingMTPLoadWeightsSWADepths:
         cls.ckpt = _make_mtp_checkpoint(cls.text, cls.NUM_DEPTHS, cls.LOCAL_IDS)
         cls.loaded = cls.model.load_weights(iter(cls.ckpt.items()))
         cls.params = dict(cls.model.named_parameters())
+
+    @classmethod
+    def teardown_class(cls):
+        del cls.model, cls.params, cls.ckpt
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def test_structure_mixed_local_full(self):
         assert (len(self.model.model.layers)) == (self.NUM_DEPTHS)
