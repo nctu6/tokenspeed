@@ -97,8 +97,8 @@ def test_router_keeps_correction_bias_and_float32_logits():
     )
 
 
-from test_dots3_note_cache import dots_runtime
-from test_dots3_note_config import checkpoint
+from test.runtime.test_dots3_note_cache import dots_runtime
+from test.runtime.test_dots3_note_config import checkpoint
 
 
 @pytest.mark.parametrize("layer_id", [0, 2])
