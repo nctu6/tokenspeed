@@ -50,12 +50,18 @@ platform = current_platform()
 
 top_k = None
 TopKTieBreak = None
+can_implement_filtered_topk = None
 
 if platform.is_nvidia:
     try:
         from flashinfer import TopKTieBreak, top_k
+        from flashinfer.topk import can_implement_filtered_topk
     except ImportError:
         pass
+
+# FlashInfer's deterministic graph-safe top-k runs only on its FilteredTopK
+# kernel (k <= 2048, 128 KiB of shared memory); CUB has no deterministic mode.
+_FILTERED_TOPK_MAX_K = 2048
 
 if platform.is_nvidia and platform.is_hopper_plus:
     from flashinfer.decode import (
@@ -368,20 +374,36 @@ def has_deterministic_decode_topk() -> bool:
     return top_k is not None and TopKTieBreak is not None
 
 
+def _filtered_topk_runs(device: torch.device, topk: int) -> bool:
+    # flashinfer runs this same shared-memory query on every top_k call.
+    if can_implement_filtered_topk is None or topk > _FILTERED_TOPK_MAX_K:
+        return False
+    with torch.cuda.device(device.index):
+        return bool(can_implement_filtered_topk())
+
+
 def deterministic_decode_topk(
     logits: torch.Tensor,
     out: torch.Tensor,
     topk: int,
 ) -> None:
-    """Select per-row top-``topk`` local offsets deterministically via flashinfer.
+    """Select per-row top-``topk`` local offsets deterministically (lowest column wins ties).
 
     ``logits`` rows must already be pre-masked with ``-inf`` beyond each request's
-    valid length; the fallback uses a stable ``tie_break=SMALL`` plus
-    ``deterministic`` + ``dsa_graph_safe``. For the length-aware (ragged) path see
+    valid length. Uses flashinfer's ``tie_break=SMALL`` + ``deterministic`` +
+    ``dsa_graph_safe`` top-k where its FilteredTopK kernel runs, and a stable
+    descending sort elsewhere (SM120/SM121, or ``topk`` above its limit). For the
+    length-aware (ragged) path see
     :func:`tokenspeed_kernel.ops.attention.dsa.cuda.ragged_decode_topk`.
     """
     if top_k is None or TopKTieBreak is None:
         raise RuntimeError("flashinfer deterministic top_k is unavailable.")
+    if not _filtered_topk_runs(logits.device, int(topk)):
+        # SM120/SM121 lack the shared memory for FilteredTopK. A stable
+        # descending sort applies the same lowest-index tie-break, row-locally.
+        indices = torch.sort(logits, dim=-1, descending=True, stable=True).indices
+        out.copy_(indices[:, : int(topk)].to(torch.int32))
+        return
     _values, indices = top_k(
         logits.contiguous(),
         int(topk),
