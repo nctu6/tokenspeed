@@ -460,6 +460,19 @@ def _planned(*, num_extends, label=None):
     )
 
 
+def _profiler_activities():
+    """CPU activity, plus CUDA where it exists.
+
+    A profiler session that starts without CUDA activity leaves kineto without
+    CUPTI for the rest of the process, so every later session in it (the GDN
+    verify and PLE launch-count tests) records no kernels.
+    """
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    return activities
+
+
 def _profile_batch(mode):
     """Real immutable scheduler batches, including a resumed prefill chunk."""
     config = SchedulerConfig()
@@ -519,9 +532,7 @@ def test_forward_profile_range_preserves_real_batch_metadata_and_result(mode):
         )
     )
     planned = replace(_planned(num_extends=batch.num_extends()), forward_op=batch)
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU]
-    ) as profiler:
+    with torch.profiler.profile(activities=_profiler_activities()) as profiler:
         assert (
             handle._submit_forward(planned, capture_next_input_ids=True).result()
             is result
@@ -574,9 +585,7 @@ def test_profile_range_closes_and_propagates_original_forward_exception():
         )
     )
     planned = replace(_planned(num_extends=1), forward_op=batch)
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU]
-    ) as profiler:
+    with torch.profiler.profile(activities=_profiler_activities()) as profiler:
         pending = handle._submit_forward(planned)
         with pytest.raises(RuntimeError) as raised:
             pending.result()
