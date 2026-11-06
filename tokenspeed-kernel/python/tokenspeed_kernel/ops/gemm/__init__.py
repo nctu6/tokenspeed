@@ -707,6 +707,9 @@ def mm(
         # ``m`` counts rows only for a 2-D A; a kernel bounding m declares
         # a_ndim {2} so batched-row callers keep the general kernels.
         "a_ndim": A.ndim,
+        # Platform selection cannot see tensor placement; a device kernel
+        # declares is_cuda {True} so CPU operands keep the torch fallback.
+        "is_cuda": A.is_cuda,
         "a_scales_inner_stride_one": (A_scales is None or A_scales.stride(-1) == 1),
         "b_inner_stride_one": B.stride(-1) == 1,
         "b_scales_inner_stride_one": (B_scales is None or B_scales.stride(-1) == 1),
