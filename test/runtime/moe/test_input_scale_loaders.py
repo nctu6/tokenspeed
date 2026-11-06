@@ -44,3 +44,20 @@ def test_local_expert_scale_writes_only_that_expert() -> None:
     param = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
     load_per_expert_input_scale(param, torch.tensor(0.6), "w2", 2)
     assert torch.equal(param.data, torch.tensor([0.0, 0.0, 0.6, 0.0]))
+
+
+def test_fused_scales_of_all_experts_on_an_ep_rank_take_the_global_max() -> None:
+    # Two local experts receive the checkpoint's four-expert fused tensor.
+    param = torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+    load_per_expert_input_scale(param, torch.tensor([0.9, 0.1, 0.3, 0.6]), "w2", None)
+    assert torch.equal(param.data, torch.tensor([0.9, 0.9]))
+
+
+def test_a_scale_tensor_that_fits_no_expert_count_is_refused() -> None:
+    param = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+    try:
+        load_per_expert_input_scale(param, torch.tensor([0.1, 0.2, 0.3]), "w2", None)
+    except ValueError as error:
+        assert "one activation scale per expert" in str(error)
+    else:
+        raise AssertionError("a 3-element scale must not load into 4 experts")
