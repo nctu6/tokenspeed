@@ -272,8 +272,11 @@ if platform.is_nvidia and platform.is_hopper_plus:
         "dsa_decode",
         name="flashmla_dsa_decode",
         solution="flashmla",
+        # FlashMLA ships SM90 and SM100-family kernels only; SM120 fails with
+        # "Unsupported architecture" and falls back to the Triton leaf.
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(10, 9),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
@@ -357,8 +360,11 @@ if platform.is_nvidia and platform.is_hopper_plus:
         "dsa_prefill",
         name="flashmla_dsa_prefill",
         solution="flashmla",
+        # FlashMLA ships SM90 and SM100-family kernels only; SM120 fails with
+        # "Unsupported architecture" and falls back to the Triton leaf.
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(10, 9),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),

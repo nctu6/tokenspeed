@@ -140,8 +140,10 @@ def _register_tokenspeed_mla_decode_kernel() -> None:
         "mla_decode_with_kvcache",
         name="tokenspeed_mla_decode_with_kvcache",
         solution="tokenspeed_mla",
+        # tokenspeed_mla decode supports SM100, SM103 and SM107 only.
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 7),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(("q", "kv_cache"), "dense", _MLA_DECODE_DTYPES),

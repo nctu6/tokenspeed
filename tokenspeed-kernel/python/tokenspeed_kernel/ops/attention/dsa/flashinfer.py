@@ -114,8 +114,11 @@ def _register_flashinfer_trtllm_dsa(
         mode,
         name=name,
         solution="flashinfer_trtllm",
+        # The ``trtllm-gen`` backend runs on SM100/SM103/SM107 only (FlashInfer
+        # rejects other GPUs); SM120 falls back to the Triton leaf.
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 7),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(

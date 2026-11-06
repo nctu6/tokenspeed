@@ -1401,8 +1401,8 @@ def _windowed_decode(q, kv_cache, page_table, cache_seqlens, cache_len, window, 
 
 
 @pytest.mark.skipif(
-    not platform.is_blackwell_plus,
-    reason="the query-axis block MLA decode is a Blackwell CuteDSL kernel",
+    not platform.is_blackwell,
+    reason="the query-axis block MLA decode is an SM100-family CuteDSL kernel",
 )
 @pytest.mark.parametrize("window", [129, -1], ids=["windowed", "full-attention"])
 def test_mla_block_decode_agrees_across_both_block_layouts(

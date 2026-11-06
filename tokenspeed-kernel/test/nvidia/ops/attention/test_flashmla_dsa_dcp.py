@@ -22,8 +22,17 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode, dsa_prefill
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import KernelRegistry
 
 platform = current_platform()
+
+
+def _flashmla_dsa_offered() -> bool:
+    return bool(
+        KernelRegistry.get().get_for_operator(
+            "attention", "dsa_decode", platform=platform, solution="flashmla"
+        )
+    )
 
 
 def _pack_sparse_kv(
@@ -49,8 +58,8 @@ def _pack_sparse_kv(
 
 
 @pytest.mark.skipif(
-    not (platform.is_nvidia and platform.is_hopper_plus),
-    reason="The flashmla DSA solution registers on Hopper+ NVIDIA GPUs only",
+    not _flashmla_dsa_offered(),
+    reason="the flashmla DSA solution is offered on SM90/SM100-family GPUs only",
 )
 @pytest.mark.parametrize("phase,q_len", [("prefill", 1), ("decode", 1), ("decode", 3)])
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])

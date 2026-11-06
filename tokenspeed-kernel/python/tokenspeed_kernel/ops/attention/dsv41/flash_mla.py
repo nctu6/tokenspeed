@@ -39,7 +39,10 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _FLASH_MLA_API: ModuleType | None = None
-if current_platform().is_hopper_plus:
+# FlashMLA ships Hopper and datacenter-Blackwell kernels only. Elsewhere (e.g.
+# SM120) the API stays unloaded, so callers see it as unavailable and use the
+# portable path instead of building schedules for a kernel that cannot run.
+if current_platform().is_hopper or current_platform().is_blackwell:
     import flash_mla.flash_mla_interface as _FLASH_MLA_API
     from flash_mla import fused_norm_rope_attn_rope_cast as _fused_v41  # noqa: F401
 

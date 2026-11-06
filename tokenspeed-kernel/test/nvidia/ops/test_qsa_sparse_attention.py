@@ -128,8 +128,9 @@ def test_qsa_sparse_attention_selects_cute_on_b200_and_b300(
     cache_dtype: torch.dtype,
     q_len: int,
 ) -> None:
-    if not current_platform().is_nvidia:
-        pytest.skip("CuTe DSL QSA requires NVIDIA")
+    # The CuTe DSL leaf registers only on an SM100-family host.
+    if not current_platform().is_blackwell:
+        pytest.skip("CuTe DSL QSA registers on SM100-family GPUs only")
     signature = format_signature(
         q=dense_tensor_format(torch.bfloat16),
         k_cache=dense_tensor_format(cache_dtype),
