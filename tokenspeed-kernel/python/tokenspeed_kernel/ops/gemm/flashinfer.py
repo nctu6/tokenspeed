@@ -442,13 +442,13 @@ if cublas_fp8_gemm is not error_fn:
 
 
 # ===-----------------------------------------------------------------------===#
-# NVFP4: FlashInfer (NVIDIA SM100)
+# NVFP4: FlashInfer (NVIDIA SM100, SM120)
 # ===-----------------------------------------------------------------------===#
 
 
 mm_fp4 = error_fn
 
-if platform.is_nvidia and platform.is_blackwell:
+if platform.is_nvidia and platform.is_blackwell_plus:
     from flashinfer import mm_fp4
 
 if mm_fp4 is not error_fn:

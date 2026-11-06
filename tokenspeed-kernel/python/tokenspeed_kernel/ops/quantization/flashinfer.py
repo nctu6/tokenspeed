@@ -94,7 +94,8 @@ if platform.is_nvidia:
         return mxfp8_quantize(x, False, enable_pdl=_resolve_enable_pdl(enable_pdl))
 
 
-if platform.is_nvidia and platform.is_blackwell:
+# FlashInfer's FP4 quantizer also runs on SM120; arch windows live on the registrations.
+if platform.is_nvidia and platform.is_blackwell_plus:
     from flashinfer import fp4_quantize as _fp4_quantize
     from flashinfer import (
         nvfp4_block_scale_interleave,
