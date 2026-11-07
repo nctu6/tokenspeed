@@ -630,9 +630,12 @@ def index_topk(
     to powers of two and at least the score tile width (at most256 lanes).
     With replicated32 heads and compatible Blackwell pages, optional DeepGEMM
     scores packed FP4 inputs with FP32 accumulation and DeepSelect selects rows
-    and block maxima; on Hopper, DeepGEMM scores FP8 ``index_v4`` rows and the
-    in-tree CuTe DSL DeepSelect kernel selects. This native accumulation
-    differs from the portable reference's intermediate BF16 rounding.
+    and block maxima; on Hopper and SM120, DeepGEMM scores FP8 ``index_v4``
+    rows and the in-tree CuTe DSL DeepSelect kernel selects (SM120 has no paged
+    FP4 kernel, and its Reindex passes score the whole history, so they stay
+    portable when that would cost more; see ``fp8_indexer_wins``). This native
+    accumulation differs from the portable reference's intermediate BF16
+    rounding.
     Full-scoring query tiles cap logits at 32MiB for paged queries and
     128MiB for a zero-row-stride request table.
     That broadcast layout gathers packed history once per call and packs Q
@@ -651,7 +654,8 @@ def index_topk(
     same; BF16 scores need not produce the FP32 path's exact Top-K at ties.
     """
     from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
-        is_hopper_indexer_available,
+        fp8_indexer_wins,
+        is_fp8_indexer_available,
         is_native_indexer_available,
     )
     from tokenspeed_kernel.thirdparty.deep_select import is_deep_select_available
@@ -685,7 +689,15 @@ def index_topk(
             and is_native_indexer_available()
             and is_deep_select_available()
         )
-        or (row_bytes == 132 and is_hopper_indexer_available())
+        or (
+            row_bytes == 132
+            and is_fp8_indexer_available()
+            and fp8_indexer_wins(
+                query_values.shape[0],
+                page_table.shape[1] * 64,
+                candidate_blocks is not None and not candidate_topk,
+            )
+        )
     )
     index_k_format = {
         68: "mxfp4",
@@ -1217,20 +1229,29 @@ def compressor_metadata(
 
 
 def local_index_supported(index_q, index_cache, candidates):
-    """Whether local FP8 candidate scoring has a native implementation."""
+    """Whether local FP8 candidate scoring has a native implementation.
+
+    A Reindex pass (``candidates`` given) is native only where a sparse scorer
+    reads just the pool; SM120 would score the whole local history instead.
+    """
     from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
-        is_hopper_indexer_available,
+        is_fp8_indexer_available,
+        platform,
     )
 
     return (
         isinstance(index_q, torch.Tensor)
         and index_q.is_cuda
-        and is_hopper_indexer_available()
+        and is_fp8_indexer_available()
         and index_cache.shape[-1] == 132
         and index_q.shape[1] % 8 == 0
         and (
             candidates is None
-            or (candidates.shape[1] > 0 and candidates.shape[1] % 16 == 0)
+            or (
+                platform.is_hopper
+                and candidates.shape[1] > 0
+                and candidates.shape[1] % 16 == 0
+            )
         )
     )
 

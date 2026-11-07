@@ -33,7 +33,12 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.moe._deep_gemm.ue8m0 import deep_gemm_requires_ue8m0
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
-from tokenspeed_kernel.signature import ScaleFormat, format_signatures
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 from tokenspeed_kernel.thirdparty.deepgemm import deepgemm_supports_sm120
 
 
@@ -150,3 +155,70 @@ def test_dsa_deepgemm_offered_on_sm120_only_with_sm120_build(
             f"build supports SM120={deepgemm_supports_sm120()}"
         )
         assert "triton" in solutions, f"{mode}: portable triton must remain"
+
+
+def _select_dsv41_index_topk(platform: PlatformInfo, index_k_format: str, native: bool):
+    from tokenspeed_kernel.selection import select_kernel
+
+    return select_kernel(
+        "attention",
+        "dsv41_index_topk",
+        format_signature(x=dense_tensor_format(torch.bfloat16)),
+        features=None,
+        platform=platform,
+        traits={
+            "index_heads": 32,
+            "index_k_format": index_k_format,
+            "index_shards": 1,
+            "native_indexer": native,
+        },
+        solution=None,
+        override=None,
+    ).name
+
+
+def test_dsv41_indexer_scores_fp8_rows_on_sm120_and_fp4_rows_on_sm100(
+    sm120_platform: PlatformInfo, b200_platform: PlatformInfo
+) -> None:
+    """SM120 has no paged FP4 MQA kernel, so only FP8 index rows go native there.
+
+    The FP8 leaves are offered on SM120 only by builds that report SM120 kernels.
+    """
+    pytest.importorskip("deep_gemm")
+    import tokenspeed_kernel.ops.attention.dsv41  # noqa: F401  (triggers registration)
+    from tokenspeed_kernel.registry import KernelRegistry
+
+    registry = KernelRegistry.get()
+    for mode in (
+        "dsv41_index_topk",
+        "dsv41_index_candidates",
+        "dsv41_merge_index_candidates",
+    ):
+        offered = {
+            spec.name
+            for spec in registry.get_for_operator(
+                "attention", mode, platform=sm120_platform
+            )
+            if spec.solution == "deep_gemm"
+        }
+        assert offered == (
+            {f"deep_gemm_sm120_{mode}"} if deepgemm_supports_sm120() else set()
+        ), (mode, offered)
+    if deepgemm_supports_sm120():
+        assert (
+            _select_dsv41_index_topk(sm120_platform, "fp8_scaled", True)
+            == "deep_gemm_sm120_dsv41_index_topk"
+        )
+    # Packed FP4 rows and passes the FP8 indexer would lose keep the portable leaf
+    assert (
+        _select_dsv41_index_topk(sm120_platform, "mxfp4", False)
+        == "triton_dsv41_index_topk"
+    )
+    assert (
+        _select_dsv41_index_topk(sm120_platform, "fp8_scaled", False)
+        == "triton_dsv41_index_topk"
+    )
+    assert (
+        _select_dsv41_index_topk(b200_platform, "mxfp4", True)
+        == "deep_gemm_dsv41_index_topk"
+    )

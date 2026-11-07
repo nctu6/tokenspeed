@@ -71,3 +71,35 @@ def test_sm100_only_leaves_are_not_offered_on_sm120(
     }
     assert not on_sm120 & sm100_only, f"{mode} offers {on_sm120 & sm100_only} on SM120"
     assert "triton" in on_sm120, f"{mode} has no portable leaf on SM120: {on_sm120}"
+
+
+# Leaves of a shared operator whose kernels need SM100/SM103 hardware: the packed
+# FP4 paged MQA scorer (DeepGEMM has no such kernel on SM120) and the upstream
+# DeepSelect package (sm100 cubins only). SM120 runs FP8 index rows through the
+# ``deep_gemm_sm120_*`` leaves and the in-tree CuTe DSL selector instead.
+_SM100_ONLY_KERNELS = [
+    ("attention", "dsv41_index_topk", "deep_gemm_dsv41_index_topk"),
+    ("attention", "dsv41_select_topk", "deepselect_dsv41_select_topk"),
+    ("attention", "dsv41_select_candidates", "deepselect_dsv41_select_candidates"),
+]
+
+
+@pytest.mark.parametrize(
+    ("family", "mode", "name"),
+    _SM100_ONLY_KERNELS,
+    ids=[k[2] for k in _SM100_ONLY_KERNELS],
+)
+def test_sm100_only_kernels_are_not_offered_on_sm120(
+    family: str,
+    mode: str,
+    name: str,
+    b200_platform: PlatformInfo,
+    sm120_platform: PlatformInfo,
+) -> None:
+    import tokenspeed_kernel.ops.attention  # noqa: F401  (registers the leaves)
+    import tokenspeed_kernel.ops.attention.dsv41  # noqa: F401
+
+    spec = KernelRegistry.get().get_by_name(name)
+    assert spec is not None and (spec.family, spec.mode) == (family, mode)
+    assert spec.capability.satisfied_by(b200_platform), name
+    assert not spec.capability.satisfied_by(sm120_platform), name

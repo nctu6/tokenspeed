@@ -73,14 +73,26 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.thirdparty.deep_select import deep_select_alignment
+from tokenspeed_kernel.thirdparty.deepgemm import (
+    SM120_ARCH_MAJOR,
+    deepgemm_supports_sm120,
+)
 
 platform = current_platform()
+
+# Workstation Blackwell has no FP4 paged MQA kernel in DeepGEMM (only FP8 paged
+# and dense, and FP4 dense/sparse), so like Hopper it scores the FP8 ``index_v4``
+# rows. The upstream DeepSelect package ships sm100 cubins only; the in-tree
+# CuTe DSL selector runs there in its compact shared-memory profile.
+_SM120_BUILD = platform.is_hopper_plus and deepgemm_supports_sm120()
+_SM120_FP8_INDEXER = _SM120_BUILD and platform.arch_version.major == SM120_ARCH_MAJOR
+_FP8_INDEXER = platform.is_hopper or _SM120_FP8_INDEXER
 
 if platform.is_blackwell:
     prepare_cuda_toolkit_env()
     import deep_gemm
 
-if platform.is_hopper:
+if _FP8_INDEXER:
     prepare_cuda_toolkit_env()
     import deep_gemm
 
@@ -390,23 +402,74 @@ def index_topk(
 
 
 # ---------------------------------------------------------------------------
-# Hopper: FP8 index rows and DeepGEMM's FP8 MQA logits
+# Hopper and SM120: FP8 index rows and DeepGEMM's FP8 MQA logits
 #
-# sm90 has no FP4 tensor cores, so the packed CSA2 path above cannot run there.
-# It does carry DeepGEMM's DeepSeek-V3.2 logits kernels, which read index rows
-# as 128 E4M3 values followed by one FP32 scale, page-planar. The "v4" cache
-# format stores exactly those rows, so scoring moves onto tensor cores; the
-# selection that follows runs on the in-tree CuTe DSL DeepSelect kernel, the
-# upstream DeepSelect package being sm100-only.
+# sm90 has no FP4 tensor cores, and DeepGEMM has no paged FP4 MQA kernel on
+# SM120, so the packed CSA2 path above cannot run on either. Both carry
+# DeepGEMM's DeepSeek-V3.2 logits kernels, which read index rows as 128 E4M3
+# values followed by one FP32 scale, page-planar. The "v4" cache format stores
+# exactly those rows, so scoring moves onto tensor cores; the selection that
+# follows runs on the in-tree CuTe DSL DeepSelect kernel, the upstream
+# DeepSelect package being sm100-only. SM120 runs it in the compact profile
+# that fits 99 KiB of shared memory, and scores Reindex passes densely: the
+# sparse CuTe scorer below is Hopper-only.
 # ---------------------------------------------------------------------------
 
 _INDEX_ROW_BYTES = _LAYOUTS["index_v4"][3]
 _INDEX_VALUE_BYTES = _LAYOUTS["index_v4"][2]
 
 
-def is_hopper_indexer_available() -> bool:
+def _register_sm120(mode, name, signatures, traits=None):
+    """Register an FP8-row indexer implementation for SM120 as well.
+
+    DeepGEMM builds without SM120 kernels fail every call there, so only builds
+    that report them offer the leaf.
+    """
+    if not _SM120_BUILD:
+        return lambda implementation: implementation
+    kwargs = {} if traits is None else {"traits": traits}
+    return register_kernel(
+        "attention",
+        mode,
+        name=name,
+        solution="deep_gemm",
+        signatures=signatures,
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 0),
+            max_arch_version=ArchVersion(12, 9),
+            vendors=frozenset({"nvidia"}),
+        ),
+        priority=Priority.SPECIALIZED,
+        **kwargs,
+    )
+
+
+def is_fp8_indexer_available() -> bool:
     """Whether this platform scores FP8 index rows with DeepGEMM."""
-    return platform.is_hopper
+    return _FP8_INDEXER
+
+
+# SM120 has no sparse scorer, so a Reindex pass scores the whole history and
+# discards all but the candidate pool, while the portable Triton scorer reads
+# only the pool (a cost independent of the history). Measured on an RTX PRO 6000
+# with 32 heads (Triton / native time): 1.1-4.7x for histories up to 16384 rows,
+# but 0.79x at 128 requests of 32768 rows and 0.54x at 128 queries of 32768.
+_SM120_DENSE_REINDEX_CAPACITY = 16384
+_SM120_DENSE_REINDEX_SCORES = 1 << 19
+
+
+def fp8_indexer_wins(rows: int, capacity: int, reindex: bool) -> bool:
+    """Whether the FP8 indexer beats the portable one for this pass.
+
+    ``reindex`` marks a pass that scores a candidate pool and publishes none.
+    Hopper's sparse scorer reads only the pool; elsewhere the pass is dense.
+    """
+    if not _SM120_FP8_INDEXER or not reindex:
+        return _FP8_INDEXER
+    return (
+        capacity <= _SM120_DENSE_REINDEX_CAPACITY
+        or rows * capacity <= _SM120_DENSE_REINDEX_SCORES
+    )
 
 
 @lru_cache(maxsize=8)
@@ -626,6 +689,12 @@ def _native_select(
         block_lengths.zero_()
 
 
+@_register_sm120(
+    "dsv41_index_topk",
+    "deep_gemm_sm120_dsv41_index_topk",
+    [format_signature(x=dense_tensor_format(torch.bfloat16))],
+    {"native_indexer": frozenset({True})},
+)
 @register_kernel(
     "attention",
     "dsv41_index_topk",
@@ -815,6 +884,11 @@ def _candidate_topk(scores, topk):
     return indices.long(), values
 
 
+@_register_sm120(
+    "dsv41_index_candidates",
+    "deep_gemm_sm120_dsv41_index_candidates",
+    [format_signature(x=dense_tensor_format(torch.bfloat16))],
+)
 @register_kernel(
     "attention",
     "dsv41_index_candidates",
@@ -851,17 +925,31 @@ def index_candidates(index_q, weights, index_cache, table, visible, candidates, 
         offsets, _ = _candidate_topk(scores, topk)
         logical, selected = gather_index_candidates(offsets, scores, positions, 64)
     else:
-        values, scales = _index_planes(index_cache)
-        scores = sparse_index_scores(
-            queries,
-            folded,
-            values.view(torch.float8_e4m3fn),
-            scales,
-            table,
-            visible,
-            candidates,
-            pdl_enabled(),
-        )
+        if sparse_index_scores_supported(queries, folded, table, candidates):
+            values, scales = _index_planes(index_cache)
+            scores = sparse_index_scores(
+                queries,
+                folded,
+                values.view(torch.float8_e4m3fn),
+                scales,
+                table,
+                visible,
+                candidates,
+                pdl_enabled(),
+            )
+        else:
+            scores = candidate_scores(
+                _hopper_paged_scores(
+                    (queries,),
+                    index_cache,
+                    folded,
+                    table,
+                    visible,
+                    table.shape[1] * 64,
+                    clean=True,
+                ),
+                candidates,
+            )
         offsets, selected = _candidate_topk(scores, topk)
         logical = (
             candidates.gather(1, offsets.clamp_min(0) // 8).long() * 8 + offsets % 8
@@ -870,6 +958,11 @@ def index_candidates(index_q, weights, index_cache, table, visible, candidates, 
     return torch.stack((logical, selected.contiguous().view(torch.int32)), dim=-1)
 
 
+@_register_sm120(
+    "dsv41_merge_index_candidates",
+    "deep_gemm_sm120_dsv41_merge_index_candidates",
+    [format_signature(x=dense_tensor_format(torch.int32))],
+)
 @register_kernel(
     "attention",
     "dsv41_merge_index_candidates",
