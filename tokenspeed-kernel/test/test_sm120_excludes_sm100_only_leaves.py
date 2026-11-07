@@ -26,13 +26,20 @@ fast-hadamard-transform wheel (sm_90/sm_100/sm_103 cubins, no PTX) all fail at
 run time on workstation Blackwell (SM120). Their leaves outrank the portable
 Triton leaves, so a capability without an upper bound makes ``auto`` selection
 pick them there and crash at serve time.
+
+None of those kernels can be ported as is (wgmma, tcgen05 and TMEM are absent
+on SM120), so SM120 has its own tensor-core Triton leaves for what they served;
+``test_sm120_runs_its_own_leaves`` pins which leaf replaces which.
 """
 
 from __future__ import annotations
 
 import pytest
+import torch
 from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 # (family, mode) -> solutions whose kernels cannot run on SM120
 _SM100_ONLY_SOLUTIONS = {
@@ -103,3 +110,109 @@ def test_sm100_only_kernels_are_not_offered_on_sm120(
     assert spec is not None and (spec.family, spec.mode) == (family, mode)
     assert spec.capability.satisfied_by(b200_platform), name
     assert not spec.capability.satisfied_by(sm120_platform), name
+
+
+_MLA_DECODE = {
+    "q_len": 1,
+    "num_q_heads": 128,
+    "kv_lora_rank": 512,
+    "qk_rope_head_dim": 64,
+    "page_size": 64,
+    "noncausal_block_size": 1,
+    "block_on_query_axis": False,
+    "logit_cap": False,
+    "return_lse": False,
+    "sliding_window": False,
+}
+_DSA = {
+    "q_len": 1,
+    "qk_nope_head_dim": 256,
+    "kv_lora_rank": 512,
+    "qk_rope_head_dim": 0,
+    "page_size": 64,
+    "topk": 2051,
+    "has_kv_cache": True,
+    "has_sparse_kv_cache": False,
+    "topk_layout": "global_slots",
+    "slot_order": "selection",
+    "logit_cap": False,
+    "return_lse": False,
+}
+_DSV4_PREFILL = {
+    "num_q_heads": 64,
+    "head_dim": 512,
+    "selected_width": 640,
+    "cache_layout": "dense_workspace",
+    "metadata_dtypes": frozenset({torch.int32}),
+    "sinks": True,
+}
+_HADAMARD = {"last_dim": 128, "contiguous": True}
+# (family, mode, signature roles, traits, leaf SM120 runs, leaf it replaces)
+_SM120_LEAVES = [
+    (
+        "transform",
+        "hadamard_transform",
+        ("x",),
+        _HADAMARD,
+        "triton_hadamard_transform_128_mma",
+        "fast_hadamard_transform",
+    ),
+    (
+        "attention",
+        "mla_decode_with_kvcache",
+        ("q", "kv_cache"),
+        _MLA_DECODE,
+        "triton_mla_mma_decode_with_kvcache",
+        "tokenspeed_mla_decode_with_kvcache",
+    ),
+    (
+        "attention",
+        "dsv4_prefill",
+        ("q", "kv"),
+        _DSV4_PREFILL,
+        "triton_dsv4_mma_prefill",
+        "flashmla_dsv4_prefill",
+    ),
+    (
+        "attention",
+        "dsa_decode",
+        ("q",),
+        {**_DSA, "q_len": 4},
+        "triton_dsa_mma_decode",
+        "flashinfer_trtllm_nope_dsa_decode",
+    ),
+    (
+        "attention",
+        "dsa_prefill",
+        ("q",),
+        _DSA,
+        "triton_dsa_mma_prefill",
+        "flashinfer_trtllm_nope_dsa_prefill",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("family", "mode", "roles", "traits", "sm120_leaf", "replaced"),
+    _SM120_LEAVES,
+    ids=[f"{leaf[0]}.{leaf[1]}" for leaf in _SM120_LEAVES],
+)
+def test_sm120_runs_its_own_leaves(
+    family, mode, roles, traits, sm120_leaf, replaced, sm120_platform: PlatformInfo
+) -> None:
+    import tokenspeed_kernel.ops.attention  # noqa: F401  (registers the leaves)
+    import tokenspeed_kernel.ops.attention.dsa  # noqa: F401
+    import tokenspeed_kernel.ops.attention.dsv4  # noqa: F401
+    import tokenspeed_kernel.ops.attention.mla  # noqa: F401
+    import tokenspeed_kernel.ops.transform  # noqa: F401
+
+    dtype = torch.bfloat16
+    signature = format_signature(**{role: dense_tensor_format(dtype) for role in roles})
+    chosen = select_kernel(
+        family, mode, signature, platform=sm120_platform, traits=traits
+    )
+    assert chosen.name == sm120_leaf
+    replaced_spec = KernelRegistry.get().get_by_name(replaced)
+    if replaced_spec is not None:
+        # The capped leaf stays registered for the platforms it was built for.
+        assert not replaced_spec.capability.satisfied_by(sm120_platform), replaced
