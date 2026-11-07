@@ -142,9 +142,10 @@ is a `ValueError`, not a silent fallback.
 `deepselect_topk(scores, ends, topk, capacity=..., cluster_size=...)` selects
 the `topk` largest entries of every FP32 row and returns their unsorted
 column indices and values. It is an in-tree CuTe DSL rendition of the
-DeepSeek DeepSelect algorithm for Hopper, where the upstream package ships no
-cubin; the V4.1 indexer uses it on sm90 for both row selection and
-block-maxima selection.
+DeepSeek DeepSelect algorithm for Hopper and SM120, where the upstream package
+ships no cubin; the V4.1 indexer uses it on sm90 and SM120 for both row
+selection and block-maxima selection, and the V3.2 DeepGEMM leaves use it on
+SM120 (see "DSA indexers on SM120" below).
 
 Contract:
 
@@ -162,8 +163,10 @@ Contract:
   cluster (non-leader CTAs ship their survivors to the leader over
   distributed shared memory). `choose_cluster_size` picks it: rows of at
   least 32K entries, and only while every cluster stays resident (about 60%
-  of the SMs for 4- and 8-CTA clusters, 80% for pairs). Every configuration
-  a call may pick must be compiled with `warmup` before CUDA-graph capture.
+  of the SMs for 4- and 8-CTA clusters, 80% for pairs; on SM120, where a CTA
+  fills an SM, 85% and 95%). Every configuration a call may pick must be
+  compiled with `warmup` before CUDA-graph capture. Rows, width and top-k are
+  runtime arguments: only the capacity and cluster size select a binary.
 
 Algorithm per CTA: an 8-bit radix select over order-preserving keys selects
 the first 8192 entries (the row's in-order tail of up to 4096 entries plus
@@ -175,6 +178,52 @@ the end, a radix select over survivors plus candidates re-selects `k` pairs
 and raises the threshold. Per-pass histograms send non-matching keys to a
 sink slot so the passes stay branch-free; one warp locates the pivot bucket
 while the others wait, since the search is a latency chain.
+
+The kernel above needs 207 KB (capacity 512) to 232 KB (capacity 2048) of
+shared memory, and SM120 allows 99 KiB per block. The same code runs there in
+a compact profile selected at import from the platform: 256 threads (rounds of
+4096 entries, whose in-order tail is the row's last full round), a two-stage
+ring, and a 3072-pair candidate buffer. A round's hits are appended in two
+groups of warps, and a group that would overflow the buffer first triggers a
+compaction, so the buffer only has to hold half a round (this is also why
+compaction runs from 1024 candidates instead of 4032). That is 93 KB at
+capacity 2048 and leaves the selected entries unchanged; the correctness tests
+run unchanged on both profiles. At capacity 2048 the buffer gathers one peer,
+so clusters are limited to pairs (quads at 1024 and below). An RTX PRO 6000
+selects 2048 of one 4K row in 4.2 us and of one 128K row in 43 us (pair), against
+41 and 198 us for the Triton radix select.
+
+## DSA indexers on SM120
+
+DeepGEMM's SM120 MQA-logits kernels serve both indexers; what differs is the
+index-key row format and the selector that follows.
+
+- **V3.2 `dsa_*_topk` / `kpool_prefill_topk`.** The DeepGEMM leaves are offered
+  on SM120 by builds that report SM120 kernels (`deepgemm_supports_sm120`) and
+  outrank the Triton leaves. Prefill selects with DeepSelect (1.3-1.9x faster
+  than the Triton radix select it replaces; the TRT-LLM prefill top-k has no
+  SM120 image). Decode keeps the TRT-LLM CuTe cluster runner, which is as fast
+  or faster up to a cliff where its clusters stop fitting (rows x clusters over
+  the SMs) and it falls back to a non-cluster kernel; DeepSelect takes over past
+  it (`_use_deepselect_decode_topk`: 32K+ entries and 96+ rows, or 64K+ entries
+  and 48+ rows; 2.1-2.7x faster on 128 rows of 64K-128K). Both selectors return
+  exact top-k sets, so the choice only affects speed.
+- **V4.1 `dsv41_index_topk`.** DeepGEMM has no paged FP4 MQA kernel on SM120, so
+  the packed-FP4 leaf (`deep_gemm_dsv41_index_topk`) and the upstream DeepSelect
+  leaves stay on SM100/SM103. SM120 scores the FP8 `index_v4` rows like Hopper
+  does (`deep_gemm_sm120_dsv41_*`, registered by builds with SM120 kernels) and
+  selects with DeepSelect. The sparse candidate scorer is Hopper-only, so a
+  Reindex pass scores the whole history; `fp8_indexer_wins` keeps it on the
+  Triton scorer, which reads only the candidate pool, where the history is
+  long (over 16384 rows and more than 2^19 row-history pairs). The leaves are
+  selected only for 132-byte `index_v4` rows. SM120 still stores the 68-byte
+  V4.1 rows (`cache_format="v41"` in the runtime attention config), because the
+  `v4` rows hold about 45% fewer tokens in the same memory; the config does not
+  select `v4` on SM120 yet, so serving reaches the native route only once it
+  does. Measured on an RTX PRO 6000 (32 heads, top-k 512, CUDA graph), Triton
+  time over native time is 2.3-7.2x for decode Full passes over 1K-32K rows and
+  1-128 requests, and 1.4-5.1x for chunked-prefill Full passes of 128-4096
+  queries.
 
 The portable Triton attention implementations support `return_lse=True` for
 both dense and packed latent caches. They return `(output, lse)`, with FP32
