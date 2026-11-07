@@ -233,9 +233,14 @@ stores (`has_kv_cache=True`, BF16 or E4M3 rows of 512 + 64 channels, page 64,
 top-k 512-2051, `kv_lora_rank` 128 or 512, 64-wide RoPE, `return_lse` either
 way, `q_len` 1-6 for decode). FlashMLA and the trtllm-gen cores are capped off
 SM120. The packed FP8 sparse cache (`has_sparse_kv_cache=True`) has no runtime
-user on SM120 and keeps `triton_dsa_decode` / `triton_dsa_prefill`, as do
-zero-width RoPE and batch-invariant plans (the leaves do not declare
-`batch_invariant`: the split count follows the batch).
+user on SM120 (the backend always passes `sparse_kv_cache=None`) and keeps
+`triton_dsa_decode` / `triton_dsa_prefill`, as do batch-invariant plans (the
+leaves do not declare `batch_invariant`: the split count follows the batch).
+A zero RoPE width is the KPool layout of GLM-5.3-Flash (`qk_nope_head_dim` 256,
+`kv_lora_rank` 512, 2048 slots plus up to three tail slots, cache rows of 512
+channels): the kernel compiles the RoPE gather and score term out, and the
+same leaves serve it (29-134x over `triton_dsa_*` at 16 and 64 heads, 1-1024
+tokens, 2051 slots; up to 125 TFLOP/s).
 
 Why it is fast: all heads of a token read the same selected rows, so a program
 owns a tile of heads of one token and multiplies each gathered tile of rows by
