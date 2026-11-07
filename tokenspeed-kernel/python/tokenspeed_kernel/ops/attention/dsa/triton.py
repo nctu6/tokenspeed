@@ -22,8 +22,13 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.dsa._triton import sparse_mma
 from tokenspeed_kernel.ops.quantization import quantize_fp8
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -613,6 +618,167 @@ def triton_dsa_prefill(
         q=q,
         kv_cache=kv_cache,
         packed_kv_cache=sparse_kv_cache,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        k_scale=k_scale,
+        out=out,
+        return_lse=return_lse,
+    )
+
+
+def _run_dsa_mma(
+    *,
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor | None,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    k_scale: float,
+    out: torch.Tensor | None,
+    return_lse: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Tensor-core sparse attention over a dense latent cache (SM120)."""
+    q = _flatten_query(q).contiguous()
+    topk_slots = topk_slots.contiguous()
+    if topk_lens is None:
+        topk_lens = torch.full(
+            (q.shape[0],), topk_slots.shape[-1], dtype=torch.int32, device=q.device
+        )
+    block_h, num_splits = sparse_mma.plan_launch(
+        q.shape[0], q.shape[1], current_platform().sm_count
+    )
+    result, lse = sparse_mma.sparse_mma_attention(
+        q,
+        kv_cache,
+        topk_slots,
+        topk_lens.contiguous(),
+        softmax_scale=float(softmax_scale) * float(k_scale),
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        return_lse=return_lse,
+        block_h=block_h,
+        block_n=sparse_mma.BLOCK_N,
+        num_warps=sparse_mma.NUM_WARPS,
+        num_stages=sparse_mma.NUM_STAGES,
+        num_splits=num_splits,
+    )
+    if out is not None:
+        out.reshape_as(result).copy_(result)
+        result = out
+    return (result, lse) if return_lse else result
+
+
+_SM120_MMA_CAPABILITY = CapabilityRequirement(
+    min_arch_version=ArchVersion(12, 0),
+    max_arch_version=ArchVersion(12, 9),
+    vendors=frozenset({"nvidia"}),
+)
+_MMA_SIGNATURES = frozenset(
+    {
+        format_signature(q=dense_tensor_format(torch.bfloat16)),
+        format_signature(q=dense_tensor_format(torch.float8_e4m3fn)),
+    }
+)
+# Dense BF16 or E4M3 latent cache only: the packed FP8 sparse cache has no
+# runtime user on SM120 and keeps the portable kernels.
+_MMA_TRAITS = {
+    "qk_nope_head_dim": frozenset({128, 192, 256}),
+    "kv_lora_rank": frozenset({128, 512}),
+    "qk_rope_head_dim": frozenset({64}),
+    "page_size": frozenset({64}),
+    "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
+    "has_kv_cache": frozenset({True}),
+    "has_sparse_kv_cache": frozenset({False}),
+    "topk_layout": frozenset({"global_slots"}),
+    "logit_cap": frozenset({False}),
+    "return_lse": frozenset({False, True}),
+}
+
+
+@register_kernel(
+    "attention",
+    "dsa_decode",
+    name="triton_dsa_mma_decode",
+    solution="triton",
+    capability=_SM120_MMA_CAPABILITY,
+    signatures=_MMA_SIGNATURES,
+    traits={**_MMA_TRAITS, "q_len": frozenset({1, 2, 3, 4, 5, 6})},
+    priority=Priority.PERFORMANT,
+)
+def triton_dsa_mma_decode(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor | None,
+    sparse_kv_cache: torch.Tensor | None,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor | None,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    q_len_per_req: int = 1,
+    kv_seq_lens: torch.Tensor | None = None,
+    logit_cap: float = 0.0,
+    k_scale: float = 1.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    del kv_seq_lens
+    return _run_dsa_mma(
+        q=q,
+        kv_cache=kv_cache,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        k_scale=k_scale,
+        out=out,
+        return_lse=return_lse,
+    )
+
+
+@register_kernel(
+    "attention",
+    "dsa_prefill",
+    name="triton_dsa_mma_prefill",
+    solution="triton",
+    capability=_SM120_MMA_CAPABILITY,
+    signatures=_MMA_SIGNATURES,
+    traits={**_MMA_TRAITS, "q_len": frozenset({1})},
+    priority=Priority.PERFORMANT,
+)
+def triton_dsa_mma_prefill(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor | None,
+    sparse_kv_cache: torch.Tensor | None,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor | None,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    q_len_per_req: int = 1,
+    kv_seq_lens: torch.Tensor | None = None,
+    logit_cap: float = 0.0,
+    k_scale: float = 1.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    del kv_seq_lens
+    return _run_dsa_mma(
+        q=q,
+        kv_cache=kv_cache,
         topk_slots=topk_slots,
         topk_lens=topk_lens,
         kv_lora_rank=kv_lora_rank,
