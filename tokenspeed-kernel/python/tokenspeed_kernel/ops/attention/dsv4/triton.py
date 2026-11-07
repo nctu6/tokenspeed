@@ -34,7 +34,12 @@ import logging
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.ops.attention.dsv4._triton import sparse_mma
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -468,6 +473,89 @@ def triton_dsv4_prefill(
         BLOCK_DIM=triton.next_power_of_2(DEEPSEEK_V4_HEAD_DIM),
         num_warps=4,
         num_stages=1,
+    )
+    return output
+
+
+@register_kernel(
+    "attention",
+    "dsv4_prefill",
+    name="triton_dsv4_mma_prefill",
+    solution="triton",
+    # Measured on SM120, where FlashMLA is not offered and the portable kernel
+    # runs every head on CUDA cores.
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(12, 0),
+        max_arch_version=ArchVersion(12, 9),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=frozenset(
+        {
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                kv=dense_tensor_format(torch.bfloat16),
+            )
+        }
+    ),
+    traits={
+        "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
+        "cache_layout": frozenset({"dense_workspace"}),
+        "metadata_dtypes": frozenset({torch.int32, torch.int64}),
+        "sinks": frozenset({True, False}),
+        "return_lse": frozenset({True, False}),
+    },
+    priority=Priority.PERFORMANT,
+)
+def triton_dsv4_mma_prefill(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    lens: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Selected shared-KV attention on tensor cores for DeepSeek V4 geometry."""
+    if q.dim() != 3 or q.shape[-1] != DEEPSEEK_V4_HEAD_DIM:
+        raise ValueError(f"expected q [tokens, heads, 512], got {tuple(q.shape)}")
+    if q.dtype != torch.bfloat16 or q.stride(-1) != 1:
+        raise ValueError("q must be BF16 with a contiguous last dimension")
+    kv_2d = kv.reshape(-1, kv.shape[-1])
+    if (
+        kv_2d.shape[-1] != DEEPSEEK_V4_HEAD_DIM
+        or kv_2d.dtype != torch.bfloat16
+        or kv_2d.stride(-1) != 1
+    ):
+        raise ValueError("kv rows must be BF16 of width 512 with unit stride")
+    indices_2d = indices.reshape(indices.shape[0], -1)
+    if indices_2d.stride(-1) != 1:
+        indices_2d = indices_2d.contiguous()
+    lens = lens.reshape(-1)
+    if indices_2d.shape[0] != q.shape[0] or lens.shape[0] != q.shape[0]:
+        raise ValueError("selected-attention metadata must have one row per query")
+    sink = None
+    if attn_sink is not None:
+        if attn_sink.numel() < q.shape[1]:
+            raise ValueError("attention sink must provide one value per query head")
+        sink = attn_sink.reshape(-1).to(torch.float32).contiguous()
+    output = out if out is not None else torch.empty_like(q)
+    if output.stride(-1) != 1:
+        raise ValueError("out must have a contiguous last dimension")
+    block_h, num_splits = sparse_mma.plan_launch(
+        q.shape[0], q.shape[1], current_platform().sm_count
+    )
+    sparse_mma.sparse_mma_attention(
+        q,
+        kv_2d,
+        indices_2d,
+        lens,
+        sink,
+        output,
+        lse,
+        softmax_scale=softmax_scale,
+        block_h=block_h,
+        num_splits=num_splits,
     )
     return output
 
