@@ -1482,11 +1482,14 @@ def test_query_block_support_declines_what_the_fast_kernel_never_declared() -> N
         noncausal_block_size=8,
         **{k: v for k, v in _QUERY_BLOCK_DIMS.items() if k != "qk_nope_head_dim"},
     )
-    assert not supports_mla_decode_query_blocks(**{**probe, "page_size": 128})
+    assert not supports_mla_decode_query_blocks(**{**probe, "page_size": 256})
     assert not supports_mla_decode_query_blocks(**{**probe, "kv_lora_rank": 8})
-    assert not supports_mla_decode_query_blocks(**{**probe, "solution": "triton"})
+    # The portable Triton kernel reads flattened rows. The SM120 tensor-core
+    # Triton kernel declares the query axis, and a block of one rides it too.
+    sm120 = current_platform().is_nvidia and current_platform().arch_version.major == 12
+    assert supports_mla_decode_query_blocks(**{**probe, "solution": "triton"}) == sm120
     # A block of one is ordinary decode or target verify, never a proposal.
-    assert not supports_mla_decode_query_blocks(**{**probe, "q_len": 1})
+    assert supports_mla_decode_query_blocks(**{**probe, "q_len": 1}) == sm120
 
 
 def test_query_block_support_distinguishes_causal_fp8_from_other_masks() -> None:

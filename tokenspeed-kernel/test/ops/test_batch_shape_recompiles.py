@@ -661,12 +661,51 @@ def test_mla_decode_table_width_and_max_seqlen():
             kv_lora_rank=rank,
             qk_rope_head_dim=rope,
             softmax_scale=0.07,
-            solution="triton",
+            override="triton_mla_decode_with_kvcache",
         )
 
     expected = run(3, 129)
     run(16, 1024)
     with assert_no_triton_compile(decode._mla_decode_kernel):
+        for cols, max_seqlen_k in ((5, 300), (7, 131), (19, 4097), (40, 1500)):
+            torch.testing.assert_close(
+                run(cols, max_seqlen_k), expected, rtol=0, atol=0
+            )
+
+
+def test_mla_mma_decode_table_width_and_max_seqlen():
+    """The SM120 tensor-core decode ignores ``max_seqlen_k`` and the table width."""
+    from tokenspeed_kernel.platform import current_platform
+
+    if not (
+        current_platform().is_nvidia and current_platform().arch_version.major == 12
+    ):
+        pytest.skip("SM120 required")
+    from tokenspeed_kernel.ops.attention.mla import mla_decode_with_kvcache
+    from tokenspeed_kernel.ops.attention.mla._triton import decode_mma
+
+    batch, heads, rank, rope, page = 3, 16, 512, 64, 64
+    q = torch.randn(batch, 1, heads, rank + rope, device=DEVICE, dtype=torch.bfloat16)
+    kv_cache = torch.randn(
+        batch * 3, page, 1, rank + rope, device=DEVICE, dtype=torch.bfloat16
+    )
+    seqlens = torch.tensor([65, 64, 129], dtype=torch.int32, device=DEVICE)
+    base = torch.arange(batch * 3, dtype=torch.int32, device=DEVICE).view(batch, 3)
+
+    def run(cols, max_seqlen_k):
+        table = torch.zeros(batch, cols, dtype=torch.int32, device=DEVICE)
+        table[:, :3] = base
+        return mla_decode_with_kvcache(
+            q, kv_cache, table, seqlens, max_seqlen_k, 128, rank, rope, 0.07,
+            override="triton_mla_mma_decode_with_kvcache",
+        )  # fmt: skip
+
+    expected = run(3, 129)
+    run(16, 1024)
+    run(17, 4097)  # the other divisibility class of the table stride
+    with assert_no_triton_compile(
+        decode_mma._mla_mma_decode_kernel, decode_mma._mla_mma_decode_combine_kernel
+    ):
         for cols, max_seqlen_k in ((5, 300), (7, 131), (19, 4097), (40, 1500)):
             torch.testing.assert_close(
                 run(cols, max_seqlen_k), expected, rtol=0, atol=0
