@@ -796,9 +796,16 @@ def _resolve_hybrid_full_backend_name(
         return "qsa"
     if is_dsa and name is None:
         return "dsa"
-    # NVIDIA K3 defaults to its CuteDSL history consumer. AMD keeps the
+    # NVIDIA K3 defaults to its CuteDSL history consumer, whose kernels need
+    # tcgen05 (SM100 family). AMD and workstation Blackwell (SM120) keep the
     # generic MLA backend; explicit user choices remain authoritative.
-    if is_kda and name is None and not current_platform().is_amd:
+    platform = current_platform()
+    if (
+        is_kda
+        and name is None
+        and not platform.is_amd
+        and not (platform.is_nvidia and platform.arch_version.major == 12)
+    ):
         return "tokenspeed_mla"
     return name
 

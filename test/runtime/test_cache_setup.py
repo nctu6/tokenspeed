@@ -1387,8 +1387,15 @@ def test_kimi_kvp_resolves_target_and_draft_before_cache_allocation(
         )
         raise ReadyForAllocation
 
+    from tokenspeed_kernel.platform import ArchVersion
+
+    # A datacenter Blackwell (SM100) platform, where K3 defaults to tokenspeed_mla.
     monkeypatch.setattr(
-        registry, "current_platform", lambda: SimpleNamespace(is_amd=False)
+        registry,
+        "current_platform",
+        lambda: SimpleNamespace(
+            is_amd=False, is_nvidia=True, arch_version=ArchVersion(10, 0)
+        ),
     )
 
     # This test resolves NVIDIA backend capabilities without constructing them.
