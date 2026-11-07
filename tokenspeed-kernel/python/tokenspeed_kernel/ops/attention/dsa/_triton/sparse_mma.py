@@ -68,11 +68,15 @@ def _load_tile(
         mask=valid[:, None],
         other=0.0,
     )
-    k_rope = tl.load(
-        kv + rows[:, None] + (RANK + tl.arange(0, ROPE)[None, :]) * channel_stride,
-        mask=valid[:, None],
-        other=0.0,
-    )
+    if ROPE > 0:
+        k_rope = tl.load(
+            kv + rows[:, None] + (RANK + tl.arange(0, ROPE)[None, :]) * channel_stride,
+            mask=valid[:, None],
+            other=0.0,
+        )
+    else:
+        # A zero RoPE width compiles the RoPE gather and score term out.
+        k_rope = k
     return valid, k, k_rope
 
 
@@ -116,7 +120,6 @@ def _sparse_mma_kernel(
     heads = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
     head_mask = heads < num_heads
     rank_offsets = tl.arange(0, RANK)
-    rope_offsets = tl.arange(0, ROPE)
     n_offsets = tl.arange(0, BLOCK_N)
 
     q_rows = (token.to(tl.int64) * num_heads + heads) * HEAD_DIM
@@ -134,11 +137,14 @@ def _sparse_mma_kernel(
         mask=head_mask[:, None],
         other=0.0,
     )
-    q_rope = tl.load(
-        q + q_rows[:, None] + RANK + rope_offsets[None, :],
-        mask=head_mask[:, None],
-        other=0.0,
-    )
+    if ROPE > 0:
+        q_rope = tl.load(
+            q + q_rows[:, None] + RANK + tl.arange(0, ROPE)[None, :],
+            mask=head_mask[:, None],
+            other=0.0,
+        )
+    else:
+        q_rope = q_nope
 
     topk_row = topk_indices + token.to(tl.int64) * topk_stride
     valid, k, k_rope = _load_tile(
@@ -175,10 +181,12 @@ def _sparse_mma_kernel(
 
         if FP8_QK:
             s = tl.dot(q_nope, tl.trans(k))
-            s = tl.dot(q_rope, tl.trans(k_rope), s)
+            if ROPE > 0:
+                s = tl.dot(q_rope, tl.trans(k_rope), s)
         else:
             s = tl.dot(q_nope, tl.trans(k.to(tl.bfloat16)))
-            s = tl.dot(q_rope, tl.trans(k_rope.to(tl.bfloat16)), s)
+            if ROPE > 0:
+                s = tl.dot(q_rope, tl.trans(k_rope.to(tl.bfloat16)), s)
         s = tl.where(valid[None, :], s * scale_log2, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(s, axis=1))

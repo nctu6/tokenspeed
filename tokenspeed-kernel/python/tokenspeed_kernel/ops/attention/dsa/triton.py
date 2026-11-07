@@ -689,7 +689,8 @@ _MMA_SIGNATURES = frozenset(
 _MMA_TRAITS = {
     "qk_nope_head_dim": frozenset({128, 192, 256}),
     "kv_lora_rank": frozenset({128, 512}),
-    "qk_rope_head_dim": frozenset({64}),
+    # Zero is the KPool layout of GLM-5.3-Flash: no RoPE rows in the cache.
+    "qk_rope_head_dim": frozenset({0, 64}),
     "page_size": frozenset({64}),
     "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
     "has_kv_cache": frozenset({True}),

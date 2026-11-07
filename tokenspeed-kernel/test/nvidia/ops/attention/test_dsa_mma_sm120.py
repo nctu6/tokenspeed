@@ -330,3 +330,75 @@ def test_batch_size_does_not_recompile():
     ):
         for tokens in sweep:
             run(tokens)
+
+
+def test_sm120_selects_the_mma_leaves_for_the_zero_rope_kpool_layout(
+    sm120_platform: PlatformInfo,
+):
+    # GLM-5.3-Flash: nope 256, no RoPE rows, 2048 selected slots plus a tail.
+    for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+        decode = dict(qk_nope_head_dim=256, qk_rope_head_dim=0, topk=2051)
+        assert (
+            _select("dsa_decode", sm120_platform, dtype, q_len=4, **decode)
+            == "triton_dsa_mma_decode"
+        )
+        assert (
+            _select("dsa_prefill", sm120_platform, dtype, **decode)
+            == "triton_dsa_mma_prefill"
+        )
+
+
+@on_sm120
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+@pytest.mark.parametrize(
+    ("heads", "lengths", "width"),
+    [(16, [2051, 2048, 700, 0], 2051), (16, [2048] * 40, 2048), (64, [2051], 2051)],
+)
+def test_zero_rope_kpool_layout_matches_float32_reference(
+    mode, dtype, heads, lengths, width
+):
+    """Every cache row is the 512-wide latent: key and value are the same row."""
+    generator = torch.Generator(device="cuda").manual_seed(heads + len(lengths))
+    num_slots = 8 * PAGE * 16
+    kv = (torch.randn(num_slots, RANK, device="cuda", generator=generator) * 0.7).to(
+        dtype
+    )
+    q = (
+        torch.randn(len(lengths), heads, RANK, device="cuda", generator=generator) * 1.5
+    ).to(dtype)
+    slots, lens = _make_selection(lengths, width, num_slots, generator, holes=True)
+    call = dsa_decode if mode == "decode" else dsa_prefill
+    out, lse = call(
+        q=q,
+        kv_cache=kv.view(-1, PAGE, 1, RANK),
+        sparse_kv_cache=None,
+        topk_slots=slots,
+        topk_lens=lens,
+        max_seqlen_k=num_slots,
+        qk_nope_head_dim=256,
+        kv_lora_rank=RANK,
+        qk_rope_head_dim=0,
+        softmax_scale=SCALE,
+        page_size=PAGE,
+        return_lse=True,
+        solution="triton",
+        slot_order="selection",
+        **({"q_len_per_req": 1} if mode == "decode" else {}),
+    )
+    flat = kv.float()
+    expected = torch.zeros(len(lengths), heads, RANK, device="cuda")
+    expected_lse = torch.full((len(lengths), heads), -float("inf"), device="cuda")
+    for row in range(len(lengths)):
+        live = slots[row, : int(lens[row])].long()
+        live = live[live >= 0]
+        if live.numel():
+            scores = (q[row].float() @ flat[live].T) * SCALE
+            expected[row] = scores.softmax(-1) @ flat[live]
+            expected_lse[row] = torch.logsumexp(scores, dim=-1)
+    torch.testing.assert_close(out.float(), expected, **OUT_TOLERANCE[dtype])
+    live_rows = torch.isfinite(expected_lse)
+    assert torch.equal(torch.isfinite(lse), live_rows)
+    torch.testing.assert_close(
+        lse[live_rows], expected_lse[live_rows], atol=LSE_ATOL, rtol=1e-6
+    )
