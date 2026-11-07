@@ -18,7 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The CuTe DSL DeepSelect-style selector against torch.topk on Hopper."""
+"""The CuTe DSL DeepSelect-style selector against torch.topk.
+
+Hopper runs the full-size profile; workstation Blackwell (SM120) runs the
+compact profile that fits its 99 KiB of shared memory. Both must select the
+same entries, so the correctness tests below run unchanged on either.
+"""
 
 import pytest
 import torch
@@ -27,8 +32,13 @@ from tokenspeed_kernel.platform import current_platform
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.version.hip is not None
-    or not current_platform().is_hopper,
-    reason="requires an NVIDIA Hopper GPU",
+    or not (
+        current_platform().is_hopper
+        or (
+            current_platform().is_nvidia and current_platform().arch_version.major == 12
+        )
+    ),
+    reason="requires an NVIDIA Hopper or SM120 GPU",
 )
 
 deep_select = pytest.importorskip(
@@ -73,6 +83,13 @@ def _check_row(scores, end, topk, indices, values):
     torch.testing.assert_close(chosen, reference, atol=0, rtol=0, equal_nan=True)
 
 
+def _require_cluster(cluster_size, topk):
+    if cluster_size not in deep_select.cluster_sizes_for(
+        deep_select.capacity_for(topk)
+    ):
+        pytest.skip("cluster does not fit the candidate buffer for this topk")
+
+
 def _select(scores, ends, topk, cluster_size, **kwargs):
     return deep_select.deepselect_topk(
         scores,
@@ -84,7 +101,7 @@ def _select(scores, ends, topk, cluster_size, **kwargs):
     )
 
 
-@pytest.mark.parametrize("cluster_size", [1, 8])
+@pytest.mark.parametrize("cluster_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("topk", [512, 1024, 2048])
 @pytest.mark.parametrize(
     "width", [1000, 4096, 8192, 8193, 12000, 40000, 65536, 131072 + 777]
@@ -93,10 +110,7 @@ def _select(scores, ends, topk, cluster_size, **kwargs):
     "distribution", ["randn", "ties", "ascending", "descending", "masked"]
 )
 def test_selects_the_top_values(width, topk, cluster_size, distribution):
-    if cluster_size not in deep_select.cluster_sizes_for(
-        deep_select.capacity_for(topk)
-    ):
-        pytest.skip("cluster does not fit the candidate buffer for this topk")
+    _require_cluster(cluster_size, topk)
     generator = torch.Generator(device="cuda").manual_seed(width * 7 + topk)
     rows = 3
     scores = _scores(rows, width, distribution, generator)
@@ -109,6 +123,7 @@ def test_selects_the_top_values(width, topk, cluster_size, distribution):
 
 @pytest.mark.parametrize("cluster_size", [1, 2, 4, 8])
 def test_ragged_ends_and_shortcut_rows(cluster_size):
+    _require_cluster(cluster_size, 512)
     generator = torch.Generator(device="cuda").manual_seed(11)
     width = 131072
     scores = _scores(6, width, "randn", generator)
@@ -123,7 +138,7 @@ def test_ragged_ends_and_shortcut_rows(cluster_size):
         _check_row(scores[row], int(ends[row]), 512, indices[row], values[row])
 
 
-@pytest.mark.parametrize("cluster_size", [1, 8])
+@pytest.mark.parametrize("cluster_size", [1, 4])
 def test_nan_entries_are_never_selected(cluster_size):
     width = 65536
     scores = _scores(2, width, "randn", torch.Generator(device="cuda").manual_seed(3))
@@ -172,6 +187,30 @@ def test_warmup_serves_an_index_less_device():
     assert deep_select.compiled_selector.cache_info().misses == misses_after_warmup
 
 
+def test_new_shapes_reuse_the_compiled_selector():
+    # Rows, width and top-k are runtime arguments: only the survivor capacity
+    # and the cluster size select a binary.
+    deep_select.warmup((512,), torch.device("cuda"))
+    misses = deep_select.compiled_selector.cache_info().misses
+    for rows, width, topk in [(1, 5000, 100), (3, 70000, 512), (7, 9001, 300)]:
+        scores = _scores(
+            rows, width, "randn", torch.Generator(device="cuda").manual_seed(width)
+        )
+        ends = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+        cluster = deep_select.choose_cluster_size(rows, width, 512, 188)
+        indices, values = _select_capacity(scores, ends, topk, 512, cluster)
+        torch.cuda.synchronize()
+        for row in range(rows):
+            _check_row(scores[row], width, topk, indices[row], values[row])
+    assert deep_select.compiled_selector.cache_info().misses == misses
+
+
+def _select_capacity(scores, ends, topk, capacity, cluster_size):
+    return deep_select.deepselect_topk(
+        scores, ends, topk, capacity=capacity, cluster_size=cluster_size
+    )
+
+
 def test_replays_inside_a_cuda_graph():
     generator = torch.Generator(device="cuda").manual_seed(5)
     scores = _scores(4, 65536, "randn", generator)
@@ -180,12 +219,13 @@ def test_replays_inside_a_cuda_graph():
     values = torch.empty((4, 512), dtype=torch.float32, device="cuda")
     deep_select.warmup((512,), scores.device)
     stream = torch.cuda.Stream()
+    cluster = max(deep_select.cluster_sizes_for(512))
     with torch.cuda.stream(stream):
-        _select(scores, ends, 512, 4, indices=out, values=values)
+        _select(scores, ends, 512, cluster, indices=out, values=values)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        _select(scores, ends, 512, 4, indices=out, values=values)
+        _select(scores, ends, 512, cluster, indices=out, values=values)
     for _ in range(2):
         out.fill_(-7)
         scores.copy_(_scores(4, 65536, "randn", generator))
@@ -195,6 +235,9 @@ def test_replays_inside_a_cuda_graph():
             _check_row(scores[row], int(ends[row]), 512, out[row], values[row])
 
 
+@pytest.mark.skipif(
+    not current_platform().is_hopper, reason="residency limits of the full profile"
+)
 def test_cluster_choice_keeps_every_cluster_resident():
     choose = deep_select.choose_cluster_size
     assert choose(1, 8192, 512, 78) == 1
@@ -207,6 +250,25 @@ def test_cluster_choice_keeps_every_cluster_resident():
     assert choose(33, 131072, 512, 78) == 1
     # 2048 survivors per CTA only leave room to gather three peers.
     assert choose(1, 131072, 2048, 78) == 4
+
+
+@pytest.mark.skipif(
+    current_platform().is_hopper, reason="residency limits of the compact profile"
+)
+def test_compact_cluster_choice_keeps_every_cluster_resident():
+    # RTX PRO 6000: 188 SMs, one CTA per SM. Below 32768 entries a split costs
+    # more than it saves; 4-CTA clusters stay in one wave up to 40 rows (160 of
+    # the 188 SMs) and 2-CTA clusters up to 89 rows (178), then rows run alone.
+    choose = deep_select.choose_cluster_size
+    assert choose(1, 16384, 512, 188) == 1
+    assert choose(1, 131072, 512, 188) == 4
+    assert choose(39, 131072, 512, 188) == 4
+    assert choose(40, 131072, 512, 188) == 2
+    assert choose(89, 131072, 512, 188) == 2
+    assert choose(90, 131072, 512, 188) == 1
+    # 2048 survivors per CTA only leave room to gather one peer.
+    assert deep_select.cluster_sizes_for(2048) == (1, 2)
+    assert choose(1, 131072, 2048, 188) == 2
 
 
 def test_rejects_unaligned_rows():

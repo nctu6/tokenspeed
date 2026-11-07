@@ -44,6 +44,15 @@ leader runs one more compaction over the gathered candidates. This mirrors
 DeepSelect's cluster variant and is what makes small batches with long rows
 fast on Hopper, whose GPCs accept portable 8-CTA clusters (H20 included).
 
+Workstation Blackwell (SM120) allows 99 KiB of dynamic shared memory per block,
+where the configuration above needs 207 KB (survivors, a 12K-pair candidate
+buffer and a three-stage ring of 8192-entry rounds). The same code runs there
+with a compact profile, chosen at import from the platform: 256 threads (rounds
+of 4096 entries, whose in-order tail is the row's last full round), a two-stage
+ring, and a 3072-pair candidate buffer that takes each round's hits in two
+groups of warps and compacts first whenever a group would overflow it. That is
+93 KB at the largest capacity and leaves the selected indices unchanged.
+
 Departures from the CUDA implementation: the main rounds stream through a
 plain three-stage ``cp.async.bulk`` shared-memory ring instead of
 TMA-swizzled buffers (only the init window is loaded straight into
@@ -63,22 +72,40 @@ import cutlass.cute as cute
 import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.utils.smem_allocator import SmemAllocator
+from tokenspeed_kernel.platform import current_platform
 
-# Geometry shared with DeepSelect's FP32 configuration.
-NUM_THREADS = 512
+# Workstation Blackwell (SM120) allows 99 KiB of dynamic shared memory per
+# block against 227 KiB on Hopper and datacenter Blackwell, so it runs the same
+# algorithm on half-size rounds (see the constants below).
+_COMPACT_SMEM = (
+    current_platform().is_nvidia and current_platform().arch_version.major == 12
+)
+
+# Geometry shared with DeepSelect's FP32 configuration. The compact profile
+# halves the CTA (256 threads, 4096 entries per round), keeps two ring stages
+# and takes round hits in two groups of warps, so that the candidate buffer
+# only has to hold half a round.
+NUM_THREADS = 256 if _COMPACT_SMEM else 512
 NUM_WARPS = NUM_THREADS // 32
 ELEMS_PER_THREAD = 16
-ROUND_ELEMS = NUM_THREADS * ELEMS_PER_THREAD  # 8192 entries per round
+ROUND_ELEMS = NUM_THREADS * ELEMS_PER_THREAD  # 8192 (4096 compact) per round
 SEG_ELEMS = 512  # one warp visits one segment per round
 SEGS_PER_ROUND = ROUND_ELEMS // SEG_ELEMS
 TAIL_ELEMS = 4096  # the row suffix that is always visited in order
 TAIL_SEGS = TAIL_ELEMS // SEG_ELEMS
 # Candidates accumulated before a compaction. DeepSelect uses 4096; the 64
 # fewer slots keep the max_topk=2048 configuration within Hopper's 227 KiB of
-# dynamic shared memory (survivors + candidates + ring + histograms).
-RECONSTRUCT_THRESHOLD = 4032
-# The check runs after a round, so up to a full round of hits may follow.
-INCOMING_SLOTS = RECONSTRUCT_THRESHOLD + ROUND_ELEMS
+# dynamic shared memory (survivors + candidates + ring + histograms). The
+# compact profile compacts earlier: 3072 candidate slots next to 2048
+# survivors and a two-stage ring take 93 KB.
+RECONSTRUCT_THRESHOLD = 1024 if _COMPACT_SMEM else 4032
+# Warps whose hits of one round are appended together. A group's hits must fit
+# the buffer, and a compaction runs first when they would not.
+INSERT_GROUPS = 2 if _COMPACT_SMEM else 1
+GROUP_WARPS = NUM_WARPS // INSERT_GROUPS
+# The check after a round leaves room for one more group of hits: a whole round
+# on the full profile, where it never overflows.
+INCOMING_SLOTS = 3072 if _COMPACT_SMEM else RECONSTRUCT_THRESHOLD + ROUND_ELEMS
 RADIX_BUCKETS = 256
 # Keys outside the bucket under refinement (or padding slots) are counted in a
 # sink slot past the real buckets, which keeps the histogram passes branch-free.
@@ -89,7 +116,7 @@ RADIX_SLOTS = RADIX_BUCKETS + 4
 NUM_HISTS = 3
 # Shared-memory ring for the main rounds: NUM_STAGES - 1 rounds are in flight
 # while one is being filtered.
-NUM_STAGES = 3
+NUM_STAGES = 2 if _COMPACT_SMEM else 3
 SEG_BYTES = SEG_ELEMS * 4
 SUPPORTED_MAX_TOPK = (512, 1024, 2048)
 SUPPORTED_CLUSTER_SIZES = (1, 2, 4, 8)
@@ -104,6 +131,8 @@ PLACEHOLDER_PAIR = (NEG_INF_BITS << 32) | 0xFFFFFFFF
 
 assert SEGS_PER_ROUND == NUM_WARPS
 assert TAIL_SEGS <= SEGS_PER_ROUND
+# One group of hits (512 per warp) must fit the candidate buffer.
+assert GROUP_WARPS * SEG_ELEMS <= INCOMING_SLOTS
 
 
 @cute.jit
@@ -848,9 +877,16 @@ class DeepSelectTopK:
         num_segs = (end + cutlass.Int32(SEG_ELEMS - 1)) // cutlass.Int32(SEG_ELEMS)
         num_perm_segs = cutlass.Int32(0)
         if num_segs > SEGS_PER_ROUND:
-            num_perm_segs = (
-                (num_segs - 1) // cutlass.Int32(TAIL_SEGS) * cutlass.Int32(TAIL_SEGS)
-            )
+            if cutlass.const_expr(TAIL_SEGS == SEGS_PER_ROUND):
+                # The init window is the tail alone, so the tail is the row's
+                # last full round: it then holds at least max_topk real entries.
+                num_perm_segs = num_segs - cutlass.Int32(TAIL_SEGS)
+            else:
+                num_perm_segs = (
+                    (num_segs - 1)
+                    // cutlass.Int32(TAIL_SEGS)
+                    * cutlass.Int32(TAIL_SEGS)
+                )
         num_perm_elems = num_perm_segs * SEG_ELEMS
         tail_elems = end - num_perm_elems
         tail_padded = num_segs * SEG_ELEMS
@@ -996,34 +1032,59 @@ class DeepSelectTopK:
             if lane == 0:
                 warp_cnt[parity_base + warp] = warp_total
             cute.arch.barrier()
-            entry = warp_cnt[parity_base + (lane & (NUM_WARPS - 1))]
+            counts = warp_cnt[parity_base + (lane & (NUM_WARPS - 1))]
             if lane >= NUM_WARPS:
-                entry = cutlass.Int32(0)
-            round_total = cute.arch.warp_redux_sync(entry, "add")
-            if lane >= warp:
-                entry = cutlass.Int32(0)
-            dst = (
-                num_incomers
-                + cute.arch.warp_redux_sync(entry, "add")
-                + lane_inclusive
-                - n_hits
-            )
-            # Hits are rare, so walking the set bits (re-reading the value from
-            # the ring, since the bit index is dynamic) beats touching all 16
-            # entries again.
-            mask = hit_mask
-            while mask != 0:
-                e = _lowest_set_bit(mask)
-                mask = mask & (mask - 1)
-                # Entry e of this lane sits at chunk e // 4, element e % 4.
-                off = ((e >> cutlass.Int32(2)) << cutlass.Int32(7)) + (
-                    e & cutlass.Int32(3)
+                counts = cutlass.Int32(0)
+            # The round's hits are appended group by group (a single group on
+            # the full profile). A group that would overflow the buffer first
+            # compacts it; the hits were found against the older threshold,
+            # which only admits extra candidates.
+            for g in cutlass.range_constexpr(INSERT_GROUPS):
+                entry = counts
+                if (lane < g * GROUP_WARPS) | (lane >= (g + 1) * GROUP_WARPS):
+                    entry = cutlass.Int32(0)
+                group_total = cute.arch.warp_redux_sync(entry, "add")
+                if num_incomers + group_total > INCOMING_SLOTS:
+                    threshold_bits = self._reconstruct(
+                        survivors,
+                        cur,
+                        incoming,
+                        num_incomers,
+                        topk,
+                        hist,
+                        tidx,
+                        warp,
+                        lane,
+                    )
+                    threshold = _bits_f32(threshold_bits)
+                    cur = cur ^ 1
+                    num_incomers = cutlass.Int32(0)
+                if lane >= warp:
+                    entry = cutlass.Int32(0)
+                dst = (
+                    num_incomers
+                    + cute.arch.warp_redux_sync(entry, "add")
+                    + lane_inclusive
+                    - n_hits
                 )
-                incoming[dst] = _pack_pair(
-                    seg_base + lane * 4 + off, _f32_bits(ring[slot + off])
-                )
-                dst = dst + 1
-            num_incomers = num_incomers + round_total
+                if (warp >= g * GROUP_WARPS) & (warp < (g + 1) * GROUP_WARPS):
+                    # Hits are rare, so walking the set bits (re-reading the
+                    # value from the ring, since the bit index is dynamic)
+                    # beats touching all 16 entries again.
+                    mask = hit_mask
+                    while mask != 0:
+                        e = _lowest_set_bit(mask)
+                        mask = mask & (mask - 1)
+                        # Entry e of this lane sits at chunk e // 4, element
+                        # e % 4.
+                        off = ((e >> cutlass.Int32(2)) << cutlass.Int32(7)) + (
+                            e & cutlass.Int32(3)
+                        )
+                        incoming[dst] = _pack_pair(
+                            seg_base + lane * 4 + off, _f32_bits(ring[slot + off])
+                        )
+                        dst = dst + 1
+                num_incomers = num_incomers + group_total
             seg = _advance_perm(seg, round_stride, perm_len)
             if (num_incomers >= RECONSTRUCT_THRESHOLD) & (m + 1 < main_rounds):
                 threshold_bits = self._reconstruct(
@@ -1186,8 +1247,10 @@ def warmup(capacities: tuple[int, ...], device: torch.device) -> None:
 
 
 # Rows below this width finish in a couple of rounds; the cluster gather and
-# extra compaction would cost more than the split saves.
-CLUSTER_MIN_WIDTH = 4 * ROUND_ELEMS
+# extra compaction would cost more than the split saves. The threshold is the
+# same 32768 entries on both profiles (measured on an RTX PRO 6000: a 2-CTA
+# split loses below it and gains 10-20% from 64K entries on).
+CLUSTER_MIN_WIDTH = 32768
 
 
 def choose_cluster_size(rows: int, width: int, capacity: int, sm_count: int) -> int:
@@ -1199,14 +1262,22 @@ def choose_cluster_size(rows: int, width: int, capacity: int, sm_count: int) -> 
     and once ``rows * cluster_size`` exceeds roughly 60% of the SMs (80% for
     pairs) a second wave queues up and doubles the time. Measured on an
     H20 (78 SMs): 8-CTA clusters serve up to 6 rows, 4-CTA up to 12, 2-CTA
-    up to 32.
+    up to 32. On the compact profile (one CTA per SM) the candidate buffer
+    only gathers up to 2-CTA clusters at capacity 2048 and 4-CTA clusters
+    below it, and the budgets are the measured residency limits.
     """
     if width < CLUSTER_MIN_WIDTH:
         return 1
     for cluster_size in reversed(cluster_sizes_for(capacity)):
         if cluster_size == 1:
             continue
-        budget = sm_count * 5 // 6 if cluster_size == 2 else sm_count * 5 // 8
+        if _COMPACT_SMEM:
+            # One CTA fills an SM, so clusters tile the GPU almost completely:
+            # 2-CTA clusters stay in one wave up to 92 rows and 4-CTA clusters
+            # up to 40 rows on an RTX PRO 6000 (188 SMs), then the time doubles.
+            budget = sm_count * 19 // 20 if cluster_size == 2 else sm_count * 17 // 20
+        else:
+            budget = sm_count * 5 // 6 if cluster_size == 2 else sm_count * 5 // 8
         if rows * cluster_size <= budget:
             return cluster_size
     return 1
