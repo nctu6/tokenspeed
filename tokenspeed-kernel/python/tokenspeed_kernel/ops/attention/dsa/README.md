@@ -225,6 +225,64 @@ index-key row format and the selector that follows.
   1-128 requests, and 1.4-5.1x for chunked-prefill Full passes of 128-4096
   queries.
 
+## Tensor-core sparse attention on SM120 (`_triton/sparse_mma.py`)
+
+`triton_dsa_mma_decode` and `triton_dsa_mma_prefill` (priority `PERFORMANT`,
+window 12.0-12.9) are the SM120 cores for the dense latent cache the runtime
+stores (`has_kv_cache=True`, BF16 or E4M3 rows of 512 + 64 channels, page 64,
+top-k 512-2051, `kv_lora_rank` 128 or 512, 64-wide RoPE, `return_lse` either
+way, `q_len` 1-6 for decode). FlashMLA and the trtllm-gen cores are capped off
+SM120. The packed FP8 sparse cache (`has_sparse_kv_cache=True`) has no runtime
+user on SM120 and keeps `triton_dsa_decode` / `triton_dsa_prefill`, as do
+zero-width RoPE and batch-invariant plans (the leaves do not declare
+`batch_invariant`: the split count follows the batch).
+
+Why it is fast: all heads of a token read the same selected rows, so a program
+owns a tile of heads of one token and multiplies each gathered tile of rows by
+all of them. The portable kernels run one program per (token, head) and
+reduce on CUDA cores. Here `S = Q K^T` runs on `mma.sync` (FP8 `m16n8k32` when
+query and cache are both E4M3, BF16 `m16n8k16` otherwise) and `O += P V` on
+FP16 probabilities for an E4M3 cache (its values are exact in FP16) or BF16
+ones, with an FP32 online softmax. One gather of a row serves both products
+(the 512 latent channels are both K and V; the 64 RoPE channels only K). The
+next tile's gather is issued before the current tile's math (register
+double-buffering; `num_stages=2`).
+
+One path with parameters: `plan_launch(tokens, heads, num_sms)` picks the
+head-tile width (16 or 32) and `num_splits`, the number of programs that share
+one (token, head tile) and each take a slice of the selected columns. Few
+tokens split up to 16 ways, and a small second kernel merges the partial
+(max, sum, accumulator) states; one split normalizes in place. The launch
+parameters depend on the token count only, so a graph captured per batch size
+replays fixed values. Token count, head count, top-k width, strides and
+split count are runtime arguments (`do_not_specialize`); the binaries are
+keyed by tile width and the combine kernel's power-of-two split bound, which
+`test_batch_size_does_not_recompile` guards.
+
+Numerics match the portable kernels: output BF16 for E4M3 queries (the query
+dtype otherwise), `k_scale` folded into the softmax scale, natural-log FP32
+LSE, `-1` slots and `topk_lens` masked, all-invalid rows zero with
+negative-infinite LSE. Against float32 attention over the stored values the
+LSE is exact to 2e-5 absolute, and the output is within one BF16 ulp.
+
+Measured on an RTX PRO 6000 (CUDA graph, 128 heads, top-k 2048, history 16K
+per request for decode and 32K for prefill), against `triton_dsa_*`: decode
+batch 1/8/32/128 is 39x/76x/97x/129x faster for E4M3 (13.5, 46, 136, 537 us),
+prefill chunks 128/512/2048/8192 is 108x/115x/113x/115x (0.48, 1.8, 7.4,
+29.5 ms); 16, 32 and 64 heads per GPU gain 27-146x on every bucket. The
+tile is within about 4x of the tensor-pipe roofline (E4M3 `QK` at 779 TFLOP/s
+and 16-bit `PV` at 404 TFLOP/s, as cuBLAS reaches on this GPU): 136 TFLOP/s
+for 128 requests of decode and 158 TFLOP/s for 8192-token prefill. Ablating the
+`QK` product alone removes 40-45% of the time. Tried and rejected, all slower
+on 128 requests of 128 heads (shipped: 540 us): a compiler-pipelined
+`tl.range` loop (640-739 us over 4 or 8 warps and 1-3 stages), 16 warps with
+a 128-register cap (812 us), `BLOCK_N` of 16 (797 us), and register caps at 8
+warps (1547 us at 168, 2045 us at 128; the kernel uses 246 registers with no
+spills, so a cap forces spilling). `BLOCK_N` of 64 was slower under every cap
+tried (2750-3711 us). A CuTe DSL kernel with TMA or `cp.async` gathers
+and a warp-specialized softmax is the next step if this becomes the bottleneck;
+it is not written.
+
 The portable Triton attention implementations support `return_lse=True` for
 both dense and packed latent caches. They return `(output, lse)`, with FP32
 natural-log LSE shaped `[tokens, heads]`; all-invalid rows produce zero output
