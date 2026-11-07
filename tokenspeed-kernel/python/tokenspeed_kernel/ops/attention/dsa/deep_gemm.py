@@ -16,6 +16,8 @@ from tokenspeed_kernel.ops.attention.dsa.cuda import (
 )
 from tokenspeed_kernel.ops.attention.dsa.cute_dsl import (
     cute_dsl_decode_topk,
+    deepselect_local_topk,
+    deepselect_supports,
     has_cute_dsl_decode_topk,
 )
 from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
@@ -53,6 +55,34 @@ _CUTE_DSL_DECODE_TOPK_ENABLED = os.environ.get("TS_DSA_DECODE_TOPK_CUTEDSL", "1"
 def _use_cute_dsl_decode_topk() -> bool:
     """Whether the DSA decode top-k should use the CuTe DSL cluster kernel."""
     return _CUTE_DSL_DECODE_TOPK_ENABLED and has_cute_dsl_decode_topk()
+
+
+# The TRT-LLM cluster runner is as fast or faster than DeepSelect until its
+# clusters stop fitting (rows x clusters over the SMs); past that it runs its
+# non-cluster kernel, which loses to DeepSelect's one CTA (or cluster pair) per
+# row on workstation Blackwell. RTX PRO 6000, top-k 2048 of random scores, us per
+# call, TRT-LLM / DeepSelect: 16K x 128 rows 12.4 / 18.2 and 32K x 64 rows
+# 17.1 / 26.1 (TRT-LLM wins), but 32K x 96 rows 31.1 / 25.7, 64K x 128 rows
+# 87.4 / 41.1, 128K x 48 rows 88.6 / 47.0 and 128K x 128 rows 173 / 65.
+_DEEPSELECT_DECODE_MIN_WIDTH = 32768
+_DEEPSELECT_DECODE_MIN_ROWS = 96
+_DEEPSELECT_DECODE_LONG_WIDTH = 65536
+_DEEPSELECT_DECODE_LONG_MIN_ROWS = 48
+
+
+def _use_deepselect_decode_topk(logits: torch.Tensor, topk: int) -> bool:
+    """Whether a decode top-k over ``logits`` should use DeepSelect."""
+    rows, width = logits.shape
+    min_rows = (
+        _DEEPSELECT_DECODE_LONG_MIN_ROWS
+        if width >= _DEEPSELECT_DECODE_LONG_WIDTH
+        else _DEEPSELECT_DECODE_MIN_ROWS
+    )
+    return (
+        width >= _DEEPSELECT_DECODE_MIN_WIDTH
+        and rows >= min_rows
+        and deepselect_supports(logits, topk)
+    )
 
 
 # Leaves can serve a batch-invariant selection only where the lowest-index
@@ -401,6 +431,10 @@ if platform.is_hopper_plus:
         local_topk_offsets = torch.empty_like(out)
         if batch_invariant:
             _row_invariant_topk(logits, seq_lens_per_token, local_topk_offsets, topk)
+        elif _use_deepselect_decode_topk(logits_full, topk):
+            deepselect_local_topk(
+                logits_full, seq_lens_per_token, topk, local_topk_offsets
+            )
         elif _use_cute_dsl_decode_topk():
             # CuTe DSL cluster radix top-k: length-aware via seq_lens/q_len_per_req,
             # so no pre-masking needed; same local offsets as the ragged path.
@@ -594,6 +628,10 @@ if platform.is_hopper_plus:
                 tile_out = out[start:end]
                 _row_invariant_topk(logits, tile_lens, tile_out, topk)
                 tile_out.masked_fill_(tile_out >= tile_lens.view(-1, 1), -1)
+            elif deepselect_supports(logits, int(topk)):
+                deepselect_local_topk(
+                    logits, candidate_lens[start:end], topk, out[start:end]
+                )
             elif _USE_TRTLLM_PREFILL_TOPK:
                 torch.ops.trtllm.indexer_topk_prefill(
                     logits.contiguous(),

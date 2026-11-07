@@ -18,7 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CuTe DSL single-pass multi-CTA (cluster) top-k for the DSA decode indexer.
+"""CuTe DSL row top-k kernels for the DSA indexer.
+
+Two selectors live here. The first wraps the vendored TensorRT-LLM single-pass
+multi-CTA (cluster) radix runners; the second (:func:`deepselect_local_topk`)
+wraps the in-tree DeepSelect kernel, which fits workstation Blackwell's
+99 KiB of shared memory. The notes below describe the first one.
 
 Wraps the vendored TensorRT-LLM CuTe DSL radix runners as a length-aware per-row
 top-k over a ``[num_rows, num_cols]`` indexer-logits matrix, matching the
@@ -36,6 +41,8 @@ from tokenspeed_kernel.platform import current_platform
 
 __all__ = [
     "cute_dsl_decode_topk",
+    "deepselect_local_topk",
+    "deepselect_supports",
     "has_cute_dsl_decode_topk",
 ]
 
@@ -165,3 +172,90 @@ def cute_dsl_decode_topk(
             output_indices=out,
         )
     return indices
+
+
+# ---------------------------------------------------------------------------
+# In-tree DeepSelect row top-k
+# ---------------------------------------------------------------------------
+
+# Where it replaces a slower selector: SM120 has no TRT-LLM prefill top-k image
+# (the Triton radix select runs there) and the TRT-LLM decode runners fall back
+# to their non-cluster kernel on large batches of long rows.
+_DEEPSELECT_AVAILABLE = False
+_MAX_GRID_ROWS = 65535
+_row_select = None
+try:
+    _platform = current_platform()
+    _deepselect_arch = _platform.is_nvidia and _platform.arch_version.major == 12
+except Exception:
+    _deepselect_arch = False
+if _deepselect_arch:
+    try:
+        from tokenspeed_kernel.ops.attention.dsa._cute_dsl import (
+            deep_select as _row_select,
+        )
+
+        _DEEPSELECT_AVAILABLE = True
+    except ImportError:
+        _DEEPSELECT_AVAILABLE = False
+
+
+def deepselect_supports(logits: torch.Tensor, topk: int) -> bool:
+    """Whether DeepSelect can select ``topk`` entries per row of ``logits``."""
+    return (
+        _DEEPSELECT_AVAILABLE
+        and 0 < topk <= _row_select.MAX_TOPK
+        and logits.dim() == 2
+        and logits.dtype == torch.float32
+        and logits.is_cuda
+        and logits.shape[0] > 0
+        and logits.shape[1] > 0
+        and logits.stride(1) == 1
+        and logits.stride(0) % _row_select.SCORE_ALIGNMENT == 0
+        and logits.stride(0) >= logits.shape[1]
+        and logits.data_ptr() % (_row_select.SCORE_ALIGNMENT * 4) == 0
+    )
+
+
+def deepselect_local_topk(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Per-row top-k column offsets over the first ``lengths[r]`` columns.
+
+    Args:
+        logits: FP32 ``[rows, cols]`` scores with unit column stride, a row
+            stride that is a multiple of 4 elements and a 16-byte aligned base
+            (the DeepGEMM logits allocation satisfies this).
+        lengths: integer ``[rows]`` valid column count of each row; columns past
+            it are never read.
+        topk: Offsets to select per row, at most 2048.
+        out: Contiguous int32 ``[rows, topk]`` destination.
+
+    Returns:
+        ``out``: unsorted local column offsets. A row shorter than ``topk``
+        holds ``0 .. length - 1`` followed by ``-1``. Ties at the k-th score
+        resolve arbitrarily but deterministically.
+    """
+    if not _DEEPSELECT_AVAILABLE:
+        raise RuntimeError("DeepSelect row top-k is unavailable on this platform")
+    # Compiles on first use, so run it once eagerly before CUDA-graph capture.
+    capacity = _row_select.capacity_for(topk)
+    lengths = lengths.to(torch.int32).contiguous()
+    # One CUDA grid row per score row, at most 65535 of them per launch.
+    for begin in range(0, logits.shape[0], _MAX_GRID_ROWS):
+        end = min(begin + _MAX_GRID_ROWS, logits.shape[0])
+        cluster_size = _row_select.choose_cluster_size(
+            end - begin, logits.shape[1], capacity, current_platform().sm_count
+        )
+        _row_select.deepselect_topk(
+            logits[begin:end],
+            lengths[begin:end],
+            topk,
+            capacity=capacity,
+            cluster_size=cluster_size,
+            indices=out[begin:end],
+        )
+    return out
