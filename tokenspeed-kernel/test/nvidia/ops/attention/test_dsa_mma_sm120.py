@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.attention.dsa import dsa_decode, dsa_prefill
 from tokenspeed_kernel.ops.attention.dsa import triton as dsa_triton
 from tokenspeed_kernel.ops.attention.dsa._triton import sparse_mma
 from tokenspeed_kernel.platform import Platform, PlatformInfo
+from tokenspeed_kernel.selection import KernelPlan
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from utils import assert_no_triton_compile, warm_specialization_classes
 
@@ -137,6 +138,51 @@ def test_plan_follows_tokens_and_heads_only():
             assert 1 <= splits <= sparse_mma.MAX_SPLITS
 
 
+def _plan(mode, platform, dtype, slot_order):
+    """The plan DSABackend builds under a bitwise envelope."""
+    traits = {
+        "qk_nope_head_dim": 128,
+        "kv_lora_rank": RANK,
+        "qk_rope_head_dim": ROPE,
+        "page_size": PAGE,
+        "has_kv_cache": True,
+        "has_sparse_kv_cache": False,
+        "logit_cap": False,
+        "topk_layout": "global_slots",
+        "slot_order": slot_order,
+        "return_lse": frozenset({False}),
+        "q_len": frozenset({1, 2, 3}) if mode == "dsa_decode" else 1,
+    }
+    return KernelPlan.select(
+        "attention",
+        mode,
+        format_signature(q=dense_tensor_format(dtype)),
+        features=frozenset({"batch_invariant"}),
+        static_traits=traits,
+        variable_traits=frozenset({"batch_size", "tokens", "topk", "max_seqlen_k"}),
+        solution=None,
+        declared_traits=(
+            frozenset({"slot_order"}) if slot_order == "sorted" else frozenset()
+        ),
+        ignore_layout=False,
+        platform=platform,
+    )
+
+
+@pytest.mark.parametrize("slot_order", ["selection", "sorted"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_bitwise_envelope_plans_the_mma_leaves(
+    dtype, slot_order, sm120_platform: PlatformInfo
+):
+    for mode, name in (
+        ("dsa_decode", "triton_dsa_mma_decode"),
+        ("dsa_prefill", "triton_dsa_mma_prefill"),
+    ):
+        plan = _plan(mode, sm120_platform, dtype, slot_order)
+        assert plan.kernel.name == name
+        assert {"batch_invariant", "cuda_graph"} <= plan.spec.features
+
+
 def _make_cache(num_slots, dtype, generator):
     kv = torch.randn(num_slots, DIM, device="cuda", generator=generator) * 0.7
     return kv.to(dtype)
@@ -224,38 +270,77 @@ def test_matches_float32_reference(mode, dtype, heads, lengths, width):
     assert not out[~live.any(dim=1)].any()
 
 
+def _attend(q, kv, slots, lens, *, num_splits, block_h=32, return_lse=True):
+    return sparse_mma.sparse_mma_attention(
+        q,
+        kv.view(-1, PAGE, 1, DIM),
+        slots,
+        lens,
+        softmax_scale=SCALE,
+        kv_lora_rank=RANK,
+        qk_rope_head_dim=ROPE,
+        return_lse=return_lse,
+        block_h=block_h,
+        block_n=sparse_mma.BLOCK_N,
+        num_warps=sparse_mma.NUM_WARPS,
+        num_stages=sparse_mma.NUM_STAGES,
+        num_splits=num_splits,
+    )
+
+
 @on_sm120
-def test_split_count_does_not_change_the_result():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("block_h", [16, 32])
+def test_split_count_does_not_change_the_result(dtype, block_h):
+    """Folding the chunks in one program or across several is bitwise equal."""
     generator = torch.Generator(device="cuda").manual_seed(5)
     num_slots = 8 * PAGE * 16
-    kv = _make_cache(num_slots, torch.float8_e4m3fn, generator)
-    q = torch.randn(3, 32, DIM, device="cuda", generator=generator).to(
-        torch.float8_e4m3fn
+    kv = _make_cache(num_slots, dtype, generator)
+    q = torch.randn(4, 40, DIM, device="cuda", generator=generator).to(dtype)
+    # Full, partial, one-tile and empty selections.
+    slots, lens = _make_selection([2048, 1000, 77, 0], 2048, num_slots, generator)
+    out, lse = _attend(q, kv, slots, lens, num_splits=1, block_h=block_h)
+    for splits in (2, 3, 5, sparse_mma.MAX_CHUNKS, 99):
+        other, other_lse = _attend(
+            q, kv, slots, lens, num_splits=splits, block_h=block_h
+        )
+        assert torch.equal(out, other), splits
+        assert torch.equal(lse, other_lse), splits
+
+
+@on_sm120
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+@pytest.mark.parametrize("heads", [16, 40, 128])
+def test_rows_do_not_depend_on_the_batch(mode, dtype, heads):
+    """A token's row is bitwise the same in any batch, split or not.
+
+    Replaying a chunk after a prefix-cache hit, or decoding next to other
+    requests, must reproduce the rows exactly; the launch shape follows the
+    token count.
+    """
+    generator = torch.Generator(device="cuda").manual_seed(3 + heads)
+    num_slots = 8 * PAGE * 16
+    kv = _make_cache(num_slots, dtype, generator)
+    count = 600
+    q = torch.randn(count, heads, DIM, device="cuda", generator=generator).to(dtype)
+    lengths = [2048, 1999, 1024, 513, 200, 33, 1, 0] * (count // 8) + [2048] * (
+        count % 8
     )
-    slots, lens = _make_selection([2048, 1000, 77], 2048, num_slots, generator)
-    results = []
-    for splits in (1, 2, 5, 16):
-        out, lse = sparse_mma.sparse_mma_attention(
-            q,
-            kv.view(-1, PAGE, 1, DIM),
-            slots,
-            lens,
-            softmax_scale=SCALE,
-            kv_lora_rank=RANK,
-            qk_rope_head_dim=ROPE,
-            return_lse=True,
-            block_h=32,
-            block_n=sparse_mma.BLOCK_N,
-            num_warps=sparse_mma.NUM_WARPS,
-            num_stages=sparse_mma.NUM_STAGES,
-            num_splits=splits,
+    slots, lens = _make_selection(lengths, 2048, num_slots, generator, holes=True)
+    full, full_lse = _run(mode, q, kv, slots, lens, return_lse=True)
+    for start, size in ((0, 1), (5, 3), (17, 9), (100, 40), (0, count)):
+        rows = slice(start, start + size)
+        part, part_lse = _run(
+            mode, q[rows], kv, slots[rows], lens[rows], return_lse=True
         )
-        results.append((out.float(), lse))
-    for out, lse in results[1:]:
-        torch.testing.assert_close(
-            out, results[0][0], **OUT_TOLERANCE[torch.float8_e4m3fn]
-        )
-        torch.testing.assert_close(lse, results[0][1], atol=2e-5, rtol=1e-6)
+        assert torch.equal(part, full[rows]), (start, size)
+        assert torch.equal(part_lse, full_lse[rows]), (start, size)
+    sm_count = Platform.get().sm_count
+    plans = {
+        sparse_mma.plan_launch(n, heads, sm_count)[1] > 1 for n in (1, 3, 9, count)
+    }
+    assert plans == {True, False}  # both launch shapes were compared
 
 
 @on_sm120
@@ -281,6 +366,7 @@ def test_out_buffer_and_flat_cache_layouts():
             SCALE,
             PAGE,
             out=buffer,
+            slot_order="selection",
         )
         assert returned is buffer
         torch.testing.assert_close(
@@ -290,7 +376,7 @@ def test_out_buffer_and_flat_cache_layouts():
 
 @on_sm120
 def test_batch_size_does_not_recompile():
-    """Token count, head count, top-k width and split count are runtime values."""
+    """Token count, head count, top-k width and chunk count are runtime values."""
     generator = torch.Generator(device="cuda").manual_seed(11)
     num_slots = 8 * PAGE * 16
     kv = _make_cache(num_slots, torch.float8_e4m3fn, generator)
@@ -301,27 +387,21 @@ def test_batch_size_does_not_recompile():
 
     def run(tokens):
         block_h, splits = sparse_mma.plan_launch(tokens, 32, 188)
-        return sparse_mma.sparse_mma_attention(
+        return _attend(
             pool[:tokens],
-            kv.view(-1, PAGE, 1, DIM),
+            kv,
             slots[:tokens],
             lens[:tokens],
-            softmax_scale=SCALE,
-            kv_lora_rank=RANK,
-            qk_rope_head_dim=ROPE,
-            return_lse=False,
-            block_h=block_h,
-            block_n=sparse_mma.BLOCK_N,
-            num_warps=sparse_mma.NUM_WARPS,
-            num_stages=sparse_mma.NUM_STAGES,
             num_splits=splits,
+            block_h=block_h,
+            return_lse=False,
         )
 
     def key(tokens):
-        # The binaries are keyed by the head-tile width and the combine kernel's
-        # power-of-two split bound; tokens only change the launch grid.
+        # The binaries are keyed by the head-tile width and split-or-not;
+        # tokens and the split count only change the launch grid.
         block_h, splits = sparse_mma.plan_launch(tokens, 32, 188)
-        return block_h, splits == 1, 1 << (splits - 1).bit_length()
+        return block_h, splits > 1
 
     sweep = (1, 2, 3, 5, 8, 9, 17, 33, 64, 100, 130)
     warm_specialization_classes(run, key, sweep, pool=(1, 4, 8, 16, 40, 130))
@@ -402,3 +482,53 @@ def test_zero_rope_kpool_layout_matches_float32_reference(
     torch.testing.assert_close(
         lse[live_rows], expected_lse[live_rows], atol=LSE_ATOL, rtol=1e-6
     )
+
+
+@on_sm120
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+def test_planned_call_matches_the_unplanned_call(mode):
+    """A plan fixes the leaf; the call through it computes the same bits."""
+    generator = torch.Generator(device="cuda").manual_seed(21)
+    num_slots = 8 * PAGE * 16
+    kv = _make_cache(num_slots, torch.bfloat16, generator)
+    q = torch.randn(7, 24, DIM, device="cuda", generator=generator).bfloat16()
+    slots, lens = _make_selection(
+        [2048, 900, 64, 5, 0, 1500, 2048], 2048, num_slots, generator
+    )
+    plan = _plan(f"dsa_{mode}", Platform.get(), torch.bfloat16, "sorted")
+    call = dsa_decode if mode == "decode" else dsa_prefill
+    extra = {"q_len_per_req": 1} if mode == "decode" else {}
+    planned = call(
+        q=q,
+        kv_cache=kv.view(-1, PAGE, 1, DIM),
+        sparse_kv_cache=None,
+        topk_slots=slots,
+        topk_lens=lens,
+        max_seqlen_k=num_slots,
+        qk_nope_head_dim=128,
+        kv_lora_rank=RANK,
+        qk_rope_head_dim=ROPE,
+        softmax_scale=SCALE,
+        page_size=PAGE,
+        slot_order="sorted",
+        kernel_plan=plan,
+        **extra,
+    )
+    unplanned = _run(mode, q, kv, slots, lens, return_lse=False)
+    assert torch.equal(planned, unplanned)
+
+
+@on_sm120
+@pytest.mark.parametrize("width", [1, 33, 64, 100, 512, 4096])
+def test_any_selection_width_matches_the_float32_reference(width):
+    """The leaves carry no width trait, so any width must be correct."""
+    generator = torch.Generator(device="cuda").manual_seed(width)
+    num_slots = 8 * PAGE * 16
+    kv = _make_cache(num_slots, torch.bfloat16, generator)
+    q = torch.randn(3, 16, DIM, device="cuda", generator=generator).bfloat16()
+    lengths = [width, max(width // 2, 1), 1]
+    slots, lens = _make_selection(lengths, width, num_slots, generator)
+    out, lse = _run("decode", q, kv, slots, lens, return_lse=True)
+    expected, expected_lse = _reference(q, kv, slots, lens)
+    torch.testing.assert_close(out.float(), expected, **OUT_TOLERANCE[torch.bfloat16])
+    torch.testing.assert_close(lse, expected_lse, atol=LSE_ATOL, rtol=1e-6)

@@ -685,20 +685,28 @@ _MMA_SIGNATURES = frozenset(
     }
 )
 # Dense BF16 or E4M3 latent cache only: the packed FP8 sparse cache has no
-# runtime user on SM120 and keeps the portable kernels.
+# runtime user on SM120 and keeps the portable kernels. The selection width is
+# not a trait: a token's chunks depend on it alone and any width is correct, so
+# a plan that leaves ``topk`` variable (``KernelPlan``) can still pick the leaf.
 _MMA_TRAITS = {
     "qk_nope_head_dim": frozenset({128, 192, 256}),
     "kv_lora_rank": frozenset({128, 512}),
     # Zero is the KPool layout of GLM-5.3-Flash: no RoPE rows in the cache.
     "qk_rope_head_dim": frozenset({0, 64}),
     "page_size": frozenset({64}),
-    "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
     "has_kv_cache": frozenset({True}),
     "has_sparse_kv_cache": frozenset({False}),
     "topk_layout": frozenset({"global_slots"}),
     "logit_cap": frozenset({False}),
     "return_lse": frozenset({False, True}),
+    # The cores reduce a token's slots in the order they arrive, so they keep
+    # whichever order the top-k leaf emitted.
+    "slot_order": frozenset({"selection", "sorted"}),
 }
+# A token's row is a function of its own query and selection only: the chunk
+# boundaries follow the width, and split and unsplit launches fold the chunks
+# identically (``_triton/sparse_mma.py``).
+_MMA_FEATURES = {"batch_invariant", "cuda_graph"}
 
 
 @register_kernel(
@@ -708,6 +716,7 @@ _MMA_TRAITS = {
     solution="triton",
     capability=_SM120_MMA_CAPABILITY,
     signatures=_MMA_SIGNATURES,
+    features=_MMA_FEATURES,
     traits={**_MMA_TRAITS, "q_len": frozenset({1, 2, 3, 4, 5, 6})},
     priority=Priority.PERFORMANT,
 )
@@ -730,8 +739,11 @@ def triton_dsa_mma_decode(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
     enable_pdl: bool = False,
+    *,
+    slot_order: str,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    del kv_seq_lens
+    # Both orders reduce the slots as they arrive; the top-k leaf chose it.
+    del kv_seq_lens, slot_order
     return _run_dsa_mma(
         q=q,
         kv_cache=kv_cache,
@@ -753,6 +765,7 @@ def triton_dsa_mma_decode(
     solution="triton",
     capability=_SM120_MMA_CAPABILITY,
     signatures=_MMA_SIGNATURES,
+    features=_MMA_FEATURES,
     traits={**_MMA_TRAITS, "q_len": frozenset({1})},
     priority=Priority.PERFORMANT,
 )
@@ -775,8 +788,11 @@ def triton_dsa_mma_prefill(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
     enable_pdl: bool = False,
+    *,
+    slot_order: str,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    del kv_seq_lens
+    # Both orders reduce the slots as they arrive; the top-k leaf chose it.
+    del kv_seq_lens, slot_order
     return _run_dsa_mma(
         q=q,
         kv_cache=kv_cache,

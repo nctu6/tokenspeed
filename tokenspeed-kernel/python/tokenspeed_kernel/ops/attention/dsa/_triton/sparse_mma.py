@@ -27,10 +27,15 @@ head of the tile at once: ``S = Q K^T`` and ``O += P V`` run on ``mma.sync``
 otherwise) with an online softmax in FP32. The latent rows are gathered once
 per tile and serve both the score and the value product.
 
-The selected columns are split across ``num_splits`` programs when a batch has
-too few (token, head tile) pairs to fill the GPU; a second kernel merges the
-partial softmax states. ``num_splits`` is a launch parameter, not a separate
-code path: with one split the main kernel normalizes and stores its result.
+A token's selected columns are cut into ``num_chunks`` chunks of whole tiles;
+the count depends on the selection width only. Each chunk runs its own online
+softmax and the chunk states are folded in order by :func:`_merge`. One program
+folds them in registers. When a batch has too few (token, head tile) pairs to
+fill the GPU, several programs share a token: each runs a run of chunks and
+stores every chunk's state, and a second kernel folds all stored states with
+the same function in the same order. The result is bitwise the same for every
+batch size and launch shape, so a token's row does not depend on the batch it
+runs in (``docs/design/numerics.md``).
 """
 
 from __future__ import annotations
@@ -80,9 +85,34 @@ def _load_tile(
     return valid, k, k_rope
 
 
+@triton.jit
+def _merge(m_run, l_run, acc_run, m_part, l_part, acc_part):
+    """Fold one chunk's softmax state into a running one.
+
+    Explicit ``fma`` keeps the compiler from contracting the products
+    differently in the two kernels that call this, which would break the
+    bitwise match between split and unsplit launches.
+    """
+    m_new = tl.maximum(m_run, m_part)
+    m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+    scale_run = tl.where(m_run == -float("inf"), 0.0, tl.exp2(m_run - m_safe))
+    scale_part = tl.where(m_part == -float("inf"), 0.0, tl.exp2(m_part - m_safe))
+    l_new = tl.fma(l_part, scale_part, l_run * scale_run)
+    acc_new = tl.fma(acc_part, scale_part[:, None], acc_run * scale_run[:, None])
+    return m_new, l_new, acc_new
+
+
 # Values that change with the batch are runtime arguments that Triton must not
 # specialize on (== 1, divisible by 16), or each new batch would recompile.
-@triton.jit(do_not_specialize=["num_heads", "topk", "tiles_per_split", "num_splits"])
+@triton.jit(
+    do_not_specialize=[
+        "num_heads",
+        "topk",
+        "chunk_tiles",
+        "num_chunks",
+        "chunks_per_split",
+    ]
+)
 def _sparse_mma_kernel(
     q,
     kv,
@@ -98,10 +128,12 @@ def _sparse_mma_kernel(
     page_stride,
     token_stride,
     channel_stride,
-    tiles_per_split,
-    num_splits,
+    chunk_tiles,
+    num_chunks,
+    chunks_per_split,
     scale_log2,
     RETURN_LSE: tl.constexpr,
+    SPLIT: tl.constexpr,
     FP8_QK: tl.constexpr,
     FP8_KV: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -125,12 +157,6 @@ def _sparse_mma_kernel(
     q_rows = (token.to(tl.int64) * num_heads + heads) * HEAD_DIM
     valid_len = tl.minimum(tl.load(topk_lens + token).to(tl.int32), topk)
     num_tiles = tl.cdiv(valid_len, BLOCK_N)
-    tile_begin = split * tiles_per_split
-    tile_end = tl.minimum(tile_begin + tiles_per_split, num_tiles)
-
-    m_i = tl.full((BLOCK_H,), -float("inf"), tl.float32)
-    l_i = tl.zeros((BLOCK_H,), tl.float32)
-    acc = tl.zeros((BLOCK_H, RANK), tl.float32)
 
     q_nope = tl.load(
         q + q_rows[:, None] + rank_offsets[None, :],
@@ -147,27 +173,29 @@ def _sparse_mma_kernel(
         q_rope = q_nope
 
     topk_row = topk_indices + token.to(tl.int64) * topk_stride
-    valid, k, k_rope = _load_tile(
-        kv,
-        topk_row,
-        tile_begin,
-        tile_end,
-        valid_len,
-        page_stride,
-        token_stride,
-        channel_stride,
-        PAGE_SIZE,
-        RANK,
-        ROPE,
-        BLOCK_N,
-    )
-    for tile in range(tile_begin, tile_end):
-        # Issue the next tile's gather before this tile's math; a tile past
-        # the end loads nothing.
-        valid_next, k_next, k_rope_next = _load_tile(
+    if SPLIT:
+        # A run of chunks per program; a chunk past the selection stores an
+        # empty state.
+        chunk_begin = split * chunks_per_split
+        chunk_end = tl.minimum(chunk_begin + chunks_per_split, num_chunks)
+    else:
+        # Chunk 0 always runs; trailing empty chunks, which the combine kernel
+        # does fold, leave a state unchanged.
+        chunk_begin = 0
+        chunk_end = tl.maximum(tl.cdiv(num_tiles, chunk_tiles), 1)
+    m_run = tl.full((BLOCK_H,), -float("inf"), tl.float32)
+    l_run = tl.zeros((BLOCK_H,), tl.float32)
+    acc_run = tl.zeros((BLOCK_H, RANK), tl.float32)
+    for chunk in range(chunk_begin, chunk_end):
+        m_i = tl.full((BLOCK_H,), -float("inf"), tl.float32)
+        l_i = tl.zeros((BLOCK_H,), tl.float32)
+        acc = tl.zeros((BLOCK_H, RANK), tl.float32)
+        tile_begin = chunk * chunk_tiles
+        tile_end = tl.minimum(tile_begin + chunk_tiles, num_tiles)
+        valid, k, k_rope = _load_tile(
             kv,
             topk_row,
-            tile + 1,
+            tile_begin,
             tile_end,
             valid_len,
             page_stride,
@@ -178,36 +206,64 @@ def _sparse_mma_kernel(
             ROPE,
             BLOCK_N,
         )
+        for tile in range(tile_begin, tile_end):
+            # Issue the next tile's gather before this tile's math; a tile
+            # past the end loads nothing.
+            valid_next, k_next, k_rope_next = _load_tile(
+                kv,
+                topk_row,
+                tile + 1,
+                tile_end,
+                valid_len,
+                page_stride,
+                token_stride,
+                channel_stride,
+                PAGE_SIZE,
+                RANK,
+                ROPE,
+                BLOCK_N,
+            )
 
-        if FP8_QK:
-            s = tl.dot(q_nope, tl.trans(k))
-            if ROPE > 0:
-                s = tl.dot(q_rope, tl.trans(k_rope), s)
+            if FP8_QK:
+                s = tl.dot(q_nope, tl.trans(k))
+                if ROPE > 0:
+                    s = tl.dot(q_rope, tl.trans(k_rope), s)
+            else:
+                s = tl.dot(q_nope, tl.trans(k.to(tl.bfloat16)))
+                if ROPE > 0:
+                    s = tl.dot(q_rope, tl.trans(k_rope.to(tl.bfloat16)), s)
+            s = tl.where(valid[None, :], s * scale_log2, -float("inf"))
+
+            m_new = tl.maximum(m_i, tl.max(s, axis=1))
+            m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+            alpha = tl.exp2(m_i - m_safe)
+            p = tl.exp2(s - m_safe[:, None])
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None]
+            if FP8_KV:
+                # E4M3 values are exact in FP16, which keeps 3 more bits of the
+                # probability than BF16 does.
+                acc = tl.dot(p.to(tl.float16), k.to(tl.float16), acc)
+            else:
+                acc = tl.dot(p.to(tl.bfloat16), k.to(tl.bfloat16), acc)
+            m_i = m_new
+            valid = valid_next
+            k = k_next
+            k_rope = k_rope_next
+        if SPLIT:
+            part = (token.to(tl.int64) * num_chunks + chunk) * num_heads + heads
+            tl.store(
+                part_acc + part[:, None] * RANK + rank_offsets[None, :],
+                acc,
+                mask=head_mask[:, None],
+            )
+            tl.store(part_ml + part * 2, m_i, mask=head_mask)
+            tl.store(part_ml + part * 2 + 1, l_i, mask=head_mask)
         else:
-            s = tl.dot(q_nope, tl.trans(k.to(tl.bfloat16)))
-            if ROPE > 0:
-                s = tl.dot(q_rope, tl.trans(k_rope.to(tl.bfloat16)), s)
-        s = tl.where(valid[None, :], s * scale_log2, -float("inf"))
+            m_run, l_run, acc_run = _merge(m_run, l_run, acc_run, m_i, l_i, acc)
 
-        m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
-        alpha = tl.exp2(m_i - m_safe)
-        p = tl.exp2(s - m_safe[:, None])
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None]
-        if FP8_KV:
-            # E4M3 values are exact in FP16, which keeps 3 more bits of the
-            # probability than BF16 does.
-            acc = tl.dot(p.to(tl.float16), k.to(tl.float16), acc)
-        else:
-            acc = tl.dot(p.to(tl.bfloat16), k.to(tl.bfloat16), acc)
-        m_i = m_new
-        valid = valid_next
-        k = k_next
-        k_rope = k_rope_next
-
-    if num_splits == 1:
-        result = tl.where(l_i[:, None] > 0.0, acc / l_i[:, None], 0.0)
+    if not SPLIT:
+        result = tl.where(l_run[:, None] > 0.0, acc_run / l_run[:, None], 0.0)
         out_rows = (token.to(tl.int64) * num_heads + heads) * RANK
         tl.store(
             out + out_rows[:, None] + rank_offsets[None, :],
@@ -216,75 +272,63 @@ def _sparse_mma_kernel(
         )
         if RETURN_LSE:
             lse_value = tl.where(
-                l_i > 0.0, (m_i + tl.log2(l_i)) * 0.6931471805599453, -float("inf")
+                l_run > 0.0,
+                (m_run + tl.log2(l_run)) * 0.6931471805599453,
+                -float("inf"),
             )
             tl.store(
                 lse + token.to(tl.int64) * num_heads + heads, lse_value, mask=head_mask
             )
-    else:
-        part = (token.to(tl.int64) * num_splits + split) * num_heads + heads
-        tl.store(
-            part_acc + part[:, None] * RANK + rank_offsets[None, :],
-            acc,
-            mask=head_mask[:, None],
-        )
-        tl.store(part_ml + part * 2, m_i, mask=head_mask)
-        tl.store(part_ml + part * 2 + 1, l_i, mask=head_mask)
 
 
-@triton.jit(do_not_specialize=["num_heads", "num_splits"])
+@triton.jit(do_not_specialize=["num_heads", "num_chunks"])
 def _sparse_mma_combine_kernel(
     part_acc,
     part_ml,
     out,
     lse,
     num_heads,
-    num_splits,
+    num_chunks,
     RETURN_LSE: tl.constexpr,
     RANK: tl.constexpr,
-    BLOCK_S: tl.constexpr,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
-    splits = tl.arange(0, BLOCK_S)
-    split_mask = splits < num_splits
     rank_offsets = tl.arange(0, RANK)
-
-    part = (token.to(tl.int64) * num_splits + splits) * num_heads + head
-    m = tl.load(part_ml + part * 2, mask=split_mask, other=-float("inf"))
-    l = tl.load(part_ml + part * 2 + 1, mask=split_mask, other=0.0)
-    m_all = tl.max(m, axis=0)
-    m_safe = tl.where(m_all == -float("inf"), 0.0, m_all)
-    weight = tl.where(split_mask & (l > 0.0), tl.exp2(m - m_safe), 0.0)
-    l_all = tl.sum(weight * l, axis=0)
-    acc = tl.load(
-        part_acc + part[:, None] * RANK + rank_offsets[None, :],
-        mask=split_mask[:, None],
-        other=0.0,
-    )
-    total = tl.sum(acc * weight[:, None], axis=0)
-    result = tl.where(l_all > 0.0, total / l_all, 0.0)
+    one = tl.zeros((1,), tl.int64)
+    # Same chunk states, same order and same _merge as the unsplit kernel.
+    m_run = tl.full((1,), -float("inf"), tl.float32)
+    l_run = tl.zeros((1,), tl.float32)
+    acc_run = tl.zeros((1, RANK), tl.float32)
+    for chunk in range(0, num_chunks):
+        part = (token.to(tl.int64) * num_chunks + chunk) * num_heads + head + one
+        m_part = tl.load(part_ml + part * 2)
+        l_part = tl.load(part_ml + part * 2 + 1)
+        acc_part = tl.load(part_acc + part[:, None] * RANK + rank_offsets[None, :])
+        m_run, l_run, acc_run = _merge(m_run, l_run, acc_run, m_part, l_part, acc_part)
+    result = tl.where(l_run[:, None] > 0.0, acc_run / l_run[:, None], 0.0)
     out_row = (token.to(tl.int64) * num_heads + head) * RANK
-    tl.store(out + out_row + rank_offsets, result)
+    tl.store(out + out_row + rank_offsets[None, :], result)
     if RETURN_LSE:
-        tl.store(
-            lse + token.to(tl.int64) * num_heads + head,
-            tl.where(
-                l_all > 0.0,
-                (m_safe + tl.log2(l_all)) * 0.6931471805599453,
-                -float("inf"),
-            ),
+        lse_value = tl.where(
+            l_run > 0.0, (m_run + tl.log2(l_run)) * 0.6931471805599453, -float("inf")
         )
+        tl.store(lse + token.to(tl.int64) * num_heads + head + one, lse_value)
 
 
 BLOCK_N = 32
 NUM_WARPS = 8
 NUM_STAGES = 2
 MAX_SPLITS = 16
+# Chunks per token selection; a split launch gives each its own program.
+MAX_CHUNKS = 8
 
 
 def plan_launch(tokens: int, heads: int, num_sms: int) -> tuple[int, int]:
     """Pick ``(block_h, num_splits)`` for a batch of ``tokens`` queries.
+
+    ``num_splits`` is how many programs the launch rule wants per (token, head
+    tile). It never changes the result.
 
     The tile shape is fixed (``BLOCK_N`` selected slots per step, ``NUM_WARPS``
     warps, ``NUM_STAGES`` stages). Only two things follow the batch: how many
@@ -309,6 +353,17 @@ def plan_launch(tokens: int, heads: int, num_sms: int) -> tuple[int, int]:
     programs = triton.cdiv(heads, block_h) * tokens
     num_splits = min(max(round(target / programs), 1), MAX_SPLITS)
     return block_h, num_splits
+
+
+def num_chunks_for(width: int, block_n: int = BLOCK_N) -> tuple[int, int]:
+    """``(chunk_tiles, num_chunks)`` for a selection ``width`` columns wide.
+
+    A function of the width alone, so every batch size cuts a token's
+    selection at the same columns.
+    """
+    tiles = max(triton.cdiv(width, block_n), 1)
+    chunk_tiles = triton.cdiv(tiles, MAX_CHUNKS)
+    return chunk_tiles, triton.cdiv(tiles, chunk_tiles)
 
 
 def sparse_mma_attention(
@@ -337,8 +392,10 @@ def sparse_mma_attention(
         topk_slots: ``[tokens, width]`` int32 global slots, ``-1`` for none.
         topk_lens: ``[tokens]`` int32 count of leading columns that are live.
         block_h, block_n, num_warps, num_stages: tile shape and launch shape.
-        num_splits: programs sharing one (token, head tile); 1 normalizes in
-            place, more write partial states merged by a second kernel.
+        num_splits: programs sharing one (token, head tile), at most the
+            number of chunks. One folds the chunks in registers; more store
+            every chunk's state for a second kernel to fold. The result is
+            bitwise the same for every value.
 
     Returns:
         ``(out, lse)``: ``out`` is ``[tokens, heads, kv_lora_rank]`` in BF16
@@ -364,19 +421,21 @@ def sparse_mma_attention(
         if return_lse
         else None
     )
-    if num_splits > 1:
+    width = topk_slots.shape[1]
+    chunk_tiles, num_chunks = num_chunks_for(width, block_n)
+    num_splits = max(min(num_splits, num_chunks), 1)
+    split = num_splits > 1
+    if split:
         part_acc = torch.empty(
-            (tokens, num_splits, heads, kv_lora_rank),
+            (tokens, num_chunks, heads, kv_lora_rank),
             dtype=torch.float32,
             device=device,
         )
         part_ml = torch.empty(
-            (tokens, num_splits, heads, 2), dtype=torch.float32, device=device
+            (tokens, num_chunks, heads, 2), dtype=torch.float32, device=device
         )
     else:
         part_acc = part_ml = out
-    width = topk_slots.shape[1]
-    tiles = triton.cdiv(width, block_n)
     grid = (triton.cdiv(heads, block_h), tokens, num_splits)
     _sparse_mma_kernel[grid](
         q,
@@ -393,10 +452,12 @@ def sparse_mma_attention(
         kv_cache.stride(0),
         kv_cache.stride(-2),
         kv_cache.stride(-1),
-        triton.cdiv(tiles, num_splits),
-        num_splits,
+        chunk_tiles,
+        num_chunks,
+        triton.cdiv(num_chunks, num_splits),
         float(softmax_scale) * _LOG2E,
         RETURN_LSE=return_lse,
+        SPLIT=split,
         FP8_QK=fp8_qk,
         FP8_KV=kv_cache.dtype == torch.float8_e4m3fn,
         HEAD_DIM=head_dim,
@@ -408,17 +469,16 @@ def sparse_mma_attention(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    if num_splits > 1:
+    if split:
         _sparse_mma_combine_kernel[(tokens, heads)](
             part_acc,
             part_ml,
             out,
             lse if return_lse else out,
             heads,
-            num_splits,
+            num_chunks,
             RETURN_LSE=return_lse,
             RANK=kv_lora_rank,
-            BLOCK_S=triton.next_power_of_2(num_splits),
             num_warps=4,
         )
     return out, lse
