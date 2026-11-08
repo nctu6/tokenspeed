@@ -28,7 +28,8 @@ import torch
 from tokenspeed_kernel.ops.attention.dsv4 import dsv4_prefill
 
 DIM = 512
-FAST, PORTABLE = "triton_dsv4_mma_prefill", "triton_dsv4_prefill"
+TRITON, CUTE = "triton_dsv4_mma_prefill", "cute_dsl_dsv4_mma_prefill"
+PORTABLE = "triton_dsv4_prefill"
 
 
 def _graph_us(fn, repeat: int = 5) -> float:
@@ -64,21 +65,23 @@ def _run(tokens: int, heads: int, width: int, rows: int) -> None:
             q, kv, indices, lens, sink, DIM**-0.5, override=name
         )
 
-    fast = _graph_us(call(FAST))
+    triton_us = _graph_us(call(TRITON))
+    fast = _graph_us(call(CUTE))
     tflops = 4.0 * tokens * heads * width * DIM / fast / 1e6
     portable = ""
     if tokens * heads <= 64 * 2048:
         slow = _graph_us(call(PORTABLE), repeat=1)
         portable = f"portable {slow:9.0f} us ({slow / fast:4.0f}x)"
     print(
-        f"tokens={tokens:5d} heads={heads:3d} width={width:4d} | {fast:8.1f} us "
-        f"{tflops:6.1f} TFLOP/s | {portable}",
+        f"tokens={tokens:5d} heads={heads:3d} width={width:4d} | "
+        f"triton {triton_us:8.1f} us cute {fast:8.1f} us "
+        f"({triton_us / fast:4.2f}x) {tflops:6.1f} TFLOP/s | {portable}",
         flush=True,
     )
 
 
 def main() -> None:
-    for heads in (16, 64, 128):
+    for heads in (32, 64, 128):
         for tokens, width, rows in (
             (1, 640, 4096),
             (16, 640, 20000),

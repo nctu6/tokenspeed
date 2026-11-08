@@ -17,11 +17,13 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Tensor-core DeepSeek V4 selected attention (``triton_dsv4_mma_prefill``).
+"""Tensor-core DeepSeek V4 selected attention on SM120.
 
-The leaf attends a BF16 workspace of 512-wide latent rows, with an optional
-per-head sink. The reference is float32 attention over the same stored values,
-rounded to BF16.
+Two leaves attend a BF16 workspace of 512-wide latent rows, with an optional
+per-head sink: the Triton ``triton_dsv4_mma_prefill`` and the CuTe DSL
+``cute_dsl_dsv4_mma_prefill``, which the registry prefers where it is built.
+The reference is float32 attention over the same stored values, rounded to
+BF16.
 """
 
 import pytest
@@ -29,13 +31,24 @@ import torch
 from tokenspeed_kernel.ops.attention.dsv4 import dsv4_prefill
 from tokenspeed_kernel.ops.attention.dsv4._triton import sparse_mma
 from tokenspeed_kernel.platform import Platform, PlatformInfo
+from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from utils import assert_no_triton_compile, warm_specialization_classes
 
 DIM = 512
 SCALE = 0.0442
-LEAF = "triton_dsv4_mma_prefill"
+TRITON_LEAF = "triton_dsv4_mma_prefill"
+CUTE_LEAF = "cute_dsl_dsv4_mma_prefill"
+# The CuTe DSL leaf registers only where the CuTe DSL imports.
+HAS_CUTE = KernelRegistry.get().get_by_name(CUTE_LEAF) is not None
+LEAVES = [TRITON_LEAF, CUTE_LEAF] if HAS_CUTE else [TRITON_LEAF]
+LEAF = CUTE_LEAF if HAS_CUTE else TRITON_LEAF
+if HAS_CUTE:
+    from tokenspeed_kernel.ops.attention.dsv4._cute_dsl import (
+        sparse_mma as cute_sparse_mma,
+    )
+on_cute = pytest.mark.skipif(not HAS_CUTE, reason="CuTe DSL leaf not built")
 
 on_sm120 = pytest.mark.skipif(
     not (Platform.get().is_nvidia and Platform.get().arch_version.major == 12),
@@ -117,9 +130,13 @@ def _select(platform, **traits):
 
 def test_sm120_selects_the_mma_leaf(sm120_platform: PlatformInfo):
     assert _select(sm120_platform) == LEAF
-    assert _select(sm120_platform, num_q_heads=16, selected_width=128) == LEAF
+    assert _select(sm120_platform, num_q_heads=32, selected_width=128) == LEAF
     assert _select(sm120_platform, sinks=False, return_lse=True) == LEAF
     assert _select(sm120_platform, metadata_dtypes=frozenset({torch.int64})) == LEAF
+    # Up to 16 heads the 4-warp CuTe CTA loses to the Triton leaf; the rule
+    # follows the head count, so one model never mixes the two.
+    assert _select(sm120_platform, num_q_heads=16, selected_width=128) == TRITON_LEAF
+    assert _select(sm120_platform, num_q_heads=8) == TRITON_LEAF
 
 
 def test_other_archs_keep_flashmla(
@@ -130,6 +147,7 @@ def test_other_archs_keep_flashmla(
 
 
 @on_sm120
+@pytest.mark.parametrize("leaf", LEAVES)
 @pytest.mark.parametrize(
     ("tokens", "heads", "rows", "width", "sink", "with_lse", "index_dtype"),
     [
@@ -140,16 +158,17 @@ def test_other_archs_keep_flashmla(
         (130, 64, 4000, 576, True, False, torch.int32),
         (2, 128, 5000, 1280, True, False, torch.int32),
         (3, 12, 300, 77, False, True, torch.int32),
+        (40, 24, 900, 1100, True, False, torch.int64),  # sink, wide ids, odd width
     ],
     ids=lambda v: str(v),
 )
 def test_matches_the_float32_reference(
-    tokens, heads, rows, width, sink, with_lse, index_dtype
+    leaf, tokens, heads, rows, width, sink, with_lse, index_dtype
 ):
     q, kv, indices, lens, sink_logits = _inputs(tokens, heads, rows, width, index_dtype)
     sink_logits = sink_logits if sink else None
     lse = torch.empty(tokens, heads, device="cuda") if with_lse else None
-    out = dsv4_prefill(q, kv, indices, lens, sink_logits, SCALE, lse=lse, override=LEAF)
+    out = dsv4_prefill(q, kv, indices, lens, sink_logits, SCALE, lse=lse, override=leaf)
     ref_out, ref_lse = _reference(q, kv, indices, lens, sink_logits)
     assert out.dtype == torch.bfloat16 and out.shape == q.shape
     torch.testing.assert_close(out, ref_out.to(torch.bfloat16), **OUT_TOLERANCE)
@@ -160,14 +179,15 @@ def test_matches_the_float32_reference(
 
 
 @on_sm120
-def test_strided_query_and_output():
+@pytest.mark.parametrize("leaf", LEAVES)
+def test_strided_query_and_output(leaf):
     q, kv, indices, lens, sink = _inputs(6, 16, 400, 200, torch.int32)
     wide_q = torch.zeros(6, 16, DIM + 64, dtype=torch.bfloat16, device="cuda")
     wide_q[..., :DIM] = q
     wide_out = torch.zeros_like(wide_q)
     out = dsv4_prefill(
         wide_q[..., :DIM], kv, indices, lens, sink, SCALE, out=wide_out[..., :DIM],
-        override=LEAF,
+        override=leaf,
     )  # fmt: skip
     assert out.data_ptr() == wide_out.data_ptr()
     ref_out, _ = _reference(q, kv, indices, lens, sink)
@@ -208,24 +228,97 @@ def test_token_count_and_width_do_not_recompile():
 
 
 @on_sm120
+@on_cute
+@pytest.mark.parametrize("tokens", [1, 3, 600])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_cute_sink_with_lse_and_rows_that_attend_nothing(tokens, index_dtype):
+    """The sink is chunk 0's initial state: a row with no live key returns the
+    sink-only state (zero output, LSE = sink logit), also when the launch is
+    split, and the LSE with a sink includes it. The facade does not combine a
+    sink with an LSE, so this calls the core directly."""
+    heads, width = 40, 640
+    q, kv, indices, lens, sink = _inputs(tokens, heads, 900, width, index_dtype)
+    lens[::3] = 0
+    indices[1::4] = -1
+    out = torch.empty_like(q)
+    lse = torch.empty(tokens, heads, device="cuda")
+    block_h, splits = cute_sparse_mma.plan_launch(
+        tokens, heads, Platform.get().sm_count
+    )
+    cute_sparse_mma.sparse_mma_attention(
+        q, kv.reshape(-1, DIM), indices, lens, sink.contiguous(), out, lse,
+        softmax_scale=SCALE, block_h=block_h, num_splits=splits,
+    )  # fmt: skip
+    ref_out, ref_lse = _reference(q, kv, indices, lens, sink)
+    torch.testing.assert_close(out, ref_out.to(torch.bfloat16), **OUT_TOLERANCE)
+    torch.testing.assert_close(lse, ref_lse, atol=LSE_ATOL, rtol=0)
+    empty = lens == 0
+    assert not out[empty].any()
+    torch.testing.assert_close(
+        lse[empty], sink.expand_as(lse[empty]), atol=LSE_ATOL, rtol=0
+    )
+
+
+@on_sm120
+@on_cute
+def test_cute_binaries_are_keyed_by_head_tile_and_metadata_only():
+    """Token count, width, strides, rows and split count are runtime values:
+    a sweep over them compiles nothing once each (head tile, metadata dtype,
+    sink) binary exists."""
+    heads = 64
+    sweep = (1, 2, 3, 5, 8, 9, 17, 33, 64, 100, 130, 515)
+
+    def run(tokens, width=640, index_dtype=torch.int32, rows=1000):
+        q, kv, indices, lens, sink = _inputs(
+            tokens, heads, rows, width, index_dtype, seed=tokens
+        )
+        out = dsv4_prefill(q, kv, indices, lens, sink, SCALE, override=CUTE_LEAF)
+        assert out.shape == q.shape
+
+    for tokens in sweep:  # every head tile and split class
+        run(tokens)
+    run(7, width=128)
+    run(7, width=592)
+    for index_dtype in (torch.int32, torch.int64):
+        run(5, index_dtype=index_dtype)
+    compiled = cute_sparse_mma._core.compiled_attention
+    combine = cute_sparse_mma._core.compiled_combine
+    before = compiled.cache_info().misses, combine.cache_info().misses
+    for tokens in sweep:
+        run(tokens)
+    run(11, width=384, rows=7000)
+    run(3, width=1408)
+    run(5, width=577)  # a row stride that is not a multiple of 16
+    run(40, index_dtype=torch.int64, rows=300)
+    assert (compiled.cache_info().misses, combine.cache_info().misses) == before
+
+
+@on_sm120
+@pytest.mark.parametrize("leaf", LEAVES)
 @pytest.mark.parametrize("heads", [2, 16, 64])
-def test_rows_do_not_depend_on_the_batch(heads):
+def test_rows_do_not_depend_on_the_batch(leaf, heads):
     """A token's row is bitwise the same in any batch, split or not.
 
     A prefill chunk replayed after a prefix-cache hit must reproduce the rows
     of the original chunk exactly; the launch shape follows the token count.
     """
     q, kv, indices, lens, sink = _inputs(600, heads, 5000, 640, torch.int32, seed=3)
-    full = dsv4_prefill(q, kv, indices, lens, sink, SCALE, override=LEAF)
+    full = dsv4_prefill(q, kv, indices, lens, sink, SCALE, override=leaf)
     for start, count in ((0, 1), (5, 4), (17, 72), (100, 200), (0, 600)):
         rows = slice(start, start + count)
         part = dsv4_prefill(
-            q[rows], kv, indices[rows], lens[rows], sink, SCALE, override=LEAF
+            q[rows], kv, indices[rows], lens[rows], sink, SCALE, override=leaf
         )
         assert torch.equal(part, full[rows]), (start, count)
     sm_count = Platform.get().sm_count
     chunks = sparse_mma.num_chunks_for(640)[1]
-    plans = {
-        2 * sparse_mma.plan_launch(n, heads, sm_count)[1] >= chunks for n in (1, 600)
-    }
+    if leaf == CUTE_LEAF:
+        plans = {
+            cute_sparse_mma.plan_launch(n, heads, sm_count)[1] > 1 for n in (1, 600)
+        }
+    else:
+        plans = {
+            2 * sparse_mma.plan_launch(n, heads, sm_count)[1] >= chunks
+            for n in (1, 600)
+        }
     assert plans == {True, False}  # both launch shapes were compared

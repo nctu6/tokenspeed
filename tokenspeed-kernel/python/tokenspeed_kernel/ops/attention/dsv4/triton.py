@@ -477,33 +477,39 @@ def triton_dsv4_prefill(
     return output
 
 
+# Measured on SM120, where FlashMLA is not offered and the portable kernel
+# runs every head on CUDA cores. The CuTe DSL leaf (``cute_dsl.py``) registers
+# with the same capability, signature, traits and features.
+_MMA_CAPABILITY = CapabilityRequirement(
+    min_arch_version=ArchVersion(12, 0),
+    max_arch_version=ArchVersion(12, 9),
+    vendors=frozenset({"nvidia"}),
+)
+_MMA_SIGNATURES = frozenset(
+    {
+        format_signature(
+            q=dense_tensor_format(torch.bfloat16),
+            kv=dense_tensor_format(torch.bfloat16),
+        )
+    }
+)
+_MMA_TRAITS = {
+    "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
+    "cache_layout": frozenset({"dense_workspace"}),
+    "metadata_dtypes": frozenset({torch.int32, torch.int64}),
+    "sinks": frozenset({True, False}),
+    "return_lse": frozenset({True, False}),
+}
+
+
 @register_kernel(
     "attention",
     "dsv4_prefill",
     name="triton_dsv4_mma_prefill",
     solution="triton",
-    # Measured on SM120, where FlashMLA is not offered and the portable kernel
-    # runs every head on CUDA cores.
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(12, 0),
-        max_arch_version=ArchVersion(12, 9),
-        vendors=frozenset({"nvidia"}),
-    ),
-    signatures=frozenset(
-        {
-            format_signature(
-                q=dense_tensor_format(torch.bfloat16),
-                kv=dense_tensor_format(torch.bfloat16),
-            )
-        }
-    ),
-    traits={
-        "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
-        "cache_layout": frozenset({"dense_workspace"}),
-        "metadata_dtypes": frozenset({torch.int32, torch.int64}),
-        "sinks": frozenset({True, False}),
-        "return_lse": frozenset({True, False}),
-    },
+    capability=_MMA_CAPABILITY,
+    signatures=_MMA_SIGNATURES,
+    traits=_MMA_TRAITS,
     priority=Priority.PERFORMANT,
 )
 def triton_dsv4_mma_prefill(

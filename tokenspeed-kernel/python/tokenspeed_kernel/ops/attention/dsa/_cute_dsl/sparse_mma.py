@@ -99,6 +99,15 @@ def _ldg_s32(addr):
 
 
 @cute.jit
+def _ldg_s64(addr):
+    return cute.arch.inline_ptx(
+        "ld.global.nc.b64 {$w0}, [{$r0}];",
+        write_only_types=[cutlass.Int64],
+        read_only_args=[addr],
+    )
+
+
+@cute.jit
 def _ldg_f32(addr):
     return cute.arch.inline_ptx(
         "ld.global.b32 {$w0}, [{$r0}];",
@@ -398,8 +407,25 @@ def _lse(m, l):
 class _SparseMma:
     """One CTA per (head tile, token, split); see the module docstring."""
 
-    def __init__(self, fp8: bool, block_h: int, rank: int, rope: int, stages: int):
+    def __init__(
+        self,
+        fp8: bool,
+        block_h: int,
+        rank: int,
+        rope: int,
+        stages: int,
+        v4: tuple[bool, bool] | None = None,
+    ):
         assert block_h in (16, 32) and rank in (128, 512) and rope in (0, 64)
+        # ``v4`` = (sink, wide_ids) selects the DeepSeek V4 variant: BF16 rows
+        # of a flat workspace (a page of one row, no divide), strided query and
+        # output, row ids checked against the workspace (int32 or int64), and
+        # an optional per-head sink as the first chunk's initial state.
+        assert v4 is None or (not fp8 and rope == 0)
+        self.v4 = v4 is not None
+        self.sink = bool(v4 and v4[0])
+        self.wide_ids = bool(v4 and v4[1])
+        self.id_bytes = 8 if self.wide_ids else 4
         self.fp8 = fp8
         self.block_h = block_h
         self.rank = rank
@@ -460,11 +486,11 @@ class _SparseMma:
     @cute.jit
     def __call__(
         self,
-        q: cute.Tensor,
+        q,  # cute.Tensor, or the address (Int64) in the V4 variant
         kv_addr: cutlass.Int64,
         slots: cute.Tensor,
         lens: cute.Tensor,
-        out: cute.Tensor,
+        out,  # cute.Tensor, or the address (Int64) in the V4 variant
         lse: cute.Tensor,
         part_acc: cute.Tensor,
         part_ml: cute.Tensor,
@@ -480,6 +506,12 @@ class _SparseMma:
         split: cutlass.Int32,
         return_lse: cutlass.Int32,
         scale_log2: cutlass.Float32,
+        num_rows: cutlass.Int32,
+        sink: cute.Tensor,
+        q_stride_token: cutlass.Int64,
+        q_stride_head: cutlass.Int64,
+        out_stride_token: cutlass.Int64,
+        out_stride_head: cutlass.Int64,
         grid_x: cutlass.Int32,
         grid_y: cutlass.Int32,
         grid_z: cutlass.Int32,
@@ -506,11 +538,35 @@ class _SparseMma:
             split,
             return_lse,
             scale_log2,
+            num_rows,
+            sink,
+            q_stride_token,
+            q_stride_head,
+            out_stride_token,
+            out_stride_head,
         ).launch(
             grid=(grid_x, grid_y, grid_z),
             block=(self.num_threads, 1, 1),
             stream=stream,
         )
+
+    @cute.jit
+    def _load_slot(self, slot_row, col, num_rows):
+        """The slot id at column ``col``; the V4 variant maps a row id that is
+        negative or past the workspace to ``-1`` (int32 or int64 ids)."""
+        if cutlass.const_expr(self.v4):
+            slot = cutlass.Int32(-1)
+            if cutlass.const_expr(self.wide_ids):
+                wide = _ldg_s64(slot_row + cutlass.Int64(col) * 8)
+                if (wide >= cutlass.Int64(0)) & (wide < cutlass.Int64(num_rows)):
+                    slot = cutlass.Int32(wide)
+            else:
+                narrow = _ldg_s32(slot_row + cutlass.Int64(col) * 4)
+                if (narrow >= 0) & (narrow < num_rows):
+                    slot = narrow
+            return slot
+        else:
+            return _ldg_s32(slot_row + cutlass.Int64(col) * 4)
 
     @cute.jit
     def _chunk_offset(self, row, chunk):
@@ -552,11 +608,14 @@ class _SparseMma:
         src = kv_addr
         if ok:
             live = cutlass.Int32(16)
-            src = (
-                kv_addr
-                + cutlass.Int64(slot // page_size) * page_stride
-                + cutlass.Int64(slot % page_size) * token_stride
-            )
+            if cutlass.const_expr(self.v4):
+                src = kv_addr + cutlass.Int64(slot) * page_stride
+            else:
+                src = (
+                    kv_addr
+                    + cutlass.Int64(slot // page_size) * page_stride
+                    + cutlass.Int64(slot % page_size) * token_stride
+                )
         dst = ring_addr + stage * (rows * self.row_stride)
         for j in cutlass.range_constexpr(self.copies_per_thread):
             chunk = part + j * self.threads_per_row
@@ -728,11 +787,11 @@ class _SparseMma:
     @cute.kernel
     def kernel(
         self,
-        q: cute.Tensor,
+        q,  # cute.Tensor, or the address (Int64) in the V4 variant
         kv_addr: cutlass.Int64,
         slots: cute.Tensor,
         lens: cute.Tensor,
-        out: cute.Tensor,
+        out,  # cute.Tensor, or the address (Int64) in the V4 variant
         lse: cute.Tensor,
         part_acc: cute.Tensor,
         part_ml: cute.Tensor,
@@ -748,6 +807,12 @@ class _SparseMma:
         split: cutlass.Int32,
         return_lse: cutlass.Int32,
         scale_log2: cutlass.Float32,
+        num_rows: cutlass.Int32,
+        sink: cute.Tensor,
+        q_stride_token: cutlass.Int64,
+        q_stride_head: cutlass.Int64,
+        out_stride_token: cutlass.Int64,
+        out_stride_head: cutlass.Int64,
     ):
         fp8 = cutlass.const_expr(self.fp8)
         rank = cutlass.const_expr(self.rank)
@@ -782,6 +847,8 @@ class _SparseMma:
 
         # ---- This token's selection and this CTA's chunks ----
         valid_len = cutlass.min(cutlass.Int32(lens[token]), topk)
+        if cutlass.const_expr(self.v4):
+            valid_len = cutlass.max(valid_len, cutlass.Int32(0))
         num_tiles = (valid_len + (rows - 1)) // rows
         chunk_begin = cutlass.Int32(0)
         chunk_end = cutlass.max(
@@ -795,7 +862,7 @@ class _SparseMma:
 
         slot_row = (
             slots.iterator.toint()
-            + cutlass.Int64(token) * cutlass.Int64(slot_stride) * 4
+            + cutlass.Int64(token) * cutlass.Int64(slot_stride) * self.id_bytes
         )
         my_row = tidx // self.threads_per_row
 
@@ -803,7 +870,10 @@ class _SparseMma:
         head1 = head0 + 8
         live0 = head0 < num_heads
         live1 = head1 < num_heads
-        q_base = q.iterator.toint()
+        if cutlass.const_expr(self.v4):
+            q_base = q  # the V4 variant takes the query's address
+        else:
+            q_base = q.iterator.toint()
         qa = cute.make_rmem_tensor((max(self.qk_steps, 1) * 4,), cutlass.Uint32)
         qr = cute.make_rmem_tensor((4,), cutlass.Uint32)
         if cutlass.const_expr(fp8):
@@ -832,15 +902,23 @@ class _SparseMma:
                     )
         else:
             # ---- This warp's query channels, kept in registers ----
-            q_row0 = (
-                q_base
-                + (
-                    cutlass.Int64(token) * cutlass.Int64(num_heads)
-                    + cutlass.Int64(head0)
+            if cutlass.const_expr(self.v4):
+                q_row0 = (
+                    q_base
+                    + cutlass.Int64(token) * q_stride_token
+                    + cutlass.Int64(head0) * q_stride_head
                 )
-                * self.row_bytes
-            )
-            q_row1 = q_row0 + 8 * self.row_bytes
+                q_row1 = q_row0 + 8 * q_stride_head
+            else:
+                q_row0 = (
+                    q_base
+                    + (
+                        cutlass.Int64(token) * cutlass.Int64(num_heads)
+                        + cutlass.Int64(head0)
+                    )
+                    * self.row_bytes
+                )
+                q_row1 = q_row0 + 8 * self.row_bytes
             for i in cutlass.range_constexpr(self.qk_steps * 4):
                 qa[i] = cutlass.Uint32(0)
             for i in cutlass.range_constexpr(4):
@@ -880,6 +958,23 @@ class _SparseMma:
         m_r1 = neg_inf
         l_r0 = cutlass.Float32(0.0)
         l_r1 = cutlass.Float32(0.0)
+        if cutlass.const_expr(self.sink):
+            # The sink is one extra key with a zero value: the initial state of
+            # chunk 0 (m = sink logit, l = 1), the first thing the fold sees.
+            if chunk_begin == 0:
+                sink_base = sink.iterator.toint()
+                if live0:
+                    m_i0 = _mul(
+                        _ldg_f32(sink_base + cutlass.Int64(head0) * 4),
+                        cutlass.Float32(1.4426950408889634),
+                    )
+                    l_i0 = cutlass.Float32(1.0)
+                if live1:
+                    m_i1 = _mul(
+                        _ldg_f32(sink_base + cutlass.Int64(head1) * 4),
+                        cutlass.Float32(1.4426950408889634),
+                    )
+                    l_i1 = cutlass.Float32(1.0)
         s = cute.make_rmem_tensor((s_tiles * 4,), cutlass.Float32)
         # Lane addresses of the E4M3 score fragments: lanes 8 m .. 8 m + 7
         # address the rows of matrix m (query rows (m % 2) * 8 .., chunk
@@ -925,7 +1020,7 @@ class _SparseMma:
             col = tile * rows + my_row
             slot = cutlass.Int32(-1)
             if (tile < tile_hi) & (col < valid_len):
-                slot = _ldg_s32(slot_row + cutlass.Int64(col) * 4)
+                slot = self._load_slot(slot_row, col, num_rows)
             self._issue_tile(
                 tile,
                 tile_hi,
@@ -946,7 +1041,7 @@ class _SparseMma:
         next_col = next_tile * rows + my_row
         next_slot = cutlass.Int32(-1)
         if (next_tile < tile_hi) & (next_col < valid_len):
-            next_slot = _ldg_s32(slot_row + cutlass.Int64(next_col) * 4)
+            next_slot = self._load_slot(slot_row, next_col, num_rows)
 
         for tile in range(tile_lo, tile_hi):
             i = tile - tile_lo
@@ -973,7 +1068,7 @@ class _SparseMma:
             next_col = (issue + 1) * rows + my_row
             next_slot = cutlass.Int32(-1)
             if (issue + 1 < tile_hi) & (next_col < valid_len):
-                next_slot = _ldg_s32(slot_row + cutlass.Int64(next_col) * 4)
+                next_slot = self._load_slot(slot_row, next_col, num_rows)
 
             base = ring_addr + stage * (rows * rs)
             # ---- Full scores of the head group ----
@@ -1177,7 +1272,20 @@ class _SparseMma:
                     g,
                     t,
                 )
+                if cutlass.const_expr(self.sink):
+                    # Only chunk 0 owns the sink.
+                    m_i0 = neg_inf
+                    m_i1 = neg_inf
+                    l_i0 = cutlass.Float32(0.0)
+                    l_i1 = cutlass.Float32(0.0)
         else:
+            if cutlass.const_expr(self.sink):
+                if tile_hi <= tile_lo:
+                    # No tiles: chunk 0 holds the sink alone.
+                    m_r0 = m_i0
+                    m_r1 = m_i1
+                    l_r0 = l_i0
+                    l_r1 = l_i1
             self._store_out(
                 out,
                 lse,
@@ -1192,6 +1300,8 @@ class _SparseMma:
                 live0,
                 live1,
                 return_lse,
+                out_stride_token,
+                out_stride_head,
                 cw,
                 g,
                 t,
@@ -1275,13 +1385,18 @@ class _SparseMma:
         live0,
         live1,
         return_lse,
+        out_stride_token,
+        out_stride_head,
         cw,
         g,
         t,
     ):
         rank = cutlass.const_expr(self.rank)
         tpg = cutlass.const_expr(self.tpg)
-        out_base = out.iterator.toint()
+        if cutlass.const_expr(self.v4):
+            out_base = out  # the V4 variant takes the output's address
+        else:
+            out_base = out.iterator.toint()
         lse_base = lse.iterator.toint()
         for half in cutlass.range_constexpr(2):
             live = live0
@@ -1295,7 +1410,14 @@ class _SparseMma:
                 row_id = cutlass.Int64(token) * cutlass.Int64(
                     num_heads
                 ) + cutlass.Int64(head0 + 8 * half)
-                row = out_base + row_id * (rank * 2)
+                if cutlass.const_expr(self.v4):
+                    row = (
+                        out_base
+                        + cutlass.Int64(token) * out_stride_token
+                        + cutlass.Int64(head0 + 8 * half) * out_stride_head
+                    )
+                else:
+                    row = out_base + row_id * (rank * 2)
                 for grp in cutlass.range_constexpr(self.groups):
                     ch = self._lane_channel(cw, grp, t)
                     words = []
@@ -1319,25 +1441,37 @@ class _SparseMma:
 class _Combine:
     """Fold the stored chunk states of one (token, head) and normalize."""
 
-    def __init__(self, rank: int):
+    def __init__(self, rank: int, strided_out: bool = False):
         self.rank = rank
         self.num_threads = rank // 4
+        # The V4 variant takes the output's address and strides.
+        self.strided_out = strided_out
 
     @cute.jit
     def __call__(
         self,
         part_acc: cute.Tensor,
         part_ml: cute.Tensor,
-        out: cute.Tensor,
+        out,  # cute.Tensor, or the address (Int64) in the V4 variant
         lse: cute.Tensor,
         num_heads: cutlass.Int32,
         num_chunks: cutlass.Int32,
         return_lse: cutlass.Int32,
+        out_stride_token: cutlass.Int64,
+        out_stride_head: cutlass.Int64,
         tokens: cutlass.Int32,
         stream,
     ):
         self.kernel(
-            part_acc, part_ml, out, lse, num_heads, num_chunks, return_lse
+            part_acc,
+            part_ml,
+            out,
+            lse,
+            num_heads,
+            num_chunks,
+            return_lse,
+            out_stride_token,
+            out_stride_head,
         ).launch(
             grid=(tokens, num_heads, 1),
             block=(self.num_threads, 1, 1),
@@ -1349,11 +1483,13 @@ class _Combine:
         self,
         part_acc: cute.Tensor,
         part_ml: cute.Tensor,
-        out: cute.Tensor,
+        out,  # cute.Tensor, or the address (Int64) in the V4 variant
         lse: cute.Tensor,
         num_heads: cutlass.Int32,
         num_chunks: cutlass.Int32,
         return_lse: cutlass.Int32,
+        out_stride_token: cutlass.Int64,
+        out_stride_head: cutlass.Int64,
     ):
         rank = cutlass.const_expr(self.rank)
         tidx, _, _ = cute.arch.thread_idx()
@@ -1381,7 +1517,15 @@ class _Combine:
         row_id = cutlass.Int64(token) * cutlass.Int64(num_heads) + cutlass.Int64(head)
         w0 = _pack_16bit(False, _finish(a0, l_run), _finish(a1, l_run))
         w1 = _pack_16bit(False, _finish(a2, l_run), _finish(a3, l_run))
-        _stg_v2_u32(out.iterator.toint() + row_id * (rank * 2) + tidx * 8, w0, w1)
+        if cutlass.const_expr(self.strided_out):
+            out_row = (
+                out
+                + cutlass.Int64(token) * out_stride_token
+                + cutlass.Int64(head) * out_stride_head
+            )
+        else:
+            out_row = out.iterator.toint() + row_id * (rank * 2)
+        _stg_v2_u32(out_row + tidx * 8, w0, w1)
         if (return_lse != 0) & (tidx == 0):
             _stg_f32(lse.iterator.toint() + row_id * 4, _lse(m_run, l_run))
 
@@ -1447,19 +1591,32 @@ def _fake(dtype, align: int):
 
 @functools.cache
 def compiled_attention(
-    fp8: bool, block_h: int, rank: int, rope: int, device_index: int
+    fp8: bool,
+    block_h: int,
+    rank: int,
+    rope: int,
+    device_index: int,
+    v4: tuple[bool, bool, bool] | None = None,
 ):
-    """Compile (once per dtype, head tile, rank and RoPE width) the attention kernel."""
+    """Compile (once per dtype, head tile, rank and RoPE width) the attention kernel.
+
+    ``v4`` is None for the DSA kernel and ``(sink, wide_ids, wide_lens)`` for the
+    DeepSeek V4 variant (``dsv4/_cute_dsl/sparse_mma.py``), whose metadata
+    dtypes and sink are compile-time choices.
+    """
     stages = stages_for(fp8, block_h, rank, rope)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    wide_ids = bool(v4 and v4[1])
+    wide_lens = bool(v4 and v4[2])
     with torch.cuda.device(device_index):
         return cute.compile(
-            _SparseMma(fp8, block_h, rank, rope, stages),
-            _fake(cutlass.Uint8, 16),
+            _SparseMma(fp8, block_h, rank, rope, stages, v4 and v4[:2]),
+            # The V4 variant takes the query and output as addresses.
+            cutlass.Int64(0) if v4 else _fake(cutlass.Uint8, 16),
             cutlass.Int64(0),
-            _fake(cutlass.Int32, 4),
-            _fake(cutlass.Int32, 4),
-            _fake(cutlass.Uint8, 16),
+            _fake(cutlass.Int64 if wide_ids else cutlass.Int32, 8 if wide_ids else 4),
+            _fake(cutlass.Int64 if wide_lens else cutlass.Int32, 8 if wide_lens else 4),
+            cutlass.Int64(0) if v4 else _fake(cutlass.Uint8, 16),
             _fake(cutlass.Float32, 4),
             _fake(cutlass.Float32, 16),
             _fake(cutlass.Float32, 4),
@@ -1475,6 +1632,12 @@ def compiled_attention(
             cutlass.Int32(0),
             cutlass.Int32(0),
             cutlass.Float32(1.0),
+            cutlass.Int32(0),
+            _fake(cutlass.Float32, 4),
+            cutlass.Int64(0),
+            cutlass.Int64(0),
+            cutlass.Int64(0),
+            cutlass.Int64(0),
             cutlass.Int32(1),
             cutlass.Int32(1),
             cutlass.Int32(1),
@@ -1484,19 +1647,25 @@ def compiled_attention(
 
 
 @functools.cache
-def compiled_combine(rank: int, device_index: int):
-    """Compile (once per rank) the kernel that folds stored chunk states."""
+def compiled_combine(rank: int, device_index: int, strided_out: bool = False):
+    """Compile (once per rank) the kernel that folds stored chunk states.
+
+    ``strided_out`` takes the output as an address with token and head strides
+    (the V4 variant).
+    """
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     with torch.cuda.device(device_index):
         return cute.compile(
-            _Combine(rank),
+            _Combine(rank, strided_out),
             _fake(cutlass.Float32, 16),
             _fake(cutlass.Float32, 4),
-            _fake(cutlass.Uint8, 16),
+            cutlass.Int64(0) if strided_out else _fake(cutlass.Uint8, 16),
             _fake(cutlass.Float32, 4),
             cutlass.Int32(1),
             cutlass.Int32(1),
             cutlass.Int32(0),
+            cutlass.Int64(0),
+            cutlass.Int64(0),
             cutlass.Int32(1),
             stream=stream,
             options="--enable-tvm-ffi",
@@ -1627,6 +1796,12 @@ def sparse_mma_attention(
         int(split),
         int(return_lse),
         float(softmax_scale) * 1.4426950408889634,
+        0,
+        part_ml.reshape(-1),
+        heads * head_dim * esize,
+        head_dim * esize,
+        heads * kv_lora_rank * 2,
+        kv_lora_rank * 2,
         grid_x,
         tokens,
         num_splits,
@@ -1640,6 +1815,8 @@ def sparse_mma_attention(
             heads,
             num_chunks,
             int(return_lse),
+            0,
+            0,
             tokens,
         )
     return out, lse
