@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.dsa import STRIDED_KV_CACHE_FEATURE
 from tokenspeed_kernel.ops.attention.dsa._triton import sparse_mma
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import (
@@ -528,6 +529,7 @@ def _run_dsa(
         "logit_cap": frozenset({False}),
         "return_lse": frozenset({False, True}),
     },
+    features={STRIDED_KV_CACHE_FEATURE},
     priority=Priority.PORTABLE,
 )
 def triton_dsa_decode(
@@ -591,6 +593,7 @@ def triton_dsa_decode(
         "logit_cap": frozenset({False}),
         "return_lse": frozenset({False, True}),
     },
+    features={STRIDED_KV_CACHE_FEATURE},
     priority=Priority.PORTABLE,
 )
 def triton_dsa_prefill(
@@ -706,7 +709,7 @@ _MMA_TRAITS = {
 # A token's row is a function of its own query and selection only: the chunk
 # boundaries follow the width, and split and unsplit launches fold the chunks
 # identically (``_triton/sparse_mma.py``).
-_MMA_FEATURES = {"batch_invariant", "cuda_graph"}
+_MMA_FEATURES = {"batch_invariant", "cuda_graph", STRIDED_KV_CACHE_FEATURE}
 
 
 @register_kernel(

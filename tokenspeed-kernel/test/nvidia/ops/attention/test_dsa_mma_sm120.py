@@ -29,7 +29,11 @@ over the same stored values and for bitwise batch invariance.
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.attention.dsa import torch_dsa_sparse_attention
-from tokenspeed_kernel.ops.attention.dsa import dsa_decode, dsa_prefill
+from tokenspeed_kernel.ops.attention.dsa import (
+    STRIDED_KV_CACHE_FEATURE,
+    dsa_decode,
+    dsa_prefill,
+)
 from tokenspeed_kernel.ops.attention.dsa import triton as dsa_triton
 from tokenspeed_kernel.ops.attention.dsa._triton import sparse_mma
 from tokenspeed_kernel.platform import Platform, PlatformInfo
@@ -73,7 +77,7 @@ on_sm120 = pytest.mark.skipif(
 )
 
 
-def _select(mode, platform, q_dtype, **traits):
+def _select(mode, platform, q_dtype, features=None, **traits):
     from tokenspeed_kernel.selection import select_kernel
 
     request = {
@@ -96,6 +100,7 @@ def _select(mode, platform, q_dtype, **traits):
         mode,
         format_signature(q=dense_tensor_format(q_dtype)),
         platform=platform,
+        features=features,
         traits=request,
     ).name
 
@@ -134,6 +139,24 @@ def test_packed_caches_and_other_archs_keep_the_portable_leaves(
         assert not _select(
             "dsa_prefill", platform, torch.bfloat16, has_kv_cache=True
         ).endswith("_dsa_mma_prefill")
+
+
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_strided_cache_feature_selects_cores_that_read_it_in_place(
+    q_dtype, sm120_platform: PlatformInfo, h100_platform: PlatformInfo
+):
+    # The dots3-note leaf asks for the feature instead of pinning a solution.
+    # SM120 still reaches the tuned core; SM90 gets the portable Triton leaf
+    # rather than a flat-row implementation that copies a strided cache.
+    features = frozenset({STRIDED_KV_CACHE_FEATURE})
+    for mode in ("dsa_decode", "dsa_prefill"):
+        assert (
+            _select(mode, sm120_platform, q_dtype, features=features)
+            == f"{CORE}_{mode.replace('dsa_', 'dsa_mma_')}"
+        )
+        assert (
+            _select(mode, h100_platform, q_dtype, features=features) == f"triton_{mode}"
+        )
 
 
 def test_plan_follows_tokens_and_heads_only():

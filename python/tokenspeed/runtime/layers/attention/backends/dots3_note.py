@@ -23,6 +23,7 @@
 from dataclasses import dataclass, replace
 
 import torch
+from tokenspeed_kernel.ops.attention.dsa import STRIDED_KV_CACHE_FEATURE
 from tokenspeed_kernel.ops.attention.mla import mla_prefill
 
 from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
@@ -45,6 +46,11 @@ class Dots3NoteCacheGroupRouter(CacheGroupRouter):
 
 
 class Dots3NoteDSABackend(DSABackend):
+    # The compact latent cache is a strided view (a page of the group's slab
+    # is not contiguous with the next), so a core that reshapes it into flat
+    # rows would copy the whole cache. Require cores that read it in place.
+    core_features = frozenset({STRIDED_KV_CACHE_FEATURE})
+
     @staticmethod
     def _make_dense_leaf(config, spec, platform, kernel_page_size):
         # The default TRTLLM dense delegate cannot run on Hopper.
@@ -222,11 +228,7 @@ def create_dots3_note_router(config: AttnConfig) -> CacheGroupRouter:
         leaf_config = replace(
             config, components=(leaf_spec,), kernel_page_size=page_size
         )
-        leaf = leaf_cls(leaf_config, leaf_spec, kernel_page_size=page_size)
-        if isinstance(leaf, DSABackend) and leaf.kernel_solution is None:
-            # Other sparse implementations can materialize the whole strided cache.
-            leaf.kernel_solution = "triton"
-        return leaf
+        return leaf_cls(leaf_config, leaf_spec, kernel_page_size=page_size)
 
     return Dots3NoteCacheGroupRouter(
         leaf_factory,
