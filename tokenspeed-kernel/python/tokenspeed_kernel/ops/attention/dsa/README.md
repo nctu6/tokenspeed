@@ -240,7 +240,10 @@ A zero RoPE width is the KPool layout of GLM-5.3-Flash (`qk_nope_head_dim` 256,
 `kv_lora_rank` 512, 2048 slots plus up to three tail slots, cache rows of 512
 channels): the kernel compiles the RoPE gather and score term out, and the
 same leaves serve it (29-134x over `triton_dsa_*` at 16 and 64 heads, 1-1024
-tokens, 2051 slots; up to 125 TFLOP/s).
+tokens, 2051 slots; up to 125 TFLOP/s). The split count of these leaves follows
+the token count, so a token's prefill row depends on its batch; the V4 leaf
+(`dsv4/README.md`) shows the fixed-chunk scheme that removes this, not yet
+applied here.
 
 Why it is fast: all heads of a token read the same selected rows, so a program
 owns a tile of heads of one token and multiplies each gathered tile of rows by
