@@ -197,3 +197,57 @@ def test_deepselect_local_topk_splits_more_rows_than_one_grid_holds():
     deepselect_local_topk(logits, lengths, topk, out)
     sample = torch.cat([torch.arange(0, 40), torch.arange(65500, 65600)])
     _assert_exact_topk(out[sample], logits[sample], lengths[sample], topk)
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_index_candidates_select_the_top_scores_of_a_shard(monkeypatch, spy, topk):
+    """A rank's owned pages hold more candidates than top-k for long rows.
+
+    The leaf selects with DeepSelect over each row's compact candidates; it
+    must keep the same scores as the framework top-k over the same logits
+    (any valid top-k has the same score multiset, whatever the tie order),
+    return distinct in-range logical positions, and pad short rows with -1.
+    """
+    from tokenspeed_kernel.ops.attention.dsa import deep_gemm as dsa_deep_gemm
+
+    torch.manual_seed(7)
+    pages, ranks, rank = 300, 4, 1
+    table_row = torch.arange(1, pages + 1, device="cuda", dtype=torch.int32)
+    owned = (table_row - 1) % ranks == rank
+    local_row = torch.where(owned, (table_row - 1) // ranks + 1, -1).to(torch.int32)
+    cache = _index_cache(int(owned.sum()) + 1)
+    # Long rows (more owned candidates than top-k), short rows, a row with
+    # nothing owned (the first token) and a request that does not exist.
+    causal = torch.tensor(
+        [19200, 12000, 9000, 4096, 3000, 700, 130, 1, 0, 5000],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    requests = torch.zeros_like(causal)
+    requests[-1] = -1
+    q = torch.randn(causal.numel(), HEADS, DIM, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(causal.numel(), HEADS, device="cuda")
+    kwargs = dict(
+        page_size=PAGE,
+        topk=topk,
+        softmax_scale=DIM**-0.5,
+        initial_tokens=4,
+        local_tokens=8,
+    )
+    leaf = dsa_deep_gemm.deep_gemm_dsa_index_candidates
+    args = (q, weights, cache, local_row[None, :], requests, causal)
+    offsets, scores = leaf(*args, **kwargs)
+    assert len(spy) == 1, "the shard's candidates must be selected with DeepSelect"
+    monkeypatch.setattr(dsa_deep_gemm, "deepselect_supports", lambda *_: False)
+    ref_offsets, ref_scores = leaf(*args, **kwargs)
+
+    for row in range(causal.numel()):
+        valid = offsets[row] >= 0
+        mine = offsets[row][valid].long()
+        assert mine.unique().numel() == mine.numel()
+        assert (mine < max(int(causal[row]), 1)).all()
+        assert (offsets[row][~valid] == -1).all()
+        assert torch.all(scores[row][~valid] == -torch.inf)
+        got = scores[row][valid].sort().values
+        want = ref_scores[row][ref_offsets[row] >= 0].sort().values
+        torch.testing.assert_close(got, want, atol=0, rtol=0)

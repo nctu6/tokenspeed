@@ -826,5 +826,14 @@ if platform.is_hopper_plus:
             initial_tokens,
             local_tokens,
         )
-        offsets = candidate_topk_offsets(logits, topk)
+        if deepselect_supports(logits, int(topk)):
+            # Selects among each row's own compact candidates (`lengths`); a
+            # short row yields all of them, then -1. Scores masked to -inf
+            # inside the length may be selected too; the gather drops them.
+            offsets = torch.empty(
+                (logits.shape[0], int(topk)), dtype=torch.int32, device=logits.device
+            )
+            deepselect_local_topk(logits, lengths.view(-1), topk, offsets)
+        else:
+            offsets = candidate_topk_offsets(logits, topk)
         return gather_index_candidates(offsets, logits, positions, page_size)
