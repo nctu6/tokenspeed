@@ -784,6 +784,133 @@ class _SparseMma:
                     s[4 * j + 2] = s[4 * j + 2] + p2
                     s[4 * j + 3] = s[4 * j + 3] + p3
 
+    @cute.jit
+    def _softmax_pv(
+        self,
+        s,
+        acc,
+        base,
+        v_off,
+        scale_log2,
+        mx0,
+        mx1,
+        m_i0,
+        m_i1,
+        l_i0,
+        l_i1,
+        scale_acc,
+    ):
+        """Online softmax update of a masked score tile and ``O += P V``.
+
+        ``mx0`` / ``mx1`` are the raw-score maxima of the thread's two rows
+        (the scale is positive, so it is applied inside ``p = 2^(s c - m)``);
+        ``s`` holds the masked scores, ``base`` the tile's shared-memory
+        address, ``scale_acc`` whether the accumulator holds earlier tiles of
+        the chunk. Returns the updated ``m`` and ``l`` of the two rows.
+        """
+        fp8 = cutlass.const_expr(self.fp8)
+        rs = cutlass.const_expr(self.row_stride)
+        n_tiles = cutlass.const_expr(self.n_tiles)
+        s_tiles = cutlass.const_expr(self.s_tiles)
+        neg_inf = cutlass.Float32(_NEG_INF)
+        m_n0 = cute.arch.fmax(m_i0, _mul(mx0, scale_log2))
+        m_n1 = cute.arch.fmax(m_i1, _mul(mx1, scale_log2))
+        ms0 = m_n0
+        ms1 = m_n1
+        if m_n0 == neg_inf:
+            ms0 = cutlass.Float32(0.0)
+        if m_n1 == neg_inf:
+            ms1 = cutlass.Float32(0.0)
+        alpha0 = _ex2(m_i0 - ms0)
+        alpha1 = _ex2(m_i1 - ms1)
+        nms0 = -ms0
+        nms1 = -ms1
+        rs0 = cutlass.Float32(0.0)
+        rs1 = cutlass.Float32(0.0)
+        # The probabilities go straight into the PV A fragments: tile j
+        # of the scores is half of the k16 step j // 2.
+        pk = cute.make_rmem_tensor((s_tiles * 2,), cutlass.Uint32)
+        for j in cutlass.range_constexpr(s_tiles):
+            p00 = _ex2(_fma(s[4 * j], scale_log2, nms0))
+            p01 = _ex2(_fma(s[4 * j + 1], scale_log2, nms0))
+            p10 = _ex2(_fma(s[4 * j + 2], scale_log2, nms1))
+            p11 = _ex2(_fma(s[4 * j + 3], scale_log2, nms1))
+            rs0 = rs0 + p00
+            rs0 = rs0 + p01
+            rs1 = rs1 + p10
+            rs1 = rs1 + p11
+            pk[2 * j] = _pack_16bit(fp8, p00, p01)
+            pk[2 * j + 1] = _pack_16bit(fp8, p10, p11)
+        rs0 = rs0 + _shfl_xor(rs0, 1)
+        rs0 = rs0 + _shfl_xor(rs0, 2)
+        rs1 = rs1 + _shfl_xor(rs1, 1)
+        rs1 = rs1 + _shfl_xor(rs1, 2)
+        l_i0 = _fma(l_i0, alpha0, rs0)
+        l_i1 = _fma(l_i1, alpha1, rs1)
+        m_i0 = m_n0
+        m_i1 = m_n1
+        if scale_acc:
+            for n in cutlass.range_constexpr(n_tiles):
+                acc[4 * n + 0] = acc[4 * n + 0] * alpha0
+                acc[4 * n + 1] = acc[4 * n + 1] * alpha0
+                acc[4 * n + 2] = acc[4 * n + 2] * alpha1
+                acc[4 * n + 3] = acc[4 * n + 3] * alpha1
+
+        # ---- O += P V over this warp's channels ----
+        for kk in cutlass.range_constexpr(self.pv_steps):
+            pa0 = pk[4 * kk]
+            pa1 = pk[4 * kk + 1]
+            pa2 = pk[4 * kk + 2]
+            pa3 = pk[4 * kk + 3]
+            for cp in cutlass.range_constexpr(self.warp_chunks // 2):
+                # Rows 16 kk .. 16 kk + 15 of chunks 2 cp and 2 cp + 1.
+                if cutlass.const_expr(fp8):
+                    v_addr = base + v_off[cp % 4] + (128 * (cp // 4) + kk * 16 * rs)
+                else:
+                    v_addr = base + v_off[0] + (32 * cp + kk * 16 * rs)
+                r0, r1, r2, r3 = _ldsm_x4_trans(v_addr)
+                for ci in cutlass.range_constexpr(2):
+                    ra = r0
+                    rb = r1
+                    if cutlass.const_expr(ci == 1):
+                        ra = r2
+                        rb = r3
+                    if cutlass.const_expr(fp8):
+                        # Bytes (k, c), (k, c+1), (k+1, c), (k+1, c+1):
+                        # pair the rows of channel c, then of c + 1.
+                        xa = _prmt(ra, ra, 0x3120)
+                        xb = _prmt(rb, rb, 0x3120)
+                    for jj in cutlass.range_constexpr(self.tpg):
+                        n = (2 * cp + ci) * self.tpg + jj
+                        if cutlass.const_expr(fp8):
+                            if cutlass.const_expr(jj == 0):
+                                b0 = _e4m3x2_lo_to_f16x2(xa)
+                                b1 = _e4m3x2_lo_to_f16x2(xb)
+                            else:
+                                b0 = _e4m3x2_hi_to_f16x2(xa)
+                                b1 = _e4m3x2_hi_to_f16x2(xb)
+                        else:
+                            b0 = ra
+                            b1 = rb
+                        d0, d1, d2, d3 = _mma_16bit_k16(
+                            fp8,
+                            pa0,
+                            pa1,
+                            pa2,
+                            pa3,
+                            b0,
+                            b1,
+                            acc[4 * n + 0],
+                            acc[4 * n + 1],
+                            acc[4 * n + 2],
+                            acc[4 * n + 3],
+                        )
+                        acc[4 * n + 0] = d0
+                        acc[4 * n + 1] = d1
+                        acc[4 * n + 2] = d2
+                        acc[4 * n + 3] = d3
+        return m_i0, m_i1, l_i0, l_i1
+
     @cute.kernel
     def kernel(
         self,
@@ -1102,103 +1229,21 @@ class _SparseMma:
             mx0 = cute.arch.fmax(mx0, _shfl_xor(mx0, 2))
             mx1 = cute.arch.fmax(mx1, _shfl_xor(mx1, 1))
             mx1 = cute.arch.fmax(mx1, _shfl_xor(mx1, 2))
-            m_n0 = cute.arch.fmax(m_i0, _mul(mx0, scale_log2))
-            m_n1 = cute.arch.fmax(m_i1, _mul(mx1, scale_log2))
-            ms0 = m_n0
-            ms1 = m_n1
-            if m_n0 == neg_inf:
-                ms0 = cutlass.Float32(0.0)
-            if m_n1 == neg_inf:
-                ms1 = cutlass.Float32(0.0)
-            alpha0 = _ex2(m_i0 - ms0)
-            alpha1 = _ex2(m_i1 - ms1)
-            nms0 = -ms0
-            nms1 = -ms1
-            rs0 = cutlass.Float32(0.0)
-            rs1 = cutlass.Float32(0.0)
-            # The probabilities go straight into the PV A fragments: tile j
-            # of the scores is half of the k16 step j // 2.
-            pk = cute.make_rmem_tensor((s_tiles * 2,), cutlass.Uint32)
-            for j in cutlass.range_constexpr(s_tiles):
-                p00 = _ex2(_fma(s[4 * j], scale_log2, nms0))
-                p01 = _ex2(_fma(s[4 * j + 1], scale_log2, nms0))
-                p10 = _ex2(_fma(s[4 * j + 2], scale_log2, nms1))
-                p11 = _ex2(_fma(s[4 * j + 3], scale_log2, nms1))
-                rs0 = rs0 + p00
-                rs0 = rs0 + p01
-                rs1 = rs1 + p10
-                rs1 = rs1 + p11
-                pk[2 * j] = _pack_16bit(fp8, p00, p01)
-                pk[2 * j + 1] = _pack_16bit(fp8, p10, p11)
-            rs0 = rs0 + _shfl_xor(rs0, 1)
-            rs0 = rs0 + _shfl_xor(rs0, 2)
-            rs1 = rs1 + _shfl_xor(rs1, 1)
-            rs1 = rs1 + _shfl_xor(rs1, 2)
-            l_i0 = _fma(l_i0, alpha0, rs0)
-            l_i1 = _fma(l_i1, alpha1, rs1)
-            m_i0 = m_n0
-            m_i1 = m_n1
-            # A chunk's first tile starts from a zero accumulator.
-            if tile % chunk_tiles != 0:
-                for n in cutlass.range_constexpr(n_tiles):
-                    acc[4 * n + 0] = acc[4 * n + 0] * alpha0
-                    acc[4 * n + 1] = acc[4 * n + 1] * alpha0
-                    acc[4 * n + 2] = acc[4 * n + 2] * alpha1
-                    acc[4 * n + 3] = acc[4 * n + 3] * alpha1
-
-            # ---- O += P V over this warp's channels ----
-            for kk in cutlass.range_constexpr(self.pv_steps):
-                pa0 = pk[4 * kk]
-                pa1 = pk[4 * kk + 1]
-                pa2 = pk[4 * kk + 2]
-                pa3 = pk[4 * kk + 3]
-                for cp in cutlass.range_constexpr(self.warp_chunks // 2):
-                    # Rows 16 kk .. 16 kk + 15 of chunks 2 cp and 2 cp + 1.
-                    if cutlass.const_expr(fp8):
-                        v_addr = base + v_off[cp % 4] + (128 * (cp // 4) + kk * 16 * rs)
-                    else:
-                        v_addr = base + v_off[0] + (32 * cp + kk * 16 * rs)
-                    r0, r1, r2, r3 = _ldsm_x4_trans(v_addr)
-                    for ci in cutlass.range_constexpr(2):
-                        ra = r0
-                        rb = r1
-                        if cutlass.const_expr(ci == 1):
-                            ra = r2
-                            rb = r3
-                        if cutlass.const_expr(fp8):
-                            # Bytes (k, c), (k, c+1), (k+1, c), (k+1, c+1):
-                            # pair the rows of channel c, then of c + 1.
-                            xa = _prmt(ra, ra, 0x3120)
-                            xb = _prmt(rb, rb, 0x3120)
-                        for jj in cutlass.range_constexpr(self.tpg):
-                            n = (2 * cp + ci) * self.tpg + jj
-                            if cutlass.const_expr(fp8):
-                                if cutlass.const_expr(jj == 0):
-                                    b0 = _e4m3x2_lo_to_f16x2(xa)
-                                    b1 = _e4m3x2_lo_to_f16x2(xb)
-                                else:
-                                    b0 = _e4m3x2_hi_to_f16x2(xa)
-                                    b1 = _e4m3x2_hi_to_f16x2(xb)
-                            else:
-                                b0 = ra
-                                b1 = rb
-                            d0, d1, d2, d3 = _mma_16bit_k16(
-                                fp8,
-                                pa0,
-                                pa1,
-                                pa2,
-                                pa3,
-                                b0,
-                                b1,
-                                acc[4 * n + 0],
-                                acc[4 * n + 1],
-                                acc[4 * n + 2],
-                                acc[4 * n + 3],
-                            )
-                            acc[4 * n + 0] = d0
-                            acc[4 * n + 1] = d1
-                            acc[4 * n + 2] = d2
-                            acc[4 * n + 3] = d3
+            m_i0, m_i1, l_i0, l_i1 = self._softmax_pv(
+                s,
+                acc,
+                base,
+                v_off,
+                scale_log2,
+                mx0,
+                mx1,
+                m_i0,
+                m_i1,
+                l_i0,
+                l_i1,
+                # A chunk's first tile starts from a zero accumulator.
+                tile % chunk_tiles != 0,
+            )
 
             # ---- Chunk end: fold (one CTA) or store (split) the state ----
             if ((tile + 1) % chunk_tiles == 0) | (tile + 1 == tile_hi):

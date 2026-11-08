@@ -150,57 +150,52 @@ def triton_mla_decode_with_kvcache(
 # Query rows per request the tensor-core kernel takes on the query axis.
 _MMA_Q_LENS = frozenset(range(1, 9))
 _MMA_DTYPES = frozenset({torch.float16, torch.bfloat16, torch.float8_e4m3fn})
-
-
-@register_kernel(
-    "attention",
-    "mla_decode_with_kvcache",
-    name="triton_mla_mma_decode_with_kvcache",
-    solution="triton",
-    # Measured on SM120, where the SM100-only tokenspeed_mla decode is not
-    # offered and the portable kernel runs every head on CUDA cores.
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(12, 0),
-        max_arch_version=ArchVersion(12, 9),
-        vendors=frozenset({"nvidia"}),
-    ),
-    signatures=format_signatures(("q", "kv_cache"), "dense", _MMA_DTYPES),
-    priority=Priority.PERFORMANT,
-    traits={
-        # One query row per request is ordinary decode (or one flattened row of
-        # a proposal block); 2 to 8 are a causal verify block or a non-causal
-        # proposal block on the query axis.
-        "q_len": _MMA_Q_LENS,
-        "noncausal_block_size": _MMA_Q_LENS,
-        "block_on_query_axis": frozenset({False, True}),
-        "logit_cap": frozenset({False}),
-        "return_lse": frozenset({False, True}),
-        "sliding_window": frozenset({False, True}),
-        "kv_lora_rank": frozenset({512}),
-        "qk_rope_head_dim": frozenset({64}),
-        "page_size": frozenset({16, 32, 64, 128}),
-    },
+# The CuTe DSL leaf (``cute_dsl.py``) registers with the same capability,
+# traits and priority band.
+_MMA_CAPABILITY = CapabilityRequirement(
+    min_arch_version=ArchVersion(12, 0),
+    max_arch_version=ArchVersion(12, 9),
+    vendors=frozenset({"nvidia"}),
 )
-def triton_mla_mma_decode_with_kvcache(
+_MMA_TRAITS = {
+    # One query row per request is ordinary decode (or one flattened row of
+    # a proposal block); 2 to 8 are a causal verify block or a non-causal
+    # proposal block on the query axis.
+    "q_len": _MMA_Q_LENS,
+    "noncausal_block_size": _MMA_Q_LENS,
+    "block_on_query_axis": frozenset({False, True}),
+    "logit_cap": frozenset({False}),
+    "return_lse": frozenset({False, True}),
+    "sliding_window": frozenset({False, True}),
+    "kv_lora_rank": frozenset({512}),
+    "qk_rope_head_dim": frozenset({64}),
+    "page_size": frozenset({16, 32, 64, 128}),
+}
+
+
+def _mma_decode_checked(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
-    max_seqlen_k: int,
-    qk_nope_head_dim: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-    softmax_scale: float,
     *,
-    logit_cap: float = 0.0,
-    return_lse: bool = False,
-    out: torch.Tensor | None = None,
-    window_left: int = -1,
-    noncausal_block_size: int = 1,
+    leaf: str,
+    logit_cap: float,
+    return_lse: bool,
+    out: torch.Tensor | None,
+    window_left: int,
+    noncausal_block_size: int,
+    launch,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Tensor-core MLA decode; see ``_triton/decode_mma.py`` for the masks."""
+    """Validate a tensor-core MLA decode call, allocate its outputs, ``launch`` it.
+
+    ``launch(q, kv_cache, out, lse)`` runs the leaf's kernel; both tensor-core
+    leaves share the contract checked here.
+    """
     if logit_cap != 0.0:
-        raise ValueError("triton_mla_mma_decode_with_kvcache has no logit cap")
+        raise ValueError(f"{leaf} has no logit cap")
     if q.dim() != 4 or q.shape[-1] != kv_lora_rank + qk_rope_head_dim:
         raise ValueError(
             f"q must have shape [B, q_len, H, {kv_lora_rank + qk_rope_head_dim}], "
@@ -246,20 +241,73 @@ def triton_mla_mma_decode_with_kvcache(
         if return_lse
         else None
     )
-    block_m, num_splits = plan_launch(batch, q_len * heads, current_platform().sm_count)
-    mla_mma_decode(
+    launch(q, kv_cache, out, lse)
+    return (out, lse) if return_lse else out
+
+
+@register_kernel(
+    "attention",
+    "mla_decode_with_kvcache",
+    name="triton_mla_mma_decode_with_kvcache",
+    solution="triton",
+    # Measured on SM120, where the SM100-only tokenspeed_mla decode is not
+    # offered and the portable kernel runs every head on CUDA cores.
+    capability=_MMA_CAPABILITY,
+    signatures=format_signatures(("q", "kv_cache"), "dense", _MMA_DTYPES),
+    priority=Priority.PERFORMANT,
+    traits=_MMA_TRAITS,
+)
+def triton_mla_mma_decode_with_kvcache(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    *,
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    window_left: int = -1,
+    noncausal_block_size: int = 1,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Tensor-core MLA decode; see ``_triton/decode_mma.py`` for the masks."""
+
+    def launch(q, kv_cache, out, lse):
+        block_m, num_splits = plan_launch(
+            q.shape[0], q.shape[1] * q.shape[2], current_platform().sm_count
+        )
+        mla_mma_decode(
+            q,
+            kv_cache,
+            out,
+            page_table,
+            cache_seqlens,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            softmax_scale,
+            lse=lse,
+            window_left=window_left,
+            noncausal_block_size=noncausal_block_size,
+            block_m=block_m,
+            num_splits=num_splits,
+        )
+
+    return _mma_decode_checked(
         q,
         kv_cache,
-        out,
         page_table,
         cache_seqlens,
         kv_lora_rank,
         qk_rope_head_dim,
-        softmax_scale,
-        lse=lse,
+        leaf="triton_mla_mma_decode_with_kvcache",
+        logit_cap=logit_cap,
+        return_lse=return_lse,
+        out=out,
         window_left=window_left,
         noncausal_block_size=noncausal_block_size,
-        block_m=block_m,
-        num_splits=num_splits,
+        launch=launch,
     )
-    return (out, lse) if return_lse else out

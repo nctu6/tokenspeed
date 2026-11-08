@@ -17,11 +17,13 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Tensor-core MLA decode (``triton_mla_mma_decode_with_kvcache``) on SM120.
+"""Tensor-core MLA decode on SM120.
 
-The leaf attends a paged BF16/FP16/E4M3 latent cache with ``mma.sync``. The
-reference is float32 attention over the same stored values, rounded to the
-output dtype.
+Two leaves attend a paged latent cache with ``mma.sync``: the Triton
+``triton_mla_mma_decode_with_kvcache`` (BF16, FP16 and E4M3 caches) and the CuTe
+DSL ``cute_dsl_mla_mma_decode_with_kvcache`` (BF16 and E4M3), which the
+registry prefers where it is built. The reference is float32 attention over
+the same stored values, rounded to the output dtype.
 """
 
 import pytest
@@ -30,6 +32,7 @@ from tokenspeed_kernel.ops.attention.mla import mla_decode_with_kvcache
 from tokenspeed_kernel.ops.attention.mla import triton as mla_triton
 from tokenspeed_kernel.ops.attention.mla._triton import decode_mma
 from tokenspeed_kernel.platform import Platform, PlatformInfo
+from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from utils import assert_no_triton_compile, warm_specialization_classes
@@ -37,7 +40,15 @@ from utils import assert_no_triton_compile, warm_specialization_classes
 RANK, ROPE = 512, 64
 DIM = RANK + ROPE
 SCALE = 0.1352
-LEAF = "triton_mla_mma_decode_with_kvcache"
+TRITON_LEAF = "triton_mla_mma_decode_with_kvcache"
+CUTE_LEAF = "cute_dsl_mla_mma_decode_with_kvcache"
+# The CuTe DSL leaf registers only where the CuTe DSL imports.
+HAS_CUTE = KernelRegistry.get().get_by_name(CUTE_LEAF) is not None
+LEAVES = [TRITON_LEAF, CUTE_LEAF] if HAS_CUTE else [TRITON_LEAF]
+LEAF = CUTE_LEAF if HAS_CUTE else TRITON_LEAF
+if HAS_CUTE:
+    from tokenspeed_kernel.ops.attention.mla._cute_dsl import decode_mma as cute_decode
+on_cute = pytest.mark.skipif(not HAS_CUTE, reason="CuTe DSL leaf not built")
 
 on_sm120 = pytest.mark.skipif(
     not (Platform.get().is_nvidia and Platform.get().arch_version.major == 12),
@@ -149,6 +160,10 @@ def test_sm120_selects_the_mma_leaf(dtype, sm120_platform: PlatformInfo):
     assert _select(sm120_platform, dtype=dtype, **flat) == LEAF
 
 
+def test_fp16_cache_keeps_the_triton_leaf(sm120_platform: PlatformInfo):
+    assert _select(sm120_platform, dtype=torch.float16) == TRITON_LEAF
+
+
 def test_logit_cap_and_other_archs_keep_their_leaves(
     sm120_platform: PlatformInfo,
     b200_platform: PlatformInfo,
@@ -161,6 +176,7 @@ def test_logit_cap_and_other_archs_keep_their_leaves(
 
 
 @on_sm120
+@pytest.mark.parametrize("leaf", LEAVES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
     ("batch", "heads", "length", "q_len", "block", "window"),
@@ -178,7 +194,7 @@ def test_logit_cap_and_other_archs_keep_their_leaves(
     ids=lambda v: str(v),
 )
 def test_matches_the_float32_reference(
-    dtype, batch, heads, length, q_len, block, window
+    leaf, dtype, batch, heads, length, q_len, block, window
 ):
     q, kv, table, lengths = _inputs(batch, heads, length, q_len, dtype)
     out, lse = mla_decode_with_kvcache(
@@ -194,7 +210,7 @@ def test_matches_the_float32_reference(
         return_lse=True,
         window_left=window,
         noncausal_block_size=block,
-        override=LEAF,
+        override=leaf,
     )
     out_dtype = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     assert out.dtype == out_dtype and out.shape == (batch, q_len, heads, RANK)
@@ -210,7 +226,7 @@ def test_fp16_and_empty_rows():
     lengths[1] = 0
     out, lse = mla_decode_with_kvcache(
         q, kv, table, lengths, 600, 128, RANK, ROPE, SCALE, return_lse=True,
-        window_left=1, noncausal_block_size=2, override=LEAF,
+        window_left=1, noncausal_block_size=2, override=TRITON_LEAF,
     )  # fmt: skip
     ref_out, ref_lse = _reference(q, kv, table, lengths, 2, 1)
     torch.testing.assert_close(out, ref_out.half(), **OUT_TOLERANCE[torch.float16])
@@ -218,12 +234,34 @@ def test_fp16_and_empty_rows():
 
 
 @on_sm120
-def test_writes_into_a_strided_output():
+@pytest.mark.parametrize("leaf", LEAVES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("batch", [2, 40])
+def test_empty_and_short_requests(leaf, dtype, batch):
+    """Requests with nothing cached (or fewer tokens than query rows) see
+    nothing: zero output and -inf LSE, in split and unsplit launches."""
+    q, kv, table, lengths = _inputs(batch, 128, 600, 3, dtype)
+    lengths[1::3] = 0
+    lengths[2::5] = 1
+    out, lse = mla_decode_with_kvcache(
+        q, kv, table, lengths, 600, 128, RANK, ROPE, SCALE, return_lse=True,
+        override=leaf,
+    )  # fmt: skip
+    ref_out, ref_lse = _reference(q, kv, table, lengths, 1, -1)
+    out_dtype = torch.bfloat16
+    torch.testing.assert_close(out, ref_out.to(out_dtype), **OUT_TOLERANCE[dtype])
+    torch.testing.assert_close(lse, ref_lse, atol=LSE_ATOL, rtol=0)
+    assert not out[lengths == 0].any()
+
+
+@on_sm120
+@pytest.mark.parametrize("leaf", LEAVES)
+def test_writes_into_a_strided_output(leaf):
     q, kv, table, lengths = _inputs(3, 16, 500, 2, torch.bfloat16)
     wide = torch.zeros(3, 2, 16, RANK + 64, dtype=torch.bfloat16, device="cuda")
     out = wide[..., :RANK]
     result = mla_decode_with_kvcache(
-        q, kv, table, lengths, 500, 128, RANK, ROPE, SCALE, out=out, override=LEAF
+        q, kv, table, lengths, 500, 128, RANK, ROPE, SCALE, out=out, override=leaf
     )
     assert result.data_ptr() == out.data_ptr()
     ref_out, _ = _reference(q, kv, table, lengths, 1, -1)
@@ -234,10 +272,11 @@ def test_writes_into_a_strided_output():
 
 
 @on_sm120
-def test_graph_replay_follows_the_metadata():
+@pytest.mark.parametrize("leaf", LEAVES)
+def test_graph_replay_follows_the_metadata(leaf):
     q, kv, table, lengths = _inputs(4, 128, 3000, 1, torch.bfloat16)
     run = lambda: mla_decode_with_kvcache(  # noqa: E731
-        q, kv, table, lengths, 3000, 128, RANK, ROPE, SCALE, override=LEAF
+        q, kv, table, lengths, 3000, 128, RANK, ROPE, SCALE, override=leaf
     )
     run()
     torch.cuda.synchronize()
@@ -263,8 +302,9 @@ def test_batch_shape_does_not_recompile():
         table = table[:, : 1 + batch % 7].contiguous()
         lengths.clamp_(max=table.shape[1] * 64)
         out = mla_decode_with_kvcache(
-            q, kv, table, lengths, 1 << 17, 128, RANK, ROPE, SCALE, override=LEAF
-        )
+            q, kv, table, lengths, 1 << 17, 128, RANK, ROPE, SCALE,
+            override=TRITON_LEAF,
+        )  # fmt: skip
         assert out.shape == (batch, 1, heads, RANK)
 
     def key(batch):
@@ -282,3 +322,41 @@ def test_batch_shape_does_not_recompile():
         for batch in sweep:
             run(batch)
     assert mla_triton.triton_mla_mma_decode_with_kvcache is not None
+
+
+@on_sm120
+@on_cute
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_cute_binaries_are_keyed_by_dtype_and_row_tile_only(dtype):
+    """Batch, table width, lengths, page size, masks and split count are
+    runtime values: after one binary per row tile exists, a sweep over them
+    compiles nothing."""
+    heads = 128
+
+    def run(batch, q_len=1, page_size=64, length=2048, window=-1, block=1):
+        q, kv, table, lengths = _inputs(
+            batch, heads, length, q_len, dtype, page_size=page_size
+        )
+        table = table[:, : 1 + batch % 7 + length // page_size].contiguous()
+        lengths.clamp_(max=table.shape[1] * page_size)
+        out = mla_decode_with_kvcache(
+            q, kv, table, lengths, 1 << 17, 128, RANK, ROPE, SCALE,
+            window_left=window, noncausal_block_size=block, override=CUTE_LEAF,
+        )  # fmt: skip
+        assert out.shape == (batch, q_len, heads, RANK)
+
+    sweep = (1, 2, 3, 5, 8, 9, 17, 33, 64, 100, 130)
+    for batch in sweep:  # both row tiles, split and unsplit
+        run(batch)
+    run(3, q_len=4)
+    compiled = cute_decode.compiled_decode
+    combine = cute_decode.compiled_combine
+    before = compiled.cache_info().misses, combine.cache_info().misses
+    for batch in sweep:
+        run(batch, length=100 + 37 * batch)
+    for page_size in (16, 32, 128):
+        run(4, page_size=page_size)
+    run(2, q_len=8, window=300)
+    run(2, q_len=4, window=200, block=4)
+    run(7, length=70000)
+    assert (compiled.cache_info().misses, combine.cache_info().misses) == before
