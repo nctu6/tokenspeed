@@ -20,8 +20,10 @@
 
 """Stream-fork staging orders event generations without host synchronization."""
 
+import gc
 import os
 import sys
+import weakref
 from contextlib import contextmanager
 
 import pytest
@@ -104,3 +106,26 @@ def test_staged_branch_event_generations(monkeypatch, enable, overlap):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class _Cycle:
+    """Garbage that only a collection frees."""
+
+    def __init__(self) -> None:
+        self.me = self
+
+
+@pytest.mark.parametrize("was_enabled", [False, True])
+def test_gc_paused_for_capture_collects_first_and_restores_the_setting(was_enabled):
+    gc.enable() if was_enabled else gc.disable()
+    try:
+        dead = weakref.ref(_Cycle())
+        with cuda_stream.gc_paused_for_capture():
+            assert dead() is None, "pending garbage was not collected on entry"
+            assert not gc.isenabled()
+            later = weakref.ref(_Cycle())
+            gc.collect(0)  # an explicit collection is still the caller's choice
+            assert later() is None
+        assert gc.isenabled() == was_enabled
+    finally:
+        gc.enable()

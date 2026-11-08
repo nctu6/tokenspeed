@@ -18,9 +18,33 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import gc
 from contextlib import contextmanager
 
 import torch
+
+
+@contextmanager
+def gc_paused_for_capture():
+    """Keep Python's cyclic GC from running while a CUDA graph is captured.
+
+    Collecting a dead ``torch.cuda.CUDAGraph`` calls ``reset``, which frees the
+    graph's memory pool; that is illegal while any stream is capturing and
+    invalidates the capture (``cudaErrorStreamCaptureInvalidated`` at the next
+    allocation or at ``capture_end``). Graphs usually sit in reference cycles
+    (a model and the runner that holds its graphs), so they die in a
+    collection that can fire at any allocation, including inside a later
+    capture. Collect the pending garbage first, then run the capture with
+    automatic collection off, and restore the previous setting after it.
+    """
+    gc.collect()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 class StreamFork:

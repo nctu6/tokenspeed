@@ -134,6 +134,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
 )
 from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalForwardContext
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
+from tokenspeed.runtime.utils.cuda_stream import gc_paused_for_capture
 
 logger = get_colorful_logger(__name__)
 
@@ -1253,18 +1254,20 @@ class AudioEncodeRunner:
         device = self.features.device
         pool = None
         self.features.zero_()
-        for n in range(self.max_requests, 0, -1):
-            self.slot_index[:n].copy_(torch.arange(n, device=device))
-            features, slot_index = self.features[:n], self.slot_index[:n]
-            self.model.encode_into_cross_cache(features, slot_index)
-            torch.cuda.synchronize(device)
-            graph = torch.cuda.CUDAGraph()
-            with capture_session(graph), torch.cuda.graph(graph, pool=pool):
+        # A collection of dead graphs inside a capture would invalidate it.
+        with gc_paused_for_capture():
+            for n in range(self.max_requests, 0, -1):
+                self.slot_index[:n].copy_(torch.arange(n, device=device))
+                features, slot_index = self.features[:n], self.slot_index[:n]
                 self.model.encode_into_cross_cache(features, slot_index)
-            if pool is None:
-                pool = graph.pool()
-            self.graphs[n] = graph
-        torch.cuda.synchronize(device)
+                torch.cuda.synchronize(device)
+                graph = torch.cuda.CUDAGraph()
+                with capture_session(graph), torch.cuda.graph(graph, pool=pool):
+                    self.model.encode_into_cross_cache(features, slot_index)
+                if pool is None:
+                    pool = graph.pool()
+                self.graphs[n] = graph
+            torch.cuda.synchronize(device)
 
 
 class WhisperForConditionalGeneration(nn.Module):

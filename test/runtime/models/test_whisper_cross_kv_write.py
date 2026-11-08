@@ -35,6 +35,7 @@ Graph replay == eager for the prefill bucket is
 ``test_whisper_prefill.py::test_whisper_audio_prefill_graph_replay_equals_eager``.
 """
 
+import gc
 import os
 import sys
 
@@ -237,6 +238,50 @@ def _graphed_runner(model):
     the model (``MultimodalRuntime.install_encoder_graphs``)."""
     (runner,) = model.make_encoder_cudagraph_wrappers(model.mapping).values()
     return runner
+
+
+class _Cycle:
+    """An object that only a collection frees, like a model and its runner."""
+
+    def __init__(self, graph: torch.cuda.CUDAGraph) -> None:
+        self.me = self
+        self.graph = graph
+
+
+@torch.inference_mode()
+def test_encoder_graph_capture_survives_a_collection_of_dead_graphs():
+    """**Validates: Requirement 3.6** (graph capture in any test order).
+
+    Dead ``CUDAGraph`` objects are freed by the cyclic GC, and freeing one
+    resets its memory pool, which is illegal while a stream is capturing: the
+    capture is invalidated. A model and the runner holding its graphs form such
+    a cycle, so a runner built after other tests dropped theirs could fail
+    depending on when a collection fired. Here a dead graph's cycle is made
+    while the encoder graphs are being captured, with a collection due at every
+    allocation: the capture must still succeed and leave GC as it found it.
+    """
+    model = build_whisper(NUM_SLOTS, seed=0)
+    side = torch.zeros(8, device="cuda")
+    pending = [torch.cuda.CUDAGraph()]
+    with torch.cuda.graph(pending[0]):
+        side.add_(1)
+
+    def drop_a_graph_in_a_cycle(module, args):
+        if torch.cuda.is_current_stream_capturing() and pending:
+            _Cycle(pending.pop())  # unreachable at once, but for its own cycle
+            _ = [[] for _ in range(100)]  # allocations that start a collection
+
+    threshold = gc.get_threshold()
+    handle = model.encoder.register_forward_pre_hook(drop_a_graph_in_a_cycle)
+    gc.set_threshold(1, 1, 1)
+    try:
+        runner = _graphed_runner(model)
+    finally:
+        gc.set_threshold(*threshold)
+        handle.remove()
+    assert gc.isenabled()
+    assert sorted(runner.graphs) == list(range(1, runner.max_requests + 1))
+    assert not pending, "the hook did not run during a capture"
 
 
 @pytest.mark.parametrize("backend", ["triton_attn", "sdpa"])
