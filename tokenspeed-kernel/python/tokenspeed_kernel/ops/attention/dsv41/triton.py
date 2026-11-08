@@ -1069,7 +1069,12 @@ def _index_finish_parts(scores, ids, k, output, lengths):
     _finish_topk(values, ids.gather(1, positions), output, lengths)
 
 
-@triton.jit
+# Widths and strides follow each batch's histories (a short history selects
+# fewer than k rows), so none of them may key a binary.
+@triton.jit(
+    do_not_specialize=["S0", "I0", "C0", "C1", "O0", "WIDTH", "K"],
+    do_not_specialize_on_alignment=["S0", "I0", "C0", "C1", "O0", "WIDTH", "K"],
+)
 def _finish_topk_kernel(
     Scores,
     Ids,
