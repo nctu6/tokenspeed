@@ -259,3 +259,189 @@ def deepselect_local_topk(
             indices=out[begin:end],
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Tensor-core sparse attention over the dense latent cache (SM120)
+# ---------------------------------------------------------------------------
+
+# The CuTe DSL cores take the contract, traits and features of the Triton mma
+# leaves (``triton_dsa_mma_*``) and rank above them on SM120.
+try:
+    from tokenspeed_kernel.ops.attention.dsa._cute_dsl import sparse_mma as _sparse_mma
+except ImportError:
+    _sparse_mma = None
+
+if _sparse_mma is not None:
+    from tokenspeed_kernel.ops.attention.dsa import triton as _dsa_triton
+    from tokenspeed_kernel.ops.attention.dsa._triton import (
+        sparse_mma as _triton_sparse_mma,
+    )
+    from tokenspeed_kernel.registry import Priority, register_kernel
+
+    def _run_cute_dsa_mma(
+        *,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        topk_slots: torch.Tensor,
+        topk_lens: torch.Tensor | None,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        softmax_scale: float,
+        k_scale: float,
+        out: torch.Tensor | None,
+        return_lse: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """CuTe DSL sparse attention; mixed query/cache dtypes run the Triton core.
+
+        The kernel is compiled for an E4M3 query over an E4M3 cache and a BF16
+        query over a BF16 cache, the pairs the DSA backend sends. Any other
+        pair keeps the Triton mma core, which handles it under the same
+        contract; the choice depends on the dtypes alone, so a row's bits still
+        do not depend on its batch.
+        """
+        if kv_cache.dtype != q.dtype:
+            return _dsa_triton._run_dsa_mma(
+                q=q,
+                kv_cache=kv_cache,
+                topk_slots=topk_slots,
+                topk_lens=topk_lens,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                softmax_scale=softmax_scale,
+                k_scale=k_scale,
+                out=out,
+                return_lse=return_lse,
+            )
+        if q.dim() == 4:
+            q = q.reshape(-1, q.shape[-2], q.shape[-1])
+        q = q.contiguous()
+        topk_slots = topk_slots.contiguous()
+        if topk_lens is None:
+            topk_lens = torch.full(
+                (q.shape[0],),
+                topk_slots.shape[-1],
+                dtype=torch.int32,
+                device=q.device,
+            )
+        block_h, num_splits = _sparse_mma.plan_launch(
+            q.shape[0], q.shape[1], current_platform().sm_count
+        )
+        chunk_tiles, num_chunks = _triton_sparse_mma.num_chunks_for(
+            topk_slots.shape[-1],
+            _sparse_mma.rows_for(q.dtype == torch.float8_e4m3fn),
+        )
+        result, lse = _sparse_mma.sparse_mma_attention(
+            q,
+            kv_cache,
+            topk_slots,
+            topk_lens.to(torch.int32).contiguous(),
+            softmax_scale=float(softmax_scale) * float(k_scale),
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            return_lse=return_lse,
+            block_h=block_h,
+            chunk_tiles=chunk_tiles,
+            num_chunks=num_chunks,
+            num_splits=num_splits,
+        )
+        if out is not None:
+            out.reshape_as(result).copy_(result)
+            result = out
+        return (result, lse) if return_lse else result
+
+    @register_kernel(
+        "attention",
+        "dsa_decode",
+        name="cute_dsl_dsa_mma_decode",
+        solution="cute_dsl",
+        capability=_dsa_triton._SM120_MMA_CAPABILITY,
+        signatures=_dsa_triton._MMA_SIGNATURES,
+        features=_dsa_triton._MMA_FEATURES,
+        traits={**_dsa_triton._MMA_TRAITS, "q_len": frozenset({1, 2, 3, 4, 5, 6})},
+        priority=Priority.PERFORMANT + 1,
+    )
+    def cute_dsl_dsa_mma_decode(
+        q: torch.Tensor,
+        kv_cache: torch.Tensor | None,
+        sparse_kv_cache: torch.Tensor | None,
+        topk_slots: torch.Tensor,
+        topk_lens: torch.Tensor | None,
+        max_seqlen_k: int,
+        qk_nope_head_dim: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        softmax_scale: float,
+        page_size: int,
+        q_len_per_req: int = 1,
+        kv_seq_lens: torch.Tensor | None = None,
+        logit_cap: float = 0.0,
+        k_scale: float = 1.0,
+        return_lse: bool = False,
+        out: torch.Tensor | None = None,
+        enable_pdl: bool = False,
+        *,
+        slot_order: str,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Both orders reduce the slots as they arrive; the top-k leaf chose it.
+        del kv_seq_lens, slot_order
+        return _run_cute_dsa_mma(
+            q=q,
+            kv_cache=kv_cache,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            k_scale=k_scale,
+            out=out,
+            return_lse=return_lse,
+        )
+
+    @register_kernel(
+        "attention",
+        "dsa_prefill",
+        name="cute_dsl_dsa_mma_prefill",
+        solution="cute_dsl",
+        capability=_dsa_triton._SM120_MMA_CAPABILITY,
+        signatures=_dsa_triton._MMA_SIGNATURES,
+        features=_dsa_triton._MMA_FEATURES,
+        traits={**_dsa_triton._MMA_TRAITS, "q_len": frozenset({1})},
+        priority=Priority.PERFORMANT + 1,
+    )
+    def cute_dsl_dsa_mma_prefill(
+        q: torch.Tensor,
+        kv_cache: torch.Tensor | None,
+        sparse_kv_cache: torch.Tensor | None,
+        topk_slots: torch.Tensor,
+        topk_lens: torch.Tensor | None,
+        max_seqlen_k: int,
+        qk_nope_head_dim: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        softmax_scale: float,
+        page_size: int,
+        q_len_per_req: int = 1,
+        kv_seq_lens: torch.Tensor | None = None,
+        logit_cap: float = 0.0,
+        k_scale: float = 1.0,
+        return_lse: bool = False,
+        out: torch.Tensor | None = None,
+        enable_pdl: bool = False,
+        *,
+        slot_order: str,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Both orders reduce the slots as they arrive; the top-k leaf chose it.
+        del kv_seq_lens, slot_order
+        return _run_cute_dsa_mma(
+            q=q,
+            kv_cache=kv_cache,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            k_scale=k_scale,
+            out=out,
+            return_lse=return_lse,
+        )

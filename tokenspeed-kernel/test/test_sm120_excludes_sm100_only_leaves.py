@@ -34,6 +34,8 @@ on SM120), so SM120 has its own tensor-core Triton leaves for what they served;
 
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 import torch
 from tokenspeed_kernel.platform import PlatformInfo
@@ -155,6 +157,13 @@ _DSV41_PACKED_INDEX = {
     "index_shards": 1,
     "native_indexer": True,
 }
+# The CuTe DSL DSA cores outrank the Triton ones where the CuTe DSL imports.
+_DSA_CORE = (
+    "cute_dsl"
+    if importlib.util.find_spec("cutlass") is not None
+    and importlib.util.find_spec("cutlass.cute") is not None
+    else "triton"
+)
 # (family, mode, signature roles, traits, leaf SM120 runs, leaf it replaces)
 _SM120_LEAVES = [
     (
@@ -186,7 +195,7 @@ _SM120_LEAVES = [
         "dsa_decode",
         ("q",),
         {**_DSA, "q_len": 4},
-        "triton_dsa_mma_decode",
+        f"{_DSA_CORE}_dsa_mma_decode",
         "flashinfer_trtllm_nope_dsa_decode",
     ),
     (
@@ -194,7 +203,7 @@ _SM120_LEAVES = [
         "dsa_prefill",
         ("q",),
         _DSA,
-        "triton_dsa_mma_prefill",
+        f"{_DSA_CORE}_dsa_mma_prefill",
         "flashinfer_trtllm_nope_dsa_prefill",
     ),
 ]
