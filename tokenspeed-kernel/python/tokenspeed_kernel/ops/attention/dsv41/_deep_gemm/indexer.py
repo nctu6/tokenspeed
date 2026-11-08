@@ -27,7 +27,6 @@ from functools import lru_cache
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexGeometry, IndexMetadata
-from tokenspeed_kernel.thirdparty.deep_select import deep_select_alignment
 
 
 @triton.jit(
@@ -334,6 +333,7 @@ def _sparse_candidate_scores(
     api: object,
     *,
     skip_score_topk: int,
+    score_alignment: int,
     index_metadata: IndexMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return BF16 logits, candidate-row ends and sorted unique 8-row block IDs.
@@ -348,11 +348,15 @@ def _sparse_candidate_scores(
     skip_score_topk is the selection width, or zero for all scores. Pools that
     fit return zero valid logits and submit no scoring work, using live GPU
     lengths. Only the selected set is meaningful for those rows.
+    score_alignment is the selector's row alignment in score elements, a
+    multiple of 32 (DeepGEMM pads the pool to whole groups of four 8-row
+    blocks); the scored width is padded to it.
     """
     tokens, count = candidates.shape
     capacity = page_table.shape[1] * 64
-    alignment = deep_select_alignment()[0] // 2
-    blocks = triton.cdiv(count, alignment // 8) * (alignment // 8)
+    if score_alignment % 32:
+        raise ValueError("score_alignment must be a multiple of 32 elements")
+    blocks = triton.cdiv(count, score_alignment // 8) * (score_alignment // 8)
     width = blocks * 8
     _warmup_sparse_mqa(api, blocks, cache.device, api.get_pdl())
     key = (

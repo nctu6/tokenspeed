@@ -80,10 +80,12 @@ from tokenspeed_kernel.thirdparty.deepgemm import (
 
 platform = current_platform()
 
-# Workstation Blackwell has no FP4 paged MQA kernel in DeepGEMM (only FP8 paged
-# and dense, and FP4 dense/sparse), so like Hopper it scores the FP8 ``index_v4``
-# rows. The upstream DeepSelect package ships sm100 cubins only; the in-tree
-# CuTe DSL selector runs there in its compact shared-memory profile.
+# Workstation Blackwell (SM120) scores both index row formats with DeepGEMM: the
+# FP8 ``index_v4`` rows with the FP8 MQA kernels (as Hopper does), and the packed
+# 68-byte V4.1 rows (MXFP4 values plus a UE8M0 word) with the block-scaled paged,
+# contiguous and sparse MQA kernels. The upstream DeepSelect package ships sm100
+# cubins only; the in-tree CuTe DSL selector runs there in its compact
+# shared-memory profile.
 _SM120_BUILD = platform.is_hopper_plus and deepgemm_supports_sm120()
 _SM120_FP8_INDEXER = _SM120_BUILD and platform.arch_version.major == SM120_ARCH_MAJOR
 _FP8_INDEXER = platform.is_hopper or _SM120_FP8_INDEXER
@@ -101,8 +103,13 @@ if _FP8_INDEXER:
 
 
 def is_native_indexer_available() -> bool:
-    """Whether the current platform supports packed DeepGEMM MQA scoring."""
+    """Whether sm100 packed DeepGEMM MQA scoring (with upstream DeepSelect) runs here."""
     return platform.is_blackwell
+
+
+def is_packed_sm120_indexer_available() -> bool:
+    """Whether SM120 scores packed 68-byte V4.1 index rows with DeepGEMM."""
+    return _SM120_FP8_INDEXER
 
 
 @lru_cache(maxsize=32)
@@ -294,7 +301,9 @@ def index_topk(
         return out
     # Scores and selection scratch are transient and independent of configured
     # request count. Never materialize the full prefill-by-history matrix.
-    sparse = _use_sparse_candidate_scores(index_cache, candidate_blocks, candidate_topk)
+    sparse = _use_sparse_candidate_scores(
+        index_cache, candidate_blocks, candidate_topk, 512
+    )
     dense = not sparse and page_table.stride(0) == 0 and n > 1
     # Wide histories benefit from skipping wholly future cleaning tiles;
     # combine full-width block preparation only for smaller capacities.
@@ -339,6 +348,7 @@ def index_topk(
                 candidates,
                 _api(packed),
                 skip_score_topk=topk,
+                score_alignment=deep_select_alignment()[0] // 2,
                 index_metadata=index_metadata,
             )
             indices = _native_indices(logits, ends, topk)
@@ -420,7 +430,7 @@ _INDEX_VALUE_BYTES = _LAYOUTS["index_v4"][2]
 
 
 def _register_sm120(mode, name, signatures, traits=None):
-    """Register an FP8-row indexer implementation for SM120 as well.
+    """Register an index-row indexer implementation for SM120 as well.
 
     DeepGEMM builds without SM120 kernels fail every call there, so only builds
     that report them offer the leaf.
@@ -613,6 +623,228 @@ def _hopper_paged_scores(
     )
 
 
+# ---------------------------------------------------------------------------
+# SM120: packed 68-byte V4.1 rows
+#
+# The rows the V4.1 checkpoint stores (64 bytes of E2M1 pairs, then one UE8M0
+# word holding the four 32-element scales, page-planar) are scored by DeepGEMM's
+# block-scaled SM120 MQA kernels: paged for Full passes, contiguous for one
+# request's chunked prefill, and the sparse paged kernel for Reindex passes,
+# which reads only the candidate pool. Queries are packed the same way, and the
+# tensor core applies both scales, so the logits are FP32 sums of exact
+# products. Selection is the CuTe DSL DeepSelect of the FP8 path below.
+# ---------------------------------------------------------------------------
+
+_PACKED_ROW_BYTES = 68
+
+
+@lru_cache(maxsize=8)
+def _warmup_packed_indexer(heads: int, device: torch.device, enable_pdl: bool) -> None:
+    """JIT the block-scaled logits kernels and the selectors before capture."""
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Warm up packed indexer kernels before graph capture")
+    deep_gemm.set_pdl(enable_pdl)
+    warmup_mqa_logits(
+        num_heads=heads,
+        index_head_dim=128,
+        cache_block_size=64,
+        max_decode_tokens=32,
+        device=device,
+    )
+    row_select.warmup((_ROW_CAPACITY, _BLOCK_CAPACITY), device)
+
+
+def _packed_api(queries):
+    enabled = pdl_enabled()
+    _warmup_packed_indexer(queries[0].shape[1], queries[0].device, enabled)
+    if deep_gemm.get_pdl() != enabled:
+        deep_gemm.set_pdl(enabled)
+    return deep_gemm
+
+
+def _packed_paged_scores(
+    queries, cache, weights, block_table, valid_lengths, capacity, *, clean
+):
+    """FP32 logits of packed queries against uint8 [pages, 64 * 68] pages."""
+    if queries[0].shape[0] == 0:
+        return torch.zeros((0, capacity), dtype=torch.float32, device=cache.device)
+    api = _packed_api(queries)
+    table, lengths = safe_metadata(
+        block_table, valid_lengths, cache.shape[0], capacity, 64
+    )
+    # The schedule generator faults on a batch without keys (see the FP8 path)
+    context_lens = lengths.clamp_min(1)[:, None]
+    schedule = api.get_paged_mqa_logits_metadata(context_lens, 64, api.get_num_sms())
+    logits = api.fp8_fp4_paged_mqa_logits(
+        q=(
+            queries[0].contiguous().view(torch.int8).unsqueeze(1),
+            queries[1].contiguous().unsqueeze(1),
+        ),
+        kv_cache=_mxfp4_cache_view(cache, 64),
+        weights=weights.contiguous(),
+        context_lens=context_lens,
+        block_table=table,
+        schedule_meta=schedule,
+        max_context_len=capacity,
+        clean_logits=False,
+        logits_dtype=torch.float32,
+    )
+    if not clean:
+        return logits
+    return clean_logits(logits, lengths, block_table, cache.shape[0], capacity, 64)
+
+
+def _packed_dense_scores(
+    queries, keys, weights, lengths, table, pages, capacity, *, clean
+):
+    """FP32 logits of packed queries against one request's gathered history."""
+    starts, ends = dense_ranges(lengths, capacity)
+    logits = _packed_api(queries).fp8_fp4_mqa_logits(
+        q=(queries[0].view(torch.int8), queries[1]),
+        kv=(keys[0].view(torch.int8), keys[1]),
+        weights=weights,
+        cu_seq_len_k_start=starts,
+        cu_seq_len_k_end=ends,
+        clean_logits=False,
+        max_seqlen_k=capacity,
+        logits_dtype=torch.float32,
+    )
+    return clean_logits(logits, ends, table, pages, capacity, 64) if clean else logits
+
+
+# The sparse scorer pads the pool to groups of four 8-row blocks, which also
+# meets the selector's FP32 row alignment.
+_SPARSE_SCORE_ALIGNMENT = 32
+
+
+def _sparse_reindex_wins(rows: int, capacity: int, pool_rows: int, broadcast: bool):
+    """Whether a packed Reindex pass should score only its pool.
+
+    The alternative scores the whole history with the paged (or, for one
+    request's chunk, the contiguous) kernel and gathers the pool from it. That
+    is cheap here, while the sparse kernel runs in one wave of CTAs and costs
+    about 85 us at any size. Measured on an RTX PRO 6000 with 32 heads and a
+    2048-block pool (16384 rows), dense / sparse time: 0.31-0.70 for every
+    history up to the pool; paged 0.40-0.59 below 2^21 scores, 1.05-3.49 from
+    there once the history exceeds the pool; broadcast 0.46-1.04 at twice the
+    pool, 0.74-0.90 at four times with 1024 or more queries, 1.47 there with
+    128 queries, 2.05-2.81 at eight times.
+    """
+    if capacity <= pool_rows:
+        return False
+    if broadcast:
+        return capacity >= 8 * pool_rows or (capacity >= 4 * pool_rows and rows <= 128)
+    return rows * capacity >= 1 << 21
+
+
+def _packed_index_topk(
+    index_q,
+    weights,
+    index_cache,
+    page_table,
+    visible_lens,
+    candidate_blocks,
+    topk,
+    candidate_topk,
+    query_chunk_size,
+    out,
+    index_metadata,
+):
+    """Score packed 68-byte rows with DeepGEMM, select with CuTe DSL DeepSelect."""
+    n = index_q.shape[0]
+    capacity = page_table.shape[1] * 64
+    pages = index_cache.shape[0]
+    cache = index_cache.as_strided(
+        (pages, 64 * _PACKED_ROW_BYTES), (index_cache.stride(0), 1)
+    )
+    # A pass that sources candidates needs every row for the block maxima, so
+    # it scores densely; a Reindex pass reads only its pool where that wins.
+    broadcast = page_table.stride(0) == 0 and n > 1
+    sparse = _use_sparse_candidate_scores(
+        index_cache, candidate_blocks, candidate_topk, 128
+    ) and _sparse_reindex_wins(n, capacity, candidate_blocks.shape[1] * 8, broadcast)
+    dense = not sparse and broadcast
+    tile = query_chunk_size
+    if not sparse:
+        budget = (128 if dense else 32) << 20
+        tile = min(tile, max(1, budget // (capacity * 4)))
+    # The sparse kernel takes BF16 head weights, the dense ones FP32
+    queries, folded = pack_index_inputs(
+        index_q, weights, torch.bfloat16 if sparse else torch.float32
+    )
+    keys = gather_index_pages(cache, page_table[0], 64) if dense else None
+    for begin in range(0, n, tile):
+        end = min(begin + tile, n)
+        visible = visible_lens[begin:end].clamp(0, capacity).to(torch.int32)
+        packed = (queries[0][begin:end], queries[1][begin:end])
+        destination = tuple(tensor[begin:end] for tensor in out)
+        if sparse:
+            scores, _, normalized = _sparse_candidate_scores(
+                packed,
+                folded[begin:end],
+                cache,
+                page_table[begin:end],
+                visible_lens[begin:end],
+                candidate_blocks[begin:end],
+                _packed_api(packed),
+                skip_score_topk=topk,
+                score_alignment=_SPARSE_SCORE_ALIGNMENT,
+                index_metadata=index_metadata,
+            )
+            # Columns past each pool's end score -inf; columns map back to rows
+            # through the sorted, deduplicated pool
+            _native_select(
+                None,
+                visible,
+                normalized,
+                topk,
+                candidate_topk,
+                destination,
+                scores.float(),
+            )
+            continue
+        bounded = bool(candidate_topk) and candidate_blocks is None
+        if dense:
+            logits = _packed_dense_scores(
+                packed,
+                keys,
+                folded[begin:end],
+                visible,
+                page_table[begin:end],
+                pages,
+                capacity,
+                clean=not bounded,
+            )
+        else:
+            logits = _packed_paged_scores(
+                packed,
+                cache,
+                folded[begin:end],
+                page_table[begin:end],
+                visible,
+                capacity,
+                clean=not bounded,
+            )
+        block_stats = None
+        if bounded:
+            logits, maxima, block_ends = clean_block_maxima(
+                logits, visible, page_table[begin:end], pages
+            )
+            block_stats = (maxima, block_ends)
+        candidates = None if candidate_blocks is None else candidate_blocks[begin:end]
+        _native_select(
+            logits,
+            visible,
+            candidates,
+            topk,
+            candidate_topk,
+            destination,
+            None,
+            block_stats=block_stats,
+        )
+    return out
+
+
 # V4.1 selects at most 512 rows and at most 2048 candidate blocks per query;
 # each selection binds to one compiled survivor capacity so that warmup knows
 # exactly which variants a capture may replay.
@@ -693,7 +925,10 @@ def _native_select(
     "dsv41_index_topk",
     "deep_gemm_sm120_dsv41_index_topk",
     [format_signature(x=dense_tensor_format(torch.bfloat16))],
-    {"native_indexer": frozenset({True})},
+    {
+        "native_indexer": frozenset({True}),
+        "index_k_format": frozenset({"fp8_scaled", "mxfp4"}),
+    },
 )
 @register_kernel(
     "attention",
@@ -725,8 +960,11 @@ def hopper_index_topk(
     out,
     index_metadata,
 ):
-    """Score FP8 index rows on tensor cores, select with CuTe DSL DeepSelect."""
-    del index_metadata
+    """Score index rows on tensor cores, select with CuTe DSL DeepSelect.
+
+    FP8 ``index_v4`` rows (Hopper and SM120) or packed 68-byte V4.1 rows
+    (SM120, which has block-scaled MQA kernels); the row width tells them apart.
+    """
     if process_group is not None or candidate_block_size != 8:
         raise ValueError(
             "Native CSA2 selection requires replicated heads and 8-row blocks"
@@ -755,6 +993,25 @@ def hopper_index_topk(
         blocks.fill_(-1)
         block_lengths.zero_()
         return out
+    if index_cache.shape[2] == _PACKED_ROW_BYTES:
+        if not _SM120_FP8_INDEXER:
+            raise ValueError(
+                "Packed V4.1 index rows need SM120 block-scaled MQA kernels"
+            )
+        return _packed_index_topk(
+            index_q,
+            weights,
+            index_cache,
+            page_table,
+            visible_lens,
+            candidate_blocks,
+            topk,
+            candidate_topk,
+            query_chunk_size,
+            out,
+            index_metadata,
+        )
+    del index_metadata
     dense = page_table.stride(0) == 0 and n > 1
     budget = (128 if dense else 32) << 20
     tile = min(query_chunk_size, max(1, budget // (capacity * 4)))
@@ -851,13 +1108,19 @@ def hopper_index_topk(
     return out
 
 
-def _use_sparse_candidate_scores(cache, candidates, candidate_topk):
-    """Native sparse reads require aligned pages and a candidate consumer."""
+def _use_sparse_candidate_scores(cache, candidates, candidate_topk, stride_alignment):
+    """Native sparse reads require aligned pages and a candidate consumer.
+
+    ``stride_alignment`` is the page-stride alignment in bytes the scorer
+    needs: 512 on sm100, 128 on SM120 (its kernel gathers rows with 16-byte
+    ``cp.async`` from 128-byte aligned pages, which every 68-byte V4.1 page
+    of 64 rows is).
+    """
     return (
         candidates is not None
         and candidates.shape[1] > 0
         and candidate_topk == 0
-        and cache.stride(0) % 512 == 0
+        and cache.stride(0) % stride_alignment == 0
         and cache.stride(0) < 2**31
         and cache.data_ptr() % 16 == 0
     )

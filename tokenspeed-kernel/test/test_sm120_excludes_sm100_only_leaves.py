@@ -40,6 +40,7 @@ from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.thirdparty.deepgemm import deepgemm_supports_sm120
 
 # (family, mode) -> solutions whose kernels cannot run on SM120
 _SM100_ONLY_SOLUTIONS = {
@@ -80,10 +81,11 @@ def test_sm100_only_leaves_are_not_offered_on_sm120(
     assert "triton" in on_sm120, f"{mode} has no portable leaf on SM120: {on_sm120}"
 
 
-# Leaves of a shared operator whose kernels need SM100/SM103 hardware: the packed
-# FP4 paged MQA scorer (DeepGEMM has no such kernel on SM120) and the upstream
-# DeepSelect package (sm100 cubins only). SM120 runs FP8 index rows through the
-# ``deep_gemm_sm120_*`` leaves and the in-tree CuTe DSL selector instead.
+# Leaves of a shared operator whose kernels need SM100/SM103 hardware: the
+# upstream DeepSelect package (sm100 cubins only, and its shared memory does not
+# fit SM120), which the sm100 packed leaf selects with. SM120 scores both FP8 and
+# packed FP4 index rows with DeepGEMM's SM120 MQA kernels in the
+# ``deep_gemm_sm120_*`` leaves and selects with the in-tree CuTe DSL kernel.
 _SM100_ONLY_KERNELS = [
     ("attention", "dsv41_index_topk", "deep_gemm_dsv41_index_topk"),
     ("attention", "dsv41_select_topk", "deepselect_dsv41_select_topk"),
@@ -147,6 +149,12 @@ _DSV4_PREFILL = {
     "sinks": True,
 }
 _HADAMARD = {"last_dim": 128, "contiguous": True}
+_DSV41_PACKED_INDEX = {
+    "index_heads": 32,
+    "index_k_format": "mxfp4",
+    "index_shards": 1,
+    "native_indexer": True,
+}
 # (family, mode, signature roles, traits, leaf SM120 runs, leaf it replaces)
 _SM120_LEAVES = [
     (
@@ -190,6 +198,19 @@ _SM120_LEAVES = [
         "flashinfer_trtllm_nope_dsa_prefill",
     ),
 ]
+# The V4.1 packed-row indexer exists on SM120 only in DeepGEMM builds with SM120
+# kernels; otherwise the portable leaf serves it
+if deepgemm_supports_sm120():
+    _SM120_LEAVES.append(
+        (
+            "attention",
+            "dsv41_index_topk",
+            ("x",),
+            _DSV41_PACKED_INDEX,
+            "deep_gemm_sm120_dsv41_index_topk",
+            "deep_gemm_dsv41_index_topk",
+        )
+    )
 
 
 @pytest.mark.parametrize(
@@ -203,6 +224,7 @@ def test_sm120_runs_its_own_leaves(
     import tokenspeed_kernel.ops.attention  # noqa: F401  (registers the leaves)
     import tokenspeed_kernel.ops.attention.dsa  # noqa: F401
     import tokenspeed_kernel.ops.attention.dsv4  # noqa: F401
+    import tokenspeed_kernel.ops.attention.dsv41  # noqa: F401
     import tokenspeed_kernel.ops.attention.mla  # noqa: F401
     import tokenspeed_kernel.ops.transform  # noqa: F401
 

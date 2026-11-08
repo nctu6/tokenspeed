@@ -177,12 +177,13 @@ def _select_dsv41_index_topk(platform: PlatformInfo, index_k_format: str, native
     ).name
 
 
-def test_dsv41_indexer_scores_fp8_rows_on_sm120_and_fp4_rows_on_sm100(
+def test_dsv41_indexer_scores_both_row_formats_on_sm120(
     sm120_platform: PlatformInfo, b200_platform: PlatformInfo
 ) -> None:
-    """SM120 has no paged FP4 MQA kernel, so only FP8 index rows go native there.
+    """SM120 scores FP8 and packed FP4 index rows natively, with one leaf.
 
-    The FP8 leaves are offered on SM120 only by builds that report SM120 kernels.
+    The leaves are offered on SM120 only by builds that report SM120 kernels;
+    sm100 keeps its packed leaf (upstream DeepSelect).
     """
     pytest.importorskip("deep_gemm")
     import tokenspeed_kernel.ops.attention.dsv41  # noqa: F401  (triggers registration)
@@ -205,11 +206,12 @@ def test_dsv41_indexer_scores_fp8_rows_on_sm120_and_fp4_rows_on_sm100(
             {f"deep_gemm_sm120_{mode}"} if deepgemm_supports_sm120() else set()
         ), (mode, offered)
     if deepgemm_supports_sm120():
-        assert (
-            _select_dsv41_index_topk(sm120_platform, "fp8_scaled", True)
-            == "deep_gemm_sm120_dsv41_index_topk"
-        )
-    # Packed FP4 rows and passes the FP8 indexer would lose keep the portable leaf
+        for index_k_format in ("fp8_scaled", "mxfp4"):
+            assert (
+                _select_dsv41_index_topk(sm120_platform, index_k_format, True)
+                == "deep_gemm_sm120_dsv41_index_topk"
+            ), index_k_format
+    # Passes the native indexer would lose keep the portable leaf
     assert (
         _select_dsv41_index_topk(sm120_platform, "mxfp4", False)
         == "triton_dsv41_index_topk"
