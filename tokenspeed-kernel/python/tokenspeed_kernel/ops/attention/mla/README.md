@@ -9,7 +9,8 @@ proposal block for DFLASH/DSPARK drafters).
 | Leaf | Where | Notes |
 |---|---|---|
 | `tokenspeed_mla_decode_with_kvcache` | SM100-SM107 | CuTe DSL tcgen05 kernel; non-causal proposal blocks on the query axis (`q_len` 2-8). |
-| `triton_mla_mma_decode_with_kvcache` | SM120 | Tensor-core split-K kernel; `q_len` 1-8, causal and non-causal blocks, window, LSE. |
+| `cute_dsl_mla_mma_decode_with_kvcache` | SM120, BF16 / E4M3 caches | CuTe DSL port of the next row (same contract and traits), `PERFORMANT + 1`. |
+| `triton_mla_mma_decode_with_kvcache` | SM120 | Tensor-core split-K kernel; `q_len` 1-8, causal and non-causal blocks, window, LSE; FP16 caches. |
 | `triton_mla_decode_with_kvcache` | any NVIDIA/AMD | One program per (row, head) on CUDA cores; `q_len` 1, logit cap. |
 | `gluon_*` | AMD | |
 
@@ -62,19 +63,57 @@ Measured on an RTX PRO 6000 (CUDA graph; memory roofline is the cache bytes at
 | E4M3 | 128 | 8 x 8192 | 4 | 650 us | 25.9 us | 112 | |
 
 At 16 heads it is 0.9-1.5x of the memory roofline from 8 requests up. At 128
-heads the kernel is compute bound: 100-142 TFLOP/s is 25-35% of what cuBLAS
-reaches, which `mma.sync` through Triton does not close (sweeps of the key tile,
-row tile, warp count, stages and split limit are flat around the shipped
-values; the DSA notes show the same ceiling). A CuTe
-DSL kernel with `ldmatrix`/`cp.async` staging is the open route: the DSA CuTe
-core (`dsa/_cute_dsl/sparse_mma.py`) reaches 63% of the E4M3 and 48% of the
-16-bit floor with that design (1.9x / 1.2x over the Triton DSA core). An MLA
-port would gather a contiguous page range instead of selected slots and add
-the causal / window mask and the `q_len` query axis; not written yet. Prefill (`triton_mla_prefill`, a
-`tl.dot` flash kernel) already runs at 104-146 TFLOP/s, the same efficiency, so
-it is not ported.
+heads the Triton kernel is compute bound at 100-142 TFLOP/s, 25-35% of what
+cuBLAS reaches; sweeps of the key tile, row tile, warp count, stages and split
+limit are flat around the shipped values. Prefill (`triton_mla_prefill`, a
+`tl.dot` flash kernel) runs at 104-146 TFLOP/s, the same efficiency, and is not
+ported.
 
-Tests: `test/nvidia/ops/attention/test_mla_decode_mma_sm120.py` (float32
-reference to one output ulp, LSE to 2e-5, graph replay, recompile guard) and
+## CuTe DSL leaf (`_cute_dsl/decode_mma.py`)
+
+`cute_dsl_mla_mma_decode_with_kvcache` subclasses the DSA CuTe DSL core
+(`dsa/_cute_dsl/sparse_mma.py`) and keeps its tile math: `cp.async` two-stage
+ring, 4 channel warps per 16 rows with one 16 x 128 FP32 accumulator each,
+E4M3 64-row tiles with the query in XOR-swizzled shared memory and key-split
+scores, BF16 32-row tiles with channel-split scores, `ldmatrix(.trans)` and
+`mma.sync`, the shared softmax/PV step. What changes is the gather and the
+mask, both the Triton leaf's: a CTA walks the contiguous position range its
+rows can see, one tile of consecutive positions at a time, resolving each
+through the request's page table (`pos >> log2(page_size)`), and masks each row
+to `first <= p < visible` (causal or non-causal block, window). The split, the
+partial states and `plan_launch` are the Triton leaf's (shape by batch size
+only, up to 128 splits). The merge kernel gives each split a thread, reduces
+the maximum and the weights in a fixed order and skips splits of weight zero;
+an empty split stores only `l = 0`. Like the Triton leaf it does not declare
+`batch_invariant`. FP16 caches keep the Triton leaf; layouts the vector loads
+cannot address (`supports`) run the Triton launch. Binaries are keyed by cache
+dtype and row tile; batch, `q_len`, heads, page size, table width, masks and
+split count are runtime values.
+
+Against the Triton leaf (CUDA graph, 1-128 requests x 1K-32K tokens, `Q` = 1;
+32 points per row):
+
+| dtype | heads | geomean | range | best |
+|---|---:|---|---|---|
+| BF16 | 16 | 1.09x | 0.97-1.40x | 1.38x at 4 x 16K (36 vs 50 us) |
+| BF16 | 128 | 1.67x | 1.23-1.95x | 213 TFLOP/s at 128 x 32K (5.48 vs 10.17 ms) |
+| E4M3 | 16 | 1.29x | 1.01-1.96x | 1.96x at 8 x 16K (34 vs 67 us) |
+| E4M3 | 128 | 1.94x | 1.23-2.31x | 355 TFLOP/s at 128 x 32K (3.29 vs 7.60 ms) |
+
+1.46x geomean. With `Q` = 4 and 8 (16 and 128 heads, 1-128 requests, 4K and
+32K): 1.84x (1.13-2.34x; E4M3 128 heads up to 380 TFLOP/s). The closest points
+are BF16 16 heads from 16 requests of 16K up (0.97-1.00x), where both leaves
+stream the cache at about 1.45 TB/s, the DRAM roofline (smaller caches stay in
+the 128 MB L2 across graph replays, which is where the 16-head wins come
+from). The first version lost at one request of
+16 heads (0.75x at 1K, 23.6 vs 17.8 us): its merge kernel looped over 128
+splits serially; the parallel merge with weight-zero skipping made it 1.23x.
+
+Tests: `test/nvidia/ops/attention/test_mla_decode_mma_sm120.py` (both leaves:
+float32 reference to one output ulp, LSE to 2e-5, causal / non-causal blocks and
+windows on the query axis, empty and short requests in split and unsplit
+launches, strided output, graph replay; Triton recompile guard; CuTe compile
+cache guard over batch, lengths, page size, masks and `q_len`; FP16 selection)
+and
 `test/ops/test_batch_shape_recompiles.py`; `bench_mla_decode_sm120.py`
 reproduces the table.

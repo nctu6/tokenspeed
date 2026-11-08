@@ -387,10 +387,18 @@ lane-constant swizzled addresses took it from 5.1 to 3.5 ms. Tests: the shared
 `test_dsa_mma_sm120.py` cases run for both solutions (float32 reference,
 bitwise rows across batches, any width, zero RoPE), plus split and head-tile
 invariance, recompile guard, `out=` and cache layouts, and the mixed-dtype
-route. The dots3-note backend pins its DSA leaves to solution `triton`
-(`backends/dots3_note.py`, for implementations that would materialize its
-strided cache); with the pin set to `cute_dsl` its model and next-n tests pass
-(14 tests), so lifting the pin on SM120 is a follow-up.
+route. The V4 prefill and MLA decode CuTe leaves reuse this kernel class
+(`dsv4/_cute_dsl/`, `mla/_cute_dsl/`).
+
+Strided caches. A core that reads `kv_cache` in place through its own page and
+token strides declares `STRIDED_KV_CACHE_FEATURE` (`strided_kv_cache`; the
+Triton portable and mma cores and both CuTe cores do). Cores that reshape the
+cache into flat rows would copy a strided view in full on every call, so a
+caller whose cache is such a view requires the feature through
+`dsa_decode` / `dsa_prefill(features=...)` and the kernel plan; dots3-note's
+compact latent cache does (`Dots3NoteDSABackend.core_features`) instead of
+pinning a solution, so SM120 reaches the CuTe cores and other platforms keep a
+core that does not copy.
 The portable Triton attention implementations support `return_lse=True` for
 both dense and packed latent caches. They return `(output, lse)`, with FP32
 natural-log LSE shaped `[tokens, heads]`; all-invalid rows produce zero output
