@@ -208,22 +208,41 @@ index-key row format and the selector that follows.
   it (`_use_deepselect_decode_topk`: 32K+ entries and 96+ rows, or 64K+ entries
   and 48+ rows; 2.1-2.7x faster on 128 rows of 64K-128K). Both selectors return
   exact top-k sets, so the choice only affects speed.
-- **V4.1 `dsv41_index_topk`.** DeepGEMM has no paged FP4 MQA kernel on SM120, so
-  the packed-FP4 leaf (`deep_gemm_dsv41_index_topk`) and the upstream DeepSelect
-  leaves stay on SM100/SM103. SM120 scores the FP8 `index_v4` rows like Hopper
-  does (`deep_gemm_sm120_dsv41_*`, registered by builds with SM120 kernels) and
-  selects with DeepSelect. The sparse candidate scorer is Hopper-only, so a
-  Reindex pass scores the whole history; `fp8_indexer_wins` keeps it on the
-  Triton scorer, which reads only the candidate pool, where the history is
-  long (over 16384 rows and more than 2^19 row-history pairs). The leaves are
-  selected only for 132-byte `index_v4` rows. SM120 still stores the 68-byte
-  V4.1 rows (`cache_format="v41"` in the runtime attention config), because the
-  `v4` rows hold about 45% fewer tokens in the same memory; the config does not
-  select `v4` on SM120 yet, so serving reaches the native route only once it
-  does. Measured on an RTX PRO 6000 (32 heads, top-k 512, CUDA graph), Triton
-  time over native time is 2.3-7.2x for decode Full passes over 1K-32K rows and
-  1-128 requests, and 1.4-5.1x for chunked-prefill Full passes of 128-4096
-  queries.
+- **V4.1 `dsv41_index_topk`.** SM120 stores the checkpoint's 68-byte rows
+  (`cache_format="v41"`: 64 bytes of E2M1 pairs, then one UE8M0 word with the
+  four 32-element scales, page-planar). One leaf, `deep_gemm_sm120_dsv41_index_topk`
+  (window 12.0-12.9, registered only by builds with SM120 kernels), scores
+  them with DeepGEMM's block-scaled SM120 MQA kernels and selects with
+  DeepSelect: the paged kernel for Full passes, the contiguous one for one
+  request's prefill chunk (a zero-stride table), and the sparse paged kernel
+  for Reindex passes over long histories. Queries are packed like the keys and
+  the tensor core applies both scales, so Full logits are FP32 sums of exact
+  products and the selected sets match an exact reference; the sparse kernel
+  writes BF16 logits, so Reindex picks may swap within one BF16 rounding of the
+  k-th score. The sm100 packed leaf (`deep_gemm_dsv41_index_topk`) and the
+  upstream DeepSelect leaves stay on SM100/SM103, since that package does not
+  fit SM120's shared memory. The same leaf scores the 132-byte FP8 `index_v4`
+  rows (the `v4` cache format, not selected on SM120) like Hopper does.
+  Measured on an RTX PRO 6000 (32 heads, top-k 512, 2048 candidate blocks, CUDA
+  graph, median of 3), Triton time over native time on packed rows:
+
+  | pass | decode, 1-128 requests x 1K-32K rows | chunked prefill, 128-4096 queries x 4K-32K rows |
+  |---|---|---|
+  | Full | 5.6-16x | 11-46x |
+  | Full that sources the candidate pool | 7.7-33x | 22-88x |
+  | Reindex over the pool | 2.2-22x | 6.8-22x |
+
+  Every pass wins, so packed rows have no shape rule against the Triton leaf.
+  Inside the leaf, a Reindex pass scores the whole history and gathers the pool
+  unless the pool-only sparse kernel wins (`_sparse_reindex_wins`): that kernel
+  runs in one wave of CTAs and costs about 85 us at any size, while the packed
+  history scorers are cheap (dense over sparse time 0.31-0.70 up to the pool's
+  16384 rows; sparse wins 1.05-3.5x on paged histories past the pool from 2^21
+  scores, and on one request's chunk from four times the pool at 128 queries or
+  eight times otherwise). For FP8 rows no pool-only scorer exists on SM120 (the
+  sparse kernel reads MX rows only), so `fp8_indexer_wins` still keeps long FP8
+  Reindex passes on Triton. TP-sharded index scoring (`index_candidates`) still
+  takes FP8 rows only.
 
 ## Tensor-core sparse attention on SM120 (`_triton/sparse_mma.py`)
 
