@@ -188,8 +188,9 @@ def test_token_count_and_width_do_not_recompile():
         assert out.shape == q.shape
 
     def key(tokens):
+        # Binaries are keyed by the head-tile width and split-or-not only.
         block_h, splits = sparse_mma.plan_launch(tokens, heads, sm_count)
-        return block_h, 1 << (splits - 1).bit_length(), splits == 1
+        return block_h, 2 * splits >= sparse_mma.num_chunks_for(640)[1]
 
     sweep = (1, 2, 3, 5, 8, 9, 17, 33, 64, 100, 130, 515)
     warm_specialization_classes(run, key, sweep, pool=(1, 4, 8, 16, 40, 130, 515))
@@ -204,3 +205,27 @@ def test_token_count_and_width_do_not_recompile():
         run(11, width=384)
         run(3, width=1408)
         run(5, width=577)  # a row stride that is not a multiple of 16
+
+
+@on_sm120
+@pytest.mark.parametrize("heads", [2, 16, 64])
+def test_rows_do_not_depend_on_the_batch(heads):
+    """A token's row is bitwise the same in any batch, split or not.
+
+    A prefill chunk replayed after a prefix-cache hit must reproduce the rows
+    of the original chunk exactly; the launch shape follows the token count.
+    """
+    q, kv, indices, lens, sink = _inputs(600, heads, 5000, 640, torch.int32, seed=3)
+    full = dsv4_prefill(q, kv, indices, lens, sink, SCALE, override=LEAF)
+    for start, count in ((0, 1), (5, 4), (17, 72), (100, 200), (0, 600)):
+        rows = slice(start, start + count)
+        part = dsv4_prefill(
+            q[rows], kv, indices[rows], lens[rows], sink, SCALE, override=LEAF
+        )
+        assert torch.equal(part, full[rows]), (start, count)
+    sm_count = Platform.get().sm_count
+    chunks = sparse_mma.num_chunks_for(640)[1]
+    plans = {
+        2 * sparse_mma.plan_launch(n, heads, sm_count)[1] >= chunks for n in (1, 600)
+    }
+    assert plans == {True, False}  # both launch shapes were compared

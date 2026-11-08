@@ -542,6 +542,9 @@ def triton_dsv4_mma_prefill(
     output = out if out is not None else torch.empty_like(q)
     if output.stride(-1) != 1:
         raise ValueError("out must have a contiguous last dimension")
+    # The DSA rule picks the head tile; a split gives every chunk its own
+    # program, which pays off only when the rule wants about that many. The
+    # split does not change the result (see ``_triton/sparse_mma.py``).
     block_h, num_splits = sparse_mma.plan_launch(
         q.shape[0], q.shape[1], current_platform().sm_count
     )
@@ -555,7 +558,7 @@ def triton_dsv4_mma_prefill(
         lse,
         softmax_scale=softmax_scale,
         block_h=block_h,
-        num_splits=num_splits,
+        split=2 * num_splits >= sparse_mma.num_chunks_for(indices_2d.shape[1])[1],
     )
     return output
 
