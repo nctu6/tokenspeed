@@ -234,16 +234,16 @@ top-k 512-2051, `kv_lora_rank` 128 or 512, 64-wide RoPE, `return_lse` either
 way, `q_len` 1-6 for decode). FlashMLA and the trtllm-gen cores are capped off
 SM120. The packed FP8 sparse cache (`has_sparse_kv_cache=True`) has no runtime
 user on SM120 (the backend always passes `sparse_kv_cache=None`) and keeps
-`triton_dsa_decode` / `triton_dsa_prefill`, as do batch-invariant plans (the
-leaves do not declare `batch_invariant`: the split count follows the batch).
+`triton_dsa_decode` / `triton_dsa_prefill`. The leaves declare
+`batch_invariant` and `cuda_graph`, and the `slot_order` trait with both
+orders (they reduce the slots as they arrive, so they keep the top-k leaf's
+order); they carry no `topk` trait, because a `KernelPlan` leaves `topk`
+variable and drops any leaf that restricts it.
 A zero RoPE width is the KPool layout of GLM-5.3-Flash (`qk_nope_head_dim` 256,
 `kv_lora_rank` 512, 2048 slots plus up to three tail slots, cache rows of 512
 channels): the kernel compiles the RoPE gather and score term out, and the
 same leaves serve it (29-134x over `triton_dsa_*` at 16 and 64 heads, 1-1024
-tokens, 2051 slots; up to 125 TFLOP/s). The split count of these leaves follows
-the token count, so a token's prefill row depends on its batch; the V4 leaf
-(`dsv4/README.md`) shows the fixed-chunk scheme that removes this, not yet
-applied here.
+tokens, 2051 slots; up to 125 TFLOP/s).
 
 Why it is fast: all heads of a token read the same selected rows, so a program
 owns a tile of heads of one token and multiplies each gathered tile of rows by
@@ -256,15 +256,26 @@ ones, with an FP32 online softmax. One gather of a row serves both products
 next tile's gather is issued before the current tile's math (register
 double-buffering; `num_stages=2`).
 
+Batch invariance: a token's selection is cut into at most `MAX_CHUNKS` (8)
+chunks of whole `BLOCK_N` tiles, a function of the selection width alone
+(`num_chunks_for`). Each chunk runs its own online softmax and the chunk states
+are folded in order by one helper (`_merge`, explicit `fma`). One program folds
+them in registers; when a batch has too few (token, head tile) pairs to fill
+the GPU, several programs share a token, each storing the state of every chunk
+it ran, and a small second kernel folds all stored states with the same helper
+in the same order. A token's row (and LSE) is therefore bitwise the same for any
+batch size, head-tile width and split count, as for FlashMLA's unsplit sparse
+prefill; `test_rows_do_not_depend_on_the_batch` and
+`test_split_count_does_not_change_the_result` guard it, and
+`test_bitwise_envelope_plans_the_mma_leaves` the plan. This is the scheme of the
+V4 leaf (`dsv4/README.md`).
 One path with parameters: `plan_launch(tokens, heads, num_sms)` picks the
 head-tile width (16 or 32) and `num_splits`, the number of programs that share
-one (token, head tile) and each take a slice of the selected columns. Few
-tokens split up to 16 ways, and a small second kernel merges the partial
-(max, sum, accumulator) states; one split normalizes in place. The launch
-parameters depend on the token count only, so a graph captured per batch size
-replays fixed values. Token count, head count, top-k width, strides and
-split count are runtime arguments (`do_not_specialize`); the binaries are
-keyed by tile width and the combine kernel's power-of-two split bound, which
+one (token, head tile) and each take a run of chunks (at most one per chunk).
+The launch parameters depend on the token count only, so a graph captured per
+batch size replays fixed values. Token count, head count, top-k width, strides,
+chunk count and split count are runtime arguments (`do_not_specialize`); the
+binaries are keyed by tile width and split-or-not, which
 `test_batch_size_does_not_recompile` guards.
 
 Numerics match the portable kernels: output BF16 for E4M3 queries (the query
@@ -280,17 +291,29 @@ prefill chunks 128/512/2048/8192 is 108x/115x/113x/115x (0.48, 1.8, 7.4,
 29.5 ms); 16, 32 and 64 heads per GPU gain 27-146x on every bucket. The
 tile is within about 4x of the tensor-pipe roofline (E4M3 `QK` at 779 TFLOP/s
 and 16-bit `PV` at 404 TFLOP/s, as cuBLAS reaches on this GPU): 136 TFLOP/s
-for 128 requests of decode and 158 TFLOP/s for 8192-token prefill. Ablating the
+for 128 requests of decode and 158 TFLOP/s for 8192-token prefill (before
+batch invariance; see the cost below). Ablating the
 `QK` product alone removes 40-45% of the time. Tried and rejected, all slower
 on 128 requests of 128 heads (shipped: 540 us): a compiler-pipelined
 `tl.range` loop (640-739 us over 4 or 8 warps and 1-3 stages), 16 warps with
 a 128-register cap (812 us), `BLOCK_N` of 16 (797 us), and register caps at 8
-warps (1547 us at 168, 2045 us at 128; the kernel uses 246 registers with no
+warps (1547 us at 168, 2045 us at 128; the kernel used 246 registers with no
 spills, so a cap forces spilling). `BLOCK_N` of 64 was slower under every cap
 tried (2750-3711 us). A CuTe DSL kernel with TMA or `cp.async` gathers
 and a warp-specialized softmax is the next step if this becomes the bottleneck;
 it is not written.
-
+Cost of batch invariance (same 64 buckets, CUDA graph): the chunk states need
+a second accumulator, so the 32-head tile now holds 255 registers and spills 34
+(E4M3) to 52 (BF16) of them. The kernel is 1.21x slower (geomean) and 1.86x at
+worst; against `triton_dsa_*` it is still 22-114x faster on every bucket (72x
+geomean; 86x before). E4M3 prefill costs 2-9% (up to 35% for 128-token chunks
+of 64-128 heads), BF16 prefill 5-9% at 16 heads and 28-37% at 32-128 heads,
+decode of 8-128 requests 0-49% (E4M3) and 0-36% (BF16), and decode of one
+request takes 17-24 us instead of 10-14 us (8 chunks bound the programs of one
+token; the old split went to 16). Tried: 16 chunks (prefill the same, one
+request unchanged, but 1.4-2.2x slower for 8-128 requests of 64-128 heads from
+the stored chunk states), 4 chunks (1.32x geomean, 3.6x at worst), and 16 warps
+(slower, 58-68 spills at 128 registers).
 The portable Triton attention implementations support `return_lse=True` for
 both dense and packed latent caches. They return `(output, lse)`, with FP32
 natural-log LSE shaped `[tokens, heads]`; all-invalid rows produce zero output
