@@ -66,8 +66,11 @@ heads the kernel is compute bound: 100-142 TFLOP/s is 25-35% of what cuBLAS
 reaches, which `mma.sync` through Triton does not close (sweeps of the key tile,
 row tile, warp count, stages and split limit are flat around the shipped
 values; the DSA notes show the same ceiling). A CuTe
-DSL kernel with `ldmatrix`/`cp.async` staging is the open route, worth up to
-about 3x on the compute-bound shapes. Prefill (`triton_mla_prefill`, a
+DSL kernel with `ldmatrix`/`cp.async` staging is the open route: the DSA CuTe
+core (`dsa/_cute_dsl/sparse_mma.py`) reaches 63% of the E4M3 and 48% of the
+16-bit floor with that design (1.9x / 1.2x over the Triton DSA core). An MLA
+port would gather a contiguous page range instead of selected slots and add
+the causal / window mask and the `q_len` query axis; not written yet. Prefill (`triton_mla_prefill`, a
 `tl.dot` flash kernel) already runs at 104-146 TFLOP/s, the same efficiency, so
 it is not ported.
 

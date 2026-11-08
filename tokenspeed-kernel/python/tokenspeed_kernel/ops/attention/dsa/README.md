@@ -272,8 +272,10 @@ query and cache are both E4M3, BF16 `m16n8k16` otherwise) and `O += P V` on
 FP16 probabilities for an E4M3 cache (its values are exact in FP16) or BF16
 ones, with an FP32 online softmax. One gather of a row serves both products
 (the 512 latent channels are both K and V; the 64 RoPE channels only K). The
-next tile's gather is issued before the current tile's math (register
-double-buffering; `num_stages=2`).
+next tile's loads are issued before the current tile's math: the whole E4M3
+tile is prefetched into registers, while a BF16 tile (twice the registers)
+prefetches only the next slots and gathers its rows where they are used; a
+whole BF16 tile in flight spilled and cost 1.0-1.6x (task 17).
 
 Batch invariance: a token's selection is cut into at most `MAX_CHUNKS` (8)
 chunks of whole `BLOCK_N` tiles, a function of the selection width alone
@@ -318,12 +320,12 @@ on 128 requests of 128 heads (shipped: 540 us): a compiler-pipelined
 a 128-register cap (812 us), `BLOCK_N` of 16 (797 us), and register caps at 8
 warps (1547 us at 168, 2045 us at 128; the kernel used 246 registers with no
 spills, so a cap forces spilling). `BLOCK_N` of 64 was slower under every cap
-tried (2750-3711 us). A CuTe DSL kernel with TMA or `cp.async` gathers
-and a warp-specialized softmax is the next step if this becomes the bottleneck;
-it is not written.
+tried (2750-3711 us). The CuTe DSL cores below replace it where they are built.
 Cost of batch invariance (same 64 buckets, CUDA graph): the chunk states need
 a second accumulator, so the 32-head tile now holds 255 registers and spills 34
-(E4M3) to 52 (BF16) of them. The kernel is 1.21x slower (geomean) and 1.86x at
+(E4M3) to 52 (BF16) of them (BF16: 4 since the slot-only prefetch above, which
+made BF16 1.24x faster on geomean and up to 1.64x at 32-128 heads; E4M3
+unchanged). The kernel is 1.21x slower (geomean) and 1.86x at
 worst; against `triton_dsa_*` it is still 22-114x faster on every bucket (72x
 geomean; 86x before). E4M3 prefill costs 2-9% (up to 35% for 128-token chunks
 of 64-128 heads), BF16 prefill 5-9% at 16 heads and 28-37% at 32-128 heads,
@@ -332,7 +334,63 @@ request takes 17-24 us instead of 10-14 us (8 chunks bound the programs of one
 token; the old split went to 16). Tried: 16 chunks (prefill the same, one
 request unchanged, but 1.4-2.2x slower for 8-128 requests of 64-128 heads from
 the stored chunk states), 4 chunks (1.32x geomean, 3.6x at worst), and 16 warps
-(slower, 58-68 spills at 128 registers).
+(slower, 58-68 spills at 128 registers). Task 17 also tried, without a gain:
+keeping the running accumulator in an L2-resident scratch (no spills, but the
+fold traffic made E4M3 13% slower), one flat tile loop with the fold at chunk
+ends (more spills), a `tl.range` pipeline (slower), and 16 chunks (0.6-0.7x for
+one request, 1.1-1.5x slower for 32-128 requests from the stored states).
+
+### CuTe DSL cores (`_cute_dsl/sparse_mma.py`)
+
+`cute_dsl_dsa_mma_decode` / `cute_dsl_dsa_mma_prefill` (solution `cute_dsl`,
+`PERFORMANT + 1`) take the contract, traits and features of the Triton mma
+leaves and outrank them on SM120 wherever the CuTe DSL imports. A query and
+cache of different dtypes (which the backend never sends) runs the Triton core;
+the choice depends on the dtypes only. Design:
+
+* A CTA owns 16 or 32 heads of one token; the selected rows of a tile (64 for
+  E4M3, 32 for BF16) are gathered with `cp.async` into a two-stage ring, so one
+  tile is in flight while the previous one is multiplied.
+* Warps split the output channels: each of four warps per 16-head group
+  multiplies a quarter of the 512 latent channels in `O += P V`, so a warp's
+  FP32 accumulator is 16 x 128 (one accumulator plus the running fold). V
+  fragments come from `ldmatrix.trans`; E4M3 values are converted to FP16
+  with `cvt.rn.f16x2.e4m3x2` (exact), BF16 values go to the MMA as loaded.
+* Scores: for E4M3 the query tile sits in shared memory and each warp scores
+  16 of the 64 rows over all 576 channels (`ldmatrix` + `m16n8k32`); rows are
+  unpadded and XOR-swizzled in 16-byte units, so the CTA fits 99 KiB with no
+  bank conflicts. For BF16 a 64-row tile and the query tile do not fit, so each
+  warp keeps its quarter of the query channels in registers and the four
+  partial score tiles are added in a fixed order.
+* FP32 online softmax in registers; the probabilities become the PV A
+  fragments directly. The chunked fold and the split combine are the Triton
+  scheme (chunks by width, ordered fold with explicit `fma`, the same helper in
+  both kernels), so rows are bitwise the same for any batch, head tile or
+  split. `plan_launch` splits only while the unsplit CTAs leave many SMs idle.
+* Binaries are keyed by dtype, head tile, rank and RoPE width; token count,
+  heads, width, strides, chunk and split counts are runtime arguments
+  (`test_cute_batch_size_does_not_recompile`). Compilation happens on first
+  use, which the CUDA-graph warm-up runs cover.
+
+Measured (same 64 buckets, CUDA graph, `bench_dsa_mma_sm120.py`), CuTe against
+the Triton core: E4M3 1.91x geomean (1.49-2.34x), BF16 1.16x (1.00-1.42x), no
+bucket slower; against the Triton core before task 17 1.92x / 1.44x, against
+the one before batch invariance 1.62x / 1.12x (BF16 decode of one request is
+20 us, 1.5x the pre-invariance 13-14 us: 8 chunks of 32-row tiles bound its
+CTAs). 128 heads: E4M3 decode batch 1/8/32/128 13.0/30.2/80.6/238 us, prefill
+128/512/2048/8192 0.24/0.87/3.47/13.7 ms (342 TFLOP/s, 63% of the tensor-pipe
+floor); BF16 decode 20.4/45.3/140/421 us, prefill 0.42/1.55/6.13/24.3 ms
+(192 TFLOP/s, 48% of the 16-bit floor). Ablation on E4M3 prefill 2048: removing
+every MMA saves only 9% and removing the gathers 13%, so the rest is the
+per-tile softmax and fragment work of two warps per scheduler; 64-row tiles and
+lane-constant swizzled addresses took it from 5.1 to 3.5 ms. Tests: the shared
+`test_dsa_mma_sm120.py` cases run for both solutions (float32 reference,
+bitwise rows across batches, any width, zero RoPE), plus split and head-tile
+invariance, recompile guard, `out=` and cache layouts, and the mixed-dtype
+route. The dots3-note backend pins its DSA leaves to solution `triton`
+(`backends/dots3_note.py`, for implementations that would materialize its
+strided cache); with the pin set to `cute_dsl` its model and next-n tests pass
+(14 tests), so lifting the pin on SM120 is a follow-up.
 The portable Triton attention implementations support `return_lse=True` for
 both dense and packed latent caches. They return `(output, lse)`, with FP32
 natural-log LSE shaped `[tokens, heads]`; all-invalid rows produce zero output

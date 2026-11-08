@@ -22,7 +22,10 @@ per (token, head) on CUDA cores, re-reading the selected rows for every head.
 (`dsa/_triton/sparse_mma.py`, whose `plan_launch` picks the head tile): a
 program owns 16-32 heads of one token, multiplies each gathered tile of 32 rows
 by all of them on `mma.sync` (`S = Q K^T`, `O += P K`, BF16 `m16n8k16`) with an
-FP32 online softmax, and issues the next gather before the current math. The
+FP32 online softmax, and loads the next tile's row ids before the current
+math (task 17: prefetching the whole BF16 tile into registers spilled; gathering
+the rows where they are used is 1.24-1.31x faster from 128 tokens, 2447 vs
+3212 us at 128 heads and 2048 tokens, and equal below 32 tokens). The
 sink is one extra zero-valued key. Rows that are negative or past the
 workspace are skipped. Token count, head count, width, row stride and chunk
 count are runtime arguments.
@@ -62,7 +65,11 @@ The gather workspace in the decode path costs 17-25% of
 `dsv41.selected_attention` at 64 tokens (25 of 141 us at 64 heads); the rest is
 the attention itself plus torch mask construction. Compute bound shapes sit at
 25-30% of cuBLAS's 413 TFLOP/s BF16, the same ceiling as the other SM120
-`mma.sync` Triton kernels. Open: a decode kernel that reads the FP8 page-planar
+`mma.sync` Triton kernels (about 35% after the task 17 change). The DSA CuTe
+DSL core (`dsa/_cute_dsl/sparse_mma.py`, BF16 path) is the template for a CuTe
+port of this leaf: same gather and fold, a 512-wide query instead of 576, the
+sink as the first chunk's initial state, int64 row ids; not written yet. Open:
+a decode kernel that reads the FP8 page-planar
 rows directly (dequantizing the 64-wide UE8M0 blocks in registers) would drop
 the BF16 workspace; the V4/V4.1 formats differ per cache role, so it needs one
 reader per format.
