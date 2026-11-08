@@ -222,6 +222,7 @@ def deepselect_local_topk(
     lengths: torch.Tensor,
     topk: int,
     out: torch.Tensor,
+    index_base: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-row top-k column offsets over the first ``lengths[r]`` columns.
 
@@ -257,6 +258,7 @@ def deepselect_local_topk(
             capacity=capacity,
             cluster_size=cluster_size,
             indices=out[begin:end],
+            index_base=None if index_base is None else index_base[begin:end],
         )
     return out
 

@@ -70,9 +70,9 @@ def spy(monkeypatch):
     calls = []
     real = dsa_deep_gemm.deepselect_local_topk
 
-    def record(logits, lengths, topk, out):
+    def record(logits, lengths, topk, out, index_base=None):
         calls.append((logits.clone(), lengths.clone()))
-        return real(logits, lengths, topk, out)
+        return real(logits, lengths, topk, out, index_base=index_base)
 
     monkeypatch.setattr(dsa_deep_gemm, "deepselect_local_topk", record)
     return calls

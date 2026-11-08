@@ -764,6 +764,7 @@ class DeepSelectTopK:
         ends: cute.Tensor,
         out: cute.Tensor,
         values: cute.Tensor,
+        bases: cute.Tensor,
     ):
         max_topk = cutlass.const_expr(self.max_topk)
 
@@ -776,6 +777,8 @@ class DeepSelectTopK:
         topk = cutlass.Int32(out.shape[1])
         end = cutlass.Int32(ends[row])
         end = cutlass.max(cutlass.min(end, width), cutlass.Int32(0))
+        # Selected indices are reported as ``bases[row] + column``.
+        base = cutlass.Int32(bases[row])
 
         smem = SmemAllocator()
         survivors = smem.allocate_tensor(
@@ -815,7 +818,7 @@ class DeepSelectTopK:
                     if i < end:
                         score = scores[row, i]
                         if score == score:
-                            index = cutlass.Int32(i)
+                            index = cutlass.Int32(i) + base
                             value = score
                     out[row, i] = index
                     values[row, i] = value
@@ -824,6 +827,7 @@ class DeepSelectTopK:
                 scores,
                 out,
                 values,
+                base,
                 row,
                 rank,
                 end,
@@ -845,6 +849,7 @@ class DeepSelectTopK:
         scores,
         out,
         values,
+        base,
         row,
         rank,
         end,
@@ -1133,7 +1138,10 @@ class DeepSelectTopK:
         if rank == 0:
             for i in range(tidx, topk, NUM_THREADS):
                 pair = survivors[cur * max_topk + i]
-                out[row, i] = _pair_index(pair)
+                index = _pair_index(pair)
+                if index >= 0:
+                    index = index + base
+                out[row, i] = index
                 values[row, i] = _pair_value(pair)
 
     # ------------------------------------------------------------------
@@ -1146,11 +1154,12 @@ class DeepSelectTopK:
         ends: cute.Tensor,
         out: cute.Tensor,
         values: cute.Tensor,
+        bases: cute.Tensor,
         stream,
     ):
         cluster_size = cutlass.const_expr(self.cluster_size)
         num_rows = scores.shape[0]
-        self.kernel(scores, ends, out, values).launch(
+        self.kernel(scores, ends, out, values, bases).launch(
             grid=(cluster_size, num_rows, 1),
             block=(NUM_THREADS, 1, 1),
             cluster=(
@@ -1187,7 +1196,7 @@ def cluster_sizes_for(capacity: int) -> tuple[int, ...]:
 def compiled_selector(capacity: int, cluster_size: int, device_index: int):
     """Compile (once per configuration and device) the selector.
 
-    The compiled callable takes ``(scores, ends, indices, values)`` as torch
+    The compiled callable takes ``(scores, ends, indices, values, bases)`` as torch
     tensors and runs on the caller's current CUDA stream, so it is safe to
     replay inside a CUDA graph once compiled.
     """
@@ -1207,6 +1216,9 @@ def compiled_selector(capacity: int, cluster_size: int, device_index: int):
     values = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32, (rows, topk), stride_order=(1, 0), assumed_align=4
     )
+    bases = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (rows,), stride_order=(0,)
+    )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     # cute.compile targets the current device, not the operands'.
     with torch.cuda.device(device_index):
@@ -1216,6 +1228,7 @@ def compiled_selector(capacity: int, cluster_size: int, device_index: int):
             ends,
             indices,
             values,
+            bases,
             stream=stream,
             options="--enable-tvm-ffi",
         )
@@ -1292,6 +1305,7 @@ def deepselect_topk(
     cluster_size: int,
     indices: torch.Tensor | None = None,
     values: torch.Tensor | None = None,
+    index_base: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Indices and values of the ``topk`` largest entries of every row.
 
@@ -1367,9 +1381,30 @@ def deepselect_topk(
             raise ValueError(
                 f"{name} must be a contiguous {dtype} [rows, topk] tensor on the scores device"
             )
+    if index_base is None:
+        index_base = _zero_bases(rows, scores.device)
+    elif (
+        index_base.shape != (rows,)
+        or index_base.dtype != torch.int32
+        or not index_base.is_contiguous()
+        or index_base.device != scores.device
+    ):
+        raise ValueError("index_base must be a contiguous int32 [rows] tensor")
     if rows == 0:
         return indices, values
     compiled_selector(capacity, cluster_size, scores.device.index)(
-        scores, ends, indices, values
+        scores, ends, indices, values, index_base
     )
     return indices, values
+
+
+_ZERO_BASES: dict[torch.device, torch.Tensor] = {}
+
+
+def _zero_bases(rows: int, device: torch.device) -> torch.Tensor:
+    """``[rows]`` zeros on ``device``, from one grow-only buffer per device."""
+    zeros = _ZERO_BASES.get(device)
+    if zeros is None or zeros.numel() < rows:
+        zeros = torch.zeros(max(rows, 4096), dtype=torch.int32, device=device)
+        _ZERO_BASES[device] = zeros
+    return zeros[:rows]

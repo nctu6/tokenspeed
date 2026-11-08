@@ -178,6 +178,24 @@ def test_shortcut_rows_replace_nan_with_placeholders():
     torch.testing.assert_close(values[0, kept], scores[0, kept], atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("cluster_size", [1, 2])
+def test_index_base_offsets_every_selected_column(cluster_size):
+    # A row reports `index_base[row] + column`; the -1 placeholders of short and
+    # NaN slots stay -1. Both the shortcut (end <= topk) and the selecting path.
+    _require_cluster(cluster_size, 512)
+    generator = torch.Generator(device="cuda").manual_seed(21)
+    width = 20000
+    scores = _scores(5, width, "randn", generator)
+    scores[1, 3] = torch.nan
+    ends = torch.tensor([width, 300, 512, 513, 0], dtype=torch.int32, device="cuda")
+    bases = torch.tensor([0, 17, 5000, 123456, 9], dtype=torch.int32, device="cuda")
+    plain, plain_values = _select(scores, ends, 512, cluster_size)
+    shifted, shifted_values = _select(scores, ends, 512, cluster_size, index_base=bases)
+    expected = torch.where(plain >= 0, plain + bases[:, None], plain)
+    assert torch.equal(shifted, expected)
+    assert torch.equal(shifted_values, plain_values)
+
+
 def test_warmup_serves_an_index_less_device():
     deep_select.warmup((512,), torch.device("cuda"))
     misses_after_warmup = deep_select.compiled_selector.cache_info().misses

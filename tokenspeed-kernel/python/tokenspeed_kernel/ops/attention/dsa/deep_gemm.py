@@ -212,6 +212,46 @@ def _resolve_prefill_tile_max_seqlen_k(
     return int(candidate_lens[start:end].max().item())
 
 
+def _gather_index_rows(
+    index_k_cache: torch.Tensor,
+    kv_workspace_slots: torch.Tensor,
+    *,
+    head_dim: int,
+    page_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather page-planar FP8 index-K rows and scales into workspace-row order."""
+    num_groups = head_dim // 128
+    row_bytes = head_dim + num_groups * 4
+    flat = index_k_cache.reshape(-1)
+    fp8_view = torch.as_strided(
+        flat.view(torch.float8_e4m3fn),
+        (index_k_cache.shape[0] // int(page_size), int(page_size), head_dim),
+        (int(page_size) * row_bytes, head_dim, 1),
+    )
+    scale_view = torch.as_strided(
+        flat.view(torch.float32),
+        (index_k_cache.shape[0] // int(page_size), int(page_size), num_groups),
+        ((int(page_size) * row_bytes) // 4, num_groups, 1),
+        (int(page_size) * head_dim) // 4,
+    )
+    slots = kv_workspace_slots.to(device=index_k_cache.device, dtype=torch.long)
+    return (
+        fp8_view[slots // int(page_size), slots % int(page_size)],
+        scale_view[slots // int(page_size), slots % int(page_size)],
+    )
+
+
+# SM120 prepares a prefill chunk's scoring inputs with one Triton launch
+# (``dsa_prefill_prepare``) instead of about twenty framework ops: for chunks
+# of a few hundred tokens the leaf is bound by the host, and the fused launch
+# is what lets it beat the Triton leaf there. It computes the canonical
+# token-group FP8 scheme and the ``combine_topk_weights`` product directly, bit
+# for bit what ``quantize_fp8`` selects on SM120 (``test_dsa_prefill_prepare``);
+# other platforms' quantizers are not checked against it, so they keep the
+# framework ops.
+_FUSED_PREFILL_PREPARE = platform.arch_version.major == SM120_ARCH_MAJOR
+
+
 if platform.is_hopper_plus:
     prepare_cuda_toolkit_env()
     import deep_ep  # noqa: F401
@@ -536,64 +576,91 @@ if platform.is_hopper_plus:
             topk=topk,
             device=q.device,
         )
-        out.fill_(-1)
-
-        q, weights = _pad_index_heads(q, weights)
-        q_2d = q.view(-1, q.shape[-1])
-        q_fp8, q_scale = quantize_fp8(
-            q_2d,
-            granularity="token_group",
-            group_size=128,
-            scale_encoding="float32",
-        )
-        q_fp8 = q_fp8.view_as(q)
-        scaled_weights = combine_topk_weights(weights, q_scale, softmax_scale)
-        if index_k_fp8 is None or index_k_scale is None:
-            hd = q.shape[-1]
-            num_groups = hd // 128
-            row_bytes = hd + num_groups * 4
-            flat = index_k_cache.reshape(-1)
-            fp8_view = torch.as_strided(
-                flat.view(q_fp8.dtype),
-                (
-                    index_k_cache.shape[0] // int(page_size),
-                    int(page_size),
-                    hd,
-                ),
-                (int(page_size) * row_bytes, hd, 1),
-            )
-            scale_view = torch.as_strided(
-                flat.view(torch.float32),
-                (
-                    index_k_cache.shape[0] // int(page_size),
-                    int(page_size),
-                    num_groups,
-                ),
-                ((int(page_size) * row_bytes) // 4, num_groups, 1),
-                (int(page_size) * hd) // 4,
-            )
-            slots = kv_workspace_slots.to(device=q.device, dtype=torch.long)
-            index_k_fp8 = fp8_view[slots // int(page_size), slots % int(page_size)]
-            index_k_scale = scale_view[slots // int(page_size), slots % int(page_size)]
-        k_fp8 = (
-            index_k_fp8.view(q_fp8.dtype)
-            if index_k_fp8.dtype == torch.uint8
-            else index_k_fp8
-        )
-        kv_fp8 = (k_fp8.contiguous(), index_k_scale.squeeze(-1).contiguous())
-        candidate_lens = (row_ends - row_starts).clamp_min(0)
-        lens_out.copy_(
-            torch.minimum(candidate_lens, torch.full_like(candidate_lens, int(topk)))
-        )
         if tokens == 0:
             return out, lens_out
+
+        has_rows = index_k_fp8 is not None and index_k_scale is not None
+        if _FUSED_PREFILL_PREPARE:
+            from tokenspeed_kernel.ops.attention.dsa._triton.prefill_prepare import (
+                dsa_prefill_prepare,
+            )
+
+            # The kernel also gathers the keys of a page-planar plane it can
+            # address as bytes; other planes are gathered below.
+            gather = (
+                not has_rows
+                and index_k_cache.dtype == torch.uint8
+                and index_k_cache.is_contiguous()
+                and q.shape[-1] == 128
+            )
+            q_fp8, scaled_weights, candidate_lens, k_fp8, k_scale = dsa_prefill_prepare(
+                q,
+                weights if weights.stride(-1) == 1 else weights.contiguous(),
+                row_starts,
+                row_ends,
+                softmax_scale=softmax_scale,
+                topk=int(topk),
+                lens_out=lens_out,
+                out_heads=32 if q.shape[1] == 16 else q.shape[1],
+                index_k_cache=index_k_cache if gather else None,
+                kv_workspace_slots=(
+                    kv_workspace_slots.to(device=q.device, dtype=torch.long)
+                    if gather
+                    else None
+                ),
+                page_size=page_size,
+            )
+            if not gather:
+                k_fp8, k_scale = (
+                    (index_k_fp8, index_k_scale)
+                    if has_rows
+                    else _gather_index_rows(
+                        index_k_cache,
+                        kv_workspace_slots,
+                        head_dim=q.shape[-1],
+                        page_size=page_size,
+                    )
+                )
+                k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+                k_scale = k_scale.squeeze(-1).contiguous()
+            kv_fp8 = (k_fp8.contiguous(), k_scale)
+        else:
+            q, weights = _pad_index_heads(q, weights)
+            q_2d = q.view(-1, q.shape[-1])
+            q_fp8, q_scale = quantize_fp8(
+                q_2d,
+                granularity="token_group",
+                group_size=128,
+                scale_encoding="float32",
+            )
+            q_fp8 = q_fp8.view_as(q)
+            scaled_weights = combine_topk_weights(weights, q_scale, softmax_scale)
+            if not has_rows:
+                index_k_fp8, index_k_scale = _gather_index_rows(
+                    index_k_cache,
+                    kv_workspace_slots,
+                    head_dim=q.shape[-1],
+                    page_size=page_size,
+                )
+            k_fp8 = (
+                index_k_fp8.view(q_fp8.dtype)
+                if index_k_fp8.dtype == torch.uint8
+                else index_k_fp8
+            )
+            kv_fp8 = (k_fp8.contiguous(), index_k_scale.squeeze(-1).contiguous())
+            candidate_lens = (row_ends - row_starts).clamp_min(0)
+            lens_out.copy_(
+                torch.minimum(
+                    candidate_lens, torch.full_like(candidate_lens, int(topk))
+                )
+            )
 
         seq_len_sum = max(int(kv_workspace_slots.numel()), 1)
         if max_logits_bytes is None:
             max_query_rows = tokens
         else:
             max_query_rows = max(1, int(max_logits_bytes) // (seq_len_sum * 4))
-        local_starts_i32 = torch.zeros_like(row_starts)
+        local_starts_i32 = None
         for start in range(0, tokens, max_query_rows):
             end = min(start + max_query_rows, tokens)
             tile_max_seqlen_k = _resolve_prefill_tile_max_seqlen_k(
@@ -623,26 +690,37 @@ if platform.is_hopper_plus:
                 initial_tokens=initial_tokens,
                 local_tokens=local_tokens,
             )
+            tile_out = out[start:end]
+            tile_starts = row_starts[start:end]
+            if not batch_invariant and deepselect_supports(logits, int(topk)):
+                # Reports workspace rows directly: local offset + row start.
+                deepselect_local_topk(
+                    logits,
+                    candidate_lens[start:end],
+                    topk,
+                    tile_out,
+                    index_base=tile_starts,
+                )
+                continue
             if batch_invariant:
                 tile_lens = candidate_lens[start:end]
-                tile_out = out[start:end]
+                tile_out.fill_(-1)
                 _row_invariant_topk(logits, tile_lens, tile_out, topk)
                 tile_out.masked_fill_(tile_out >= tile_lens.view(-1, 1), -1)
-            elif deepselect_supports(logits, int(topk)):
-                deepselect_local_topk(
-                    logits, candidate_lens[start:end], topk, out[start:end]
-                )
             elif _USE_TRTLLM_PREFILL_TOPK:
+                if local_starts_i32 is None:
+                    local_starts_i32 = torch.zeros_like(row_starts)
+                tile_out.fill_(-1)
                 torch.ops.trtllm.indexer_topk_prefill(
                     logits.contiguous(),
                     local_starts_i32[start:end],
                     candidate_lens[start:end].to(torch.int32).contiguous(),
-                    out[start:end],
+                    tile_out,
                     int(topk),
                 )
             else:
                 # Same local offsets (and -1 padding) as the TRT-LLM kernel
-                out[start:end].copy_(
+                tile_out.copy_(
                     triton_topk_from_logits(
                         logits,
                         int(topk),
@@ -650,8 +728,12 @@ if platform.is_hopper_plus:
                         enable_pdl=pdl_enabled(),
                     )
                 )
-        valid = out >= 0
-        out.copy_(torch.where(valid, out + row_starts.unsqueeze(1), out))
+            # These selectors report offsets local to the row's start
+            tile_out.copy_(
+                torch.where(
+                    tile_out >= 0, tile_out + tile_starts.unsqueeze(1), tile_out
+                )
+            )
         return out, lens_out
 
 
