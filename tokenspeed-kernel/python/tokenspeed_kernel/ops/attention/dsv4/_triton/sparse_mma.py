@@ -60,21 +60,17 @@ MAX_CHUNKS = 4
 
 
 @triton.jit
-def _load_rows(
-    kv,
-    index_row,
-    tile,
-    tile_end,
-    valid_len,
-    num_rows,
-    kv_stride_row,
-    BLOCK_N: tl.constexpr,
-    DIM: tl.constexpr,
-):
-    """Gather the workspace rows of one tile of the selection."""
+def _load_index(index_row, tile, tile_end, valid_len, BLOCK_N: tl.constexpr):
+    """The workspace row ids of one tile of the selection; ``-1`` past it."""
     cols = tile * BLOCK_N + tl.arange(0, BLOCK_N)
     in_range = (cols < valid_len) & (tile < tile_end)
-    rows = tl.load(index_row + cols, mask=in_range, other=-1).to(tl.int64)
+    return tl.load(index_row + cols, mask=in_range, other=-1)
+
+
+@triton.jit
+def _gather_rows(kv, rows, num_rows, kv_stride_row, DIM: tl.constexpr):
+    """Gather the workspace rows of one tile; ids out of range load zeros."""
+    rows = rows.to(tl.int64)
     valid = (rows >= 0) & (rows < num_rows)
     rows = tl.where(valid, rows, 0)
     k = tl.load(
@@ -194,31 +190,13 @@ def _dsv4_sparse_mma_kernel(
         acc = tl.zeros((BLOCK_H, DIM), tl.float32)
         tile_begin = chunk * chunk_tiles
         tile_end = tl.minimum(tile_begin + chunk_tiles, num_tiles)
-        valid, k = _load_rows(
-            kv,
-            index_row,
-            tile_begin,
-            tile_end,
-            valid_len,
-            num_rows,
-            kv_stride_row,
-            BLOCK_N,
-            DIM,
-        )
+        # A BF16 tile prefetched whole into registers would spill, so the
+        # loop prefetches only the next tile's row ids and gathers its rows
+        # where they are used.
+        rows = _load_index(index_row, tile_begin, tile_end, valid_len, BLOCK_N)
         for tile in range(tile_begin, tile_end):
-            # Issue the next tile's gather before this tile's math; a tile
-            # past the end loads nothing.
-            valid_next, k_next = _load_rows(
-                kv,
-                index_row,
-                tile + 1,
-                tile_end,
-                valid_len,
-                num_rows,
-                kv_stride_row,
-                BLOCK_N,
-                DIM,
-            )
+            valid, k = _gather_rows(kv, rows, num_rows, kv_stride_row, DIM)
+            rows = _load_index(index_row, tile + 1, tile_end, valid_len, BLOCK_N)
             s = tl.dot(q_tile, tl.trans(k))
             s = tl.where(valid[None, :], s * scale_log2, -float("inf"))
             m_new = tl.maximum(m_i, tl.max(s, axis=1))
@@ -229,8 +207,6 @@ def _dsv4_sparse_mma_kernel(
             acc = acc * alpha[:, None]
             acc = tl.dot(p.to(k.dtype), k, acc)
             m_i = m_new
-            valid = valid_next
-            k = k_next
         if SPLIT:
             part = (token.to(tl.int64) * num_chunks + chunk) * num_heads + heads
             tl.store(

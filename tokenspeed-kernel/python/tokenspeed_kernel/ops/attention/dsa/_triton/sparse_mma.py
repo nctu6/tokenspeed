@@ -47,24 +47,26 @@ _LOG2E = 1.4426950408889634
 
 
 @triton.jit
-def _load_tile(
+def _load_slots(topk_row, tile, tile_end, valid_len, BLOCK_N: tl.constexpr):
+    """The selected slots of one tile; ``-1`` past the selection or the chunk."""
+    cols = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    in_range = (cols < valid_len) & (tile < tile_end)
+    return tl.load(topk_row + cols, mask=in_range, other=-1)
+
+
+@triton.jit
+def _gather(
     kv,
-    topk_row,
-    tile,
-    tile_end,
-    valid_len,
+    slot,
     page_stride,
     token_stride,
     channel_stride,
     PAGE_SIZE: tl.constexpr,
     RANK: tl.constexpr,
     ROPE: tl.constexpr,
-    BLOCK_N: tl.constexpr,
 ):
-    """Gather the latent and RoPE rows of the selected slots of one tile."""
-    cols = tile * BLOCK_N + tl.arange(0, BLOCK_N)
-    in_range = (cols < valid_len) & (tile < tile_end)
-    slot = tl.load(topk_row + cols, mask=in_range, other=-1).to(tl.int64)
+    """Gather the latent and RoPE rows of one tile's slots."""
+    slot = slot.to(tl.int64)
     valid = slot >= 0
     slot = tl.where(valid, slot, 0)
     rows = (slot // PAGE_SIZE) * page_stride + (slot % PAGE_SIZE) * token_stride
@@ -136,6 +138,7 @@ def _sparse_mma_kernel(
     SPLIT: tl.constexpr,
     FP8_QK: tl.constexpr,
     FP8_KV: tl.constexpr,
+    PREFETCH_ROWS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     RANK: tl.constexpr,
     ROPE: tl.constexpr,
@@ -192,37 +195,47 @@ def _sparse_mma_kernel(
         acc = tl.zeros((BLOCK_H, RANK), tl.float32)
         tile_begin = chunk * chunk_tiles
         tile_end = tl.minimum(tile_begin + chunk_tiles, num_tiles)
-        valid, k, k_rope = _load_tile(
-            kv,
-            topk_row,
-            tile_begin,
-            tile_end,
-            valid_len,
-            page_stride,
-            token_stride,
-            channel_stride,
-            PAGE_SIZE,
-            RANK,
-            ROPE,
-            BLOCK_N,
-        )
-        for tile in range(tile_begin, tile_end):
-            # Issue the next tile's gather before this tile's math; a tile
-            # past the end loads nothing.
-            valid_next, k_next, k_rope_next = _load_tile(
+        slot = _load_slots(topk_row, tile_begin, tile_end, valid_len, BLOCK_N)
+        if PREFETCH_ROWS:
+            valid, k, k_rope = _gather(
                 kv,
-                topk_row,
-                tile + 1,
-                tile_end,
-                valid_len,
+                slot,
                 page_stride,
                 token_stride,
                 channel_stride,
                 PAGE_SIZE,
                 RANK,
                 ROPE,
-                BLOCK_N,
             )
+        for tile in range(tile_begin, tile_end):
+            # Issue the next tile's loads before this tile's math; a tile past
+            # the end loads nothing. E4M3 tiles are small enough to prefetch
+            # whole into registers; a BF16 tile would spill there, so it
+            # prefetches only the next slots and gathers its own rows here.
+            if PREFETCH_ROWS:
+                slot = _load_slots(topk_row, tile + 1, tile_end, valid_len, BLOCK_N)
+                valid_next, k_next, k_rope_next = _gather(
+                    kv,
+                    slot,
+                    page_stride,
+                    token_stride,
+                    channel_stride,
+                    PAGE_SIZE,
+                    RANK,
+                    ROPE,
+                )
+            else:
+                valid, k, k_rope = _gather(
+                    kv,
+                    slot,
+                    page_stride,
+                    token_stride,
+                    channel_stride,
+                    PAGE_SIZE,
+                    RANK,
+                    ROPE,
+                )
+                slot = _load_slots(topk_row, tile + 1, tile_end, valid_len, BLOCK_N)
 
             if FP8_QK:
                 s = tl.dot(q_nope, tl.trans(k))
@@ -247,9 +260,10 @@ def _sparse_mma_kernel(
             else:
                 acc = tl.dot(p.to(tl.bfloat16), k.to(tl.bfloat16), acc)
             m_i = m_new
-            valid = valid_next
-            k = k_next
-            k_rope = k_rope_next
+            if PREFETCH_ROWS:
+                valid = valid_next
+                k = k_next
+                k_rope = k_rope_next
         if SPLIT:
             part = (token.to(tl.int64) * num_chunks + chunk) * num_heads + heads
             tl.store(
@@ -460,6 +474,7 @@ def sparse_mma_attention(
         SPLIT=split,
         FP8_QK=fp8_qk,
         FP8_KV=kv_cache.dtype == torch.float8_e4m3fn,
+        PREFETCH_ROWS=kv_cache.dtype == torch.float8_e4m3fn,
         HEAD_DIM=head_dim,
         RANK=kv_lora_rank,
         ROPE=qk_rope_head_dim,
