@@ -373,3 +373,23 @@ hidden width. Some kernels (Triton MXFP4) return no weights; `MoELayer` then
 returns the precomputed route weights it passed in. FP16 inputs, ROCm builds
 without the fused finalizer, and kernels without deferred finalize keep the
 kernel's own finalized output.
+
+## MegaMoE on SM120
+
+`deep_gemm_mxfp4_mega_moe_apply` (V4 / V4.1 MXFP4 experts) stays capped at
+SM100-SM109 (`max_arch_version` 10.9); `test_sm120_excludes_sm100_only_leaves.py`
+checks that no `mega_moe` leaf is offered on SM120.
+
+DeepGEMM's `fp8_fp4_mega_moe` does run on SM120, but for one rank only. The SM100
+kernel fuses dispatch, both expert GEMMs, SwiGLU and combine around TMEM, 2-CTA
+UMMA and NVLink symmetric memory. The SM120 version runs the same steps as a
+sequence of kernels, with the same results as the unfused reference: an FP8 x
+MXFP4 grouped GEMM (`mma.sync kind::mxf8f6f4`) and SwiGLU, quantization and
+combine kernels. TokenSpeed's MegaMoE path needs expert parallelism
+(`ep_size > 1`), and the V4 / V4.1 experts (139 / 272 GB) do not fit on one GPU.
+So no SM120 serving configuration can reach the single-rank kernel.
+
+Against Marlin W4A16 on SM120 (cold weights, CUDA graph), it is 0.81x at 1
+token, 0.97-0.99x at 4-64 tokens (both are at the DRAM roofline), 1.01-1.09x at
+256-1024 tokens, and 1.59-1.87x at 4096-8192 tokens. Details are in DeepGEMM
+`deepgemm-analysis.md` section 9.26.
