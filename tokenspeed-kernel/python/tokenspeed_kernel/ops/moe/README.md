@@ -375,21 +375,42 @@ without the fused finalizer, and kernels without deferred finalize keep the
 kernel's own finalized output.
 
 ## MegaMoE on SM120
+`deep_gemm_sm120_mxfp4_mega_moe_apply` serves the V4 / V4.1 MXFP4 experts on
+SM120 (arch 12.x) for EP 2. It is registered only when the DeepGEMM build
+reports `get_mega_moe_max_ranks(12) >= 2` (`deepgemm_sm120_mega_moe_max_ranks`,
+behind `deepgemm_supports_sm120`). The fused SM100 leaf
+`deep_gemm_mxfp4_mega_moe_apply` stays capped at 10.9 (TMEM, 2-CTA UMMA, NVLink).
+`test_sm120_excludes_sm100_only_leaves.py` checks both rules.
 
-`deep_gemm_mxfp4_mega_moe_apply` (V4 / V4.1 MXFP4 experts) stays capped at
-SM100-SM109 (`max_arch_version` 10.9); `test_sm120_excludes_sm100_only_leaves.py`
-checks that no `mega_moe` leaf is offered on SM120.
+SM120 has no NVLink, so DeepGEMM runs MegaMoE there as a sequence of kernels.
+The ranks write into each other's torch symmetric-memory buffers with peer
+stores over PCIe (CUDA IPC): tokens go out to the owners of their experts, the
+owners run local FP8 x MXFP4 grouped GEMMs and SwiGLU, and the expert rows come
+back to be summed in top-k order. A system-scope epoch barrier in the buffer
+orders the steps, so the call replays in CUDA graphs. Results are bitwise equal
+to a single rank holding all experts. Calls that share the buffer must be
+ordered on one stream per rank. The SM120 leaf keeps the scale rows in order
+(no UTCCP transpose). V4.1's 2304-wide experts are not padded to 2560 there.
 
-DeepGEMM's `fp8_fp4_mega_moe` does run on SM120, but for one rank only. The SM100
-kernel fuses dispatch, both expert GEMMs, SwiGLU and combine around TMEM, 2-CTA
-UMMA and NVLink symmetric memory. The SM120 version runs the same steps as a
-sequence of kernels, with the same results as the unfused reference: an FP8 x
-MXFP4 grouped GEMM (`mma.sync kind::mxf8f6f4`) and SwiGLU, quantization and
-combine kernels. TokenSpeed's MegaMoE path needs expert parallelism
-(`ep_size > 1`), and the V4 / V4.1 experts (139 / 272 GB) do not fit on one GPU.
-So no SM120 serving configuration can reach the single-rank kernel.
+MegaMoE stays opt-in: `--moe-backend mega_moe` with attention DP (each rank
+brings its own tokens). Against what the default path runs at EP 2 on SM120,
+Marlin W4A16 plus its all-reduce or all-gather / reduce-scatter, at the same
+served tokens (cold weights, CUDA graph, GPUs on one PCIe switch):
 
-Against Marlin W4A16 on SM120 (cold weights, CUDA graph), it is 0.81x at 1
-token, 0.97-0.99x at 4-64 tokens (both are at the DRAM roofline), 1.01-1.09x at
-256-1024 tokens, and 1.59-1.87x at 4096-8192 tokens. Details are in DeepGEMM
-`deepgemm-analysis.md` section 9.26.
+| Tokens per rank | V4 | V4.1 |
+|---|---|---|
+| 1 | 0.95x | 0.96x |
+| 2-1024 | 1.00-1.05x | 0.99-1.02x |
+| 2048-4096 | 1.30x | 1.28-1.35x |
+
+At EP 2 a V4 rank holds 70 GB of routed experts; V4.1 needs at least 4 ranks.
+Details and the per-size table are in DeepGEMM `deepgemm-analysis.md`
+section 9.26.
+
+## Triton MXFP4 expert offsets
+The Triton MXFP4 stage kernels advance every expert base (weights, scales,
+biases, route ids) in int64. At the V4.1 shapes (384 experts, hidden 5120,
+intermediate 2304) a 32-bit `expert_id * rows * columns` wraps from expert 182
+(stage 1: another expert's weights, silently) and from expert 364 (stage 2: an
+illegal memory access). `test_triton_mxfp4_large_expert_offsets.py` covers both
+boundaries.
