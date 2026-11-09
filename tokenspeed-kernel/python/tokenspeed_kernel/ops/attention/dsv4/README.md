@@ -13,6 +13,7 @@ into a workspace and calls it too, so both models and both phases share this lea
 | `flashmla_dsv4_prefill` / `flashmla_dsv4_decode` | SM90-SM109 | FlashMLA sparse kernels (wgmma/tcgen05); capped off SM120. |
 | `cute_dsl_dsv4_mma_prefill` | SM120, more than 16 heads | CuTe DSL port of the next row (same contract, traits and batch invariance), `PERFORMANT + 1`. |
 | `triton_dsv4_mma_prefill` | SM120 | Tensor-core kernel, any head count, int32/int64 metadata, sink and/or LSE, batch-invariant. |
+| `triton_dsv4_mma_decode` | SM120, 16 heads from 32 tokens | Dequantizes the FP8 page-planar rows in the tile loop of the Triton kernel; no BF16 workspace. |
 | `triton_dsv4_prefill`, `triton_dsv4_decode` | any NVIDIA/AMD | CUDA cores; decode dequantizes into a BF16 workspace first. |
 
 ## SM120 (`_triton/sparse_mma.py`)
@@ -62,14 +63,40 @@ top-k; `portable` is `triton_dsv4_prefill`):
 | 128 | 128 | 210 us | 102 | 1862 us (9x) |
 | 128 | 2048 | 3080 us | 112 | |
 
-The gather workspace in the decode path costs 17-25% of
-`dsv41.selected_attention` at 64 tokens (25 of 141 us at 64 heads); the rest is
-the attention itself plus torch mask construction. Compute bound shapes of the
-Triton leaf sit at about 35% of cuBLAS's 413 TFLOP/s BF16. Open: a decode
-kernel that reads the FP8 page-planar rows directly (dequantizing the 64-wide
-UE8M0 blocks in registers) would drop the BF16 workspace; the V4/V4.1 formats
-differ per cache role, so it needs one reader per format.
-
+Compute bound shapes of the Triton leaf sit at about 35% of cuBLAS's 413
+TFLOP/s BF16.
+## Direct reader of packed caches (`_triton/paged_mma.py`)
+The portable decode gathered every selected cache row into a BF16 workspace
+(640 KB per query at 640 rows, written and read back) through a launch per
+segment, a `cat` and mask and index construction (17-25% of
+`dsv41.selected_attention` at 64 tokens, and most of it at 1-16 tokens, where
+the glue and launches dominate). `_dsv4_sparse_mma_kernel` with the tile loaded
+by dequantizing the packed rows in registers does the same work without the
+workspace: FP8 with UE8M0 scales (V4.1 `swa`; V4 `swa_v4` / `global_v4` with
+the BF16 RoPE tail) and FP4 with E4M3 scales (V4.1 `global`), page-planar,
+strided cache views included. An E4M3 or E2M1 value times a power of two or an
+E4M3 scale has at most four significant bits, so the BF16 tile is exact and the
+result is bit-identical to the workspace route (and batch-invariant, with the
+same chunking: the selection is `swa_width` columns then the compressed ones, a
+tile belongs to one segment, so `swa_width` is a multiple of 32).
+- `triton_dsv41_mma_selected_attention` (V4.1 `dsv41_selected_attention`; SM120
+  has no FlashMLA): 128 window + 512 compressed rows, CUDA graph, 16/64/128
+  heads x 1-256 tokens, 21 points: 1.66x geomean over the portable route, 1.01x
+  worst (128 heads, 128 tokens), 3.7x best (16 heads, 256 tokens); 41 vs 24 us
+  at one token. It runs the portable route for what it does not read (workspace
+  prefill, a window width off the tile, odd layouts).
+- `triton_dsv4_mma_decode` (`dsv4_decode`, V4 FP8 page-planar caches): selected
+  only for 16 heads from 32 tokens (1.23x at 32, 1.79x at 128, 2.28x at 256).
+  Above 16 heads the workspace route reaches the CuTe DSL dense kernel, 1.1-1.6x
+  faster than this Triton one, and beats the direct reader (64 heads 0.69-1.11x,
+  128 heads 0.72-0.79x of the workspace route; one token 17 vs 22 us); a few
+  tokens at 16 heads is 0.75-0.8x. With 16 heads both routes run the Triton
+  kernel, so the choice never changes a bit. Open: the same dequantizing tile in
+  the CuTe DSL kernel, which would win above 16 heads too.
+`bench_dsv41_paged_sm120.py v41|v4` reproduces the tables;
+`test_dsv4_paged_mma_sm120.py` checks bit equality with the portable route (both
+formats, 16-128 heads, holes, out-of-cache and short lengths), strided page
+views, the no-sink LSE, batch invariance and recompilation.
 ## CuTe DSL leaf (`_cute_dsl/sparse_mma.py`)
 
 `cute_dsl_dsv4_mma_prefill` runs the BF16 path of the DSA CuTe DSL core

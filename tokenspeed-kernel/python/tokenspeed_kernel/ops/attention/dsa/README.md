@@ -208,6 +208,20 @@ index-key row format and the selector that follows.
   it (`_use_deepselect_decode_topk`: 32K+ entries and 96+ rows, or 64K+ entries
   and 48+ rows; 2.1-2.7x faster on 128 rows of 64K-128K). Both selectors return
   exact top-k sets, so the choice only affects speed.
+  Tiny prefill chunks are bound by the host: the GPU work of a 128-token chunk
+  is ~40 us, and the leaf used to spend ~350 us issuing about 100 framework ops
+  around it (277 vs 144 us for the Triton leaf). On SM120 `dsa_prefill_prepare`
+  (`_triton/prefill_prepare.py`) does the query quantization, the weight
+  folding, the candidate counts and the key gather in one launch, bit-identical
+  to the framework ops it replaces (`test_dsa_prefill_prepare_sm120.py`; other
+  platforms keep the ops because the quantizer they select is not checked
+  against it), and DeepSelect reports workspace rows itself (`index_base`, the
+  row start added to each selected column; `-1` padding stays). Host time per
+  call drops from 360 to 118-124 us at 1-1024 tokens; the leaf beats the
+  Triton leaf at every chunk size (back-to-back eager calls, 1-512 tokens
+  1.35-6.0x, 1024 tokens 21x, 2K-8K tokens with prefixes 54-98x;
+  `scripts/sm120_dsa_vs_tokenspeed.py` in DeepGEMM). The launch rule is "one
+  path": no chunk-size rule exists or is needed.
 - **V4.1 `dsv41_index_topk`.** SM120 stores the checkpoint's 68-byte rows
   (`cache_format="v41"`: 64 bytes of E2M1 pairs, then one UE8M0 word with the
   four 32-element scales, page-planar). One leaf, `deep_gemm_sm120_dsv41_index_topk`
@@ -447,6 +461,18 @@ offsets, masking padding and handling partial tails and empty shards. Query
 quantization and head padding match the unsharded path; portable Triton provides
 the same interface. Query tiling bounds scratch memory, and fixed-shape GPU
 metadata supports CUDA graph replay without host reads.
+
+On SM120 the DeepGEMM leaf selects each row's candidates with DeepSelect over
+the row's own compact length (the first `lengths` columns; a short row yields
+all of them, then `-1`), not `torch.topk` over the padded row. At the logits a
+DCP rank produces (top-k 2048, 64 heads, 1/4 of the pages owned) it is faster
+than `torch.topk` at every shape (2-8x from 128 rows) and than the TRT-LLM
+cluster runner from 128 rows or at 1/4 ownership; the runner is 1.1-1.7x faster
+only for full-length rows (no sharding) with up to 32 rows of 16K+ candidates,
+which a sharded rank does not see, so there is no rule. The whole leaf over
+1-2048 query rows, 16K-128K contexts and 2/4/8 ranks is 1.25-4.7x faster than
+the `torch.topk` leaf (geomean about 2) and 3-64x faster than the Triton leaf
+(`scripts/sm120_bench_index_candidates.py` in DeepGEMM).
 
 The Triton FP8 indexer skips Q/K scoring for tiles with no causally visible,
 owned entries. Empty tiles still write negative-infinite logits, including
