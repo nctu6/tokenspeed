@@ -116,6 +116,27 @@ def test_sm100_only_kernels_are_not_offered_on_sm120(
     assert not spec.capability.satisfied_by(sm120_platform), name
 
 
+def test_mega_moe_is_not_offered_on_sm120(sm120_platform: PlatformInfo) -> None:
+    """DeepGEMM's SM120 ``fp8_fp4_mega_moe`` runs one rank only.
+
+    The fused SM100 kernel is built on TMEM, 2-CTA UMMA and NVLink symmetric
+    memory; DeepGEMM's SM120 version is a sequence of kernels (dispatch, two
+    FP8 x FP4 grouped GEMMs, SwiGLU, combine) for a single rank. TokenSpeed's
+    MegaMoE path requires expert parallelism (``ep_size > 1``), and the V4 /
+    V4.1 experts (139 / 272 GB) do not fit one GPU, so the leaf stays off SM120.
+    """
+    import tokenspeed_kernel.ops.moe  # noqa: F401  (registers the leaves)
+
+    offered = {
+        spec.name
+        for spec in KernelRegistry.get().get_for_operator(
+            "moe", "apply", platform=sm120_platform
+        )
+        if spec.solution == "mega_moe"
+    }
+    assert not offered, f"MegaMoE leaves offered on SM120: {offered}"
+
+
 _MLA_DECODE = {
     "q_len": 1,
     "num_q_heads": 128,

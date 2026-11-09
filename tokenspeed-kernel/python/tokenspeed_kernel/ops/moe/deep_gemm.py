@@ -385,6 +385,8 @@ if platform.is_blackwell:
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
+            # SM120's DeepGEMM MegaMoE runs one rank, while this path needs EP
+            # (see README.md, "MegaMoE on SM120")
             max_arch_version=ArchVersion(10, 9),
             required_features=frozenset({"tensor_core:f4"}),
         ),
