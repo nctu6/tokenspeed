@@ -647,6 +647,48 @@ def index_q_quantize(q, cache_format, out):
     return out
 
 
+def _prefill_workspace_attention(
+    q,
+    prefill_kv,
+    prefill_indices,
+    attn_sink,
+    softmax_scale,
+    out,
+    lse,
+    *,
+    solution,
+):
+    """Attention over a prefill's gathered K/V workspace (``dsv4_prefill``).
+
+    ``solution`` restricts the ``dsv4_prefill`` choice: the portable leaf keeps
+    it on Triton, and the SM120 leaf passes None, so the registry picks the
+    best core for the model's head count.
+    """
+    from tokenspeed_kernel.ops.attention.dsv4 import dsv4_prefill
+
+    if prefill_indices is None:
+        raise ValueError("prefill_kv requires prefill_indices")
+    if attn_sink is not None:
+        attn_sink = attn_sink[: q.shape[1]]
+    out = _output(out, q.shape, q.dtype, q.device)
+    lengths = torch.full(
+        (q.shape[0],), prefill_indices.shape[-1], dtype=torch.int32, device=q.device
+    )
+    dsv4_prefill(
+        q=q.contiguous(),
+        kv=prefill_kv,
+        indices=prefill_indices,
+        lens=lengths,
+        attn_sink=None if attn_sink is None else attn_sink.contiguous(),
+        softmax_scale=softmax_scale,
+        out=out,
+        lse=lse,
+        override=None,
+        solution=solution,
+    )
+    return out
+
+
 @register_kernel(
     "attention",
     "dsv41_selected_attention",
@@ -679,25 +721,16 @@ def selected_attention(
     from tokenspeed_kernel.ops.attention.dsv4 import dsv4_prefill
 
     if prefill_kv is not None:
-        if prefill_indices is None:
-            raise ValueError("prefill_kv requires prefill_indices")
-        out = _output(out, q.shape, q.dtype, q.device)
-        lengths = torch.full(
-            (q.shape[0],), prefill_indices.shape[-1], dtype=torch.int32, device=q.device
-        )
-        dsv4_prefill(
-            q=q.contiguous(),
-            kv=prefill_kv,
-            indices=prefill_indices,
-            lens=lengths,
-            attn_sink=None if attn_sink is None else attn_sink.contiguous(),
-            softmax_scale=softmax_scale,
-            out=out,
-            lse=lse,
-            override=None,
+        return _prefill_workspace_attention(
+            q,
+            prefill_kv,
+            prefill_indices,
+            attn_sink,
+            softmax_scale,
+            out,
+            lse,
             solution="triton",
         )
-        return out
     if prefill_indices is not None:
         raise ValueError("prefill_indices requires prefill_kv")
     if q.ndim != 3 or q.shape[-1] != 512 or q.dtype != torch.bfloat16 or q.shape[1] < 1:
@@ -858,9 +891,22 @@ def mma_selected_attention(
         prefill_kv,
         prefill_indices,
     )
+    if prefill_kv is not None:
+        # The prefill workspace is dense BF16 rows: any registered
+        # ``dsv4_prefill`` core serves it, so the SM120 CuTe DSL core is
+        # selected where it is registered for this head count.
+        return _prefill_workspace_attention(
+            q,
+            prefill_kv,
+            prefill_indices,
+            attn_sink,
+            softmax_scale,
+            out,
+            lse,
+            solution=None,
+        )
     if (
-        prefill_kv is not None
-        or prefill_indices is not None
+        prefill_indices is not None
         or q.ndim != 3
         or q.shape[-1] != 512
         or q.dtype != torch.bfloat16

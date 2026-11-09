@@ -335,3 +335,65 @@ def test_dsv4_decode_reader_equals_the_workspace_route(heads, extra):
         override="triton_dsv4_mma_prefill",
     )
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("heads", "core"),
+    [
+        (16, "triton_dsv4_mma_prefill"),
+        (32, "cute_dsl_dsv4_mma_prefill"),
+        (64, "cute_dsl_dsv4_mma_prefill"),
+    ],
+)
+@pytest.mark.parametrize("with_lse", [False, True])
+def test_prefill_workspace_runs_the_registry_choice(heads, core, with_lse):
+    # A prefill hands the SM120 leaf a gathered BF16 workspace. It must reach
+    # the core the registry picks for the head count (the CuTe DSL core from
+    # 17 heads), not the Triton core only, and match a direct call to it.
+    from tokenspeed_kernel.ops.attention.dsv4 import dsv4_prefill
+
+    generator = torch.Generator(device="cuda").manual_seed(heads)
+    tokens, width, rows = 300, 640, 4000
+    q = torch.randn(
+        tokens, heads, 512, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    kv = torch.randn(
+        rows, 512, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    indices = torch.randint(
+        0, rows, (tokens, width), device="cuda", generator=generator
+    ).to(torch.int32)
+    indices[:, width - 50 :] = -1
+    sink = None if with_lse else torch.randn(heads, device="cuda", generator=generator)
+    lse = torch.empty(tokens, heads, device="cuda") if with_lse else None
+    out = _direct(
+        q,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        sink,
+        512**-0.5,
+        None,
+        256,
+        None,
+        kv,
+        indices,
+        lse=lse,
+    )
+    expected_lse = torch.empty(tokens, heads, device="cuda") if with_lse else None
+    expected = dsv4_prefill(
+        q,
+        kv,
+        indices,
+        torch.full((tokens,), width, dtype=torch.int32, device="cuda"),
+        sink,
+        512**-0.5,
+        lse=expected_lse,
+        override=core,
+    )
+    assert torch.equal(out, expected)
+    if with_lse:
+        assert torch.equal(lse, expected_lse)
