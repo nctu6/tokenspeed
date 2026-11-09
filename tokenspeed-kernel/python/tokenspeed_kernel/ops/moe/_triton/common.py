@@ -43,7 +43,10 @@ def _routing_kernel(
         matches = route_mask & (selected_experts == expert_start + expert_id)
         local_rank = tl.cumsum(matches.to(tl.int32), axis=0) - 1
         tl.store(
-            expert_route_ids_ptr + expert_id * num_routes + count + local_rank,
+            expert_route_ids_ptr
+            + expert_id.to(tl.int64) * num_routes
+            + count
+            + local_rank,
             route_ids,
             mask=matches,
         )
