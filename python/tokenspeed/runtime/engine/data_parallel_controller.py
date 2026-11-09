@@ -176,6 +176,8 @@ class DataParallelController:
         self.max_num_seqs = None
         self.chunked_prefill_size = None
         self.max_model_len = None
+        self.multimodal_encoder_dtype: str | None = None
+        self.cache_storage = None
         self.supports_prompt_logprobs = None
         self.server_args = server_args
         self.port_args = port_args
@@ -331,12 +333,22 @@ class DataParallelController:
                 dp_ranks_per_node * server_args.node_rank,
                 dp_ranks_per_node * (server_args.node_rank + 1),
             )
+        # A thread that raises would otherwise die silently and leave the
+        # scheduler-info fields unset, so the caller would fail later with an
+        # unrelated AttributeError. Collect the errors and re-raise the first.
+        launch_errors: list[BaseException] = []
+
+        def launch_group(dp_rank: int) -> None:
+            try:
+                self.launch_tensor_parallel_group(
+                    server_args, dp_port_args[dp_rank], dp_rank
+                )
+            except BaseException as e:  # noqa: BLE001 - re-raised below
+                launch_errors.append(e)
+
         for dp_rank in dp_rank_range:
             # Create a thread for each worker
-            thread = threading.Thread(
-                target=self.launch_tensor_parallel_group,
-                args=(server_args, dp_port_args[dp_rank], dp_rank),
-            )
+            thread = threading.Thread(target=launch_group, args=(dp_rank,))
             threads.append(thread)
 
         # Start all threads
@@ -344,6 +356,9 @@ class DataParallelController:
             thread.start()
         for thread in threads:
             thread.join()
+
+        if launch_errors:
+            raise launch_errors[0]
 
         return dp_port_args
 
