@@ -402,7 +402,12 @@ lane-constant swizzled addresses took it from 5.1 to 3.5 ms. Tests: the shared
 bitwise rows across batches, any width, zero RoPE), plus split and head-tile
 invariance, recompile guard, `out=` and cache layouts, and the mixed-dtype
 route. The V4 prefill and MLA decode CuTe leaves reuse this kernel class
-(`dsv4/_cute_dsl/`, `mla/_cute_dsl/`).
+(`dsv4/_cute_dsl/`, `mla/_cute_dsl/`). Still open: the BF16 path at 42-48% of
+the 16-bit floor (channel-split partial scores; a register-resident query with
+a key split as in E4M3, or a smaller ring, are untried), and decode of one
+request, bound by its 8 width chunks (20 us BF16). Sharing gathered rows across
+a 2-CTA cluster over DSMEM is ruled out on SM120: DSMEM pulls run at about
+33 GB/s per CTA (DeepGEMM `deepgemm-analysis.md` 9.28).
 
 Strided caches. A core that reads `kv_cache` in place through its own page and
 token strides declares `STRIDED_KV_CACHE_FEATURE` (`strided_kv_cache`; the

@@ -406,6 +406,18 @@ served tokens (cold weights, CUDA graph, GPUs on one PCIe switch):
 At EP 2 a V4 rank holds 70 GB of routed experts; V4.1 needs at least 4 ranks.
 Details and the per-size table are in DeepGEMM `deepgemm-analysis.md`
 section 9.26.
+With several ranks the intermediate rows are sized for the worst routing of
+the largest batch on every rank (about 2.6 GB at 8192 tokens per rank at V4.1
+shapes). DeepGEMM keeps them in one persistent buffer per device, allocated by
+the first call and grown by a larger one; the leaf's warmup runs the largest
+token count before the KV planner measures memory, so the planner counts the
+buffer. Serving on real V4.1 weights (40 layers, 128 experts, GPUs 6+7, 2 x 2K
+tokens): MegaMoE DP2/EP2 prefills 1.25x faster than Marlin TP2 (18.1-18.6K vs
+14.5-14.8K tok/s) and decodes 1.31x slower (13.9 vs 10.6 ms TPOT): attention DP
+reads every dense weight on each GPU (+2.6 ms per step at 2 requests), and the
+MegaMoE glue around the grouped GEMMs (barriers, push, dispatch, gather,
+SwiGLU, return, combine) adds 2.3 ms per step while the GEMMs tie Marlin
+(DeepGEMM `deepgemm-analysis.md` 9.29).
 
 ## Triton MXFP4 expert offsets
 The Triton MXFP4 stage kernels advance every expert base (weights, scales,

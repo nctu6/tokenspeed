@@ -116,3 +116,27 @@ dependent launch right after its own wait, so the GEMM prefetches weights while
 it runs (the GEMM waits for the quantizer before reading activations). Grids
 above 1024 blocks launch as a plain kernel instead, because PDL-launched blocks
 that wait on the previous GEMM take its SMs (up to 18% slower at M = 4096).
+
+## Block-scaled MXFP8 DeepGEMM (SM120)
+
+`deepgemm_sm120_mm_mxfp8` (op `mm`, `SPECIALIZED`) serves E4M3 operands with
+UE8M0 scales per 32 K on both sides, the format of the DeepSeek V4.1 dense
+projections, on DeepGEMM's block-scaled SM120 kernel (`recipe=(1, 1, 32)`).
+Before it, the Triton block-FP8 kernel was the only SM120 leaf for this
+signature and took most of a V4.1 decode step. Scales arrive as canonical
+`uint8 [MN, K/32]` and are packed into DeepGEMM's int32 MN-major words by one
+Triton launch (`_triton/ue8m0_pack.py`). For a reused weight,
+`prepare_mxfp8_weight_scales` packs the weight scales once on SM120 (it returns
+FlashInfer's swizzled scales on SM100), and `mm(prepacked_scales=True)` with
+those int32 scales quantizes 16-bit activations straight into the packed layout
+(`quantize_fp8_group32_mn_major_scales`, same codes and scale bytes as the
+canonical group-32 quantizer). N must be a multiple of 64 and K of 128; other
+weights keep the canonical path.
+
+The leaf runs DeepGEMM in deterministic mode, which on SM120 skips stream-K and
+the BLOCK_N = 32 K-warp split, so each output is one in-order K loop and a row
+does not depend on its batch (`batch_invariant`). It registers only with
+DeepGEMM builds that report the mode (`get_deterministic_algorithms`). Measured
+on an RTX PRO 6000 (CUDA graph, weights larger than L2) on the six V4.1
+projections at M = 1..2048: 2.2-11.7x faster than the Triton leaf. Tests:
+`test/nvidia/ops/gemm/test_deepgemm_sm120_mxfp8.py`.

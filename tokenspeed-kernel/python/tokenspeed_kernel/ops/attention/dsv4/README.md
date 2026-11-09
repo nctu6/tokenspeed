@@ -137,8 +137,15 @@ row's bits with its batch, so they stay. More chunks (8) help only below 16
 tokens (10.9 vs 13.7 us at one token) and cost from 16 tokens, and the count
 may not follow the batch; fewer (1-2) lose 2-3x below 16 tokens. Kept 4.
 
+V4.1 prefill reaches this core too: the SM120 selected-attention leaf
+(`triton_dsv41_mma_selected_attention`) hands its gathered BF16 workspace to
+`dsv4_prefill` with an open solution, so the registry picks this core above 16
+heads. The portable V4.1 leaf keeps `solution="triton"`; before the SM120 leaf
+had its own route, that pin kept every SM120 V4.1 prefill on the Triton core
+(about 7% of end-to-end prefill at 64 heads on real V4.1 weights).
 Tests: `test/nvidia/ops/attention/test_dsv4_mma_sm120.py` (both leaves: float32
 reference to one BF16 ulp, LSE to 2e-5, strided q/out, bitwise batch
 invariance; Triton recompile guard; CuTe sink-with-LSE and empty rows, compile
 cache guard; selection by head count) and
-`ops/test_attention_dsv4*.py`; `bench_dsv4_mma_sm120.py` reproduces the tables.
+`ops/test_attention_dsv4*.py`; `test_dsv4_paged_mma_sm120.py::test_prefill_workspace_runs_the_registry_choice`
+covers the V4.1 prefill route; `bench_dsv4_mma_sm120.py` reproduces the tables.
