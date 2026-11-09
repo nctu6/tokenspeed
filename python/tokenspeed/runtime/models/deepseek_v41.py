@@ -1294,7 +1294,11 @@ class DeepseekV41MoE(DeepseekV4MoE):
     def __init__(self, config, mapping, quant_config, layer_index, prefix, aux_stream):
         expert_config = config
         padded = (
-            get_moe_backend().is_mega_moe() and config.moe_intermediate_size % 512 != 0
+            get_moe_backend().is_mega_moe()
+            and config.moe_intermediate_size % 512 != 0
+            # DeepGEMM's SM120 MegaMoE takes any multiple of 128 (its scale
+            # rows are TMA-loaded per 128 outputs, not copied by UTCCP)
+            and current_platform().arch_version.major != 12
         )
         if padded:
             # MegaMoE TMA loads require a 16-byte-aligned 1x32 scale row.

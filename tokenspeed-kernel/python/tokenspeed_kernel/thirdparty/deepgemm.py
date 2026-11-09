@@ -49,6 +49,25 @@ def deepgemm_supports_sm120() -> bool:
     return SM120_ARCH_MAJOR in supported
 
 
+@functools.cache
+def deepgemm_sm120_mega_moe_max_ranks() -> int:
+    """Most ranks the installed DeepGEMM's SM120 ``fp8_fp4_mega_moe`` serves (0: none).
+
+    SM120 has no NVLink and no TMEM, so DeepGEMM runs MegaMoE there as a sequence of
+    kernels whose ranks write into each other's symmetric buffers with CUDA IPC peer
+    stores over PCIe. Builds with only the SM100 kernel, or with the one-rank SM120
+    version, have no ``get_mega_moe_max_ranks`` and report 0.
+    """
+    if not deepgemm_supports_sm120():
+        return 0
+    import deep_gemm
+
+    try:
+        return int(deep_gemm.get_mega_moe_max_ranks(SM120_ARCH_MAJOR))
+    except AttributeError:
+        return 0
+
+
 def block_fp8_mm(
     a: torch.Tensor,
     b: torch.Tensor,

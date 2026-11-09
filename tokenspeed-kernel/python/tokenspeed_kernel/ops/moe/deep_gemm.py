@@ -35,6 +35,10 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.thirdparty.deepgemm import (
+    SM120_ARCH_MAJOR,
+    deepgemm_sm120_mega_moe_max_ranks,
+)
 
 platform = current_platform()
 logger = logging.getLogger(__name__)
@@ -46,9 +50,24 @@ logger = logging.getLogger(__name__)
 
 
 # DeepGEMM implementation of the DeepSeek V4/V4.1 MegaMoE boundary.
+#
+# SM100 runs the fused kernel over NVLink symmetric memory. SM120 has neither NVLink nor
+# TMEM: DeepGEMM runs the same steps as a sequence of kernels whose ranks write into each
+# other's symmetric buffers with CUDA IPC peer stores over PCIe (README.md, "MegaMoE on
+# SM120"). Builds without that version register no SM120 leaf.
+_SM120_MEGA_MOE_MAX_RANKS = (
+    deepgemm_sm120_mega_moe_max_ranks() if platform.is_nvidia else 0
+)
+_IS_SM120 = platform.is_nvidia and platform.arch_version.major == SM120_ARCH_MAJOR
+# The ranks the SM120 leaf has been run on (two GPUs); the kernels take up to
+# ``_SM120_MEGA_MOE_MAX_RANKS``.
+_SM120_MEGA_MOE_EP_SIZES = frozenset({2})
+_MEGA_MOE_AVAILABLE = platform.is_blackwell or (
+    _IS_SM120 and _SM120_MEGA_MOE_MAX_RANKS >= max(_SM120_MEGA_MOE_EP_SIZES)
+)
 
 
-if platform.is_blackwell:
+if _MEGA_MOE_AVAILABLE:
     prepare_cuda_toolkit_env()
     from deep_gemm import (
         fp8_fp4_mega_moe,
@@ -133,9 +152,13 @@ def _pack_ue8m0_scale_(scale: torch.Tensor) -> torch.Tensor:
 
 
 def _reorder_scale_rows_(
-    scale: torch.Tensor, interleave_gate_up: bool, granularity: int
+    scale: torch.Tensor, interleave_gate_up: bool, granularity: int, utccp: bool
 ) -> torch.Tensor:
-    """Apply MegaMoE gate/up and UTCCP row permutations in place."""
+    """Apply MegaMoE gate/up and, for the SM100 kernel, UTCCP row permutations in place.
+
+    SM120 TMA-loads the scales into shared memory instead of copying them to TMEM with
+    UTCCP, so they keep their row order there.
+    """
     grouped = scale if scale.ndim == 3 else scale.unsqueeze(0)
     groups, rows, packed_columns = grouped.shape
     if rows % 128:
@@ -147,8 +170,9 @@ def _reorder_scale_rows_(
             blocks = half // granularity
             source = source.view(2, blocks, granularity, packed_columns)
             source = source.transpose(0, 1).reshape(rows, packed_columns)
-        source = source.view(-1, 4, 32, packed_columns)
-        source = source.transpose(1, 2).reshape(rows, packed_columns)
+        if utccp:
+            source = source.view(-1, 4, 32, packed_columns)
+            source = source.transpose(1, 2).reshape(rows, packed_columns)
         grouped[group].copy_(source)
     return scale
 
@@ -169,6 +193,18 @@ def deep_gemm_mxfp4_mega_moe_process_weights(
         raise ValueError("DeepGEMM MegaMoE requires persistent_max_num_tokens_per_gpu")
     if w.top_k > w.num_experts:
         raise ValueError("top_k cannot exceed num_experts")
+    utccp = not _IS_SM120
+    if _IS_SM120:
+        if w.ep_size not in _SM120_MEGA_MOE_EP_SIZES:
+            raise ValueError(
+                f"SM120 MegaMoE runs on {sorted(_SM120_MEGA_MOE_EP_SIZES)} EP ranks, "
+                f"got {w.ep_size}"
+            )
+        if hidden_size % 512 or intermediate_size % 128:
+            raise ValueError(
+                "SM120 MegaMoE needs hidden_size divisible by 512 and "
+                f"intermediate_size by 128, got {hidden_size} and {intermediate_size}"
+            )
     tensors = (w13_weight, w13_weight_scale, w2_weight, w2_weight_scale)
     names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
     expected_shapes = _expected_shapes(
@@ -189,9 +225,9 @@ def deep_gemm_mxfp4_mega_moe_process_weights(
 
     w13_weight = _interleave_gate_up_(w13_weight.view(torch.int8), 8)
     w13_scale = _pack_ue8m0_scale_(w13_weight_scale)
-    w13_scale = _reorder_scale_rows_(w13_scale, True, 8)
+    w13_scale = _reorder_scale_rows_(w13_scale, True, 8, utccp)
     w2_scale = _pack_ue8m0_scale_(w2_weight_scale)
-    w2_scale = _reorder_scale_rows_(w2_scale, False, 8)
+    w2_scale = _reorder_scale_rows_(w2_scale, False, 8, utccp)
 
     state = _DeepGemmMegaMoEState(
         l1_weights=(w13_weight, w13_scale),
@@ -375,7 +411,27 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
     _warmed_configs.add(warmup_key)
 
 
-if platform.is_blackwell:
+_MEGA_MOE_TRAITS = {
+    "weight_dtype": frozenset({"mxfp4"}),
+    "activation": frozenset({"swiglu"}),
+    "routing_mode": frozenset({"precomputed_topk"}),
+    "supports_deferred_finalize": frozenset({False}),
+    "supports_ep": frozenset({True}),
+    "supports_all_to_all_ep": frozenset({False}),
+    "persistent_workspace": frozenset({True}),
+    "ispp_alignment": frozenset({128}),
+    "hidden_alignment": frozenset({128}),
+    "swiglu_form": frozenset({"standard"}),
+    "activation_clamped": frozenset({False, True}),
+    "internal_activation_dtype": frozenset({"input"}),
+    "supports_bias": frozenset({False}),
+}
+_MEGA_MOE_SIGNATURES = frozenset(
+    {format_signature(x=dense_tensor_format(torch.bfloat16))}
+)
+
+
+if _MEGA_MOE_AVAILABLE:
 
     @register_kernel(
         "moe",
@@ -385,33 +441,12 @@ if platform.is_blackwell:
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
-            # SM120's DeepGEMM MegaMoE runs one rank, while this path needs EP
-            # (see README.md, "MegaMoE on SM120")
+            # SM120 has its own leaf below
             max_arch_version=ArchVersion(10, 9),
             required_features=frozenset({"tensor_core:f4"}),
         ),
-        signatures=frozenset(
-            {
-                format_signature(
-                    x=dense_tensor_format(torch.bfloat16),
-                )
-            }
-        ),
-        traits={
-            "weight_dtype": frozenset({"mxfp4"}),
-            "activation": frozenset({"swiglu"}),
-            "routing_mode": frozenset({"precomputed_topk"}),
-            "supports_deferred_finalize": frozenset({False}),
-            "supports_ep": frozenset({True}),
-            "supports_all_to_all_ep": frozenset({False}),
-            "persistent_workspace": frozenset({True}),
-            "ispp_alignment": frozenset({128}),
-            "hidden_alignment": frozenset({128}),
-            "swiglu_form": frozenset({"standard"}),
-            "activation_clamped": frozenset({False, True}),
-            "internal_activation_dtype": frozenset({"input"}),
-            "supports_bias": frozenset({False}),
-        },
+        signatures=_MEGA_MOE_SIGNATURES,
+        traits=_MEGA_MOE_TRAITS,
         priority=Priority.SPECIALIZED,
         weight_preprocessor=deep_gemm_mxfp4_mega_moe_process_weights,
     )
@@ -487,3 +522,55 @@ if platform.is_blackwell:
     deep_gemm_mxfp4_mega_moe_apply._tokenspeed_warmup = (  # type: ignore[attr-defined]
         warmup_deep_gemm_mxfp4_mega_moe
     )
+
+    if _SM120_MEGA_MOE_MAX_RANKS >= max(_SM120_MEGA_MOE_EP_SIZES):
+
+        @register_kernel(
+            "moe",
+            "apply",
+            name="deep_gemm_sm120_mxfp4_mega_moe_apply",
+            solution="mega_moe",
+            capability=CapabilityRequirement(
+                vendors=frozenset({"nvidia"}),
+                min_arch_version=ArchVersion(SM120_ARCH_MAJOR, 0),
+                max_arch_version=ArchVersion(SM120_ARCH_MAJOR, 9),
+                required_features=frozenset({"tensor_core:f4"}),
+            ),
+            signatures=_MEGA_MOE_SIGNATURES,
+            traits={
+                **_MEGA_MOE_TRAITS,
+                # The SM120 gather moves 16-byte chunks of 32 lanes
+                "hidden_alignment": frozenset({512}),
+                "ep_size": _SM120_MEGA_MOE_EP_SIZES,
+            },
+            priority=Priority.SPECIALIZED,
+            weight_preprocessor=deep_gemm_mxfp4_mega_moe_process_weights,
+        )
+        def deep_gemm_sm120_mxfp4_mega_moe_apply(
+            plan: dict,
+            x: torch.Tensor,
+            w: torch.nn.Module,
+            router_logits: torch.Tensor | None,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+            num_tokens_global: int | None,
+            max_num_tokens_per_gpu: int | None,
+            do_finalize: bool,
+            enable_pdl: bool,
+        ) -> torch.Tensor:
+            return deep_gemm_mxfp4_mega_moe_apply(
+                plan,
+                x,
+                w,
+                router_logits,
+                topk_weights,
+                topk_ids,
+                num_tokens_global,
+                max_num_tokens_per_gpu,
+                do_finalize,
+                enable_pdl,
+            )
+
+        deep_gemm_sm120_mxfp4_mega_moe_apply._tokenspeed_warmup = (  # type: ignore[attr-defined]
+            warmup_deep_gemm_mxfp4_mega_moe
+        )

@@ -38,11 +38,14 @@ import importlib.util
 
 import pytest
 import torch
-from tokenspeed_kernel.platform import PlatformInfo
+from tokenspeed_kernel.platform import PlatformInfo, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-from tokenspeed_kernel.thirdparty.deepgemm import deepgemm_supports_sm120
+from tokenspeed_kernel.thirdparty.deepgemm import (
+    deepgemm_sm120_mega_moe_max_ranks,
+    deepgemm_supports_sm120,
+)
 
 # (family, mode) -> solutions whose kernels cannot run on SM120
 _SM100_ONLY_SOLUTIONS = {
@@ -116,25 +119,76 @@ def test_sm100_only_kernels_are_not_offered_on_sm120(
     assert not spec.capability.satisfied_by(sm120_platform), name
 
 
-def test_mega_moe_is_not_offered_on_sm120(sm120_platform: PlatformInfo) -> None:
-    """DeepGEMM's SM120 ``fp8_fp4_mega_moe`` runs one rank only.
+_MEGA_MOE_TRAITS = {
+    "weight_dtype": "mxfp4",
+    "activation": "swiglu",
+    "routing_mode": "precomputed_topk",
+    "supports_deferred_finalize": False,
+    "supports_ep": True,
+    "supports_all_to_all_ep": False,
+    "persistent_workspace": True,
+    "ispp": 2048,
+    "hidden": 4096,
+    "ep_size": 2,
+    "swiglu_form": "standard",
+    "activation_clamped": True,
+    "internal_activation_dtype": "input",
+    "supports_bias": False,
+}
 
-    The fused SM100 kernel is built on TMEM, 2-CTA UMMA and NVLink symmetric
-    memory; DeepGEMM's SM120 version is a sequence of kernels (dispatch, two
-    FP8 x FP4 grouped GEMMs, SwiGLU, combine) for a single rank. TokenSpeed's
-    MegaMoE path requires expert parallelism (``ep_size > 1``), and the V4 /
-    V4.1 experts (139 / 272 GB) do not fit one GPU, so the leaf stays off SM120.
+
+def _select_mega_moe(platform: PlatformInfo, **traits):
+    return select_kernel(
+        "moe",
+        "apply",
+        format_signature(x=dense_tensor_format(torch.bfloat16)),
+        platform=platform,
+        traits={**_MEGA_MOE_TRAITS, **traits},
+        solution="mega_moe",
+    )
+
+
+def test_sm100_mega_moe_leaf_is_not_offered_on_sm120(
+    b200_platform: PlatformInfo, sm120_platform: PlatformInfo
+) -> None:
+    """The fused SM100 kernel needs TMEM, 2-CTA UMMA and NVLink symmetric memory."""
+    import tokenspeed_kernel.ops.moe  # noqa: F401  (registers the leaves)
+
+    spec = KernelRegistry.get().get_by_name("deep_gemm_mxfp4_mega_moe_apply")
+    if spec is None:
+        pytest.skip("the DeepGEMM MegaMoE leaves are registered on Blackwell hosts")
+    assert spec.capability.satisfied_by(b200_platform)
+    assert not spec.capability.satisfied_by(sm120_platform)
+
+
+def test_sm120_mega_moe_leaf_follows_the_deepgemm_build(
+    b200_platform: PlatformInfo, sm120_platform: PlatformInfo
+) -> None:
+    """SM120 runs MegaMoE as a sequence of kernels whose ranks write into each
+    other's symmetric buffers over PCIe (DeepGEMM builds with the multi-rank
+    SM120 version). It is offered on SM120 only, for the EP size it has run on,
+    and for the widths its row copies take (hidden a multiple of 512).
     """
     import tokenspeed_kernel.ops.moe  # noqa: F401  (registers the leaves)
 
-    offered = {
-        spec.name
-        for spec in KernelRegistry.get().get_for_operator(
-            "moe", "apply", platform=sm120_platform
+    name = "deep_gemm_sm120_mxfp4_mega_moe_apply"
+    spec = KernelRegistry.get().get_by_name(name)
+    if spec is None:
+        # Not a Blackwell host, or a DeepGEMM without the multi-rank SM120 kernels
+        assert deepgemm_sm120_mega_moe_max_ranks() < 2 or not (
+            current_platform().is_blackwell
+            or current_platform().arch_version.major == 12
         )
-        if spec.solution == "mega_moe"
-    }
-    assert not offered, f"MegaMoE leaves offered on SM120: {offered}"
+        pytest.skip("no SM120 MegaMoE leaf registered here")
+    assert spec.capability.satisfied_by(sm120_platform)
+    assert not spec.capability.satisfied_by(b200_platform)
+    assert _select_mega_moe(sm120_platform).name == name
+    # Not for other EP sizes or widths
+    for traits in ({"ep_size": 4}, {"ep_size": 1}, {"hidden": 4224}, {"ispp": 2000}):
+        with pytest.raises(Exception):
+            _select_mega_moe(sm120_platform, **traits)
+    # V4.1's 2304-wide experts need no padding to 2560 there
+    assert _select_mega_moe(sm120_platform, hidden=5120, ispp=2304).name == name
 
 
 _MLA_DECODE = {
