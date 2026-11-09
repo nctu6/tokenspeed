@@ -1268,6 +1268,14 @@ prefill chunk. Two consequences:
 DeepEP all-to-all layouts and for Kimi-K3's SiTU experts, which the CUTLASS
 epilogue does not implement.
 
+For numerics checks on fewer GPUs than the 384 experts need, the real
+checkpoint can run with only its first routed experts, for example
+`--hf-overrides '{"n_routed_experts": 128, "num_checkpoint_experts": 384}'`.
+The router keeps the rows of those experts (a different model than the
+checkpoint, but the same one on every kernel path), the other experts are not
+read, and every other tensor keeps the strict coverage check. A layer subset
+does not work: the FlatKV cache packing is fixed for the 40-layer layout.
+
 Add `--speculative-algorithm DSPARK` for same-checkpoint DSpark decoding.
 The draft seeds its context windows from the decoder's kept rows, and each
 draft stage attends its 128-row window plus the non-causal proposal block
