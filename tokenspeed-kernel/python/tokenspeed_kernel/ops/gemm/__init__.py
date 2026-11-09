@@ -382,8 +382,9 @@ def prepare_mxfp8_weight_scales(
             unchanged.
 
     Returns:
-        New 1-D uint8 scales in FlashInfer's F8_128x4 layout, or None when
-        the prepacked path does not apply.
+        New 1-D uint8 scales in FlashInfer's F8_128x4 layout (SM100), int32
+        ``[N, K/128]`` scales packed for DeepGEMM (SM120), or None when the
+        prepacked path does not apply.
     """
     if (
         weight.ndim != 2
@@ -394,6 +395,17 @@ def prepare_mxfp8_weight_scales(
         or weight_scales.device != weight.device
     ):
         raise ValueError("1x32 FP8 weights require canonical UE8M0 [N, K/32] scales")
+    if (
+        weight.is_cuda
+        and weight.stride(-1) == 1
+        and deepgemm_sm120_mxfp8_supports(*weight.shape)
+        and resolve_kernel_override("gemm", "mm", None)
+        in (None, "deepgemm_sm120_mm_mxfp8")
+        and resolve_kernel_override("quantization", "fp8_with_scale", None) is None
+    ):
+        # SM120: DeepGEMM's block-scaled GEMM reads the scales packed four
+        # K groups per int32 word, MN-major; pack the weight's once.
+        return pack_ue8m0_mn_major(weight_scales)
     if not (
         has_flashinfer_mxfp8()
         and weight.is_cuda
@@ -418,10 +430,11 @@ def _mm_mxfp8_prepacked(
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     n, k = B.shape
-    if not has_flashinfer_mxfp8():
+    sm120_packed = B_scales is not None and B_scales.dtype == torch.int32
+    if not (has_flashinfer_mxfp8() or sm120_packed):
         raise ValueError(
             "mm(prepacked_scales=True) with block_size [1, 32] requires "
-            "FlashInfer's MXFP8 GEMM"
+            "FlashInfer's MXFP8 GEMM, or DeepGEMM's on SM120"
         )
     quantized = A.dtype == _fp8_dtype
     if (
@@ -443,6 +456,31 @@ def _mm_mxfp8_prepacked(
             "mm(prepacked_scales=True) requires canonical [M, K/32] UE8M0 "
             "activation scales with E4M3 codes"
         )
+    if sm120_packed:
+        if tuple(B_scales.shape) != (n, k // 128) or not deepgemm_sm120_mxfp8_supports(
+            n, k
+        ):
+            raise ValueError(
+                "mm(prepacked_scales=True) with int32 weight scales requires the "
+                "SM120 DeepGEMM MXFP8 GEMM and scales from "
+                "prepare_mxfp8_weight_scales"
+            )
+        if out is not None:
+            _validate_gemm_out(
+                out, shape=(A.shape[0], n), dtype=out_dtype, device=A.device, op="mm"
+            )
+        if A.shape[0] == 0:
+            return out if out is not None else A.new_empty((0, n), dtype=out_dtype)
+        result = deepgemm_sm120_mm_mxfp8_prepacked(
+            A, B, A_scales, B_scales, out_dtype, out if bias is None else None
+        )
+        if bias is None:
+            return result
+        result = result + bias
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
     if (
         B_scales is None
         or B_scales.dtype != torch.uint8
@@ -612,11 +650,13 @@ def mm(
                 not in (
                     None,
                     "flashinfer_mm_mxfp8",
+                    "deepgemm_sm120_mm_mxfp8",
                 )
             ):
                 raise ValueError(
                     "mm(prepacked_scales=True) with block_size [1, 32] runs only "
-                    "flashinfer_mm_mxfp8 and takes no alpha or solution"
+                    "flashinfer_mm_mxfp8 or deepgemm_sm120_mm_mxfp8 and takes no "
+                    "alpha or solution"
                 )
             return _mm_mxfp8_prepacked(
                 A, B, A_scales, B_scales, bias=bias, out=out, out_dtype=out_dtype
@@ -3748,6 +3788,11 @@ import tokenspeed_kernel.ops.gemm.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.deepgemm  # noqa: E402,F401
 from tokenspeed_kernel.ops.gemm.deepgemm import (  # noqa: E402
     MXFP4_LINEAR_DEEPGEMM_SM120_LAYOUT,
+    deepgemm_sm120_mm_mxfp8_prepacked,
+    deepgemm_sm120_mxfp8_supports,
+)
+from tokenspeed_kernel.ops.gemm._triton.ue8m0_pack import (  # noqa: E402
+    pack_ue8m0_mn_major,
 )
 from tokenspeed_kernel.thirdparty.deepgemm import pack_ue8m0_scales  # noqa: E402
 import tokenspeed_kernel.ops.gemm.cute_dsl  # noqa: E402,F401

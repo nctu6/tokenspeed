@@ -22,7 +22,11 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.activation import silu_and_mul
-from tokenspeed_kernel.ops.quantization.triton import mxfp4_quantize_mn_major_scales
+from tokenspeed_kernel.ops.gemm._triton.ue8m0_pack import pack_ue8m0_mn_major
+from tokenspeed_kernel.ops.quantization.triton import (
+    mxfp4_quantize_mn_major_scales,
+    quantize_fp8_group32_mn_major_scales,
+)
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -41,6 +45,8 @@ from tokenspeed_kernel.thirdparty.deepgemm import (
     SM120_ARCH_MAJOR,
     block_fp8_mm,
     block_mxfp4_mm,
+    block_mxfp8_mm,
+    deepgemm_has_deterministic_query,
     deepgemm_supports_sm120,
     pack_ue8m0_scales,
 )
@@ -272,6 +278,100 @@ def _run_deepgemm_mm_mxfp4(
     )
 
 
+def _run_deepgemm_mm_mxfp8(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None,
+    block_size: list[int] | None,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """SM120 MXFP8 GEMM: E4M3 [M,K] @ [N,K].T with UE8M0 scales per 32 K."""
+    _require_sm120_mxfp4()
+    if alpha is not None or block_size is None or tuple(block_size) != (1, 32):
+        raise ValueError(
+            "DeepGEMM MXFP8 GEMM requires 1x32 block scales and alpha=None"
+        )
+    if A.dtype != torch.float8_e4m3fn or B.dtype != A.dtype:
+        raise ValueError("DeepGEMM MXFP8 GEMM requires E4M3 operands")
+    if out_dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("DeepGEMM MXFP8 GEMM produces BF16 or FP32 output")
+    if A.ndim != 2 or B.ndim != 2 or not A.is_contiguous() or not B.is_contiguous():
+        raise ValueError("DeepGEMM MXFP8 GEMM requires contiguous 2D A[M,K], B[N,K]")
+    m, k = A.shape
+    n, kb = B.shape
+    if m < 1 or n < 1 or k != kb or n % 64 or k % 128:
+        raise ValueError("DeepGEMM MXFP8 GEMM requires matching K, N%64=0 and K%128=0")
+    if A_scales is None or B_scales is None:
+        raise ValueError("DeepGEMM MXFP8 GEMM requires A and B scales")
+    for scale, mn in ((A_scales, m), (B_scales, n)):
+        if (
+            scale.dtype != torch.uint8
+            or tuple(scale.shape) != (mn, k // 32)
+            or scale.device != A.device
+            or scale.stride(1) != 1
+        ):
+            raise ValueError(
+                "DeepGEMM MXFP8 GEMM requires uint8 UE8M0 [MN, K/32] scales"
+            )
+    if out is None:
+        out = torch.empty((m, n), device=A.device, dtype=out_dtype)
+    elif (
+        tuple(out.shape) != (m, n)
+        or out.dtype != out_dtype
+        or out.device != A.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError("DeepGEMM MXFP8 out must be contiguous [M,N] on the device")
+    return block_mxfp8_mm(
+        A, B, pack_ue8m0_mn_major(A_scales), pack_ue8m0_mn_major(B_scales), out
+    )
+
+
+def deepgemm_sm120_mxfp8_supports(n: int, k: int) -> bool:
+    """Whether the SM120 MXFP8 leaf serves a ``[N, K]`` weight on this device."""
+    return (
+        DEEPGEMM_SM120_MXFP8_REGISTERED
+        and Platform.get().is_nvidia
+        and Platform.get().arch_version.major == SM120_ARCH_MAJOR
+        and n % 64 == 0
+        and k % 128 == 0
+    )
+
+
+def deepgemm_sm120_mm_mxfp8_prepacked(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor,
+    out_dtype: torch.dtype,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """SM120 MXFP8 GEMM with weight scales packed once by ``pack_ue8m0_mn_major``.
+
+    Args:
+        A: BF16/FP16 ``[M, K]`` (quantized here) or E4M3 codes.
+        B: E4M3 weight ``[N, K]``.
+        A_scales: Canonical uint8 UE8M0 ``[M, K/32]`` scales of E4M3 codes, or
+            None for 16-bit activations.
+        B_scales: int32 ``[N, K/128]`` packed weight scales.
+        out_dtype: BF16 or FP32.
+        out: Optional contiguous ``[M, N]`` destination.
+    """
+    m, k = A.shape
+    n = B.shape[0]
+    if A.dtype == torch.float8_e4m3fn:
+        values, packed_a = A, pack_ue8m0_mn_major(A_scales)
+    else:
+        values, packed_a = quantize_fp8_group32_mn_major_scales(A)
+    if out is None:
+        out = torch.empty((m, n), device=A.device, dtype=out_dtype)
+    return block_mxfp8_mm(values, B, packed_a, B_scales, out)
+
+
 def _run_deepgemm_mxfp4_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -294,6 +394,9 @@ def _run_deepgemm_mxfp4_linear(
     out = _check_mxfp4_operands(x_fp4, weight, x.dtype, out)
     return block_mxfp4_mm(x_fp4, weight, x_scale, weight_scale, out)
 
+
+# Set where the SM120 MXFP8 leaf registers (below).
+DEEPGEMM_SM120_MXFP8_REGISTERED = False
 
 # The SM120 build reads the canonical FP32 scales directly (no transpose), and
 # beats both the FlashInfer and Triton block-FP8 leaves on decode shapes while
@@ -379,6 +482,69 @@ if current_platform().is_hopper_plus and deepgemm_supports_sm120():
             block_size=block_size,
             out=out,
         )
+
+    # V4.1 dense projections: E4M3 weights and activations with UE8M0 scales per
+    # 32 K on both sides. The block-scaled ``mma.sync`` reads the scales
+    # natively (deepgemm-analysis.md 9.29). It runs in DeepGEMM's deterministic
+    # mode, so it is batch invariant; only builds that keep that mode batch
+    # invariant on SM120 register it.
+    _MXFP8_UE8M0_SCALE = ScaleFormat(
+        storage_dtype=torch.uint8, granularity="block", block_shape=(1, 32)
+    )
+    _MXFP8_UE8M0_SIGNATURES = format_signatures(
+        ("a", "b"), "mxfp8", {torch.float8_e4m3fn}, scale=_MXFP8_UE8M0_SCALE
+    )
+
+    DEEPGEMM_SM120_MXFP8_REGISTERED = deepgemm_has_deterministic_query()
+    if DEEPGEMM_SM120_MXFP8_REGISTERED:
+
+        @register_kernel(
+            "gemm",
+            "mm",
+            name="deepgemm_sm120_mm_mxfp8",
+            solution="deepgemm",
+            capability=CapabilityRequirement(
+                vendors=frozenset({"nvidia"}),
+                min_arch_version=ArchVersion(SM120_ARCH_MAJOR, 0),
+                max_arch_version=ArchVersion(SM120_ARCH_MAJOR, 9),
+            ),
+            signatures=_MXFP8_UE8M0_SIGNATURES,
+            traits={
+                "n_align": frozenset({64}),
+                "k_align": frozenset({128}),
+                "a_inner_stride_one": frozenset({True}),
+                "a_ndim": frozenset({2}),
+                "b_inner_stride_one": frozenset({True}),
+                "a_scales_inner_stride_one": frozenset({True}),
+                "b_scales_inner_stride_one": frozenset({True}),
+                "out_dtype": frozenset({torch.bfloat16, torch.float32}),
+                "out_inner_stride_one": frozenset({True}),
+            },
+            features={"batch_invariant"},
+            priority=Priority.SPECIALIZED,
+        )
+        def deepgemm_sm120_mm_mxfp8(
+            A: torch.Tensor,
+            B: torch.Tensor,
+            A_scales: torch.Tensor | None,
+            B_scales: torch.Tensor | None,
+            out_dtype: torch.dtype,
+            *,
+            alpha: torch.Tensor | None = None,
+            block_size: list[int] | None = None,
+            out: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            """SM120 MXFP8 GEMM: E4M3 [M,K] @ [N,K].T with UE8M0 per-32 scales."""
+            return _run_deepgemm_mm_mxfp8(
+                A,
+                B,
+                A_scales,
+                B_scales,
+                out_dtype,
+                alpha=alpha,
+                block_size=block_size,
+                out=out,
+            )
 
     # Dense MXFP4 linear (dynamic MXFP4 activations), the op the MXFP4 dense layer
     # calls. The weight scale is packed once at prepare time; the activation is

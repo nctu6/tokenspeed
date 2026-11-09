@@ -50,6 +50,21 @@ def deepgemm_supports_sm120() -> bool:
 
 
 @functools.cache
+def deepgemm_has_deterministic_query() -> bool:
+    """Whether the installed DeepGEMM reports its deterministic-algorithms mode.
+
+    Builds that have it also keep SM120 block-scaled GEMMs batch invariant in
+    that mode (no stream-K split and no K-warp split, whose summation order
+    follows the batch).
+    """
+    if not deepgemm_supports_sm120():
+        return False
+    import deep_gemm
+
+    return "get_deterministic_algorithms" in dir(deep_gemm)
+
+
+@functools.cache
 def deepgemm_sm120_mega_moe_max_ranks() -> int:
     """Most ranks the installed DeepGEMM's SM120 ``fp8_fp4_mega_moe`` serves (0: none).
 
@@ -150,4 +165,41 @@ def block_mxfp4_mm(
         out,
         recipe=(1, 1, 32),
     )
+    return out
+
+
+def block_mxfp8_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """MXFP8 GEMM d = a @ b.T on SM120 (E4M3 operands, UE8M0 scale per 32 K).
+
+    Batch invariant: a row of ``out`` depends only on its row of ``a``.
+
+    Args:
+        a: E4M3 ``[M, K]``.
+        b: E4M3 ``[N, K]``.
+        a_scale: UE8M0 scales ``[M, K/128]`` int32 packed as ``pack_ue8m0_scales``.
+        b_scale: UE8M0 scales ``[N, K/128]`` int32 packed as ``pack_ue8m0_scales``.
+        out: BF16 or FP32 ``[M, N]`` destination.
+    """
+    import deep_gemm
+
+    if deep_gemm.get_pdl() != pdl_enabled():
+        deep_gemm.set_pdl(pdl_enabled())
+
+    # Run with deterministic algorithms, which keep each output a single
+    # in-order K loop: a row's bits then do not depend on the batch. The mode
+    # is process-wide, so restore the caller's choice afterwards.
+    deterministic = deep_gemm.get_deterministic_algorithms()
+    if not deterministic:
+        deep_gemm.use_deterministic_algorithms(True)
+    try:
+        deep_gemm.fp8_fp4_gemm_nt((a, a_scale), (b, b_scale), out, recipe=(1, 1, 32))
+    finally:
+        if not deterministic:
+            deep_gemm.use_deterministic_algorithms(False)
     return out

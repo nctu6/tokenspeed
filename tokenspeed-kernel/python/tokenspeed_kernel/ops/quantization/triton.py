@@ -1959,3 +1959,98 @@ def _quantize_fp8_group32_swizzled(
             num_stages=1,
         )
     return quantized, scales
+
+
+@triton.jit(do_not_specialize=["M", "aligned_m", "X0"])
+def _fp8_group32_ue8m0_quantize_mn_major(
+    X,
+    Q,
+    S,
+    M,
+    aligned_m,
+    X0,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    # One program: BLOCK_M rows x one 128-wide K block (four groups of 32).
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = rows < M
+    groups = tl.arange(0, 4)
+    columns = pid_k * 128 + groups[:, None] * 32 + tl.arange(0, 32)[None, :]
+    values = tl.load(
+        X + rows[:, None, None].to(tl.int64) * X0 + columns[None, :, :],
+        mask=row_mask[:, None, None],
+        other=0.0,
+    ).to(tl.float32)
+    # Same arithmetic as ``_fp8_group32_ue8m0_quantize``.
+    amax = tl.maximum(tl.max(tl.abs(values), 2), 1.0e-4)
+    raw = amax * (1.0 / 448.0)
+    bits = raw.to(tl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    scale = (exponent << 23).to(tl.float32, bitcast=True)
+    inverse_scale = 1.0 / scale
+    quantized = (values * inverse_scale[:, :, None]).to(tl.float8e4nv)
+    tl.store(
+        Q + rows[:, None, None].to(tl.int64) * K + columns[None, :, :],
+        quantized,
+        mask=row_mask[:, None, None],
+    )
+    # The four group bytes of a K block form one int32 word, MN-major, with
+    # ``aligned_m`` words per K block; rows of the alignment padding store 0.
+    offsets = (pid_k * aligned_m + rows[:, None]).to(tl.int64) * 4 + groups[None, :]
+    tl.store(
+        S + offsets,
+        tl.where(row_mask[:, None], exponent, 0).to(tl.uint8),
+        mask=rows[:, None] < aligned_m,
+    )
+
+
+def quantize_fp8_group32_mn_major_scales(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``[M, K]`` to E4M3 with UE8M0 scales per 32 K, packed MN-major.
+
+    Same codes and scale bytes as ``triton_quantize_fp8_group32_ue8m0``, with
+    the scales written in the layout DeepGEMM's SM120 block-scaled GEMM reads
+    (four K-group bytes per int32 word, MN-major, M aligned up to 4).
+
+    Args:
+        x: BF16/FP16 ``[M, K]`` with unit inner stride and K divisible by 128.
+
+    Returns:
+        E4M3 ``[M, K]`` and int32 scales ``[M, K/128]`` with strides
+        ``(1, align4(M))``.
+    """
+    if (
+        x.ndim != 2
+        or x.dtype not in (torch.bfloat16, torch.float16)
+        or x.stride(1) != 1
+        or x.shape[1] % 128
+    ):
+        raise ValueError(
+            "group-32 MN-major FP8 quantization requires 16-bit [M, K] with unit "
+            "inner stride and K divisible by 128"
+        )
+    m, k = x.shape
+    aligned_m = (m + 3) // 4 * 4
+    quantized = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty((k // 128, aligned_m), dtype=torch.int32, device=x.device)
+    if aligned_m:
+        block_m = 4
+        _fp8_group32_ue8m0_quantize_mn_major[
+            (triton.cdiv(aligned_m, block_m), k // 128)
+        ](
+            x,
+            quantized,
+            scales.view(torch.uint8),
+            m,
+            aligned_m,
+            x.stride(0),
+            K=k,
+            BLOCK_M=block_m,
+            num_warps=2,
+            num_stages=1,
+        )
+    return quantized, scales.T[:m]
