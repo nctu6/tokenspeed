@@ -1399,12 +1399,23 @@ def deepselect_topk(
 
 
 _ZERO_BASES: dict[torch.device, torch.Tensor] = {}
+_ZERO_BASES_ROWS = 1 << 16
 
 
 def _zero_bases(rows: int, device: torch.device) -> torch.Tensor:
-    """``[rows]`` zeros on ``device``, from one grow-only buffer per device."""
+    """``[rows]`` int32 zeros on ``device``.
+
+    Up to ``_ZERO_BASES_ROWS`` rows come from one buffer per device, made on the
+    first eager call. A capture never creates it (a buffer allocated inside a
+    CUDA graph would live in the graph's pool and dangle once the graph is
+    freed), and rows past the buffer get a fresh tensor.
+    """
     zeros = _ZERO_BASES.get(device)
-    if zeros is None or zeros.numel() < rows:
-        zeros = torch.zeros(max(rows, 4096), dtype=torch.int32, device=device)
+    if zeros is None and rows <= _ZERO_BASES_ROWS:
+        if torch.cuda.is_current_stream_capturing():
+            return torch.zeros(rows, dtype=torch.int32, device=device)
+        zeros = torch.zeros(_ZERO_BASES_ROWS, dtype=torch.int32, device=device)
         _ZERO_BASES[device] = zeros
+    if zeros is None or rows > _ZERO_BASES_ROWS:
+        return torch.zeros(rows, dtype=torch.int32, device=device)
     return zeros[:rows]

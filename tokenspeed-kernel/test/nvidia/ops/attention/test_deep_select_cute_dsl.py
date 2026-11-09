@@ -196,6 +196,35 @@ def test_index_base_offsets_every_selected_column(cluster_size):
     assert torch.equal(shifted_values, plain_values)
 
 
+def test_default_index_base_survives_the_graph_that_first_needed_it():
+    # The zero offsets of a call without `index_base` are cached per device. A
+    # first call inside a capture must not cache a buffer from the graph's pool:
+    # once that graph is freed the next call would read freed memory.
+    deep_select.warmup((512,), torch.device("cuda"))
+    deep_select._ZERO_BASES.clear()
+    generator = torch.Generator(device="cuda").manual_seed(31)
+    scores = _scores(4, 9000, "randn", generator)
+    ends = torch.full((4,), 9000, dtype=torch.int32, device="cuda")
+    indices = torch.empty((4, 512), dtype=torch.int32, device="cuda")
+    values = torch.empty((4, 512), dtype=torch.float32, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        _select(scores, ends, 512, 1, indices=indices, values=values)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph.replay()
+    torch.cuda.synchronize()
+    for row in range(4):
+        _check_row(scores[row], 9000, 512, indices[row], values[row])
+    del graph
+    torch.cuda.empty_cache()
+    other_indices, other_values = _select(scores, ends, 512, 1)
+    torch.cuda.synchronize()
+    for row in range(4):
+        _check_row(scores[row], 9000, 512, other_indices[row], other_values[row])
+
+
 def test_warmup_serves_an_index_less_device():
     deep_select.warmup((512,), torch.device("cuda"))
     misses_after_warmup = deep_select.compiled_selector.cache_info().misses
