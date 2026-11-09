@@ -150,6 +150,19 @@ _DSV4_PREFILL = {
     "metadata_dtypes": frozenset({torch.int32}),
     "sinks": True,
 }
+_DSV4_DECODE = {
+    "num_tokens": 32,
+    "num_q_heads": 16,
+    "head_dim": 512,
+    "swa_selected_width": 128,
+    "extra_selected_width": 512,
+    "cache_layout": "fp8_swa_page_planar",
+    "has_extra_segment": True,
+    "metadata_dtypes": frozenset({torch.int32}),
+    "return_lse": False,
+    "sinks": True,
+    "topk_layout": "global_slots",
+}
 _HADAMARD = {"last_dim": 128, "contiguous": True}
 _DSV41_PACKED_INDEX = {
     "index_heads": 32,
@@ -190,6 +203,22 @@ _SM120_LEAVES = [
         _DSV4_PREFILL,
         f"{_DSA_CORE}_dsv4_mma_prefill",
         "flashmla_dsv4_prefill",
+    ),
+    (
+        "attention",
+        "dsv4_decode",
+        ("q", "swa_kv_cache"),
+        _DSV4_DECODE,
+        "triton_dsv4_mma_decode",
+        "flashmla_dsv4_decode",
+    ),
+    (
+        "attention",
+        "dsv41_selected_attention",
+        ("x",),
+        {"flashmla_eligible": False},
+        "triton_dsv41_mma_selected_attention",
+        "flashmla_dsv41_selected_attention",
     ),
     (
         "attention",
@@ -239,7 +268,12 @@ def test_sm120_runs_its_own_leaves(
     import tokenspeed_kernel.ops.transform  # noqa: F401
 
     dtype = torch.bfloat16
-    signature = format_signature(**{role: dense_tensor_format(dtype) for role in roles})
+    signature = format_signature(
+        **{
+            role: dense_tensor_format(torch.uint8 if role == "swa_kv_cache" else dtype)
+            for role in roles
+        }
+    )
     chosen = select_kernel(
         family, mode, signature, platform=sm120_platform, traits=traits
     )

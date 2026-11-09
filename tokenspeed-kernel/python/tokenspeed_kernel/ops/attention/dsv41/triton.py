@@ -24,7 +24,7 @@ import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import resolve_group_slot
 from tokenspeed_kernel.ops.layernorm.triton import reference_rmsnorm_row
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -777,6 +777,159 @@ def selected_attention(
             override=None,
             solution="triton",
         )
+    return out
+
+
+# SM120 has no FlashMLA, so decode runs the portable gather above. The kernel
+# below reads the packed rows itself (see ``dsv4/_triton/paged_mma.py``); its
+# result is bitwise the portable route's.
+_MMA_CAPABILITY = CapabilityRequirement(
+    min_arch_version=ArchVersion(12, 0),
+    max_arch_version=ArchVersion(12, 9),
+    vendors=frozenset({"nvidia"}),
+)
+
+
+def _paged_segment(cache, slots, lens, role, tokens):
+    """``(cache, format, slots, lens, rows)`` for the direct reader, or None.
+
+    The portable route reads the sliding window as ``swa`` rows and the
+    compressed rows as ``global`` rows, whatever their widths; so does this.
+    """
+    from tokenspeed_kernel.ops.attention.dsv4._triton import paged_mma
+
+    if cache is None or cache.ndim != 3 or cache.dtype != torch.uint8:
+        return None
+    if cache.shape[1:] != (64, paged_mma.ROW_BYTES[role]):
+        return None
+    if slots is None or slots.ndim != 2 or slots.shape[0] != tokens:
+        return None
+    if slots.dtype not in (torch.int32, torch.int64) or slots.stride(-1) != 1:
+        return None
+    if (
+        lens is None
+        or lens.shape != (tokens,)
+        or lens.dtype not in (torch.int32, torch.int64)
+    ):
+        return None
+    return cache, role, slots, lens, 64
+
+
+@register_kernel(
+    "attention",
+    "dsv41_selected_attention",
+    name="triton_dsv41_mma_selected_attention",
+    solution="triton",
+    capability=_MMA_CAPABILITY,
+    signatures=_QUERY_SIGNATURES,
+    priority=Priority.PERFORMANT,
+)
+def mma_selected_attention(
+    q,
+    swa_cache,
+    swa_slots,
+    swa_lens,
+    global_cache,
+    global_slots,
+    global_lens,
+    attn_sink,
+    softmax_scale,
+    out,
+    query_chunk_size,
+    schedule,
+    prefill_kv,
+    prefill_indices,
+    *,
+    lse=None,
+):
+    args = (
+        q,
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        global_cache,
+        global_slots,
+        global_lens,
+        attn_sink,
+        softmax_scale,
+        out,
+        query_chunk_size,
+        schedule,
+        prefill_kv,
+        prefill_indices,
+    )
+    if (
+        prefill_kv is not None
+        or prefill_indices is not None
+        or q.ndim != 3
+        or q.shape[-1] != 512
+        or q.dtype != torch.bfloat16
+        or q.shape[1] < 1
+        or q.shape[0] < 1
+        or q.stride(-1) != 1
+        or (
+            attn_sink is not None
+            and (attn_sink.shape != (q.shape[1],) or attn_sink.dtype != torch.float32)
+        )
+        or (
+            lse is not None
+            and (
+                attn_sink is not None
+                or lse.shape != q.shape[:2]
+                or lse.dtype != torch.float32
+                or not lse.is_contiguous()
+            )
+        )
+        or (
+            out is not None
+            and (out.shape != q.shape or out.dtype != q.dtype or out.stride(-1) != 1)
+        )
+    ):
+        return selected_attention(*args, lse=lse)
+    from tokenspeed_kernel.ops.attention.dsv4._triton import paged_mma, sparse_mma
+
+    tokens = q.shape[0]
+    swa = _paged_segment(swa_cache, swa_slots, swa_lens, "swa", tokens)
+    extra = None
+    if global_cache is not None:
+        extra = _paged_segment(
+            global_cache, global_slots, global_lens, "global", tokens
+        )
+        if extra is None:
+            return selected_attention(*args, lse=lse)
+    elif global_slots is not None or global_lens is not None:
+        return selected_attention(*args, lse=lse)
+    # A tile of the selection must belong to one segment, and there must be rows
+    if (
+        swa is None
+        or swa[2].shape[1] % sparse_mma.BLOCK_N
+        or swa[2].shape[1] + (0 if extra is None else extra[2].shape[1]) == 0
+    ):
+        return selected_attention(*args, lse=lse)
+    _same_device(
+        q,
+        (
+            swa_cache,
+            swa_slots,
+            swa_lens,
+            global_cache,
+            global_slots,
+            global_lens,
+            attn_sink,
+            out,
+            lse,
+        ),
+    )
+    out = _output(out, q.shape, q.dtype, q.device)
+    paged_mma.paged_mma_decode(
+        q,
+        swa,
+        extra,
+        attn_sink,
+        out,
+        lse,
+        softmax_scale=softmax_scale,
+    )
     return out
 
 
