@@ -1797,6 +1797,23 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
         return ctx.bs
 
 
+def mla_rope_scaling(config) -> dict | None:
+    """The config's RoPE scaling for the MLA layers, None for plain RoPE.
+
+    The MLA attention turns any scaling it gets into deepseek-yarn.
+    transformers 5 normalizes a config without scaling (Moonlight,
+    DeepSeek-V2-Lite) into a factor-less ``{"rope_type": "default", ...}``
+    dict; that is plain RoPE and must not reach the yarn path.
+    """
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if not rope_scaling:
+        return None
+    rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+    if rope_type == "default" and "factor" not in rope_scaling:
+        return None
+    return rope_scaling
+
+
 class DeepseekV3DecoderLayer(nn.Module):
     @property
     def attention_cls(self) -> type[nn.Module]:
@@ -1816,7 +1833,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         self.mapping = mapping
         self.hidden_size = config.hidden_size
         rope_theta = get_rope_theta(config)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_scaling = mla_rope_scaling(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
         self.self_attn = self.attention_cls(
