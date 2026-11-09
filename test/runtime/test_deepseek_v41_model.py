@@ -170,6 +170,7 @@ def _config():
         n_group=1,
         topk_group=1,
         n_routed_experts=4,
+        num_checkpoint_experts=None,
         n_shared_experts=1,
         num_experts_per_tok=2,
         moe_intermediate_size=128,
@@ -2474,6 +2475,73 @@ def test_checkpoint_requires_every_local_constituent(monkeypatch, missing, tmp_p
         model.load_weights(rest.items())
     MoELayer.process_weights_after_loading.assert_not_called()
     assert not hasattr(model, "checkpoint_load_report")
+
+
+def _expert_subset_checkpoint(config, experts):
+    """Checkpoint with ``experts`` routed experts for a model that keeps fewer."""
+    full = copy(config)
+    full.n_routed_experts = experts
+    return _checkpoint(full)
+
+
+def test_expert_subset_loads_the_first_experts_of_a_wider_checkpoint(
+    monkeypatch, tmp_path
+):
+    """num_checkpoint_experts keeps the checkpoint's first routed experts: the
+    router keeps their rows and the other experts are never read."""
+    config = _loader_config()
+    config.num_checkpoint_experts = 8
+    with set_default_torch_dtype(torch.bfloat16):
+        model = _loader_model(monkeypatch, config, 1, "cpu")
+    weights = _expert_subset_checkpoint(config, 8)
+    left_out = [
+        n for n in weights if re.match(r"layers\.\d+\.ffn\.experts\.[4-7]\.", n)
+    ]
+    assert len(left_out) == 3 * 3 * 2 * 4
+    assert not any(model.checkpoint_weight_name_filter(n) for n in left_out)
+    assert model.checkpoint_weight_name_filter("layers.0.ffn.experts.3.w1.weight")
+    rest = _bind_engram_tables(model, weights, tmp_path)
+    model.load_weights(rest.items())
+    assert model.checkpoint_load_report["skipped"]["left_out_expert"] == len(left_out)
+    for i, layer in enumerate(model.model.layers):
+        torch.testing.assert_close(
+            layer.ffn.gate.weight,
+            weights[f"layers.{i}.ffn.gate.weight"][:4],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            layer.ffn.gate.e_score_correction_bias,
+            weights[f"layers.{i}.ffn.gate.bias"][:4],
+            rtol=0,
+            atol=0,
+        )
+        # EP rank 1 of 4 holds expert 1.
+        expert = weights[f"layers.{i}.ffn.experts.1.w2.weight"].view(torch.uint8)
+        torch.testing.assert_close(
+            layer.ffn.experts.w2_weight[0][:, : expert.shape[1]], expert, rtol=0, atol=0
+        )
+
+
+def test_expert_subset_keeps_the_strict_checkpoint_check(monkeypatch, tmp_path):
+    config = _loader_config()
+    model = _loader_model(monkeypatch, config, 0, "cpu")
+    # Without the override a wider checkpoint is a wrong checkpoint.
+    rest = _bind_engram_tables(model, _expert_subset_checkpoint(config, 8), tmp_path)
+    with pytest.raises(ValueError, match=r"gate.weight: expected \(4, 128\)"):
+        model.load_weights(rest.items())
+    # The declared checkpoint width must match the router rows.
+    config.num_checkpoint_experts = 6
+    model = _loader_model(monkeypatch, config, 0, "cpu")
+    (tmp_path / "wider").mkdir()
+    rest = _bind_engram_tables(
+        model, _expert_subset_checkpoint(config, 8), tmp_path / "wider"
+    )
+    with pytest.raises(ValueError, match="expected 6 expert rows"):
+        model.load_weights(rest.items())
+    config.num_checkpoint_experts = 2
+    with pytest.raises(ValueError, match="num_checkpoint_experts"):
+        model.checkpoint_weight_name_filter("layers.0.ffn.experts.0.w1.weight")
 
 
 def test_load_weights_rejects_engram_embed_in_iterator(monkeypatch):

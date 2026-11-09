@@ -2179,7 +2179,37 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 "image_end",
                 "image_newline",
             )
-        return not is_engram_embed_checkpoint_name(self._checkpoint_name(name))
+        raw = self._checkpoint_name(name)
+        return not (
+            is_engram_embed_checkpoint_name(raw) or self._is_left_out_expert(raw)
+        )
+
+    def _expert_subset(self) -> bool:
+        """Whether the model keeps only the checkpoint's first routed experts.
+
+        ``num_checkpoint_experts`` (unset unless overridden) is the checkpoint's
+        routed expert count when the model builds only ``n_routed_experts`` of
+        them: the router weights and biases keep their first rows, and the
+        other experts are never read.
+        """
+        config = self.model.config
+        if config.num_checkpoint_experts is None:
+            return False
+        if config.num_checkpoint_experts < config.n_routed_experts:
+            raise ValueError(
+                f"num_checkpoint_experts ({config.num_checkpoint_experts}) must be "
+                f">= n_routed_experts ({config.n_routed_experts})"
+            )
+        return True
+
+    def _is_left_out_expert(self, name: str) -> bool:
+        if not self._expert_subset():
+            return False
+        match = re.match(r"layers\.\d+\.ffn\.experts\.(\d+)\.", name)
+        config = self.model.config
+        return match is not None and (
+            config.n_routed_experts <= int(match[1]) < config.num_checkpoint_experts
+        )
 
     def resolve_lm_head(self, config, quant_config, prefix):
         """Keep the checkpoint head unquantized in the model loading dtype."""
@@ -2325,6 +2355,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             return "vision"
         if name.startswith("mtp."):
             return "draft"
+        if self._is_left_out_expert(name):
+            return "left_out_expert"
         match = re.fullmatch(r"layers\.(\d+)\.ffn\.gate\.bias_vl", name)
         if (
             match
@@ -2436,6 +2468,17 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             if reason is not None:
                 skipped[reason] += 1
                 continue
+            if self._expert_subset() and re.fullmatch(
+                r"layers\.\d+\.ffn\.gate\.(weight|bias|bias_vl)", name
+            ):
+                # Router rows of the kept experts; the full-size check below
+                # still rejects a checkpoint with fewer experts.
+                if tensor.shape[0] != config.num_checkpoint_experts:
+                    raise ValueError(
+                        f"{raw_name}: expected {config.num_checkpoint_experts} "
+                        f"expert rows, got {tensor.shape[0]}"
+                    )
+                tensor = tensor[: config.n_routed_experts]
             expert = re.fullmatch(
                 r"layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)", name
             )
