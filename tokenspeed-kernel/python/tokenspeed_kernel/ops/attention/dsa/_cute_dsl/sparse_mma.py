@@ -1581,34 +1581,40 @@ class _Combine:
 
 
 MAX_SPLITS = 16
+MAX_CHUNKS = 8  # chunks per selection (the Triton core's count)
 
 
 def plan_launch(tokens: int, heads: int, num_sms: int) -> tuple[int, int]:
     """``(block_h, num_splits)`` for a batch of ``tokens`` queries.
 
-    Neither value changes the result. The head tile follows the Triton rule
-    (``_triton.sparse_mma.plan_launch``): 32 heads share a gathered tile once
-    there are enough CTAs, 16 below that. Splitting a token's chunks over
-    several CTAs only pays while the unsplit CTAs leave many SMs idle (one CTA
-    fills an SM): up to 8 tokens it aims at about 2/3 of the SMs; above that it
-    splits only while there are fewer unsplit CTAs than half the SMs (32-head
-    CTAs) or than the SMs (16-head CTAs, half the warps), aiming at 2.75 CTAs
-    per SM. Measured on an RTX PRO 6000 (188 SMs): past those counts the
-    stored chunk states of a split cost more than the extra CTAs gain.
+    Neither value changes the result. 32 heads share a gathered tile once the
+    32-head CTAs alone can cover the SMs, 16 below that (the Triton rule,
+    ``_triton.sparse_mma.plan_launch``, switches at two thirds of the SMs; a
+    16-head CTA wins at that crossing by 1.07-1.14x).
+
+    A CTA fills an SM, so a launch runs in waves of ``num_sms`` CTAs, and a
+    split CTA takes a run of ``MAX_CHUNKS / num_splits`` chunks. The split is
+    the one with the fewest chunk times, ``waves * chunks per CTA`` (ties go to
+    fewer splits, which store fewer chunk states): one more CTA than SMs costs
+    a whole second wave (BF16, 32 programs: 8 splits 52 us, 4 splits 47 us,
+    unsplit 140 us). A split is taken only if it needs at least 1.25x (16-head
+    CTAs) or 1.5x (32-head CTAs) fewer chunk times than unsplit, because the
+    stored states cost what the model does not count (16-head BF16, 512
+    tokens: 4 splits are 0.76x of unsplit). Measured on an RTX PRO 6000 (188 SMs) over decode
+    batches of 1-192 tokens at 16-128 heads, E4M3 and BF16: never slower than
+    the earlier rule (target CTA counts of 2/3 and 2.75 SMs), 1.05-1.6x faster
+    at the points where that rule left a wave nearly empty.
     """
-    wide_tiles = -(-heads // 32) * tokens * MAX_SPLITS >= num_sms * 2 // 3
+    wide_tiles = -(-heads // 32) * tokens * MAX_SPLITS >= num_sms
     block_h = 32 if heads > 16 and wide_tiles else 16
     programs = -(-heads // block_h) * tokens
-    # A 16-head CTA has half the warps, so it stays split until the unsplit
-    # CTAs alone cover every SM.
-    unsplit_from = num_sms // 2 if block_h == 32 else num_sms
-    if tokens <= 8:
-        target = num_sms * 2 // 3
-    elif programs >= unsplit_from:
-        return block_h, 1
-    else:
-        target = num_sms * 11 // 4
-    return block_h, min(max(round(target / programs), 1), MAX_SPLITS)
+    chunk_times = {
+        splits: -(-programs * splits // num_sms) * (MAX_CHUNKS // splits)
+        for splits in (1, 2, 4, MAX_CHUNKS)
+    }
+    best = min((times, splits) for splits, times in chunk_times.items())[1]
+    margin = 1.25 if block_h == 16 else 1.5
+    return block_h, (best if chunk_times[best] * margin < chunk_times[1] else 1)
 
 
 def rows_for(fp8: bool) -> int:

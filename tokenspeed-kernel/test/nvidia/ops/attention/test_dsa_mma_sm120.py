@@ -617,6 +617,36 @@ def test_cute_plan_follows_tokens_and_heads_only():
             assert 1 <= splits <= cute_sparse_mma.MAX_SPLITS
 
 
+@on_cute
+def test_cute_plan_does_not_start_a_second_wave_for_a_few_ctas():
+    """A CTA fills an SM: a split that spills a few CTAs into a second wave
+    costs a whole wave (BF16, 32 programs: 8 splits 52 us, 4 splits 47 us)."""
+    sms = 188
+    chunks = cute_sparse_mma.MAX_CHUNKS
+    assert chunks == sparse_mma.MAX_CHUNKS
+    # 32 programs of 32 heads: 8 splits would be 256 CTAs, 4 splits one wave.
+    assert cute_plan_launch(32, 32, sms) == (32, 4)
+    # 24 programs: 8 splits are 192 CTAs, four more than the SMs.
+    assert cute_plan_launch(24, 32, sms) == (32, 4)
+    # Under a wave the split is the widest.
+    assert cute_plan_launch(20, 32, sms) == (32, chunks)
+    assert cute_plan_launch(1, 128, sms) == (16, chunks)
+    # 16-head CTAs at the crossing where 32-head CTAs would not fill the GPU.
+    assert cute_plan_launch(8, 32, sms)[0] == 16
+    assert cute_plan_launch(4, 64, sms)[0] == 16
+    assert cute_plan_launch(2, 128, sms)[0] == 16
+    for tokens in range(1, 700):
+        for heads in (16, 24, 32, 64, 128):
+            block_h, splits = cute_plan_launch(tokens, heads, sms)
+            assert splits in (1, 2, 4, chunks)
+            programs = -(-heads // block_h) * tokens
+            # Never more chunk times (waves x chunks per CTA) than unsplit.
+            assert (
+                -(-programs * splits // sms) * (chunks // splits)
+                <= -(-programs // sms) * chunks
+            )
+
+
 @on_sm120
 @on_cute
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
