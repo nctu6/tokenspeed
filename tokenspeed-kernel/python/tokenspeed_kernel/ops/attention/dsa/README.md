@@ -380,12 +380,38 @@ the choice depends on the dtypes only. Design:
   fragments directly. The chunked fold and the split combine are the Triton
   scheme (chunks by width, ordered fold with explicit `fma`, the same helper in
   both kernels), so rows are bitwise the same for any batch, head tile or
-  split. `plan_launch` splits only while the unsplit CTAs leave many SMs idle.
+  split. `plan_launch` models the launch in waves of one CTA per SM and picks
+  the split (1, 2, 4 or 8 CTAs per token) with the fewest chunk times, `waves x
+  chunks per CTA`, taking a split only if it needs 1.25x (16-head CTAs) or
+  1.5x (32-head CTAs) fewer than unsplit; 32-head CTAs start once they alone
+  fill the SMs. One CTA more than SMs costs a whole second wave (BF16, 32
+  programs: 8 splits 52 us, 4 splits 47 us, unsplit 140 us). Over 140 decode
+  shapes (1-192 tokens, 16-128 heads) this is 1.05x (BF16) / 1.04x (E4M3)
+  faster than the earlier target-CTA-count rule, worst 0.97x (noise), up to
+  1.63x where that rule left a wave nearly empty or stayed unsplit at 96-192
+  CTAs; large batches (128-2048 tokens) 1.02x. Rows are bitwise the same.
 * Binaries are keyed by dtype, head tile, rank and RoPE width; token count,
   heads, width, strides, chunk and split counts are runtime arguments
   (`test_cute_batch_size_does_not_recompile`). Compilation happens on first
   use, which the CUDA-graph warm-up runs cover.
 
+What bounds the BF16 core (task 24 ablations, 128 heads, 2048-token prefill,
+6.1 ms, BF16 CuTe core): removing the whole partial-score exchange (store,
+barrier, sum) gives 5.1 ms, every MMA 4.9 ms, the score MMAs alone 4.9 ms, the
+PV MMAs alone 5.3 ms, the gathers alone 6.0 ms (no change), gathers + exchange
++ MMAs 2.6 ms. So the exchange is 17%, not the cause of the 48%: the CTA is
+bound by a chain per tile (wait, scores, exchange barrier, softmax, PV) that
+two warps per scheduler cannot overlap, and by the L2 -> SM gather (4.8 ms
+floor with `cp.async`, 3.2-4.0 TB/s). Tried and lost: a bulk copy per row
+(`cp.async.bulk` + mbarrier, zero-fill of absent rows by the owner thread) has
+a 3.8 ms gather floor but the whole kernel is 1.12x slower (6.85 vs 6.13 ms);
+a 1-stage ring with 2 CTAs per SM (V4, 16 heads, 8 warps) is 0.55-0.82x of the
+Triton leaf (the 2-stage 8-warp CTA: 0.76-1.10x); 16 chunks
+per selection (a CuTe-only chunk count) makes one-request decode 1.3-1.46x
+faster (BF16 20.3 -> 14.2 us, E4M3 13.1 -> 9.8 us at 16-32 heads) but costs
+0.8-0.9x at 4-64 tokens, where every chunk state is stored, so it cannot be
+chosen without following the batch. A 3-stage ring or a key split for BF16
+needs the query next to the ring in 99 KiB, which does not fit.
 Measured (same 64 buckets, CUDA graph, `bench_dsa_mma_sm120.py`), CuTe against
 the Triton core: E4M3 1.91x geomean (1.49-2.34x), BF16 1.16x (1.00-1.42x), no
 bucket slower; against the Triton core before task 17 1.92x / 1.44x, against

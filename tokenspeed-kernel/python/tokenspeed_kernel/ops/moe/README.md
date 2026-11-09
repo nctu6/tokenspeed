@@ -417,7 +417,16 @@ tokens): MegaMoE DP2/EP2 prefills 1.25x faster than Marlin TP2 (18.1-18.6K vs
 reads every dense weight on each GPU (+2.6 ms per step at 2 requests), and the
 MegaMoE glue around the grouped GEMMs (barriers, push, dispatch, gather,
 SwiGLU, return, combine) adds 2.3 ms per step while the GEMMs tie Marlin
-(DeepGEMM `deepgemm-analysis.md` 9.29).
+(DeepGEMM `deepgemm-analysis.md` 9.29). A graph timeline of one call at 2
+tokens per rank (V4.1 shapes, cold weights, 195 us) puts the glue on the
+critical path at about 25 us: 13 us before the first GEMM (input staging 2,
+push 2, barrier 3, dispatch 2, gather 4), 2 us between the GEMMs (SwiGLU runs
+under the GEMM's PDL tail) and 10 us after the second (return 4, barrier 3,
+combine 3). Fusing push + barrier + dispatch + gather and return + barrier +
+combine would save about 9 us per layer, 0.36 ms per step (2.6% of the 13.9 ms
+TPOT); the GEMMs are 165 us. Not done: the barrier skew between ranks, which
+is most of the 0.8-1.05 ms the serving trace shows for the two barriers, does
+not shrink with fusion.
 
 ## Triton MXFP4 expert offsets
 The Triton MXFP4 stage kernels advance every expert base (weights, scales,

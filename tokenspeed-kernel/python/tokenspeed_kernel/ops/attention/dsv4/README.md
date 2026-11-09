@@ -136,6 +136,17 @@ floor). The only losses are window-only selections (128 rows) of 1-2 tokens,
 row's bits with its batch, so they stay. More chunks (8) help only below 16
 tokens (10.9 vs 13.7 us at one token) and cost from 16 tokens, and the count
 may not follow the batch; fewer (1-2) lose 2-3x below 16 tokens. Kept 4.
+`plan_launch` was re-swept (task 24, 3 head counts x 14 token counts x both
+head tiles x 1/2/4 splits, widths 640 and 128): the best (tile, split) per
+point is only 1.01x better than the shipped rule, and the DSA wave model loses
+(0.97x geomean at width 128), so only 4 chunks of 5 tiles are planned by the
+two-thirds rule. 16 heads with an 8-warp CTA (two channel splits per head
+group, 32-row tiles, 16 KB exchange) is correct and 1.08-1.10x faster than the
+4-warp CTA at 1-16 tokens, 0.92-0.93x of Triton at 64-128 tokens and 0.86x at
+2048 (0.76x for window-only rows): better than the 4-warp CTA (0.77x at 2048)
+but still behind Triton from 64 tokens, and a leaf that follows the batch would
+change rows, so 16 heads stay on Triton. Its score sum has 8 partials, so it
+would also not equal the 4-warp CTA bit for bit.
 
 V4.1 prefill reaches this core too: the SM120 selected-attention leaf
 (`triton_dsv41_mma_selected_attention`) hands its gathered BF16 workspace to
