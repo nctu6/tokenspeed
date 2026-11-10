@@ -434,9 +434,9 @@ prefill graphs off, median of 9, TPOT from 257 tokens):
 | Path | Prefill tok/s | TPOT ms |
 |---|---|---|
 | Marlin TP2 (`auto`) | 15.1K | 10.69 |
-| MegaMoE, attention TP2 + MoE TP2 | 16.9K (1.12x) | 10.66 |
+| MegaMoE, attention TP2 + MoE TP2 | 17.0K (1.12x) | 10.66 |
 | MegaMoE, attention TP2 + EP2 | 16.8K (1.11x) | 11.22 |
-| MegaMoE, attention DP2 + EP2 | 19.1K (1.26x) | 13.90 |
+| MegaMoE, attention DP2 + EP2 | 19.1K (1.26x) | 14.02 |
 
 The TP2 attention path removes the DP penalty (every DP rank reads the whole
 dense model, +2.6 ms) and the barrier / push / return glue, but an EP range
