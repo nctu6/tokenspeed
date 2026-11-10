@@ -138,13 +138,17 @@ _MEGA_MOE_TRAITS = {
 }
 
 
-def _select_mega_moe(platform: PlatformInfo, **traits):
+def _select_mega_moe(platform: PlatformInfo, drop=(), **traits):
     return select_kernel(
         "moe",
         "apply",
         format_signature(x=dense_tensor_format(torch.bfloat16)),
         platform=platform,
-        traits={**_MEGA_MOE_TRAITS, **traits},
+        traits={
+            name: value
+            for name, value in {**_MEGA_MOE_TRAITS, **traits}.items()
+            if name not in drop
+        },
         solution="mega_moe",
     )
 
@@ -185,7 +189,7 @@ def test_sm120_mega_moe_leaf_follows_the_deepgemm_build(
     assert not spec.capability.satisfied_by(b200_platform)
     assert _select_mega_moe(sm120_platform).name == name
     # Not for other EP sizes or widths
-    for traits in ({"ep_size": 4}, {"ep_size": 1}, {"hidden": 4224}, {"ispp": 2000}):
+    for traits in ({"ep_size": 4}, {"hidden": 4224}, {"ispp": 2000}):
         with pytest.raises(Exception):
             _select_mega_moe(sm120_platform, **traits)
     # V4.1's 2304-wide experts need no padding to 2560 there
@@ -206,6 +210,15 @@ def test_sm120_mega_moe_serves_replicated_tokens_and_sm100_does_not(
     assert _select_mega_moe(sm120_platform, ep_token_layout="replicated").name == name
     with pytest.raises(Exception):
         _select_mega_moe(sm120_platform, ep_token_layout="gathered")
+    # Under MoE TP the experts are not split over ranks (no EP in the plan) and
+    # each rank holds a slice of every expert: V4.1's 1152 per rank at TP 2
+    tp_shard = {"ep_size": 1, "ep_token_layout": "replicated", "ispp": 1152}
+    assert (
+        _select_mega_moe(
+            sm120_platform, drop=("supports_ep",), hidden=5120, **tp_shard
+        ).name
+        == name
+    )
     if KernelRegistry.get().get_by_name("deep_gemm_mxfp4_mega_moe_apply") is not None:
         with pytest.raises(Exception):
             _select_mega_moe(

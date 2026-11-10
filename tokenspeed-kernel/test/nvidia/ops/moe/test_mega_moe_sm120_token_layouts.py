@@ -21,10 +21,11 @@
 
 ``scattered``: each rank brings its own tokens and the kernel pushes them to the
 experts' ranks (attention DP). ``replicated``: both ranks hold the same tokens
-and each runs only its own experts, one rank alone with the other experts'
-routes masked; the caller sums the two partials (attention TP). For the same
-tokens the two layouts must agree with each other and with a float reference, and
-the replicated call must replay in a CUDA graph.
+and each runs its own shard of the experts, one rank alone; the caller sums the
+two partials (attention TP). The shard is half of the experts (EP: the other
+experts' routes are masked slots) or half of every expert's intermediate width
+(MoE TP). For the same tokens the layouts must agree with each other and with a
+float reference, and the replicated calls must replay in a CUDA graph.
 
 Needs two SM120 GPUs, so normal one-GPU pytest runs skip it:
 ``torchrun --standalone --nproc-per-node=2 -m pytest -q <this file>``
@@ -68,22 +69,42 @@ class _Swiglu:
 class _Experts(torch.nn.Module):
     """The attributes the MegaMoE leaf reads from a ``MoELayer``."""
 
-    def __init__(self, raw: dict[str, torch.Tensor], rank: int, num_local: int):
+    def __init__(self, raw: dict[str, torch.Tensor], rank: int, shard: str):
+        """``shard``: "ep" holds half of the experts, "tp" half of every expert."""
         super().__init__()
-        lo, hi = rank * num_local, (rank + 1) * num_local
-        for name in ("w13_weight", "w2_weight"):
-            setattr(self, name, torch.nn.Parameter(raw[name][lo:hi].clone(), False))
-        self.w13_weight_scale = torch.nn.Parameter(
-            raw["w13_scale"][lo:hi].clone(), False
-        )
-        self.w2_weight_scale = torch.nn.Parameter(raw["w2_scale"][lo:hi].clone(), False)
+        if shard == "ep":
+            num_local = NUM_EXPERTS // 2
+            lo, hi = rank * num_local, (rank + 1) * num_local
+            w13, w13_scale = raw["w13_weight"][lo:hi], raw["w13_scale"][lo:hi]
+            w2, w2_scale = raw["w2_weight"][lo:hi], raw["w2_scale"][lo:hi]
+        else:
+            num_local = NUM_EXPERTS
+            half = INTERMEDIATE // 2
+            rows = torch.arange(2 * INTERMEDIATE, device="cuda")
+            rows = torch.cat(
+                [
+                    rows[rank * half : (rank + 1) * half],
+                    rows[INTERMEDIATE + rank * half : INTERMEDIATE + (rank + 1) * half],
+                ]
+            )
+            w13, w13_scale = raw["w13_weight"][:, rows], raw["w13_scale"][:, rows]
+            # K of the down projection is packed two per byte, scaled per 32
+            w2 = raw["w2_weight"][:, :, rank * half // 2 : (rank + 1) * half // 2]
+            w2_scale = raw["w2_scale"][
+                :, :, rank * half // 32 : (rank + 1) * half // 32
+            ]
+        self.w13_weight = torch.nn.Parameter(w13.clone(), False)
+        self.w13_weight_scale = torch.nn.Parameter(w13_scale.clone(), False)
+        self.w2_weight = torch.nn.Parameter(w2.clone(), False)
+        self.w2_weight_scale = torch.nn.Parameter(w2_scale.clone(), False)
         self.hidden_size = HIDDEN
         self.intermediate_size = INTERMEDIATE
         self.top_k = TOP_K
         self.num_experts = NUM_EXPERTS
         self.num_local_experts = num_local
-        self.ep_rank = rank
-        self.ep_size = NUM_EXPERTS // num_local
+        self.ep_rank = rank if shard == "ep" else 0
+        self.ep_size = 2 if shard == "ep" else 1
+        self.tp_size = 2 if shard == "tp" else 1
         self.swiglu_arg = _Swiglu(alpha=None, limit=LIMIT)
 
 
@@ -110,16 +131,15 @@ def _reference(x, raw, topk_ids, topk_weights) -> torch.Tensor:
     return out
 
 
-def _plan_and_experts(raw, rank, layout, group):
-    num_local = NUM_EXPERTS // 2
-    experts = _Experts(raw, rank, num_local)
+def _plan_and_experts(raw, rank, layout, shard, group):
+    experts = _Experts(raw, rank, shard)
     plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
         routing_mode="precomputed_topk",
-        ep_size=2,
-        ispp=INTERMEDIATE,
+        ep_size=experts.ep_size,
+        ispp=INTERMEDIATE // experts.tp_size,
         hidden=HIDDEN,
         num_experts=NUM_EXPERTS,
         top_k=TOP_K,
@@ -179,10 +199,13 @@ def test_replicated_tokens_match_scattered_tokens_and_a_float_reference() -> Non
     # The one-rank group of this rank; every rank creates every group, in order.
     solo_groups = [dist.new_group([r]) for r in range(2)]
     scattered_plan, scattered_experts = _plan_and_experts(
-        raw, rank, "scattered", dist.group.WORLD
+        raw, rank, "scattered", "ep", dist.group.WORLD
     )
     replicated_plan, replicated_experts = _plan_and_experts(
-        raw, rank, "replicated", solo_groups[rank]
+        raw, rank, "replicated", "ep", solo_groups[rank]
+    )
+    tp_plan, tp_experts = _plan_and_experts(
+        raw, rank, "replicated", "tp", solo_groups[rank]
     )
 
     # One token set on both ranks, with routes of every kind: spread over both
@@ -211,8 +234,10 @@ def test_replicated_tokens_match_scattered_tokens_and_a_float_reference() -> Non
             max_num_tokens_per_gpu=tokens.shape[0],
         )
 
-    def replicated(tokens, ids, weights):
-        partial = run(replicated_plan, replicated_experts, tokens, ids, weights)
+    def replicated(
+        tokens, ids, weights, plan=replicated_plan, experts=replicated_experts
+    ):
+        partial = run(plan, experts, tokens, ids, weights)
         dist.all_reduce(partial)
         return partial
 
@@ -227,6 +252,7 @@ def test_replicated_tokens_match_scattered_tokens_and_a_float_reference() -> Non
     scattered_out = torch.cat(gathered)
 
     replicated_out = replicated(x, topk_ids, topk_weights)
+    tp_out = replicated(x, topk_ids, topk_weights, tp_plan, tp_experts)
     expected = _reference(x, raw, topk_ids, topk_weights)
 
     # The sum of the two partials differs from the in-kernel FP32 combine by the
@@ -237,8 +263,14 @@ def test_replicated_tokens_match_scattered_tokens_and_a_float_reference() -> Non
     assert float((replicated_out.float() - scattered_out.float()).abs().max()) < (
         2**-6 * peak
     )
-    # Both are FP8-activation kernels against a float reference.
+    # The TP shard sums each expert's two halves of the down projection, and
+    # quantizes the same activations: it differs from the EP shard by BF16
+    # rounding of the partials too.
+    assert _relative_error(tp_out, scattered_out) < 2**-8
+    assert float((tp_out.float() - scattered_out.float()).abs().max()) < 2**-6 * peak
+    # All are FP8-activation kernels against a float reference.
     assert _relative_error(replicated_out, expected) < 0.05
+    assert _relative_error(tp_out, expected) < 0.05
     assert _relative_error(scattered_out, expected) < 0.05
 
     # Rank 1's experts alone serve the third block: rank 0's partial is zero.
@@ -256,29 +288,27 @@ def test_replicated_tokens_match_scattered_tokens_and_a_float_reference() -> Non
         assert partial.float().abs().max() > 0
 
     # Deterministic, and a captured graph replays with new inputs.
-    again = replicated(x, topk_ids, topk_weights)
-    assert torch.equal(again, replicated_out)
-    graph = torch.cuda.CUDAGraph()
-    static_x = x[:48].clone()
-    static_ids = topk_ids[:48].clone()
-    static_weights = topk_weights[:48].clone()
-    torch.cuda.synchronize()
-    with torch.cuda.graph(graph):
-        static_out = run(
-            replicated_plan, replicated_experts, static_x, static_ids, static_weights
-        )
-    static_x.copy_(x[48:96])
-    static_ids.copy_(topk_ids[48:96])
-    static_weights.copy_(topk_weights[48:96])
-    graph.replay()
-    eager = run(
-        replicated_plan,
-        replicated_experts,
-        x[48:96],
-        topk_ids[48:96],
-        topk_weights[48:96],
+    assert torch.equal(replicated(x, topk_ids, topk_weights), replicated_out)
+    assert torch.equal(
+        replicated(x, topk_ids, topk_weights, tp_plan, tp_experts), tp_out
     )
-    assert torch.equal(static_out, eager)
+    for plan, experts in (
+        (replicated_plan, replicated_experts),
+        (tp_plan, tp_experts),
+    ):
+        graph = torch.cuda.CUDAGraph()
+        static_x = x[:48].clone()
+        static_ids = topk_ids[:48].clone()
+        static_weights = topk_weights[:48].clone()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            static_out = run(plan, experts, static_x, static_ids, static_weights)
+        static_x.copy_(x[48:96])
+        static_ids.copy_(topk_ids[48:96])
+        static_weights.copy_(topk_weights[48:96])
+        graph.replay()
+        eager = run(plan, experts, x[48:96], topk_ids[48:96], topk_weights[48:96])
+        assert torch.equal(static_out, eager)
     dist.barrier()
 
 

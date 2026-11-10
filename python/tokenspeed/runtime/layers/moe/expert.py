@@ -373,8 +373,14 @@ class MoELayer(torch.nn.Module):
             mapping = global_server_args_dict["mapping"]
             if ep_token_layout == "replicated":
                 # Every rank holds the same tokens: the kernel runs alone over
-                # this rank's experts and the caller sums the partials.
-                mega_group = mapping.moe.tp_group
+                # this rank's shard of the experts and the caller sums the
+                # partials. Mixed TP x EP is not served, so one of the two MoE
+                # groups is this rank alone.
+                mega_group = (
+                    mapping.moe.tp_group
+                    if mapping.moe.tp_size == 1
+                    else mapping.moe.ep_group
+                )
             else:
                 # Each rank brings its own tokens: the kernel spans the EP ranks.
                 mega_group = mapping.moe.ep_group

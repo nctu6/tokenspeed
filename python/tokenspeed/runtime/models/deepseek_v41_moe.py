@@ -274,11 +274,13 @@ class DeepseekV4MoE(nn.Module):
         self.use_mega_moe = moe_backend.is_mega_moe()
         self.use_gluon_petit = moe_backend.is_gluon_petit()
         # MegaMoE meets the tokens one of two ways (moe_plan ep_token_layout).
-        # With attention TP every EP rank already holds the same tokens: the
-        # kernel runs this rank's experts over all of them and returns a
-        # partial, so the layer is a normal EP layer (shared expert shard,
-        # then the TP-EP all-reduce). With attention DP each rank brings its
-        # own tokens and the kernel pushes them to the experts' ranks.
+        # With attention TP every rank of the MoE group already holds the same
+        # tokens: the kernel runs this rank's shard of the experts (an expert
+        # range under EP, a slice of every expert under MoE TP) over all of
+        # them and returns a partial, so the layer is a normal TP / EP layer
+        # (shared expert shard, then the TP-EP all-reduce). With attention DP
+        # each rank brings its own tokens and the kernel pushes them to the
+        # experts' ranks.
         self.ep_token_layout: str | None = None
         if self.use_mega_moe:
             self.ep_token_layout = (
@@ -306,10 +308,10 @@ class DeepseekV4MoE(nn.Module):
                     "precomputed routing."
                 )
         if self.use_mega_moe:
-            if mapping.moe.ep_size <= 1:
-                raise ValueError("DeepSeek V4 MegaMoE requires expert parallelism.")
-            if mapping.moe.tp_size != 1:
+            if mapping.moe.tp_size > 1 and mapping.moe.ep_size > 1:
                 raise ValueError("DeepSeek V4 MegaMoE does not support mixed TP/EP.")
+            if mapping.moe.ep_size <= 1 and self.ep_token_layout == "scattered":
+                raise ValueError("DeepSeek V4 MegaMoE requires expert parallelism.")
             if global_server_args_dict.get("ep_num_redundant_experts", 0):
                 raise ValueError(
                     "DeepSeek V4 MegaMoE does not support redundant EP experts."
