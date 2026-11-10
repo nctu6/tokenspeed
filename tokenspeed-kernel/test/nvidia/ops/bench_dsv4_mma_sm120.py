@@ -81,10 +81,12 @@ def _run(tokens: int, heads: int, width: int, rows: int) -> None:
 
 
 def main() -> None:
-    for heads in (32, 64, 128):
+    # 16 heads is the Triton leaf's (the CuTe leaf loses to it by token count).
+    for heads in (16, 32, 64, 128):
         for tokens, width, rows in (
             (1, 640, 4096),
             (16, 640, 20000),
+            (64, 640, 20000),
             (128, 640, 100000),
             (512, 640, 4096),
             (2048, 640, 8192),

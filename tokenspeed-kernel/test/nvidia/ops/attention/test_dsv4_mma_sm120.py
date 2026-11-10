@@ -242,12 +242,13 @@ def test_cute_sink_with_lse_and_rows_that_attend_nothing(tokens, index_dtype):
     indices[1::4] = -1
     out = torch.empty_like(q)
     lse = torch.empty(tokens, heads, device="cuda")
-    block_h, splits = cute_sparse_mma.plan_launch(
-        tokens, heads, Platform.get().sm_count
+    block_h, cwarps, splits, full_tokens = cute_sparse_mma.plan_launch(
+        tokens, heads, Platform.get().sm_count, width
     )
     cute_sparse_mma.sparse_mma_attention(
         q, kv.reshape(-1, DIM), indices, lens, sink.contiguous(), out, lse,
-        softmax_scale=SCALE, block_h=block_h, num_splits=splits,
+        softmax_scale=SCALE, block_h=block_h, cwarps=cwarps, num_splits=splits,
+        full_tokens=full_tokens,
     )  # fmt: skip
     ref_out, ref_lse = _reference(q, kv, indices, lens, sink)
     torch.testing.assert_close(out, ref_out.to(torch.bfloat16), **OUT_TOLERANCE)
@@ -313,8 +314,11 @@ def test_rows_do_not_depend_on_the_batch(leaf, heads):
     sm_count = Platform.get().sm_count
     chunks = sparse_mma.num_chunks_for(640)[1]
     if leaf == CUTE_LEAF:
+        # One token splits every program; 600 tokens run whole CTAs (with a
+        # stream-K tail of split ones for some head counts).
         plans = {
-            cute_sparse_mma.plan_launch(n, heads, sm_count)[1] > 1 for n in (1, 600)
+            cute_sparse_mma.plan_launch(n, heads, sm_count, 640)[3] == 0
+            for n in (1, 600)
         }
     else:
         plans = {
@@ -322,3 +326,95 @@ def test_rows_do_not_depend_on_the_batch(leaf, heads):
             for n in (1, 600)
         }
     assert plans == {True, False}  # both launch shapes were compared
+
+
+def _cute_rows(q, kv, indices, lens, sink, *, block_h, cwarps, splits, full_tokens):
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[0], q.shape[1], device="cuda")
+    cute_sparse_mma.sparse_mma_attention(
+        q, kv.reshape(-1, DIM), indices, lens, sink, out, lse,
+        softmax_scale=SCALE, block_h=block_h, cwarps=cwarps, num_splits=splits,
+        full_tokens=full_tokens,
+    )  # fmt: skip
+    return out, lse
+
+
+@on_sm120
+@on_cute
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_cute_rows_do_not_depend_on_the_launch_shape(index_dtype):
+    """Rows and LSE are bitwise the same for every head tile, warp layout
+    (a 16-head CTA in 4 or 8 warps, or two 4-warp groups), split count and
+    stream-K mix of whole and split tokens."""
+    tokens, heads = 37, 40
+    q, kv, indices, lens, sink = _inputs(tokens, heads, 3000, 640, index_dtype, seed=11)
+    sink = sink.contiguous()
+    shapes = [(16, 4), (16, 8), (32, 4)]
+    reference = _cute_rows(
+        q, kv, indices, lens, sink, block_h=32, cwarps=4, splits=1, full_tokens=tokens
+    )
+    for block_h, cwarps in shapes:
+        for splits in (1, 2, 4):
+            for full_tokens in (tokens, 0, 1, 20, tokens - 1):
+                out, lse = _cute_rows(
+                    q, kv, indices, lens, sink,
+                    block_h=block_h, cwarps=cwarps, splits=splits, full_tokens=full_tokens,
+                )  # fmt: skip
+                assert torch.equal(out, reference[0]), (
+                    block_h,
+                    cwarps,
+                    splits,
+                    full_tokens,
+                )
+                assert torch.equal(lse, reference[1]), (
+                    block_h,
+                    cwarps,
+                    splits,
+                    full_tokens,
+                )
+
+
+@on_sm120
+@on_cute
+@pytest.mark.parametrize("heads", [1, 8, 16])
+def test_cute_eight_warp_cta_with_partial_head_tiles(heads):
+    """A 16-head CTA of 8 warps with fewer live heads than its tile still
+    matches the 4-warp CTA bit for bit and the float32 reference."""
+    q, kv, indices, lens, sink = _inputs(9, heads, 700, 300, torch.int32, seed=5)
+    four = _cute_rows(
+        q, kv, indices, lens, sink, block_h=16, cwarps=4, splits=1, full_tokens=9
+    )
+    eight = _cute_rows(
+        q, kv, indices, lens, sink, block_h=16, cwarps=8, splits=2, full_tokens=3
+    )
+    assert torch.equal(four[0], eight[0]) and torch.equal(four[1], eight[1])
+    ref_out, _ = _reference(q, kv, indices, lens, sink)
+    torch.testing.assert_close(eight[0], ref_out.to(torch.bfloat16), **OUT_TOLERANCE)
+
+
+@on_cute
+@pytest.mark.parametrize("width", [128, 640, 1152])
+@pytest.mark.parametrize("heads", [16, 17, 40, 128])
+def test_cute_plan_is_a_valid_launch(heads, width):
+    chunks = cute_sparse_mma.num_chunks_for(width)[1]
+    for tokens in range(1, 700):
+        block_h, cwarps, splits, full_tokens = cute_sparse_mma.plan_launch(
+            tokens, heads, 188, width
+        )
+        assert block_h in (16, 32) and (heads > 16 or block_h == 16)
+        assert cwarps == (8 if block_h == 16 else 4)
+        assert 1 <= splits <= chunks and 0 <= full_tokens <= tokens
+        assert splits > 1 or full_tokens == tokens
+        # The grid keeps one row per whole token and ``splits`` per split token.
+        assert full_tokens + (tokens - full_tokens) * splits <= 65535
+
+
+@on_cute
+def test_cute_plan_fills_the_last_wave_with_split_programs():
+    """192 programs on 188 SMs: 188 whole CTAs and the other 4 split four ways
+    run in one wave and a short tail, not in two whole-CTA waves."""
+    assert cute_sparse_mma.plan_launch(192, 32, 188, 640) == (32, 4, 4, 188)
+    # A batch that fills the SMs with whole CTAs, and one far below, are unsplit
+    # and split by the uniform rule.
+    assert cute_sparse_mma.plan_launch(188, 32, 188, 640)[2:] == (1, 188)
+    assert cute_sparse_mma.plan_launch(1, 64, 188, 640) == (16, 8, 4, 0)

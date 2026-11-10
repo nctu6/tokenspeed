@@ -39,9 +39,14 @@ Scores, ``S = Q K^T``:
   XOR-swizzled in 16-byte units, which keeps every ``ldmatrix`` and V load
   free of bank conflicts and the CTA within 99 KiB.
 * BF16 (``m16n8k16``): a 64-row tile and the query tile do not both fit, so
-  each warp keeps its quarter of the query channels in registers, scores all
+  each warp keeps its quarter of the query channels in registers, scores the
   32 rows over them, and the four partial sums are added in a fixed order.
-  Rows are padded by 16 bytes for conflict-free fragment loads.
+  Rows are padded by 16 bytes for conflict-free fragment loads. The V4 variant
+  can run a 16-head CTA in 8 warps (``cwarps``): the two warps of a channel
+  quarter split the 32 rows between them (the same MMA sequence per row, so the
+  same partial sums) and the 8 warps split the output channels of ``O += P V``
+  (64 each, half the accumulator). Two warps per scheduler hide the tile chain
+  better; the bits are those of the 4-warp CTA.
 
 The FP32 online softmax runs in registers (every warp of a head group computes
 the same values) and the probabilities are reused as the ``m16n8k16`` A
@@ -432,8 +437,16 @@ class _SparseMma:
         rope: int,
         stages: int,
         v4: tuple[bool, bool] | None = None,
+        cwarps: int = CHANNEL_WARPS,
     ):
         assert block_h in (16, 32) and rank in (128, 512) and rope in (0, 64)
+        # ``cwarps`` warps of a head group split the output channels of
+        # ``O += P V``: 4, or 8 for a 16-head BF16 CTA without RoPE (V4). The
+        # scores always sum four channel quarters, so both give the same bits.
+        assert cwarps == CHANNEL_WARPS or (
+            cwarps == 2 * CHANNEL_WARPS and block_h == 16 and rope == 0 and v4
+        )
+        self.cwarps = cwarps
         # ``v4`` = (sink, wide_ids) selects the DeepSeek V4 variant: BF16 rows
         # of a flat workspace (a page of one row, no divide), strided query and
         # output, row ids checked against the workspace (int32 or int64), and
@@ -452,9 +465,10 @@ class _SparseMma:
         self.head_dim = rank + rope
         self.row_bytes = self.head_dim * self.esize
         self.head_groups = block_h // 16
-        self.num_warps = self.head_groups * CHANNEL_WARPS
+        self.num_warps = self.head_groups * cwarps
         self.num_threads = self.num_warps * 32
-        self.warp_ch = rank // CHANNEL_WARPS  # latent channels per warp
+        self.warp_ch = rank // cwarps  # latent channels per warp (output)
+        self.score_ch = rank // CHANNEL_WARPS  # channels per score quarter
         if fp8:
             # 64-row tiles, rows unpadded and XOR-swizzled in 16-byte units;
             # the query tile lives in shared memory and each warp scores 16
@@ -484,7 +498,7 @@ class _SparseMma:
         self.warp_chunks = self.warp_ch * self.esize // 16
         self.groups = self.warp_ch // self.group_ch
         self.n_tiles = self.groups * self.tpg  # 16 x 8 output tiles per warp
-        self.qk_steps = (self.head_dim // 32) if fp8 else (self.warp_ch // 16)
+        self.qk_steps = (self.head_dim // 32) if fp8 else (self.score_ch // 16)
         self.chunks_per_row = self.row_bytes // 16
         self.threads_per_row = self.num_threads // self.rows
         self.copies_per_thread = -(-self.chunks_per_row // self.threads_per_row)
@@ -493,7 +507,7 @@ class _SparseMma:
             exchange = self.num_warps * 32 * 8 * 4
             q_tile = block_h * self.row_bytes
         else:
-            exchange = self.num_warps * 32 * 16 * 4
+            exchange = self.head_groups * CHANNEL_WARPS * 32 * 16 * 4
             q_tile = 0
         self.q_offset = ring
         self.x_offset = ring + q_tile
@@ -723,15 +737,27 @@ class _SparseMma:
 
     @cute.jit
     def _scores_channel_split(self, s, base, qa, qr, x_addr, hg, cw, lane, g, t):
-        """BF16: all 32 rows over this warp's channels, partials summed in the group."""
+        """BF16: all 32 rows over a channel quarter, partials summed in the group.
+
+        With 4 warps a warp scores all 32 rows over its quarter. With 8 the two
+        warps of a quarter split the rows (``jn`` of the 4 score tiles each);
+        a row's partial is the same sequence of MMAs, so the sum is unchanged.
+        """
         rank = cutlass.const_expr(self.rank)
         rs = cutlass.const_expr(self.row_stride)
+        jn = cutlass.const_expr(4 * CHANNEL_WARPS // self.cwarps)
+        qcw = cw
+        rh = 0
+        if cutlass.const_expr(self.cwarps != CHANNEL_WARPS):
+            qcw = cw % CHANNEL_WARPS
+            rh = cw // CHANNEL_WARPS
         for e in cutlass.range_constexpr(16):
             s[e] = cutlass.Float32(0.0)
         # ldmatrix: lanes 8 m .. 8 m + 7 address rows 8 j + lane % 8 of the
         # m-th 8-channel chunk of a pair of steps.
-        k_lane = (lane % 8) * rs + (cw * self.warp_ch + 8 * (lane // 8)) * 2
-        for j in cutlass.range_constexpr(4):
+        k_lane = (lane % 8) * rs + (qcw * self.score_ch + 8 * (lane // 8)) * 2
+        for jj in cutlass.range_constexpr(jn):
+            j = rh * jn + jj
             row_addr = base + (8 * j + g) * rs
             for kp in cutlass.range_constexpr(self.qk_steps // 2):
                 k0, k1, k2, k3 = _ldsm_x4(base + k_lane + (8 * j * rs + kp * 64))
@@ -750,15 +776,15 @@ class _SparseMma:
                         qa[ks * 4 + 3],
                         b0,
                         b1,
-                        s[4 * j + 0],
-                        s[4 * j + 1],
-                        s[4 * j + 2],
-                        s[4 * j + 3],
+                        s[4 * jj + 0],
+                        s[4 * jj + 1],
+                        s[4 * jj + 2],
+                        s[4 * jj + 3],
                     )
-                    s[4 * j + 0] = d0
-                    s[4 * j + 1] = d1
-                    s[4 * j + 2] = d2
-                    s[4 * j + 3] = d3
+                    s[4 * jj + 0] = d0
+                    s[4 * jj + 1] = d1
+                    s[4 * jj + 2] = d2
+                    s[4 * jj + 3] = d3
             if cutlass.const_expr(self.rope > 0):
                 ch = rank + cw * self.rope_ch
                 b0 = _lds_u32(row_addr + (ch + 2 * t) * 2)
@@ -771,27 +797,30 @@ class _SparseMma:
                     qr[3],
                     b0,
                     b1,
-                    s[4 * j + 0],
-                    s[4 * j + 1],
-                    s[4 * j + 2],
-                    s[4 * j + 3],
+                    s[4 * jj + 0],
+                    s[4 * jj + 1],
+                    s[4 * jj + 2],
+                    s[4 * jj + 3],
                 )
-                s[4 * j + 0] = d0
-                s[4 * j + 1] = d1
-                s[4 * j + 2] = d2
-                s[4 * j + 3] = d3
+                s[4 * jj + 0] = d0
+                s[4 * jj + 1] = d1
+                s[4 * jj + 2] = d2
+                s[4 * jj + 3] = d3
             _sts_v4_f32(
-                x_addr + (((hg * CHANNEL_WARPS + cw) * 4 + j) * 32 + lane) * 16,
-                s[4 * j + 0],
-                s[4 * j + 1],
-                s[4 * j + 2],
-                s[4 * j + 3],
+                x_addr + (((hg * self.cwarps + cw) * jn + jj) * 32 + lane) * 16,
+                s[4 * jj + 0],
+                s[4 * jj + 1],
+                s[4 * jj + 2],
+                s[4 * jj + 3],
             )
-        cute.arch.barrier(barrier_id=1 + hg, number_of_threads=CHANNEL_WARPS * 32)
+        cute.arch.barrier(barrier_id=1 + hg, number_of_threads=self.cwarps * 32)
         for j in cutlass.range_constexpr(4):
             for c in cutlass.range_constexpr(CHANNEL_WARPS):
+                # Quarter c of tile j was scored by warp (j // jn) * 4 + c.
+                owner = cutlass.const_expr((j // jn) * CHANNEL_WARPS + c)
                 p0, p1, p2, p3 = _lds_v4_f32(
-                    x_addr + (((hg * CHANNEL_WARPS + c) * 4 + j) * 32 + lane) * 16
+                    x_addr
+                    + (((hg * self.cwarps + owner) * jn + j % jn) * 32 + lane) * 16
                 )
                 if cutlass.const_expr(c == 0):
                     s[4 * j + 0] = p0
@@ -990,8 +1019,11 @@ class _SparseMma:
         lane = tidx % 32
         g = lane // 4
         t = lane % 4
-        hg = warp // CHANNEL_WARPS  # head group
-        cw = warp % CHANNEL_WARPS  # channel (and, for E4M3 scores, row) group
+        hg = warp // self.cwarps  # head group
+        cw = warp % self.cwarps  # output channel (and, for E4M3 scores, row) group
+        qcw = cw  # score channel quarter
+        if cutlass.const_expr(self.cwarps != CHANNEL_WARPS):
+            qcw = cw % CHANNEL_WARPS
 
         smem = SmemAllocator()
         pool = smem.allocate_tensor(
@@ -1083,7 +1115,7 @@ class _SparseMma:
             for i in cutlass.range_constexpr(4):
                 qr[i] = cutlass.Uint32(0)
             for ks in cutlass.range_constexpr(self.qk_steps):
-                ch = cw * self.warp_ch + ks * 16
+                ch = qcw * self.score_ch + ks * 16
                 off0 = cutlass.Int64((ch + 2 * t) * 2)
                 off1 = cutlass.Int64((ch + 8 + 2 * t) * 2)
                 if live0:
@@ -1668,9 +1700,20 @@ def _tail_end(ready: list[tuple[float, int]], duration: float, count: int) -> fl
 
 
 def _launch_time(
-    programs: int, full: int, splits: int, num_sms: int, unsplit_us: float
+    programs: int,
+    full: int,
+    splits: int,
+    num_sms: int,
+    unsplit_us: float,
+    fixed_us: float = 0.0,
+    split_cta_us: float = _SPLIT_CTA_US,
+    combine_us: float = _COMBINE_US,
 ) -> float:
-    """Modelled time of ``full`` whole programs, then the rest split ``splits`` ways."""
+    """Modelled time of ``full`` whole programs, then the rest split ``splits`` ways.
+
+    ``fixed_us`` of a whole program's ``unsplit_us`` is per-CTA setup that a
+    split CTA pays in full; the rest divides among the splits.
+    """
     waves, last = divmod(full, num_sms)
     ready = [(0.0, num_sms)]
     end = 0.0
@@ -1683,8 +1726,8 @@ def _launch_time(
     tail = programs - full
     if tail == 0:
         return end
-    cta_us = unsplit_us / splits + _SPLIT_CTA_US
-    return max(end, _tail_end(ready, cta_us, tail * splits)) + _COMBINE_US
+    cta_us = fixed_us + (unsplit_us - fixed_us) / splits + split_cta_us
+    return max(end, _tail_end(ready, cta_us, tail * splits)) + combine_us
 
 
 def _uniform_splits(programs: int, block_h: int, num_sms: int) -> int:
@@ -1769,10 +1812,18 @@ def rows_for(fp8: bool) -> int:
     return 64 if fp8 else 32
 
 
-def stages_for(fp8: bool, block_h: int, rank: int, rope: int) -> int:
+def stages_for(
+    fp8: bool,
+    block_h: int,
+    rank: int,
+    rope: int,
+    v4: tuple[bool, bool] | None = None,
+    cwarps: int = CHANNEL_WARPS,
+) -> int:
     """Ring depth: the most tiles (at most 4) that fit 99 KiB of shared memory."""
     for stages in (4, 3, 2):
-        if _SparseMma(fp8, block_h, rank, rope, stages).smem_bytes <= 99 * 1024:
+        core = _SparseMma(fp8, block_h, rank, rope, stages, v4, cwarps)
+        if core.smem_bytes <= 99 * 1024:
             return stages
     raise ValueError("no ring depth fits the shared memory")
 
@@ -1795,6 +1846,7 @@ def compiled_attention(
     rope: int,
     device_index: int,
     v4: tuple[bool, bool, bool] | None = None,
+    cwarps: int = CHANNEL_WARPS,
 ):
     """Compile (once per dtype, head tile, rank and RoPE width) the attention kernel.
 
@@ -1802,13 +1854,13 @@ def compiled_attention(
     DeepSeek V4 variant (``dsv4/_cute_dsl/sparse_mma.py``), whose metadata
     dtypes and sink are compile-time choices.
     """
-    stages = stages_for(fp8, block_h, rank, rope)
+    stages = stages_for(fp8, block_h, rank, rope, v4 and v4[:2], cwarps)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     wide_ids = bool(v4 and v4[1])
     wide_lens = bool(v4 and v4[2])
     with torch.cuda.device(device_index):
         return cute.compile(
-            _SparseMma(fp8, block_h, rank, rope, stages, v4 and v4[:2]),
+            _SparseMma(fp8, block_h, rank, rope, stages, v4 and v4[:2], cwarps),
             # The V4 variant takes the query and output as addresses.
             cutlass.Int64(0) if v4 else _fake(cutlass.Uint8, 16),
             cutlass.Int64(0),

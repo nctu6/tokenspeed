@@ -34,6 +34,12 @@ is key and value at once. What the variant changes:
   fold sees and rows with no live key still return the sink-only state. It
   joins the denominator only.
 
+A 16-head CTA runs 8 warps (``cwarps``) and a 32-head CTA 8 warps as two head
+groups of 4. The 16-head CTA splits the rows of the score tiles between two
+warps per channel quarter and the output channels between all 8, so it adds
+the same four channel quarters in the same order: its rows are bitwise those of
+a 4-warp CTA.
+
 Numerics contract and batch invariance are the Triton leaf's: BF16 scores and
 probabilities accumulated in FP32, an FP32 online softmax per chunk, and a
 selection cut into at most ``MAX_CHUNKS`` chunks of whole tiles whose number
@@ -44,9 +50,10 @@ chunk states. A row is bitwise the same for every batch, head tile and split.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 from tokenspeed_kernel.ops.attention.dsa._cute_dsl import sparse_mma as _core
-from tokenspeed_kernel.platform import current_platform
 
 __all__ = [
     "MAX_CHUNKS",
@@ -73,21 +80,97 @@ def num_chunks_for(width: int) -> tuple[int, int]:
     return chunk_tiles, -(-tiles // chunk_tiles)
 
 
-def plan_launch(tokens: int, heads: int, num_sms: int) -> tuple[int, int]:
-    """``(block_h, num_splits)`` for ``tokens`` queries of ``heads`` heads.
+# Measured on an RTX PRO 6000 (188 SMs), CUDA graph, one token, 1-4 splits of
+# widths 128 / 640 / 1152: a CTA takes ``_FIXED_US`` (query load, prologue,
+# stores) plus ``_TILE_US`` per 32-row tile of its chunks, and a split CTA about
+# a microsecond more in all (its stored states and the combine kernel).
+_FIXED_US = {16: 5.0, 32: 7.8}
+_TILE_US = {16: 1.44, 32: 1.9}
+_SPLIT_CTA_US = 0.5
+_COMBINE_US = 0.5
+_PLAN_MARGIN = (
+    1.05  # a plan replaces the base plan only if the model puts it this far ahead
+)
+_MAX_PLANNED_WAVES = 64  # beyond this the last partial wave is below 1.6%
 
-    Neither value changes the result. Measured on an RTX PRO 6000 (188 SMs)
-    with 640 selected rows: a launch is latency bound until about two thirds
-    of the SMs hold a CTA, so the split aims at that many CTAs, one chunk
-    each. A 16-head CTA has half the warps of a 32-head one and loses to it as
-    soon as the batch has more than 32 of them, which is also the point where
-    splitting stops paying (128 or more 32-head CTAs fill the GPU unsplit).
+
+def _base_plan(tokens: int, heads: int, num_sms: int, num_chunks: int):
+    """``(block_h, num_splits)`` of the uniform rule: a launch is latency bound
+    until about two thirds of the SMs hold a CTA, so the split aims at that
+    many CTAs, one chunk each. A 16-head CTA has half the warps of a 32-head one
+    on a 4-warp layout and loses to it once the batch has more than 32 of them.
     """
     narrow = -(-heads // 16) * tokens
     block_h = 16 if heads <= 16 or narrow <= 32 else 32
     programs = -(-heads // block_h) * tokens
     target = num_sms * 2 // 3
-    return block_h, min(max(round(target / programs), 1), MAX_CHUNKS)
+    return block_h, min(max(round(target / programs), 1), num_chunks)
+
+
+@functools.lru_cache(maxsize=4096)
+def plan_launch(
+    tokens: int, heads: int, num_sms: int, width: int
+) -> tuple[int, int, int, int]:
+    """``(block_h, cwarps, num_splits, full_tokens)`` for ``tokens`` queries.
+
+    No value changes the result. The launch runs the programs (token, head
+    tile) of the first ``full_tokens`` tokens in one CTA each and shares every
+    later program among ``num_splits`` CTAs, each taking a run of chunks whose
+    states a combine kernel folds (see ``dsa._cute_dsl.sparse_mma``). A CTA
+    fills an SM, so a launch runs in waves of ``num_sms`` CTAs; a model of the
+    waves (:func:`_core._launch_time`, the constants above) picks the head tile
+    (16 heads in 8 warps, or 32 in two groups of 4) and the split, and a
+    stream-K tail that fills the SMs the last wave of whole CTAs leaves idle.
+    A plan replaces the uniform rule (:func:`_base_plan`) only if the model puts
+    it ``_PLAN_MARGIN`` ahead of it.
+    """
+    chunk_tiles, num_chunks = num_chunks_for(width)
+    tiles = chunk_tiles * num_chunks
+
+    def modelled(block_h: int, splits: int, full_tokens: int) -> float:
+        head_tiles = -(-heads // block_h)
+        unsplit = _FIXED_US[block_h] + tiles * _TILE_US[block_h]
+        return _core._launch_time(
+            head_tiles * tokens,
+            head_tiles * full_tokens,
+            splits,
+            num_sms,
+            unsplit,
+            _FIXED_US[block_h],
+            _SPLIT_CTA_US,
+            _COMBINE_US,
+        )
+
+    block_h, splits = _base_plan(tokens, heads, num_sms, num_chunks)
+    best = (block_h, splits, 0 if splits > 1 else tokens)
+    cwarps = lambda block_h: (
+        2 * _core.CHANNEL_WARPS if block_h == 16 else _core.CHANNEL_WARPS
+    )
+    if tokens * -(-heads // 16) <= _MAX_PLANNED_WAVES * num_sms:
+        base_us = best_us = modelled(*best)
+        for tile_h in (16, 32) if heads > 16 else (16,):
+            head_tiles = -(-heads // tile_h)
+            programs = head_tiles * tokens
+            tails = {programs % num_sms + num_sms * j for j in (0, 1, 2)}
+            tails |= {num_sms * m // 8 for m in range(1, 17)}
+            for splits in (1, 2, 4):
+                if splits > num_chunks:
+                    continue
+                options = [tokens] if splits == 1 else [0]
+                if splits > 1:
+                    options += [
+                        tokens - tail_tokens
+                        for tail_tokens in sorted(
+                            {-(-tail // head_tiles) for tail in tails}
+                        )
+                        if 0 < tail_tokens < tokens
+                    ]
+                for full_tokens in options:
+                    t = modelled(tile_h, splits, full_tokens)
+                    if t < best_us and t * _PLAN_MARGIN < base_us:
+                        best_us = t
+                        best = (tile_h, splits, full_tokens)
+    return best[0], cwarps(best[0]), best[1], best[2]
 
 
 def supports(
@@ -138,7 +221,9 @@ def sparse_mma_attention(
     *,
     softmax_scale: float,
     block_h: int,
+    cwarps: int,
     num_splits: int,
+    full_tokens: int,
 ) -> None:
     """Attend ``q`` over the workspace rows named by ``indices``.
 
@@ -153,9 +238,14 @@ def sparse_mma_attention(
         out: ``[tokens, heads, 512]`` BF16 result with unit inner stride.
         lse: ``[tokens, heads]`` contiguous FP32 natural-log normalizer or None.
         block_h: heads per CTA (16 or 32).
-        num_splits: CTAs sharing one (token, head tile), each taking a run of
-            chunks; 1 folds in registers. The result is bitwise the same for
-            every value.
+        cwarps: warps per head group (4, or 8 with ``block_h`` 16).
+        num_splits, full_tokens: the first ``full_tokens`` tokens run each head
+            tile in one CTA and fold its chunks in registers; every later token
+            shares each head tile among ``num_splits`` CTAs, each taking a run
+            of chunks whose stored states a combine kernel folds.
+            ``full_tokens`` equal to the token count is an unsplit launch, 0
+            splits every token. The result is bitwise the same for every
+            value of the three.
     """
     tokens, heads, dim = q.shape
     device = q.device
@@ -163,16 +253,25 @@ def sparse_mma_attention(
         return
     chunk_tiles, num_chunks = num_chunks_for(indices.shape[1])
     num_splits = max(min(num_splits, num_chunks), 1)
-    split = num_splits > 1
-    # Every token is split or none is (the core also takes a mix).
+    if not 0 <= full_tokens <= tokens:
+        raise ValueError(f"full_tokens {full_tokens} outside [0, {tokens}]")
+    if num_splits == 1:
+        full_tokens = tokens
+    tail_tokens = tokens - full_tokens
+    if full_tokens + tail_tokens * num_splits > _core.MAX_GRID_ROWS:
+        raise ValueError(
+            f"{full_tokens} whole + {tail_tokens} split tokens x {num_splits} "
+            f"splits exceed the {_core.MAX_GRID_ROWS} rows of a grid"
+        )
+    split = tail_tokens > 0
     head_tiles = -(-heads // block_h)
-    full_tokens = 0 if split else tokens
     if split:
+        # States are [tail token][chunk][head].
         part_acc = torch.empty(
-            (tokens, num_chunks, heads, dim), dtype=torch.float32, device=device
+            (tail_tokens, num_chunks, heads, dim), dtype=torch.float32, device=device
         )
         part_ml = torch.empty(
-            (tokens, num_chunks, heads, 2), dtype=torch.float32, device=device
+            (tail_tokens, num_chunks, heads, 2), dtype=torch.float32, device=device
         )
     else:
         part_acc = part_ml = lse if lse is not None else torch.empty(4, device=device)
@@ -188,6 +287,7 @@ def sparse_mma_attention(
         0,
         device_index,
         (sink is not None, indices.dtype == torch.int64, lens.dtype == torch.int64),
+        cwarps,
     )
     # The kernel counts strides in bytes.
     out_stride_token = out.stride(0) * 2
@@ -222,7 +322,7 @@ def sparse_mma_attention(
         out_stride_token,
         out_stride_head,
         head_tiles,
-        full_tokens + (tokens - full_tokens) * num_splits,
+        full_tokens + tail_tokens * num_splits,
     )
     if split:
         _core.compiled_combine(dim, device_index, True)(
@@ -236,5 +336,5 @@ def sparse_mma_attention(
             out_stride_token,
             out_stride_head,
             full_tokens,
-            tokens - full_tokens,
+            tail_tokens,
         )

@@ -40,9 +40,12 @@ if _sparse_mma is not None:
         solution="cute_dsl",
         capability=_dsv4_triton._MMA_CAPABILITY,
         signatures=_dsv4_triton._MMA_SIGNATURES,
-        # A 16-head CTA (4 warps) is 0.7-0.8x of the Triton leaf from 64
-        # tokens, so narrower models keep the Triton leaf. The rule follows the
-        # model's head count, never the batch, so a row stays bitwise stable.
+        # At 16 heads a token's gather is the whole job (the 640 rows of a
+        # token are read for 16 heads only) and the Triton leaf already reads
+        # them at the L2 rate: this leaf is 0.82-1.3x of it by token count, so
+        # models of 16 heads or fewer keep the Triton leaf (docs: analysis
+        # 9.35). The rule follows the model's head count, never the batch, so a
+        # row stays bitwise stable.
         traits={**_dsv4_triton._MMA_TRAITS, "num_q_heads_min": frozenset({17})},
         priority=Priority.PERFORMANT + 1,
     )
@@ -82,8 +85,8 @@ if _sparse_mma is not None:
         sink = None
         if attn_sink is not None:
             sink = attn_sink.reshape(-1).to(torch.float32).contiguous()
-        block_h, num_splits = _sparse_mma.plan_launch(
-            q.shape[0], q.shape[1], current_platform().sm_count
+        block_h, cwarps, num_splits, full_tokens = _sparse_mma.plan_launch(
+            q.shape[0], q.shape[1], current_platform().sm_count, indices_2d.shape[1]
         )
         _sparse_mma.sparse_mma_attention(
             q,
@@ -95,6 +98,8 @@ if _sparse_mma is not None:
             lse,
             softmax_scale=softmax_scale,
             block_h=block_h,
+            cwarps=cwarps,
             num_splits=num_splits,
+            full_tokens=full_tokens,
         )
         return output
