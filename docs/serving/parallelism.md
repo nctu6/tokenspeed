@@ -264,6 +264,18 @@ dispatch, SiTU expert computation, and combine with MegaMoE. It requires
 The AG/RS and FlashInfer transports quantize NVFP4 activations before dispatch and transfer their
 block scales alongside the routing IDs and weights. Combine outputs remain BF16.
 
+On SM120 (RTX PRO 6000), `--moe-backend mega_moe` serves DeepSeek V4.1 MXFP4
+experts on two GPUs in either token layout. With attention DP
+(`--data-parallel-size 2 --ep-size 2`) each rank brings its own tokens and
+MegaMoE pushes them to the experts' ranks and back. With attention TP (the
+default for two GPUs) the ranks hold the same tokens, so each runs its shard of
+the experts alone and the usual TP all-reduce sums the partials: the shard is
+half of every expert's intermediate width (MoE TP 2, the default) or half of the
+experts (`--ep-size 2`). On real V4.1 weights the TP layouts prefill 1.11-1.12x
+faster than Marlin TP2 and decode within 0-5% of it (MoE TP 2 ties); attention DP
+prefills 1.26x faster and decodes 1.3x slower. `--moe-backend auto` keeps Marlin.
+See [MegaMoE on SM120](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/README.md#megamoe-on-sm120).
+
 #### Tensor-parallel subgroups within DP
 
 Shard selected dense weights across contiguous groups of DP ranks with these
