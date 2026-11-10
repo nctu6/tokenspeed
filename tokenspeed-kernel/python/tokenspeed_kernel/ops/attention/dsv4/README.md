@@ -101,8 +101,8 @@ views, the no-sink LSE, batch invariance and recompilation.
 
 `cute_dsl_dsv4_mma_prefill` runs the BF16 path of the DSA CuTe DSL core
 (`dsa/_cute_dsl/sparse_mma.py`: `cp.async` two-stage ring of 32-row tiles,
-4 channel warps per 16-head group with one 16 x 128 FP32 accumulator each,
-channel-split scores, `ldmatrix(.trans)` fragments, `mma.sync` `m16n8k16`) in a
+4 channel warps per 16-head group with one 16 x 128 FP32 accumulator each (8
+warps for a 16-head CTA, below), channel-split scores, `ldmatrix(.trans)` fragments, `mma.sync` `m16n8k16`) in a
 V4 variant: rank 512 and no RoPE columns, a flat workspace row table (a row id
 addresses `kv + id * row_stride`), int32 or int64 row ids checked against the
 workspace in the kernel, strided query and output, and the sink as chunk 0's
@@ -115,13 +115,39 @@ the vector loads cannot address (`supports`) run the Triton leaf. Binaries are
 keyed by head tile, metadata dtypes and sink; token count, width, row count and
 strides are runtime values.
 
-`plan_launch` aims at two thirds of the SMs (one chunk per CTA when split) and
-uses 16-head CTAs only up to 32 of them. Selection: the leaf declares
-`num_q_heads_min = 17`. A 16-head CTA has 4 warps and one per SM, and loses to
-the Triton leaf from 64 tokens (0.70-0.79x at 64-4096 tokens, 640 rows); the
-rule follows the model's head count, never the batch, so one model never mixes
-the two leaves. Measured against the Triton leaf (CUDA graph, sink, 1-4096
-tokens, widths 128 / 640 / 1152; 117 points):
+`plan_launch(tokens, heads, num_sms, width)` returns `(block_h, cwarps,
+num_splits, full_tokens)`: the uniform rule (aim at two thirds of the SMs with
+one chunk per CTA when split, 16-head CTAs up to 32 of them) is the base, and a
+wave model replaces it when it is 5% ahead. The model is the CTA time
+(`5.0 + 1.44 us` per 32-row tile for a 16-head CTA, `7.8 + 1.9 us` for a 32-head
+one, fitted to 1-4 splits of widths 128 / 640 / 1152), a split CTA costing
+0.5 us more and the combine 0.5 us, list-scheduled on the SMs in grid order. It
+chooses the head tile, the split (1, 2, 4) and a stream-K tail: the first
+`full_tokens` tokens run each head tile in one CTA, the others are split, so the
+short CTAs fill the SMs the last wave of whole CTAs leaves idle (the DSA core's
+schedule, task 30). The width enters because a 128-row selection (4 tiles) never
+pays for the stored states and the combine that a 640-row one does. A 16-head
+CTA runs 8 warps (`cwarps` 8): the two warps of a channel quarter score half of
+the 32 rows each (the same MMA sequence per row, so the same partial sums and
+the same fixed-order sum of four quarters) and the 8 warps split the output
+channels (64 each, half the accumulator, two warps per scheduler). Its rows are
+bitwise those of the 4-warp CTA, so the plan may use either freely.
+Against the 4-warp CTA and the uniform plan (HEAD, same GPU and graph; 165
+points: 17 / 24 / 40 / 96 / 128 heads x widths 128 / 640 / 1152 x 1-500 tokens):
+1.095x geomean, 1.08-1.17x at 1-3 tokens of width 640 / 1152 (the 8-warp
+CTA), up to 1.66x at token counts a little past a whole number of waves
+(17 heads, width 1152, 40 tokens: 43.8 to 26.5 us; 32 heads, width 640, 192
+tokens: 97.6 to 66.7 us). Worst 0.89x (17 heads, width 128, 24 tokens: 8.3 to
+9.3 us; three points below 0.97x, all 128-row launches of a few microseconds
+where the model's split cost is too high for a 32-head CTA). Over 126 points
+of 32 / 64 / 128 heads the best uniform (tile, split) per point is only 1.03x
+ahead of the shipped plan. (Task 24 found the DSA wave model losing, 0.97x at
+width 128, with the 4-warp 16-head CTA, V4's chunk times left out and no
+stream-K tail; this one has V4's own CTA times, the width and the tail.) Rows
+and LSE are bitwise equal across head tile, warp layout, split count and
+stream-K mix (`test_cute_rows_do_not_depend_on_the_launch_shape`).
+Measured against the Triton leaf above 16 heads (task 17; CUDA graph, sink, 1-4096
+tokens, widths 128 / 640 / 1152; 117 points, before the plan above):
 
 | heads | width 128 | width 640 | width 1152 |
 |---:|---|---|---|
@@ -136,17 +162,34 @@ floor). The only losses are window-only selections (128 rows) of 1-2 tokens,
 row's bits with its batch, so they stay. More chunks (8) help only below 16
 tokens (10.9 vs 13.7 us at one token) and cost from 16 tokens, and the count
 may not follow the batch; fewer (1-2) lose 2-3x below 16 tokens. Kept 4.
-`plan_launch` was re-swept (task 24, 3 head counts x 14 token counts x both
-head tiles x 1/2/4 splits, widths 640 and 128): the best (tile, split) per
-point is only 1.01x better than the shipped rule, and the DSA wave model loses
-(0.97x geomean at width 128), so only 4 chunks of 5 tiles are planned by the
-two-thirds rule. 16 heads with an 8-warp CTA (two channel splits per head
-group, 32-row tiles, 16 KB exchange) is correct and 1.08-1.10x faster than the
-4-warp CTA at 1-16 tokens, 0.92-0.93x of Triton at 64-128 tokens and 0.86x at
-2048 (0.76x for window-only rows): better than the 4-warp CTA (0.77x at 2048)
-but still behind Triton from 64 tokens, and a leaf that follows the batch would
-change rows, so 16 heads stay on Triton. Its score sum has 8 partials, so it
-would also not equal the 4-warp CTA bit for bit.
+Selection: the leaf declares `num_q_heads_min = 17`. At 16 heads one token's
+640 rows are gathered for 16 heads only, so the Triton leaf (8 warps, loads
+straight to registers) already runs at the L2 -> SM gather rate (1.34 GB in
+341 us at 2048 tokens, 3.9 TB/s; the `cp.async` gather of the CuTe core with the
+MMAs removed takes 325 us on 8 warps and 348 us on 4). CUDA graph, sink, best of
+5, microseconds (CuTe on the 4-warp CTA of HEAD and on the shipped plan):
+| tokens | Triton 640 | CuTe 4w | CuTe 8w | Triton 128 | CuTe 4w | CuTe 8w |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 13.4 | 13.4 (1.00x) | 11.9 (1.13x) | 6.2 | 6.9 (0.89x) | 6.7 (0.92x) |
+| 4 | 13.8 | 13.9 (0.99x) | 12.3 (1.12x) | 6.2 | 7.0 (0.88x) | 6.9 (0.89x) |
+| 16 | 14.4 | 14.1 (1.02x) | 12.8 (1.13x) | 6.5 | 7.2 (0.92x) | 7.2 (0.90x) |
+| 64 | 21.7 | 25.9 (0.84x) | 23.7 (0.92x) | 10.3 | 11.8 (0.91x) | 10.1 (1.03x) |
+| 128 | 33.3 | 42.9 (0.78x) | 38.4 (0.87x) | 15.3 | 14.5 (1.05x) | 11.6 (1.32x) |
+| 512 | 117.2 | 128.2 (0.91x) | 115.9 (1.01x) | 28.4 | 41.8 (0.68x) | 34.7 (0.82x) |
+| 2048 | 340.6 | 459.0 (0.74x) | 403.5 (0.84x) | 89.1 | 146.7 (0.63x) | 122.5 (0.73x) |
+Between them the mid counts swing (192 / 256 / 384 tokens, width 640:
+1.02x / 0.94x / 1.18x; width 128: 1.12x / 1.16x / 0.92x), so no head-count rule
+covers them and a rule by tokens would change a row's bits with its batch
+(the two leaves differ bit for bit), so 16 heads stay on Triton. Tried at 16
+heads, none of which wins at every count: more splits of a token (4 splits help
+only below 64 tokens, 128 tokens have 128 CTAs of 4 chunk times on 188 SMs and
+no split count beats unsplit: 37.9 us against Triton 33.3); two or four tokens
+per CTA sharing the window rows (a token's tiles are its own 32 columns, which
+the bitwise invariance fixes, so only the gather can be shared: even with the
+cost of the gather removed for all but every 2nd / 4th token, 8 warps reach
+369 / 343 us at 640 rows and 111 / 104 us at 128 rows against Triton's 341 / 92
+us at 2048 tokens); a persistent CTA (the stream-K tail is the plan above).
+Measured analysis in `deepgemm-analysis.md` section 9.35.
 
 V4.1 prefill reaches this core too: the SM120 selected-attention leaf
 (`triton_dsv41_mma_selected_attention`) hands its gathered BF16 workspace to

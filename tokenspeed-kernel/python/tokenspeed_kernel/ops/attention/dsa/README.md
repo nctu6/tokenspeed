@@ -370,6 +370,9 @@ the choice depends on the dtypes only. Design:
   FP32 accumulator is 16 x 128 (one accumulator plus the running fold). V
   fragments come from `ldmatrix.trans`; E4M3 values are converted to FP16
   with `cvt.rn.f16x2.e4m3x2` (exact), BF16 values go to the MMA as loaded.
+  The V4 variant also runs a 16-head CTA in 8 warps (`cwarps`; the output
+  channels split 8 ways, the score rows between the two warps of a channel
+  quarter, bitwise the 4-warp result; `dsv4/README.md`).
 * Scores: for E4M3 the query tile sits in shared memory and each warp scores
   16 of the 64 rows over all 576 channels (`ldmatrix` + `m16n8k32`); rows are
   unpadded and XOR-swizzled in 16-byte units, so the CTA fits 99 KiB with no
@@ -469,7 +472,8 @@ a key split as in E4M3, or a smaller ring, are untried), and decode of one
 request, bound by its 8 width chunks (20 us BF16 / 13 us E4M3: 5.3 / 4.6 us
 of launch, query and combine, then about 1.9 / 2.2 us per tile of the chain). Sharing gathered rows across
 a 2-CTA cluster over DSMEM is ruled out on SM120: DSMEM pulls run at about
-33 GB/s per CTA (DeepGEMM `deepgemm-analysis.md` 9.28).
+33 GB/s per CTA (DeepGEMM `deepgemm-analysis.md` 9.28). Sharing them between
+tokens of one CTA is bounded for V4 at 16 heads (`deepgemm-analysis.md` 9.35).
 
 Strided caches. A core that reads `kv_cache` in place through its own page and
 token strides declares `STRIDED_KV_CACHE_FEATURE` (`strided_kv_cache`; the
