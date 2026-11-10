@@ -208,6 +208,9 @@ class DistributedInitializer:
         pg_manager.init_process_group(config.mapping.lm_head.tp_group)
         pg_manager.init_process_group(config.mapping.dense.tp_group)
         pg_manager.init_process_group(config.mapping.moe.tp_ep_group)
+        # MegaMoE over replicated tokens (attention TP) runs each rank's experts
+        # alone, on the MoE TP group, which is one rank when MoE TP is 1.
+        pg_manager.init_process_group(config.mapping.moe.tp_group)
         if config.mapping.has_pp:
             # Cross-stage group for hidden-state P2P (nccl) and small control
             # broadcasts like the sampled first token (gloo).

@@ -188,3 +188,41 @@ def test_fp32_correction_bias_requires_deepseek_v3_routing(monkeypatch):
                 "routing_method_type": RoutingMethodType.MiniMax2,
             },
         )
+
+
+@pytest.mark.parametrize(
+    "layout, group_name",
+    [("scattered", "ep"), ("replicated", "tp"), (None, "ep")],
+)
+def test_mega_moe_group_follows_the_token_layout(monkeypatch, layout, group_name):
+    # Scattered tokens (attention DP) span the EP ranks. Replicated tokens
+    # (attention TP) need no exchange: the kernel runs alone, on the MoE TP
+    # group, which is one rank. Callers that name no layout keep the EP group.
+    groups = {"ep": (0, 1), "tp": (0,)}
+    process_groups = {group: object() for group in groups.values()}
+    monkeypatch.setitem(
+        global_server_args_dict,
+        "mapping",
+        SimpleNamespace(
+            moe=SimpleNamespace(ep_group=groups["ep"], tp_group=groups["tp"])
+        ),
+    )
+    monkeypatch.setattr(
+        expert_module, "get_moe_backend", lambda: SimpleNamespace(value="mega_moe")
+    )
+    monkeypatch.setattr(
+        expert_module.pg_manager,
+        "get_device_process_group",
+        lambda group: process_groups[group],
+    )
+    plan = _plan_kwargs(
+        monkeypatch,
+        activation="swiglu",
+        ep_rank=0,
+        ep_size=2,
+        tp_rank=0,
+        tp_size=1,
+        ep_token_layout=layout,
+    )
+    assert plan["ep_token_layout"] == layout
+    assert plan["process_group"] is process_groups[groups[group_name]]

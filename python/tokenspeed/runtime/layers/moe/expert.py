@@ -93,6 +93,7 @@ class MoELayer(torch.nn.Module):
         routing_mode: str | None = None,
         internal_activation_dtype_override: str | None = None,
         persistent_max_num_tokens_per_gpu: int | None = None,
+        ep_token_layout: str | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -370,7 +371,14 @@ class MoELayer(torch.nn.Module):
             ]
         elif moe_backend == "mega_moe":
             mapping = global_server_args_dict["mapping"]
-            process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
+            if ep_token_layout == "replicated":
+                # Every rank holds the same tokens: the kernel runs alone over
+                # this rank's experts and the caller sums the partials.
+                mega_group = mapping.moe.tp_group
+            else:
+                # Each rank brings its own tokens: the kernel spans the EP ranks.
+                mega_group = mapping.moe.ep_group
+            process_group = pg_manager.get_device_process_group(mega_group)
         # --moe-combine-order: how a token's routed contributions meet across
         # the MoE TP-EP group (docs/design/numerics.md, alignment.trainer).
         # ServerArgs already refused MoE TP > 1 and DeepEP under "slot".
@@ -513,6 +521,7 @@ class MoELayer(torch.nn.Module):
                 deepep_low_latency_max_num_tokens_per_gpu
             ),
             persistent_max_num_tokens_per_gpu=persistent_max_num_tokens_per_gpu,
+            ep_token_layout=ep_token_layout,
             features=(
                 frozenset({"batch_invariant"})
                 if global_server_args_dict["numerics"] in BITWISE_ENVELOPES

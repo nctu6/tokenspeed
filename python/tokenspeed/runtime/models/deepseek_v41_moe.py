@@ -273,7 +273,22 @@ class DeepseekV4MoE(nn.Module):
         moe_backend = get_moe_backend()
         self.use_mega_moe = moe_backend.is_mega_moe()
         self.use_gluon_petit = moe_backend.is_gluon_petit()
-        self.owns_ep_communication = self.use_mega_moe or self.use_gluon_petit
+        # MegaMoE meets the tokens one of two ways (moe_plan ep_token_layout).
+        # With attention TP every EP rank already holds the same tokens: the
+        # kernel runs this rank's experts over all of them and returns a
+        # partial, so the layer is a normal EP layer (shared expert shard,
+        # then the TP-EP all-reduce). With attention DP each rank brings its
+        # own tokens and the kernel pushes them to the experts' ranks.
+        self.ep_token_layout: str | None = None
+        if self.use_mega_moe:
+            self.ep_token_layout = (
+                "replicated"
+                if mapping.attn.tp_size == mapping.moe.tp_ep_size
+                else "scattered"
+            )
+        self.owns_ep_communication = (
+            self.ep_token_layout == "scattered" or self.use_gluon_petit
+        )
         # Petit's VMM-backed collective and auxiliary-stream shared experts do
         # not replay safely together. Keep both branches on the main stream.
         self.stream_fork = StreamFork(None if self.use_gluon_petit else aux_stream)
@@ -339,7 +354,7 @@ class DeepseekV4MoE(nn.Module):
                 # Normal EP sums routed and shared partials over the same TPxEP
                 # group. Fused MegaMoE paths return complete routed outputs and
                 # therefore keep the shared expert dense and local.
-                is_shared_expert=not (self.use_mega_moe or self.use_gluon_petit),
+                is_shared_expert=not self.owns_ep_communication,
             )
         else:
             self.shared_experts = None
@@ -377,6 +392,7 @@ class DeepseekV4MoE(nn.Module):
             persistent_max_num_tokens_per_gpu=(
                 _deepseek_v4_mega_moe_max_num_tokens() if self.use_mega_moe else None
             ),
+            ep_token_layout=self.ep_token_layout,
         )
         self.topk = DeepseekV4TopK(
             top_k=config.num_experts_per_tok,
@@ -559,7 +575,7 @@ class DeepseekV4MoE(nn.Module):
         comm_manager: CommManager | None = None,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.use_mega_moe:
+        if self.ep_token_layout == "scattered":
             if out is not None:
                 raise ValueError("DeepSeek V4 MegaMoE does not support out")
             return self.forward_mega_moe(
