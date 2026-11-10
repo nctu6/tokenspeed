@@ -82,6 +82,16 @@ if _MEGA_MOE_AVAILABLE:
 
 _MXFP4_BLOCK_SIZE = 32
 _DISABLE_WARMUP_ENV = "TOKENSPEED_DISABLE_MEGA_MOE_WARMUP"
+# How the tokens meet the experts (``moe_plan(ep_token_layout=...)``):
+#   scattered:  every EP rank brings its own tokens (attention DP). The kernel
+#               spans all ranks: push, local experts, return, and it hands each
+#               rank the complete output of its own tokens.
+#   replicated: every EP rank holds the same tokens (attention TP). Nothing is
+#               exchanged: the kernel runs as one rank over this rank's experts
+#               (the other experts' routes are masked slots) and returns this
+#               rank's partial output, which the caller sums over the EP group.
+_SCATTERED = "scattered"
+_REPLICATED = "replicated"
 _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int], object] = {}
 _warmed_configs: set[
     tuple[int, torch.device, int, int, int, int, int, float | None, bool]
@@ -93,6 +103,21 @@ class _DeepGemmMegaMoEState:
     l1_weights: tuple[torch.Tensor, torch.Tensor]
     l2_weights: tuple[torch.Tensor, torch.Tensor]
     device: torch.device
+
+
+def _kernel_num_experts(plan: dict, w: torch.nn.Module) -> int:
+    """Experts the kernel indexes: all of them across the EP ranks, or this
+    rank's own when the tokens are replicated and it runs alone."""
+    if plan["ep_token_layout"] == _REPLICATED:
+        return w.num_local_experts
+    return w.num_experts
+
+
+def _local_expert_range(plan: dict, w: torch.nn.Module) -> tuple[int, int]:
+    """First global expert and expert count this rank's kernel call serves."""
+    if plan["ep_token_layout"] == _REPLICATED:
+        return w.ep_rank * w.num_local_experts, w.num_local_experts
+    return 0, w.num_experts
 
 
 def _expected_shapes(
@@ -193,6 +218,26 @@ def deep_gemm_mxfp4_mega_moe_process_weights(
         raise ValueError("DeepGEMM MegaMoE requires persistent_max_num_tokens_per_gpu")
     if w.top_k > w.num_experts:
         raise ValueError("top_k cannot exceed num_experts")
+    layout = plan["ep_token_layout"]
+    if layout not in (_SCATTERED, _REPLICATED):
+        raise ValueError(
+            f"DeepGEMM MegaMoE needs ep_token_layout 'scattered' or 'replicated', "
+            f"got {layout!r}"
+        )
+    group = plan.get("process_group")
+    if layout == _REPLICATED:
+        # The kernel runs alone: a rank group (or none, which would fall back to
+        # the world) would exchange with ranks that hold the same tokens.
+        if group is None or group.size() != 1:
+            raise ValueError(
+                "DeepGEMM MegaMoE with replicated tokens needs a one-rank "
+                "process_group"
+            )
+    elif group is not None and group.size() != w.ep_size:
+        raise ValueError(
+            f"DeepGEMM MegaMoE with scattered tokens needs a process_group of "
+            f"the {w.ep_size} EP ranks, got {group.size()}"
+        )
     utccp = not _IS_SM120
     if _IS_SM120:
         if w.ep_size not in _SM120_MEGA_MOE_EP_SIZES:
@@ -364,7 +409,7 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
     if not isinstance(state, _DeepGemmMegaMoEState):
         raise TypeError("invalid DeepGEMM MegaMoE state")
     process_group = plan.get("process_group")
-    num_experts = w.num_experts
+    num_experts = _kernel_num_experts(plan, w)
     top_k = w.top_k
     hidden_size = w.hidden_size
     intermediate_size = w.intermediate_size
@@ -425,6 +470,7 @@ _MEGA_MOE_TRAITS = {
     "activation_clamped": frozenset({False, True}),
     "internal_activation_dtype": frozenset({"input"}),
     "supports_bias": frozenset({False}),
+    "ep_token_layout": frozenset({_SCATTERED}),
 }
 _MEGA_MOE_SIGNATURES = frozenset(
     {format_signature(x=dense_tensor_format(torch.bfloat16))}
@@ -491,7 +537,7 @@ if _MEGA_MOE_AVAILABLE:
         symm_buffer = _get_symm_buffer(
             state=state,
             process_group=plan.get("process_group"),
-            num_experts=w.num_experts,
+            num_experts=_kernel_num_experts(plan, w),
             top_k=w.top_k,
             hidden_size=w.hidden_size,
             intermediate_size=w.intermediate_size,
@@ -499,6 +545,7 @@ if _MEGA_MOE_AVAILABLE:
         )
         num_tokens = x.shape[0]
         topk_ids = topk_ids.to(torch.int64)
+        expert_begin, num_local_experts = _local_expert_range(plan, w)
         stage_mxfp4_mega_moe_inputs(
             x,
             topk_weights,
@@ -507,6 +554,8 @@ if _MEGA_MOE_AVAILABLE:
             symm_buffer.x_sf[:num_tokens],
             symm_buffer.topk_idx[:num_tokens],
             symm_buffer.topk_weights[:num_tokens],
+            expert_begin,
+            num_local_experts,
         )
         output = torch.empty_like(x, dtype=torch.bfloat16)
         fp8_fp4_mega_moe(
@@ -542,6 +591,9 @@ if _MEGA_MOE_AVAILABLE:
                 # The SM120 gather moves 16-byte chunks of 32 lanes
                 "hidden_alignment": frozenset({512}),
                 "ep_size": _SM120_MEGA_MOE_EP_SIZES,
+                # Also runs as one rank over this rank's experts when the EP
+                # ranks hold the same tokens (attention TP)
+                "ep_token_layout": frozenset({_SCATTERED, _REPLICATED}),
             },
             priority=Priority.SPECIALIZED,
             weight_preprocessor=deep_gemm_mxfp4_mega_moe_process_weights,

@@ -47,6 +47,8 @@ def _stage_mxfp4_mega_moe_inputs_kernel(
     topk_idx_stride_k: tl.constexpr,
     topk_weights_out_stride_m: tl.constexpr,
     topk_weights_out_stride_k: tl.constexpr,
+    local_expert_begin,
+    num_local_experts,
     hidden_size: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -103,6 +105,11 @@ def _stage_mxfp4_mega_moe_inputs_kernel(
             mask=topk_mask,
             other=0,
         ).to(tl.int64)
+        # Local expert index, or -1 (a masked slot) when another rank owns it.
+        local_ids = ids - local_expert_begin
+        ids = tl.where(
+            (local_ids >= 0) & (local_ids < num_local_experts), local_ids, -1
+        )
         tl.store(
             topk_idx_out
             + token_id * topk_idx_stride_m
@@ -135,7 +142,17 @@ def stage_mxfp4_mega_moe_inputs(
     x_sf: torch.Tensor,
     topk_idx_out: torch.Tensor,
     topk_weights_out: torch.Tensor,
+    local_expert_begin: int,
+    num_local_experts: int,
 ) -> None:
+    """Quantize ``hidden_states`` into the MegaMoE input views.
+
+    Routes whose expert is outside ``[local_expert_begin, local_expert_begin +
+    num_local_experts)`` are staged as masked slots (-1) and the others as
+    indices relative to ``local_expert_begin``. A kernel that spans all of the
+    experts passes ``0`` and the global expert count; a kernel that serves one
+    rank's experts over replicated tokens passes that rank's range.
+    """
     num_tokens, hidden_size = hidden_states.shape
     if num_tokens == 0:
         return
@@ -175,6 +192,8 @@ def stage_mxfp4_mega_moe_inputs(
         topk_idx_out.stride(1),
         topk_weights_out.stride(0),
         topk_weights_out.stride(1),
+        local_expert_begin,
+        num_local_experts,
         hidden_size,
         topk_ids.shape[1],
         BLOCK_K=block_k,

@@ -255,6 +255,21 @@ def dispatch_topk_ids(topk_ids: torch.Tensor, dispatch: ExpertDispatch) -> torch
 #     Only kernels declaring ``combine_order={"slot", ...}`` are eligible.
 COMBINE_ORDERS = ("rank", "slot")
 
+# How the tokens meet the experts when they are split over EP ranks
+# (``moe_plan(ep_token_layout=...)``), for kernels that own the exchange of
+# tokens themselves (MegaMoE):
+#
+# ``"scattered"``
+#     Every EP rank brings its own tokens (attention DP). The kernel moves each
+#     route to the rank of its expert and back, and returns the complete output
+#     of this rank's tokens.
+# ``"replicated"``
+#     Every EP rank holds the same tokens (attention TP). The kernel moves
+#     nothing: it runs this rank's experts over all tokens and returns this
+#     rank's partial, which the caller sums over the group
+#     (``combine_order="rank"``).
+EP_TOKEN_LAYOUTS = ("scattered", "replicated")
+
 # ===-----------------------------------------------------------------------===#
 # Latent-MoE input projections
 # ===-----------------------------------------------------------------------===#
@@ -1354,6 +1369,7 @@ def _build_traits(
     internal_activation_dtype: str | None,
     with_bias: bool,
     combine_order: str,
+    ep_token_layout: str | None,
 ) -> dict[str, Any]:
     if internal_activation_dtype is None:
         internal_activation_dtype = "input"
@@ -1365,6 +1381,8 @@ def _build_traits(
     # Seller-declared: excludes only kernels declaring another order; the
     # post-selection check turns a silent kernel down for "slot".
     traits["combine_order"] = combine_order
+    if ep_token_layout is not None:
+        traits["ep_token_layout"] = ep_token_layout
     if activation is not None:
         traits["activation"] = activation
     if requires_deferred_finalize:
@@ -1499,6 +1517,7 @@ def moe_plan(
     features: frozenset[str],
     solution: str | None = None,
     fp32_correction_bias: bool = False,
+    ep_token_layout: str | None = None,
 ) -> dict:
     """Create a MoE execution plan.
 
@@ -1569,6 +1588,12 @@ def moe_plan(
             the caller must not reduce; it needs a kernel declaring the
             ``combine_order`` trait with ``"slot"`` and, for ``ep_size > 1``,
             the EP process group. Required keyword.
+        ep_token_layout: How the tokens are split over the EP ranks for a
+            kernel that owns the exchange itself, one of ``EP_TOKEN_LAYOUTS``
+            (see there), or None (the default) when the plan has no such
+            kernel. A kernel declaring the ``ep_token_layout`` trait is
+            eligible only for the layouts it lists, and checks the plan names
+            one.
         features: Registered capabilities the apply kernel must declare, e.g.
             ``frozenset({"batch_invariant"})``, which plans the kernel once
             from static geometry (``KernelPlan``); empty for ordinary
@@ -1597,6 +1622,11 @@ def moe_plan(
         raise ValueError(
             f"combine_order must be one of {list(COMBINE_ORDERS)}, got "
             f"{combine_order!r}"
+        )
+    if ep_token_layout is not None and ep_token_layout not in EP_TOKEN_LAYOUTS:
+        raise ValueError(
+            f"ep_token_layout must be one of {list(EP_TOKEN_LAYOUTS)} or None, "
+            f"got {ep_token_layout!r}"
         )
     if combine_order == "slot" and ep_size is not None and ep_size > 1:
         if process_group is None:
@@ -1627,6 +1657,7 @@ def moe_plan(
         internal_activation_dtype=internal_activation_dtype,
         with_bias=with_bias,
         combine_order=combine_order,
+        ep_token_layout=ep_token_layout,
     )
     traits["persistent_workspace"] = persistent_max_num_tokens_per_gpu is not None
 
@@ -1710,6 +1741,7 @@ def moe_plan(
         "persistent_max_num_tokens_per_gpu": persistent_max_num_tokens_per_gpu,
         "fast_math": fast_math,
         "combine_order": combine_order,
+        "ep_token_layout": ep_token_layout,
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,

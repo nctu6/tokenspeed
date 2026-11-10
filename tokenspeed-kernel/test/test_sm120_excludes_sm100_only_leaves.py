@@ -134,6 +134,7 @@ _MEGA_MOE_TRAITS = {
     "activation_clamped": True,
     "internal_activation_dtype": "input",
     "supports_bias": False,
+    "ep_token_layout": "scattered",
 }
 
 
@@ -189,6 +190,27 @@ def test_sm120_mega_moe_leaf_follows_the_deepgemm_build(
             _select_mega_moe(sm120_platform, **traits)
     # V4.1's 2304-wide experts need no padding to 2560 there
     assert _select_mega_moe(sm120_platform, hidden=5120, ispp=2304).name == name
+
+
+def test_sm120_mega_moe_serves_replicated_tokens_and_sm100_does_not(
+    b200_platform: PlatformInfo, sm120_platform: PlatformInfo
+) -> None:
+    """With attention TP the EP ranks hold the same tokens and need no exchange:
+    the SM120 leaf runs its experts alone on them. The SM100 leaf's kernel spans
+    the ranks and is only offered for tokens scattered over them."""
+    import tokenspeed_kernel.ops.moe  # noqa: F401  (registers the leaves)
+
+    name = "deep_gemm_sm120_mxfp4_mega_moe_apply"
+    if KernelRegistry.get().get_by_name(name) is None:
+        pytest.skip("no SM120 MegaMoE leaf registered here")
+    assert _select_mega_moe(sm120_platform, ep_token_layout="replicated").name == name
+    with pytest.raises(Exception):
+        _select_mega_moe(sm120_platform, ep_token_layout="gathered")
+    if KernelRegistry.get().get_by_name("deep_gemm_mxfp4_mega_moe_apply") is not None:
+        with pytest.raises(Exception):
+            _select_mega_moe(
+                b200_platform, ep_token_layout="replicated", ispp=2560, hidden=4096
+            )
 
 
 _MLA_DECODE = {
