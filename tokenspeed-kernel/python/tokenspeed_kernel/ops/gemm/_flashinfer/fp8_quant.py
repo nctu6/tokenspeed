@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.registry import error_fn
 
 platform = current_platform()
@@ -30,6 +30,11 @@ _fp8_dtype = torch.float8_e4m3fn
 _fp8_max = torch.finfo(_fp8_dtype).max
 _fp8_min = torch.finfo(_fp8_dtype).min
 
+# The TRT-LLM quantizer ships no image after SM100 (the same window as the
+# registered trtllm_quantize_fp8_* leaves). On a newer GPU its launch fails
+# without raising and leaves the output uninitialized, so the Triton kernel
+# below handles every row count there.
+_TRTLLM_QUANT_MAX_ARCH = ArchVersion(10, 9)
 _trtllm_per_token_group_quant_fp8 = error_fn
 
 if platform.is_nvidia:
@@ -97,10 +102,11 @@ def flashinfer_fp8_blockscale_quantize_prepacked(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize activations into FlashInfer's native MN-major scale layout.
 
-    For row counts already divisible by four, this exposes TRT-LLM's native
-    ``[K / 128, M]`` scale output directly. Otherwise a fused Triton kernel
-    writes the valid quantized rows plus zero/one padding directly into
-    ``[round_up(M, 4), K]`` values and ``[K / 128, round_up(M, 4)]`` scales.
+    For row counts already divisible by four on SM100 or older, this exposes
+    TRT-LLM's native ``[K / 128, M]`` scale output directly. Otherwise a fused
+    Triton kernel writes the valid quantized rows plus zero/one padding
+    directly into ``[round_up(M, 4), K]`` values and
+    ``[K / 128, round_up(M, 4)]`` scales.
 
     Args:
         x: Contiguous BF16/FP16 activation matrix shaped ``[M, K]``.
@@ -133,6 +139,7 @@ def flashinfer_fp8_blockscale_quantize_prepacked(
         padded_rows == valid_rows
         and x.dtype == torch.bfloat16
         and _trtllm_per_token_group_quant_fp8 is not error_fn
+        and platform.arch_version <= _TRTLLM_QUANT_MAX_ARCH
     ):
         x_q, x_s = _trtllm_per_token_group_quant_fp8(x, group_size, False)
         expected_shape = (columns // group_size, valid_rows)
