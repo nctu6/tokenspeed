@@ -164,6 +164,9 @@ def sparse_mma_attention(
     chunk_tiles, num_chunks = num_chunks_for(indices.shape[1])
     num_splits = max(min(num_splits, num_chunks), 1)
     split = num_splits > 1
+    # Every token is split or none is (the core also takes a mix).
+    head_tiles = -(-heads // block_h)
+    full_tokens = 0 if split else tokens
     if split:
         part_acc = torch.empty(
             (tokens, num_chunks, heads, dim), dtype=torch.float32, device=device
@@ -207,7 +210,9 @@ def sparse_mma_attention(
         chunk_tiles,
         num_chunks,
         -(-num_chunks // num_splits),
-        int(split),
+        full_tokens,
+        num_splits,
+        _core.split_magic(num_splits),
         int(lse is not None),
         float(softmax_scale) * 1.4426950408889634,
         kv.shape[0],
@@ -216,9 +221,8 @@ def sparse_mma_attention(
         q.stride(1) * 2,
         out_stride_token,
         out_stride_head,
-        -(-heads // block_h),
-        tokens,
-        num_splits,
+        head_tiles,
+        full_tokens + (tokens - full_tokens) * num_splits,
     )
     if split:
         _core.compiled_combine(dim, device_index, True)(
@@ -231,5 +235,6 @@ def sparse_mma_attention(
             int(lse is not None),
             out_stride_token,
             out_stride_head,
-            tokens,
+            full_tokens,
+            tokens - full_tokens,
         )

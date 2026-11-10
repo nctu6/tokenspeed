@@ -52,9 +52,16 @@ fragments come from ``ldmatrix.trans``.
 Batch invariance is the Triton kernel's scheme: a token's selection is cut into
 ``num_chunks`` chunks of whole tiles fixed by the width, each chunk runs its
 own softmax state, and the states are folded in order by :func:`_fold` with
-explicit ``fma``. One CTA folds them in registers (``split == 0``); split
-launches store every chunk state and :class:`_Combine` folds them with the same
-helpers, so a row is bitwise the same for any batch size, head tile or split.
+explicit ``fma``. A CTA that owns all the chunks of a (token, head tile)
+folds them in registers; the others store every chunk state and
+:class:`_Combine` folds them with the same helpers, so a row is bitwise the
+same for any batch size, head tile or split.
+
+The launch is a stream-K schedule: the grid has one row of blocks per whole
+token (a CTA per head tile) followed by ``num_splits`` rows per split token.
+The hardware hands CTAs out in grid order, so the short split CTAs fill the SMs
+that the last wave of whole CTAs leaves idle (:func:`plan_launch`). Which
+tokens are whole or split never changes a row's bits.
 Batch-varying values (token count, head count, width, strides, chunk and split
 counts) are runtime arguments; a binary is keyed by dtype, head tile, rank and
 RoPE width only.
@@ -295,6 +302,16 @@ def _prmt(a, b, selector: cutlass.Constexpr):
 
 
 @cute.jit
+def _mulhi(x, magic):
+    """``x // d`` for ``magic = ceil(2**32 / d)``, ``d >= 2`` and ``x < 2**20``."""
+    return cute.arch.inline_ptx(
+        "mul.hi.u32 {$w0}, {$r0}, {$r1};",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[x, magic],
+    )
+
+
+@cute.jit
 def _ex2(x):
     return cute.arch.inline_ptx(
         "ex2.approx.ftz.f32 {$w0}, {$r0};",
@@ -503,7 +520,9 @@ class _SparseMma:
         chunk_tiles: cutlass.Int32,
         num_chunks: cutlass.Int32,
         chunks_per_split: cutlass.Int32,
-        split: cutlass.Int32,
+        full_tokens: cutlass.Int32,
+        tail_splits: cutlass.Int32,
+        tail_magic: cutlass.Uint32,
         return_lse: cutlass.Int32,
         scale_log2: cutlass.Float32,
         num_rows: cutlass.Int32,
@@ -514,7 +533,6 @@ class _SparseMma:
         out_stride_head: cutlass.Int64,
         grid_x: cutlass.Int32,
         grid_y: cutlass.Int32,
-        grid_z: cutlass.Int32,
         stream,
     ):
         self.kernel(
@@ -535,7 +553,9 @@ class _SparseMma:
             chunk_tiles,
             num_chunks,
             chunks_per_split,
-            split,
+            full_tokens,
+            tail_splits,
+            tail_magic,
             return_lse,
             scale_log2,
             num_rows,
@@ -545,7 +565,7 @@ class _SparseMma:
             out_stride_token,
             out_stride_head,
         ).launch(
-            grid=(grid_x, grid_y, grid_z),
+            grid=(grid_x, grid_y, 1),
             block=(self.num_threads, 1, 1),
             stream=stream,
         )
@@ -931,7 +951,9 @@ class _SparseMma:
         chunk_tiles: cutlass.Int32,
         num_chunks: cutlass.Int32,
         chunks_per_split: cutlass.Int32,
-        split: cutlass.Int32,
+        full_tokens: cutlass.Int32,
+        tail_splits: cutlass.Int32,
+        tail_magic: cutlass.Uint32,
         return_lse: cutlass.Int32,
         scale_log2: cutlass.Float32,
         num_rows: cutlass.Int32,
@@ -953,7 +975,17 @@ class _SparseMma:
         neg_inf = cutlass.Float32(_NEG_INF)
 
         tidx, _, _ = cute.arch.thread_idx()
-        head_tile, token, split_id = cute.arch.block_idx()
+        head_tile, row, _ = cute.arch.block_idx()
+        # Rows of blocks are tokens, head tiles run along a row. The first
+        # ``full_tokens`` rows each fold their chunks in registers; every later
+        # token takes ``tail_splits`` rows, each a run of chunks whose states a
+        # combine kernel folds.
+        token = row
+        split_id = cutlass.Int32(0)
+        if row >= full_tokens:
+            tail_token = _mulhi(row - full_tokens, tail_magic)
+            split_id = row - full_tokens - tail_token * tail_splits
+            token = full_tokens + tail_token
         warp = cute.arch.make_warp_uniform(tidx // 32)
         lane = tidx % 32
         g = lane // 4
@@ -981,7 +1013,7 @@ class _SparseMma:
         chunk_end = cutlass.max(
             (num_tiles + chunk_tiles - 1) // chunk_tiles, cutlass.Int32(1)
         )
-        if split != 0:
+        if row >= full_tokens:
             chunk_begin = split_id * chunks_per_split
             chunk_end = cutlass.min(chunk_begin + chunks_per_split, num_chunks)
         tile_lo = chunk_begin * chunk_tiles
@@ -1248,7 +1280,7 @@ class _SparseMma:
             # ---- Chunk end: fold (one CTA) or store (split) the state ----
             if ((tile + 1) % chunk_tiles == 0) | (tile + 1 == tile_hi):
                 chunk = tile // chunk_tiles
-                if split != 0:
+                if token >= full_tokens:
                     self._store_state(
                         part_acc,
                         part_ml,
@@ -1257,7 +1289,7 @@ class _SparseMma:
                         m_i1,
                         l_i0,
                         l_i1,
-                        token,
+                        token - full_tokens,
                         chunk,
                         num_chunks,
                         num_heads,
@@ -1292,7 +1324,7 @@ class _SparseMma:
                 l_i1 = cutlass.Float32(0.0)
 
         cute.arch.cp_async_wait_group(0)
-        if split != 0:
+        if token >= full_tokens:
             # Chunks of this run past the selection store an empty state.
             first_empty = cutlass.max(
                 chunk_begin, (num_tiles + chunk_tiles - 1) // chunk_tiles
@@ -1306,7 +1338,7 @@ class _SparseMma:
                     m_i1,
                     l_i0,
                     l_i1,
-                    token,
+                    token - full_tokens,
                     chunk,
                     num_chunks,
                     num_heads,
@@ -1367,7 +1399,7 @@ class _SparseMma:
         m1,
         l0,
         l1,
-        token,
+        tail_token,
         chunk,
         num_chunks,
         num_heads,
@@ -1378,10 +1410,11 @@ class _SparseMma:
         g,
         t,
     ):
+        """Store a chunk state of rows ``head0`` (+ 8): ``[tail token][chunk][head]``."""
         rank = cutlass.const_expr(self.rank)
         tpg = cutlass.const_expr(self.tpg)
         part0 = (
-            cutlass.Int64(token) * cutlass.Int64(num_chunks) + cutlass.Int64(chunk)
+            cutlass.Int64(tail_token) * cutlass.Int64(num_chunks) + cutlass.Int64(chunk)
         ) * cutlass.Int64(num_heads) + cutlass.Int64(head0)
         acc_base = part_acc.iterator.toint()
         ml_base = part_ml.iterator.toint()
@@ -1504,7 +1537,8 @@ class _Combine:
         return_lse: cutlass.Int32,
         out_stride_token: cutlass.Int64,
         out_stride_head: cutlass.Int64,
-        tokens: cutlass.Int32,
+        full_tokens: cutlass.Int32,
+        tail_tokens: cutlass.Int32,
         stream,
     ):
         self.kernel(
@@ -1517,8 +1551,9 @@ class _Combine:
             return_lse,
             out_stride_token,
             out_stride_head,
+            full_tokens,
         ).launch(
-            grid=(tokens, num_heads, 1),
+            grid=(tail_tokens, num_heads, 1),
             block=(self.num_threads, 1, 1),
             stream=stream,
         )
@@ -1535,10 +1570,12 @@ class _Combine:
         return_lse: cutlass.Int32,
         out_stride_token: cutlass.Int64,
         out_stride_head: cutlass.Int64,
+        full_tokens: cutlass.Int32,
     ):
         rank = cutlass.const_expr(self.rank)
         tidx, _, _ = cute.arch.thread_idx()
-        token, head, _ = cute.arch.block_idx()
+        tail_token, head, _ = cute.arch.block_idx()
+        token = full_tokens + tail_token
         acc_base = part_acc.iterator.toint()
         ml_base = part_ml.iterator.toint()
         m_run = cutlass.Float32(_NEG_INF)
@@ -1549,7 +1586,8 @@ class _Combine:
         a3 = cutlass.Float32(0.0)
         for chunk in range(num_chunks):
             part = (
-                cutlass.Int64(token) * cutlass.Int64(num_chunks) + cutlass.Int64(chunk)
+                cutlass.Int64(tail_token) * cutlass.Int64(num_chunks)
+                + cutlass.Int64(chunk)
             ) * cutlass.Int64(num_heads) + cutlass.Int64(head)
             m_part = _ldg_f32(ml_base + part * 8)
             l_part = _ldg_f32(ml_base + part * 8 + 4)
@@ -1581,40 +1619,149 @@ class _Combine:
 
 
 MAX_SPLITS = 16
+MAX_GRID_ROWS = 65535  # CUDA's limit on a grid's y extent
 MAX_CHUNKS = 8  # chunks per selection (the Triton core's count)
 
 
-def plan_launch(tokens: int, heads: int, num_sms: int) -> tuple[int, int]:
-    """``(block_h, num_splits)`` for a batch of ``tokens`` queries.
+# Measured on an RTX PRO 6000 (188 SMs), CUDA graph, 2048 selected slots, one
+# CTA per program: the time of a CTA that runs all 8 chunks of its program,
+# microseconds, by (E4M3, block_h). A CTA that takes ``1 / k`` of the chunks
+# adds about ``_SPLIT_CTA_US`` for its prologue and the stored states, and the
+# combine kernel ``_COMBINE_US`` once per launch with split programs
+# (BF16 32-head, k = 2 / 4 / 8: 79 / 43 / 25 us against 138 / k).
+_UNSPLIT_US = {
+    (False, 16): 115.0,
+    (False, 32): 138.0,
+    (True, 16): 62.0,
+    (True, 32): 81.0,
+}
+_SPLIT_CTA_US = 4.0
+_COMBINE_US = 4.0
+_PLAN_MARGIN = (
+    1.08  # a stream-K plan must beat the base plan by this factor in the model
+)
+_MAX_PLANNED_WAVES = 64  # beyond this the last partial wave is below 1.6%
 
-    Neither value changes the result. 32 heads share a gathered tile once the
-    32-head CTAs alone can cover the SMs, 16 below that (the Triton rule,
-    ``_triton.sparse_mma.plan_launch``, switches at two thirds of the SMs; a
-    16-head CTA wins at that crossing by 1.07-1.14x).
 
-    A CTA fills an SM, so a launch runs in waves of ``num_sms`` CTAs, and a
-    split CTA takes a run of ``MAX_CHUNKS / num_splits`` chunks. The split is
-    the one with the fewest chunk times, ``waves * chunks per CTA`` (ties go to
-    fewer splits, which store fewer chunk states): one more CTA than SMs costs
-    a whole second wave (BF16, 32 programs: 8 splits 52 us, 4 splits 47 us,
-    unsplit 140 us). A split is taken only if it needs at least 1.25x (16-head
-    CTAs) or 1.5x (32-head CTAs) fewer chunk times than unsplit, because the
-    stored states cost what the model does not count (16-head BF16, 512
-    tokens: 4 splits are 0.76x of unsplit). Measured on an RTX PRO 6000 (188 SMs) over decode
-    batches of 1-192 tokens at 16-128 heads, E4M3 and BF16: never slower than
-    the earlier rule (target CTA counts of 2/3 and 2.75 SMs), 1.05-1.6x faster
-    at the points where that rule left a wave nearly empty.
+def _tail_end(ready: list[tuple[float, int]], duration: float, count: int) -> float:
+    """When the last of ``count`` CTAs of ``duration`` finishes.
+
+    ``ready`` lists ``(time an SM frees up, SMs)``; the hardware hands the
+    next CTA to whichever SM is free first, so the finish time is the least
+    ``m`` for which the SMs can run ``count`` CTAs by ``m``.
     """
-    wide_tiles = -(-heads // 32) * tokens * MAX_SPLITS >= num_sms
-    block_h = 32 if heads > 16 and wide_tiles else 16
-    programs = -(-heads // block_h) * tokens
+
+    def capacity(m: float) -> int:
+        return sum(
+            n * max(int((m - t) / duration + 1e-9), 0) for t, n in ready if m > t
+        )
+
+    low = min(t for t, _ in ready)
+    high = low + duration * count
+    for _ in range(60):
+        mid = (low + high) / 2
+        if capacity(mid) >= count:
+            high = mid
+        else:
+            low = mid
+    return high
+
+
+def _launch_time(
+    programs: int, full: int, splits: int, num_sms: int, unsplit_us: float
+) -> float:
+    """Modelled time of ``full`` whole programs, then the rest split ``splits`` ways."""
+    waves, last = divmod(full, num_sms)
+    ready = [(0.0, num_sms)]
+    end = 0.0
+    if full:
+        waves += last > 0
+        end = waves * unsplit_us
+        busy = last or num_sms
+        ready = [((waves - 1) * unsplit_us, num_sms - busy), (end, busy)]
+        ready = [(t, n) for t, n in ready if n]
+    tail = programs - full
+    if tail == 0:
+        return end
+    cta_us = unsplit_us / splits + _SPLIT_CTA_US
+    return max(end, _tail_end(ready, cta_us, tail * splits)) + _COMBINE_US
+
+
+def _uniform_splits(programs: int, block_h: int, num_sms: int) -> int:
+    """CTAs per program when every program is split alike (1: none are).
+
+    The split with the fewest chunk times, ``waves * chunks per CTA`` (ties go
+    to fewer splits, which store fewer chunk states), taken only if it needs at
+    least 1.25x (16-head CTAs) or 1.5x (32-head CTAs) fewer chunk times than
+    unsplit, because the stored states cost what that count does not (16-head
+    BF16, 512 tokens: 4 splits are 0.76x of unsplit).
+    """
     chunk_times = {
         splits: -(-programs * splits // num_sms) * (MAX_CHUNKS // splits)
         for splits in (1, 2, 4, MAX_CHUNKS)
     }
     best = min((times, splits) for splits, times in chunk_times.items())[1]
     margin = 1.25 if block_h == 16 else 1.5
-    return block_h, (best if chunk_times[best] * margin < chunk_times[1] else 1)
+    return best if chunk_times[best] * margin < chunk_times[1] else 1
+
+
+@functools.lru_cache(maxsize=4096)
+def plan_launch(
+    tokens: int, heads: int, num_sms: int, fp8: bool
+) -> tuple[int, int, int]:
+    """``(block_h, num_splits, full_tokens)`` for a batch of ``tokens`` queries.
+
+    No value changes the result. A program is one (token, head tile); the
+    launch runs the programs of the first ``full_tokens`` tokens in one CTA
+    each and shares every later program among ``num_splits`` CTAs, each taking
+    a run of ``MAX_CHUNKS / num_splits`` chunks whose states a second kernel
+    folds.
+
+    32 heads share a gathered tile once the 32-head CTAs alone can cover the
+    SMs, 16 below that (the Triton rule, ``_triton.sparse_mma.plan_launch``,
+    switches at two thirds of the SMs; a 16-head CTA wins at that crossing by
+    1.07-1.14x).
+
+    A CTA fills an SM, so a launch runs in waves of ``num_sms`` CTAs, and one
+    CTA more than SMs costs a whole second wave (BF16, 32-head programs: 188
+    take 149 us, 189 take 287). The base plan splits every program alike
+    (:func:`_uniform_splits`; none for a batch that fills the SMs). A stream-K
+    plan runs whole programs first and splits the rest after them (the
+    hardware hands CTAs out in block order), so the short CTAs fill the SMs
+    that the last whole wave leaves idle; it replaces the base plan only if
+    the model of :func:`_launch_time` puts it ``_PLAN_MARGIN`` ahead. Measured
+    on an RTX PRO 6000 (188 SMs) over decode batches of 1-192 tokens at 16-128
+    heads, E4M3 and BF16.
+    """
+    wide_tiles = -(-heads // 32) * tokens * MAX_SPLITS >= num_sms
+    block_h = 32 if heads > 16 and wide_tiles else 16
+    head_tiles = -(-heads // block_h)
+    programs = head_tiles * tokens
+    base_splits = _uniform_splits(programs, block_h, num_sms)
+    best = (base_splits, 0 if base_splits > 1 else tokens)
+    if programs > _MAX_PLANNED_WAVES * num_sms or programs <= num_sms:
+        return block_h, best[0], best[1]
+    unsplit_us = _UNSPLIT_US[(fp8, block_h)]
+    best_us = _launch_time(programs, best[1] * head_tiles, best[0], num_sms, unsplit_us)
+    base_us = best_us
+    tails = {programs % num_sms + num_sms * j for j in (0, 1, 2)}
+    tails |= {num_sms * m // 8 for m in range(1, 17)}
+    for splits in (2, 4, MAX_CHUNKS):
+        for tail in sorted(tails):
+            tail_tokens = -(-tail // head_tiles)
+            if not 0 < tail_tokens < tokens:
+                continue
+            full = (tokens - tail_tokens) * head_tiles
+            t = _launch_time(programs, full, splits, num_sms, unsplit_us)
+            if t < best_us and t * _PLAN_MARGIN < base_us:
+                best_us = t
+                best = (splits, tokens - tail_tokens)
+    return block_h, best[0], best[1]
+
+
+def split_magic(num_splits: int) -> int:
+    """The multiplier the kernel divides block rows by ``num_splits`` with."""
+    return -(-(1 << 32) // num_splits) if num_splits > 1 else 0
 
 
 def rows_for(fp8: bool) -> int:
@@ -1681,6 +1828,8 @@ def compiled_attention(
             cutlass.Int32(1),
             cutlass.Int32(1),
             cutlass.Int32(0),
+            cutlass.Int32(1),
+            cutlass.Uint32(0),
             cutlass.Int32(0),
             cutlass.Float32(1.0),
             cutlass.Int32(0),
@@ -1689,7 +1838,6 @@ def compiled_attention(
             cutlass.Int64(0),
             cutlass.Int64(0),
             cutlass.Int64(0),
-            cutlass.Int32(1),
             cutlass.Int32(1),
             cutlass.Int32(1),
             stream=stream,
@@ -1717,6 +1865,7 @@ def compiled_combine(rank: int, device_index: int, strided_out: bool = False):
             cutlass.Int32(0),
             cutlass.Int64(0),
             cutlass.Int64(0),
+            cutlass.Int32(0),
             cutlass.Int32(1),
             stream=stream,
             options="--enable-tvm-ffi",
@@ -1737,6 +1886,7 @@ def sparse_mma_attention(
     chunk_tiles: int,
     num_chunks: int,
     num_splits: int,
+    full_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Attend ``q`` over the cache rows named by ``topk_slots``.
 
@@ -1752,9 +1902,13 @@ def sparse_mma_attention(
         block_h: 16 or 32 heads per CTA.
         chunk_tiles, num_chunks: the chunks of the selection (by its width
             alone; ``_triton.sparse_mma.num_chunks_for``).
-        num_splits: CTAs sharing one (token, head tile), each taking a run of
-            chunks; 1 folds in registers. The result is bitwise the same for
-            every value.
+        num_splits, full_tokens: the first ``full_tokens`` tokens run each head
+            tile in one CTA and fold its chunks in registers; every later token
+            shares each head tile among ``num_splits`` CTAs, each taking a run
+            of chunks whose stored states a second kernel folds.
+            ``full_tokens`` equal to the token count is an unsplit launch, 0
+            splits every token. The result is bitwise the same for every
+            value.
 
     Returns:
         ``(out, lse)``: BF16 ``[tokens, heads, kv_lora_rank]`` and the FP32
@@ -1806,15 +1960,27 @@ def sparse_mma_attention(
     if tokens == 0 or heads == 0:
         return out, lse
     num_splits = max(min(num_splits, num_chunks), 1)
-    split = num_splits > 1
+    head_tiles = -(-heads // block_h)
+    if not 0 <= full_tokens <= tokens:
+        raise ValueError(f"full_tokens {full_tokens} outside [0, {tokens}]")
+    if num_splits == 1:
+        full_tokens = tokens
+    tail_tokens = tokens - full_tokens
+    if full_tokens + tail_tokens * num_splits > MAX_GRID_ROWS:
+        raise ValueError(
+            f"{full_tokens} whole + {tail_tokens} split tokens x {num_splits} "
+            f"splits exceed the {MAX_GRID_ROWS} rows of a grid"
+        )
+    split = tail_tokens > 0
     if split:
+        # States are [tail token][chunk][head].
         part_acc = torch.empty(
-            (tokens, num_chunks, heads, kv_lora_rank),
+            (tail_tokens, num_chunks, heads, kv_lora_rank),
             dtype=torch.float32,
             device=device,
         )
         part_ml = torch.empty(
-            (tokens, num_chunks, heads, 2), dtype=torch.float32, device=device
+            (tail_tokens, num_chunks, heads, 2), dtype=torch.float32, device=device
         )
     else:
         part_acc = part_ml = lse if return_lse else torch.empty(4, device=device)
@@ -1825,7 +1991,6 @@ def sparse_mma_attention(
     kernel = compiled_attention(
         fp8, block_h, kv_lora_rank, qk_rope_head_dim, device_index
     )
-    grid_x = -(-heads // block_h)
     kernel(
         _flat(q, torch.uint8),
         kv_cache.data_ptr(),
@@ -1844,7 +2009,9 @@ def sparse_mma_attention(
         chunk_tiles,
         num_chunks,
         -(-num_chunks // num_splits),
-        int(split),
+        full_tokens,
+        num_splits,
+        split_magic(num_splits),
         int(return_lse),
         float(softmax_scale) * 1.4426950408889634,
         0,
@@ -1853,9 +2020,8 @@ def sparse_mma_attention(
         head_dim * esize,
         heads * kv_lora_rank * 2,
         kv_lora_rank * 2,
-        grid_x,
-        tokens,
-        num_splits,
+        head_tiles,
+        full_tokens + tail_tokens * num_splits,
     )
     if split:
         compiled_combine(kv_lora_rank, device_index)(
@@ -1868,6 +2034,7 @@ def sparse_mma_attention(
             int(return_lse),
             0,
             0,
-            tokens,
+            full_tokens,
+            tail_tokens,
         )
     return out, lse

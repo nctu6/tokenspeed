@@ -326,8 +326,11 @@ if _sparse_mma is not None:
                 dtype=torch.int32,
                 device=q.device,
             )
-        block_h, num_splits = _sparse_mma.plan_launch(
-            q.shape[0], q.shape[1], current_platform().sm_count
+        block_h, num_splits, full_tokens = _sparse_mma.plan_launch(
+            q.shape[0],
+            q.shape[1],
+            current_platform().sm_count,
+            q.dtype == torch.float8_e4m3fn,
         )
         chunk_tiles, num_chunks = _triton_sparse_mma.num_chunks_for(
             topk_slots.shape[-1],
@@ -346,6 +349,7 @@ if _sparse_mma is not None:
             chunk_tiles=chunk_tiles,
             num_chunks=num_chunks,
             num_splits=num_splits,
+            full_tokens=full_tokens,
         )
         if out is not None:
             out.reshape_as(result).copy_(result)

@@ -382,8 +382,16 @@ def test_rows_do_not_depend_on_the_batch(solution, mode, dtype, heads):
         assert torch.equal(part_lse, full_lse[rows]), (start, size)
     sm_count = Platform.get().sm_count
     plan_launch = sparse_mma.plan_launch if solution == "triton" else cute_plan_launch
-    plans = {plan_launch(n, heads, sm_count)[1] > 1 for n in (1, 3, 9, count)}
-    assert plans == {True, False}  # both launch shapes were compared
+    if solution == "triton":
+        plans = {plan_launch(n, heads, sm_count)[1] > 1 for n in (1, 3, 9, count)}
+        assert plans == {True, False}  # both launch shapes were compared
+    else:
+        # Every token split, a mix of whole and split tokens, or none split.
+        kinds = set()
+        for n in (1, 3, 9, 40, count):
+            _, _, full = plan_launch(n, heads, sm_count, dtype == torch.float8_e4m3fn)
+            kinds.add("split" if full == 0 else "whole" if full == n else "mixed")
+        assert len(kinds) >= 2, kinds
 
 
 @on_sm120
@@ -580,7 +588,9 @@ def test_any_selection_width_matches_the_float32_reference(solution, dtype, widt
     torch.testing.assert_close(lse, expected_lse, atol=LSE_ATOL, rtol=1e-6)
 
 
-def _cute_attend(q, kv, slots, lens, *, num_splits, block_h, return_lse=True):
+def _cute_attend(
+    q, kv, slots, lens, *, num_splits, block_h, full_tokens=0, return_lse=True
+):
     chunk_tiles, num_chunks = sparse_mma.num_chunks_for(
         slots.shape[1], cute_sparse_mma.rows_for(q.dtype == torch.float8_e4m3fn)
     )
@@ -597,6 +607,7 @@ def _cute_attend(q, kv, slots, lens, *, num_splits, block_h, return_lse=True):
         chunk_tiles=chunk_tiles,
         num_chunks=num_chunks,
         num_splits=num_splits,
+        full_tokens=full_tokens,
     )
 
 
@@ -604,17 +615,20 @@ def _cute_attend(q, kv, slots, lens, *, num_splits, block_h, return_lse=True):
 def test_cute_plan_follows_tokens_and_heads_only():
     sms = 188
     # One token of 128 heads: narrow tiles, split.
-    block_h, splits = cute_plan_launch(1, 128, sms)
-    assert block_h == 16 and splits > 1
+    block_h, splits, full = cute_plan_launch(1, 128, sms, False)
+    assert block_h == 16 and splits > 1 and full == 0
     # 128 or more unsplit CTAs fill the GPU well enough: no split.
-    assert cute_plan_launch(128, 128, sms) == (32, 1)
-    assert cute_plan_launch(64, 64, sms) == (32, 1)
-    assert cute_plan_launch(64, 16, sms)[0] == 16
-    for tokens in (1, 3, 8, 9, 40, 512, 8192):
-        for heads in (8, 16, 24, 32, 64, 128):
-            block_h, splits = cute_plan_launch(tokens, heads, sms)
-            assert block_h in (16, 32)
-            assert 1 <= splits <= cute_sparse_mma.MAX_SPLITS
+    assert cute_plan_launch(128, 128, sms, False) == (32, 1, 128)
+    assert cute_plan_launch(64, 64, sms, True) == (32, 1, 64)
+    assert cute_plan_launch(64, 16, sms, False)[0] == 16
+    for fp8 in (False, True):
+        for tokens in (1, 3, 8, 9, 40, 512, 8192):
+            for heads in (8, 16, 24, 32, 64, 128):
+                block_h, splits, full = cute_plan_launch(tokens, heads, sms, fp8)
+                assert block_h in (16, 32)
+                assert 1 <= splits <= cute_sparse_mma.MAX_SPLITS
+                assert 0 <= full <= tokens
+                assert (splits == 1) == (full == tokens)
 
 
 @on_cute
@@ -625,26 +639,51 @@ def test_cute_plan_does_not_start_a_second_wave_for_a_few_ctas():
     chunks = cute_sparse_mma.MAX_CHUNKS
     assert chunks == sparse_mma.MAX_CHUNKS
     # 32 programs of 32 heads: 8 splits would be 256 CTAs, 4 splits one wave.
-    assert cute_plan_launch(32, 32, sms) == (32, 4)
+    assert cute_plan_launch(32, 32, sms, False) == (32, 4, 0)
     # 24 programs: 8 splits are 192 CTAs, four more than the SMs.
-    assert cute_plan_launch(24, 32, sms) == (32, 4)
+    assert cute_plan_launch(24, 32, sms, False) == (32, 4, 0)
     # Under a wave the split is the widest.
-    assert cute_plan_launch(20, 32, sms) == (32, chunks)
-    assert cute_plan_launch(1, 128, sms) == (16, chunks)
+    assert cute_plan_launch(20, 32, sms, False) == (32, chunks, 0)
+    assert cute_plan_launch(1, 128, sms, False) == (16, chunks, 0)
     # 16-head CTAs at the crossing where 32-head CTAs would not fill the GPU.
-    assert cute_plan_launch(8, 32, sms)[0] == 16
-    assert cute_plan_launch(4, 64, sms)[0] == 16
-    assert cute_plan_launch(2, 128, sms)[0] == 16
-    for tokens in range(1, 700):
-        for heads in (16, 24, 32, 64, 128):
-            block_h, splits = cute_plan_launch(tokens, heads, sms)
-            assert splits in (1, 2, 4, chunks)
-            programs = -(-heads // block_h) * tokens
-            # Never more chunk times (waves x chunks per CTA) than unsplit.
-            assert (
-                -(-programs * splits // sms) * (chunks // splits)
-                <= -(-programs // sms) * chunks
-            )
+    assert cute_plan_launch(8, 32, sms, False)[0] == 16
+    assert cute_plan_launch(4, 64, sms, False)[0] == 16
+    assert cute_plan_launch(2, 128, sms, False)[0] == 16
+    for fp8 in (False, True):
+        for tokens in range(1, 700):
+            for heads in (16, 24, 32, 64, 128):
+                block_h, splits, full = cute_plan_launch(tokens, heads, sms, fp8)
+                assert splits in (1, 2, 4, chunks)
+                programs = -(-heads // block_h) * tokens
+                if full in (0, tokens):
+                    # Never more chunk times (waves x chunks per CTA) than unsplit.
+                    assert (
+                        -(-programs * splits // sms) * (chunks // splits)
+                        <= -(-programs // sms) * chunks
+                    )
+
+
+@on_cute
+def test_cute_plan_fills_the_last_wave_with_split_programs():
+    """One program more than a wave of whole programs does not start a second
+    wave of them: the extra programs are split over the idle SMs (BF16 32-head
+    programs: 192 whole take 287 us, 188 whole + 4 split programs 173)."""
+    sms = 188
+    chunks = cute_sparse_mma.MAX_CHUNKS
+    for fp8 in (False, True):
+        assert cute_plan_launch(192, 16, sms, fp8) == (16, chunks, sms)
+        assert cute_plan_launch(192, 32, sms, fp8) == (32, chunks, sms)
+        # Two whole waves, then the 5 + 5 remaining programs.
+        assert cute_plan_launch(386, 16, sms, fp8)[2] == 2 * sms
+    # A whole number of waves stays whole.
+    assert cute_plan_launch(2 * sms, 16, sms, False) == (16, 1, 2 * sms)
+    # Whatever the plan, whole programs come first and only a tail is split.
+    for fp8 in (False, True):
+        for tokens in range(1, 400):
+            for heads in (16, 40, 128):
+                block_h, splits, full = cute_plan_launch(tokens, heads, sms, fp8)
+                if 0 < full < tokens:
+                    assert splits > 1
 
 
 @on_sm120
@@ -665,11 +704,77 @@ def test_cute_split_count_and_head_tile_do_not_change_the_result(dtype, rope):
     out, lse = _cute_attend(q, kv, slots, lens, num_splits=1, block_h=32)
     for block_h in (16, 32):
         for splits in (1, 2, 3, 5, 8, 99):
-            other, other_lse = _cute_attend(
-                q, kv, slots, lens, num_splits=splits, block_h=block_h
-            )
-            assert torch.equal(out, other), (block_h, splits)
-            assert torch.equal(lse, other_lse), (block_h, splits)
+            # Every token split, a mix of whole and split tokens, none split.
+            for full in range(5):
+                other, other_lse = _cute_attend(
+                    q,
+                    kv,
+                    slots,
+                    lens,
+                    num_splits=splits,
+                    block_h=block_h,
+                    full_tokens=full,
+                )
+                assert torch.equal(out, other), (block_h, splits, full)
+                assert torch.equal(lse, other_lse), (block_h, splits, full)
+
+
+@on_sm120
+@on_cute
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_cute_rows_do_not_depend_on_a_stream_k_schedule(dtype):
+    """192 tokens of 16 heads are 192 programs: the plan runs 188 whole and 4
+    split over the idle SMs, while a smaller batch splits all or none of its
+    programs. A token's row is the same bits in each."""
+    generator = torch.Generator(device="cuda").manual_seed(21)
+    num_slots = 8 * PAGE * 16
+    kv = _make_cache(num_slots, dtype, generator)
+    count = 192
+    q = torch.randn(count, 16, DIM, device="cuda", generator=generator).to(dtype)
+    lengths = [2048, 1999, 1024, 513, 200, 33, 1, 0] * (count // 8)
+    slots, lens = _make_selection(lengths, 2048, num_slots, generator, holes=True)
+    fp8 = dtype == torch.float8_e4m3fn
+    sms = 188
+
+    def run(rows):
+        block_h, splits, full = cute_plan_launch(rows.stop - rows.start, 16, sms, fp8)
+        out = _cute_attend(
+            q[rows],
+            kv,
+            slots[rows],
+            lens[rows],
+            num_splits=splits,
+            block_h=block_h,
+            full_tokens=full,
+        )
+        return (block_h, splits, full), out
+
+    plan, (full_out, full_lse) = run(slice(0, count))
+    assert 0 < plan[2] < count  # whole programs first, the rest split
+    plans = {plan}
+    for start, size in ((0, 1), (3, 5), (40, 24), (100, 91), (0, count - 1)):
+        rows = slice(start, start + size)
+        part_plan, (part, part_lse) = run(rows)
+        plans.add(part_plan)
+        assert torch.equal(part, full_out[rows]), (start, size)
+        assert torch.equal(part_lse, full_lse[rows]), (start, size)
+    assert len(plans) > 2
+
+
+@on_sm120
+@on_cute
+def test_cute_launch_rejects_more_rows_than_a_grid_holds():
+    """A split launch has one grid row per whole token and ``num_splits`` per
+    split token; CUDA caps a grid's y extent at 65535."""
+    tokens = cute_sparse_mma.MAX_GRID_ROWS // 8 + 1
+    q = torch.zeros(tokens, 16, DIM, device="cuda", dtype=torch.bfloat16)
+    kv = torch.zeros(PAGE, PAGE, DIM, device="cuda", dtype=torch.bfloat16)
+    slots = torch.zeros(tokens, 2048, device="cuda", dtype=torch.int32)
+    lens = torch.zeros(tokens, device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="rows of a grid"):
+        _cute_attend(q, kv, slots, lens, num_splits=8, block_h=16, full_tokens=0)
+    with pytest.raises(ValueError, match="full_tokens"):
+        _cute_attend(q, kv, slots, lens, num_splits=8, block_h=16, full_tokens=-1)
 
 
 @on_sm120
@@ -680,10 +785,10 @@ def test_cute_batch_size_does_not_recompile():
     num_slots = 8 * PAGE * 16
     for dtype in (torch.float8_e4m3fn, torch.bfloat16):
         kv = _make_cache(num_slots, dtype, generator)
-        pool = torch.randn(130, 40, DIM, device="cuda", generator=generator).to(dtype)
-        slots, lens = _make_selection([1900] * 130, 2048, num_slots, generator)
+        pool = torch.randn(400, 40, DIM, device="cuda", generator=generator).to(dtype)
+        slots, lens = _make_selection([1900] * 400, 2048, num_slots, generator)
 
-        def run(tokens, heads, width, block_h, splits):
+        def run(tokens, heads, width, block_h, splits, full):
             _cute_attend(
                 pool[:tokens, :heads].contiguous(),
                 kv,
@@ -691,19 +796,22 @@ def test_cute_batch_size_does_not_recompile():
                 lens[:tokens],
                 num_splits=splits,
                 block_h=block_h,
+                full_tokens=full,
             )
 
         # Warm both head tiles and both launch shapes (split or not).
         for block_h in (16, 32):
             for splits in (1, 2):
-                run(4, 32, 2048, block_h, splits)
+                run(4, 32, 2048, block_h, splits, 0)
         torch.cuda.synchronize()
         attention = cute_sparse_mma.compiled_attention.cache_info().misses
         combine = cute_sparse_mma.compiled_combine.cache_info().misses
-        for tokens in (1, 2, 3, 5, 8, 9, 17, 33, 64, 100, 130):
-            for heads, width in ((32, 2048), (40, 2051), (24, 512)):
-                block_h, splits = cute_plan_launch(tokens, heads, 188)
-                run(tokens, heads, width, block_h, splits)
+        for tokens in (1, 2, 3, 5, 8, 9, 17, 33, 64, 100, 130, 192, 193, 389):
+            for heads, width in ((32, 2048), (40, 2051), (24, 512), (16, 2048)):
+                block_h, splits, full = cute_plan_launch(
+                    tokens, heads, 188, dtype == torch.float8_e4m3fn
+                )
+                run(tokens, heads, width, block_h, splits, full)
         torch.cuda.synchronize()
         assert cute_sparse_mma.compiled_attention.cache_info().misses == attention
         assert cute_sparse_mma.compiled_combine.cache_info().misses == combine
