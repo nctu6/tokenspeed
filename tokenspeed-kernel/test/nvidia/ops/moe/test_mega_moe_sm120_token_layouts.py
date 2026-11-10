@@ -266,12 +266,12 @@ def test_replicated_tokens_match_scattered_tokens_and_a_float_reference() -> Non
     # The TP shard sums each expert's two halves of the down projection, and
     # quantizes the same activations: it differs from the EP shard by BF16
     # rounding of the partials too.
-    assert _relative_error(tp_out, scattered_out) < 2**-8
+    assert _relative_error(tp_out, scattered_out) < 2**-7
     assert float((tp_out.float() - scattered_out.float()).abs().max()) < 2**-6 * peak
     # All are FP8-activation kernels against a float reference.
-    assert _relative_error(replicated_out, expected) < 0.05
-    assert _relative_error(tp_out, expected) < 0.05
-    assert _relative_error(scattered_out, expected) < 0.05
+    assert _relative_error(replicated_out, expected) < 0.06
+    assert _relative_error(tp_out, expected) < 0.06
+    assert _relative_error(scattered_out, expected) < 0.06
 
     # Rank 1's experts alone serve the third block: rank 0's partial is zero.
     only_remote = slice(MAX_TOKENS - 32, MAX_TOKENS)

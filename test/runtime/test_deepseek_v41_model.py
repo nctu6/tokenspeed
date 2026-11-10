@@ -2682,12 +2682,14 @@ def test_routing_matches_reference_bias_and_normalization(topk, vision, with_ima
     )
     moe.hash_indices_dtype = torch.int64
     moe.use_mega_moe = False
+    moe.ep_token_layout = None
     moe.use_gluon_petit = False
     empty = logits[:0]
     target = torch.empty_like(empty)
     assert moe(empty, image_mask, 0, 0) is empty
     assert moe(empty, image_mask, 0, 0, out=target) is target
     moe.use_mega_moe = True
+    moe.ep_token_layout = "scattered"
     with pytest.raises(ValueError, match="MegaMoE does not support out"):
         moe(empty, image_mask, 0, 0, out=target)
     router_logits, actual_bias, _, _ = moe._routing_inputs(logits, image_mask)
