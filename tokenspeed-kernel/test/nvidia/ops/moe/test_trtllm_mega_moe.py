@@ -211,6 +211,7 @@ def run_correctness(capacity: int, live_tokens: int, tune: bool):
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        ep_token_layout=None,
         features=frozenset(),
     )
     w, ref = _weights(plan)

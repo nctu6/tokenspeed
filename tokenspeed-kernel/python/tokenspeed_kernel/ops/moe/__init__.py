@@ -1517,7 +1517,7 @@ def moe_plan(
     features: frozenset[str],
     solution: str | None = None,
     fp32_correction_bias: bool = False,
-    ep_token_layout: str | None = None,
+    ep_token_layout: str | None,
 ) -> dict:
     """Create a MoE execution plan.
 
@@ -1590,10 +1590,10 @@ def moe_plan(
             the EP process group. Required keyword.
         ep_token_layout: How the tokens are split over the EP ranks for a
             kernel that owns the exchange itself, one of ``EP_TOKEN_LAYOUTS``
-            (see there), or None (the default) when the plan has no such
-            kernel. A kernel declaring the ``ep_token_layout`` trait is
-            eligible only for the layouts it lists, and checks the plan names
-            one.
+            (see there), or None when the plan has no such kernel (every
+            kernel but MegaMoE). Required keyword. A kernel declaring the
+            ``ep_token_layout`` trait is eligible only for the layouts it
+            lists, and checks the plan names one.
         features: Registered capabilities the apply kernel must declare, e.g.
             ``frozenset({"batch_invariant"})``, which plans the kernel once
             from static geometry (``KernelPlan``); empty for ordinary

@@ -76,6 +76,7 @@ def test_bf16_precision_policy_keeps_input_and_backend_validation(
             layer_index=1,
             prefix="model.layers.1.mlp.experts",
             routing_config={"precision_policy": "bf16_route_accum_fp32"},
+            ep_token_layout=None,
         )
 
 

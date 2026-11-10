@@ -394,6 +394,7 @@ def test_petit_layer_constraints(
         tp_size=1,
         ep_rank=0,
         ep_size=8,
+        ep_token_layout=None,
     )
     layer_args.update(layer_overrides)
     with (

@@ -338,6 +338,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                 "routing_method_type": RoutingMethodType.RenormalizeNaive,
                 "normalize_topk_weights": config.norm_topk_prob,
             },
+            ep_token_layout=None,
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,

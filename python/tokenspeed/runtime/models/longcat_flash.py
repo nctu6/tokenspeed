@@ -354,6 +354,7 @@ class _RuntimeLongcatMoE(nn.Module):
                 ],
                 "routing_method_type": _RoutingMethodType.DeepSeekV3,
             },
+            ep_token_layout=None,
         )
         if config.zero_expert_num > 0 and self.experts.topk_output_format.is_bypassed():
             raise ValueError(

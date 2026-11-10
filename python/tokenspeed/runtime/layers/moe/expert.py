@@ -93,7 +93,11 @@ class MoELayer(torch.nn.Module):
         routing_mode: str | None = None,
         internal_activation_dtype_override: str | None = None,
         persistent_max_num_tokens_per_gpu: int | None = None,
-        ep_token_layout: str | None = None,
+        *,
+        # Required: None says no kernel of the layer owns the token exchange
+        # (every backend but DeepGEMM MegaMoE, which refuses a plan without
+        # "scattered" or "replicated"; see moe_plan).
+        ep_token_layout: str | None,
     ):
         super().__init__()
         self.layer_index = layer_index

@@ -328,6 +328,7 @@ def test_portable_fp8_layer_refuses_an_incompatible_precision_contract(
             ep_rank=0,
             ep_size=1,
             routing_config={"precision_policy": "default", **change},
+            ep_token_layout=None,
         )
 
 

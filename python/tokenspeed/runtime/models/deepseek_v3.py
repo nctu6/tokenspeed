@@ -426,6 +426,7 @@ class DeepseekV3MoE(nn.Module):
                 "precision_policy": getattr(config, "moe_precision_policy", "default"),
                 "output_scale": getattr(config, "moe_output_scale", 1.0),
             },
+            ep_token_layout=None,
         )
 
         self.topk = TopK(

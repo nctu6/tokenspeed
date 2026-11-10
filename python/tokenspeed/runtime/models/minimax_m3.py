@@ -217,6 +217,7 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
             swiglu_beta=1.0,
             w13_input_layout="concatenated",
             routing_config=routing_config,
+            ep_token_layout=None,
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,

@@ -287,6 +287,7 @@ def test_router_to_mxfp4_experts(tokens: int) -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        ep_token_layout=None,
         features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
