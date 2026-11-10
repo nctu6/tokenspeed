@@ -380,16 +380,34 @@ the choice depends on the dtypes only. Design:
   fragments directly. The chunked fold and the split combine are the Triton
   scheme (chunks by width, ordered fold with explicit `fma`, the same helper in
   both kernels), so rows are bitwise the same for any batch, head tile or
-  split. `plan_launch` models the launch in waves of one CTA per SM and picks
-  the split (1, 2, 4 or 8 CTAs per token) with the fewest chunk times, `waves x
-  chunks per CTA`, taking a split only if it needs 1.25x (16-head CTAs) or
-  1.5x (32-head CTAs) fewer than unsplit; 32-head CTAs start once they alone
-  fill the SMs. One CTA more than SMs costs a whole second wave (BF16, 32
-  programs: 8 splits 52 us, 4 splits 47 us, unsplit 140 us). Over 140 decode
-  shapes (1-192 tokens, 16-128 heads) this is 1.05x (BF16) / 1.04x (E4M3)
-  faster than the earlier target-CTA-count rule, worst 0.97x (noise), up to
-  1.63x where that rule left a wave nearly empty or stayed unsplit at 96-192
-  CTAs; large batches (128-2048 tokens) 1.02x. Rows are bitwise the same.
+  split.
+* Stream-K launch. The grid has one row of blocks per whole token (a CTA per
+  head tile, chunks folded in registers) followed by `num_splits` rows per split
+  token (each CTA a run of chunks, states stored, folded by the combine
+  kernel); the hardware hands CTAs out in grid order, so the short split CTAs
+  fill the SMs that the last wave of whole CTAs leaves idle.
+  `plan_launch(tokens, heads, num_sms, fp8)` returns `(block_h, num_splits,
+  full_tokens)`. A CTA fills an SM, so one CTA more than SMs costs a whole
+  second wave (BF16, 32-head programs: 188 take 149 us, 189 take 287 us). The
+  base plan splits every token alike: the split (1, 2, 4 or 8 CTAs per token)
+  with the fewest chunk times, `waves x chunks per CTA`, taken only if it needs
+  1.25x (16-head CTAs) or 1.5x (32-head CTAs) fewer than unsplit; 32-head CTAs
+  start once they alone fill the SMs. A stream-K plan (whole tokens first, a
+  tail of 1/8-2 waves split 2, 4 or 8 ways) replaces it only if a wave model
+  (unsplit CTA 115 / 138 us BF16, 62 / 81 us E4M3 at 16 / 32 heads, +4 us per
+  split CTA, +4 us for the combine) puts it 8% ahead. Against the uniform plan
+  alone, over 140 decode shapes of 1-192 tokens at 16-128 heads and both
+  dtypes: 1.032x geomean (BF16 1.034x, E4M3 1.029x), up to 1.38x, worst 0.97x;
+  64 buckets (16/32/64/128 heads, decode 1/8/32/128, prefill 128-8192) 1.017x,
+  worst 0.986x, up to 1.30x (64 heads, 128 tokens: 291 -> 216 us BF16). The
+  gain is at token counts a little past a whole number of waves, where the old
+  plan ran a second wave or split every token. Rows and LSE are bitwise equal
+  across plans (`test_cute_rows_do_not_depend_on_a_stream_k_schedule`,
+  `test_cute_split_count_and_head_tile_do_not_change_the_result` over every
+  `full_tokens`). Whole and split tokens are separated by token, not by head
+  tile, because the state store of the first stream-K kernel took one more
+  live register and cost the E4M3 core 3-6%; keeping the token-indexed store
+  keeps the one-request decode at 20.2 us BF16 / 13.3 us E4M3 (was 20.3 / 13.1).
 * Binaries are keyed by dtype, head tile, rank and RoPE width; token count,
   heads, width, strides, chunk and split counts are runtime arguments
   (`test_cute_batch_size_does_not_recompile`). Compilation happens on first
@@ -410,7 +428,24 @@ Triton leaf (the 2-stage 8-warp CTA: 0.76-1.10x); 16 chunks
 per selection (a CuTe-only chunk count) makes one-request decode 1.3-1.46x
 faster (BF16 20.3 -> 14.2 us, E4M3 13.1 -> 9.8 us at 16-32 heads) but costs
 0.8-0.9x at 4-64 tokens, where every chunk state is stored, so it cannot be
-chosen without following the batch. A 3-stage ring or a key split for BF16
+chosen without following the batch. Task 30 repeated this with a brute-force
+plan per shape (block_h x splits x whole tokens) for both chunk counts: 16
+chunks are 1.31x (BF16) / 1.23x (E4M3) faster at 1-4 tokens and 0.95x / 0.91x
+at 13-64 tokens (worst 0.85x / 0.81x), 1.06x / 1.01x geomean over the 140
+shapes. A split CTA costs 7-10 us (state store at the end of its chain plus the
+combine; BF16 32 heads: 2 / 4 / 8 splits are 79 / 43 / 25 us against 138 / k)
+and the extra states are L2 / DRAM traffic comparable to the gathers at 64
+tokens x 128 heads. A persistent CTA that prefetches the next token's query
+and first tile has no work to chain at one request (8-16 CTAs) and at most
+3.4-5% to gain elsewhere: a launch whose selections are all empty (launch,
+query load, store, combine) takes 17 of 441 us (BF16, 128 heads, 128 tokens)
+and 8 of 248 us (E4M3); BF16 holds the query in 32 of its 255 registers and
+E4M3 stages it in 18-36 KB next to the 99 KiB ring, so there is nowhere to
+prefetch it. Keeping chunk states on chip across a run is not bit-exact: the
+fold is a left fold, so a CTA that owns chunks 4-7 needs the running state of
+chunk 3, and a chain of CTAs through global memory or DSMEM pays one hop per
+CTA against the 2 us combine. Prefetching the combine's chunk loads (1-8
+states ahead) gained nothing. A 3-stage ring or a key split for BF16
 needs the query next to the ring in 99 KiB, which does not fit.
 Measured (same 64 buckets, CUDA graph, `bench_dsa_mma_sm120.py`), CuTe against
 the Triton core: E4M3 1.91x geomean (1.49-2.34x), BF16 1.16x (1.00-1.42x), no
@@ -431,7 +466,8 @@ route. The V4 prefill and MLA decode CuTe leaves reuse this kernel class
 (`dsv4/_cute_dsl/`, `mla/_cute_dsl/`). Still open: the BF16 path at 42-48% of
 the 16-bit floor (channel-split partial scores; a register-resident query with
 a key split as in E4M3, or a smaller ring, are untried), and decode of one
-request, bound by its 8 width chunks (20 us BF16). Sharing gathered rows across
+request, bound by its 8 width chunks (20 us BF16 / 13 us E4M3: 5.3 / 4.6 us
+of launch, query and combine, then about 1.9 / 2.2 us per tile of the chain). Sharing gathered rows across
 a 2-CTA cluster over DSMEM is ruled out on SM120: DSMEM pulls run at about
 33 GB/s per CTA (DeepGEMM `deepgemm-analysis.md` 9.28).
 
