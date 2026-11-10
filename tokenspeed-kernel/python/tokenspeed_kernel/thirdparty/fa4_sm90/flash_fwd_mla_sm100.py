@@ -4,45 +4,43 @@ import math
 from functools import partial
 from typing import Callable, Optional
 
-
 import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int64, Int32, Uint32, Boolean, const_expr
-from cutlass.cute import FastDivmodDivisor
 import cutlass.pipeline as pipeline
-from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.utils import ClcDynamicPersistentTileScheduler
-
-from quack import copy_utils
-
-from tokenspeed_kernel.thirdparty.fa4_sm90.pack_gqa import pack_gqa_layout, make_packgqa_tiled_tma_atom
-from tokenspeed_kernel.thirdparty.fa4_sm90.paged_kv import PagedKVManager
-from tokenspeed_kernel.thirdparty.fa4_sm90 import utils as fa_utils
-from tokenspeed_kernel.thirdparty.fa4_sm90.seqlen_info import SeqlenInfoQK
-from tokenspeed_kernel.thirdparty.fa4_sm90.block_info import BlockInfo
-from tokenspeed_kernel.thirdparty.fa4_sm90.mask import AttentionMask
 import tokenspeed_kernel.thirdparty.fa4_sm90.blackwell_helpers as fa_sm100_utils
+from cutlass import Boolean, Float32, Int32, Int64, Uint32, const_expr
+from cutlass.cute import FastDivmodDivisor
+from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.utils import ClcDynamicPersistentTileScheduler
+from quack import copy_utils
+from tokenspeed_kernel.thirdparty.fa4_sm90 import utils as fa_utils
+from tokenspeed_kernel.thirdparty.fa4_sm90.block_info import BlockInfo
+from tokenspeed_kernel.thirdparty.fa4_sm90.fa_logging import fa_log, fa_printf
+from tokenspeed_kernel.thirdparty.fa4_sm90.mask import AttentionMask
+from tokenspeed_kernel.thirdparty.fa4_sm90.named_barrier import (
+    NamedBarrierFwdSm100_MLA2CTA,
+)
+from tokenspeed_kernel.thirdparty.fa4_sm90.pack_gqa import (
+    make_packgqa_tiled_tma_atom,
+    pack_gqa_layout,
+)
+from tokenspeed_kernel.thirdparty.fa4_sm90.paged_kv import PagedKVManager
+from tokenspeed_kernel.thirdparty.fa4_sm90.seqlen_info import SeqlenInfoQK
 from tokenspeed_kernel.thirdparty.fa4_sm90.softmax import SoftmaxSm100
 from tokenspeed_kernel.thirdparty.fa4_sm90.tile_scheduler import (
+    ParamsBase,
     SchedulerState,
     SchedulingMode,
+    SingleTileLPTScheduler,
+    SingleTileScheduler,
+    SingleTileVarlenScheduler,
     TileSchedulerArguments,
     TileSchedulerProtocol,
-    SingleTileScheduler,
-    SingleTileLPTScheduler,
-    SingleTileVarlenScheduler,
-    ParamsBase,
 )
-from tokenspeed_kernel.thirdparty.fa4_sm90.fa_logging import fa_log, fa_printf
-from tokenspeed_kernel.thirdparty.fa4_sm90.utils import smid, get_batch_from_cu_tensor
-
 from tokenspeed_kernel.thirdparty.fa4_sm90.topk_gather_kv import CpasyncGatherKVManager
-
-
-from tokenspeed_kernel.thirdparty.fa4_sm90.named_barrier import NamedBarrierFwdSm100_MLA2CTA
+from tokenspeed_kernel.thirdparty.fa4_sm90.utils import get_batch_from_cu_tensor, smid
 
 
 class FlashAttentionMLAForwardSm100:
@@ -91,8 +89,12 @@ class FlashAttentionMLAForwardSm100:
         )
 
         self.is_varlen_q = has_seqused_q or has_cu_seqlens_q
-        self.use_packed_varlen_sched = has_cu_seqlens_q and qhead_per_kvhead == 128 and pack_gqa
-        self.use_varlen_scheduler = self.is_varlen_q and not self.use_packed_varlen_sched
+        self.use_packed_varlen_sched = (
+            has_cu_seqlens_q and qhead_per_kvhead == 128 and pack_gqa
+        )
+        self.use_varlen_scheduler = (
+            self.is_varlen_q and not self.use_packed_varlen_sched
+        )
 
         if const_expr(self.use_varlen_scheduler):
             self.TileScheduler = SingleTileVarlenScheduler
@@ -186,7 +188,9 @@ class FlashAttentionMLAForwardSm100:
             or self.cluster_tile_m % qhead_per_kvhead == 0
             or qhead_per_kvhead % self.cluster_tile_m == 0
         )
-        self.num_hdimv_splits = 2  # split hdimv in half for our Qv @ V^T and P @ V mmas.
+        self.num_hdimv_splits = (
+            2  # split hdimv in half for our Qv @ V^T and P @ V mmas.
+        )
         assert hdimv % 32 == 0
         assert self.topk_length % self.tile_n == 0 or not self.is_topk_gather
         self.epi_tile = (self.cta_tile_m, self.hdimv // self.num_hdimv_splits)
@@ -246,9 +250,9 @@ class FlashAttentionMLAForwardSm100:
         self.tmem_offset_O1 = self.tmem_offset_O0 + self.tmem_cols_Oi
         self.tmem_offsets_O = [self.tmem_offset_O0, self.tmem_offset_O1]
         self.total_tmem = self.tmem_offset_O1 + self.tmem_cols_Oi
-        assert self.total_tmem <= self.tmem_alloc_cols, (
-            f"Total TMEM columns allocated {self.total_tmem} exceeds capacity {self.tmem_alloc_cols}"
-        )
+        assert (
+            self.total_tmem <= self.tmem_alloc_cols
+        ), f"Total TMEM columns allocated {self.total_tmem} exceeds capacity {self.tmem_alloc_cols}"
 
     def _get_shared_storage_cls(self):
         self.buffer_align_bytes = 1024
@@ -264,7 +268,7 @@ class FlashAttentionMLAForwardSm100:
         def mbar_struct(num_stages):
             return cute.struct.MemRange[Int64, 2 * num_stages]
 
-        (sQ_struct, sK_struct, sQv_struct, sV_struct, sP_struct) = (
+        sQ_struct, sK_struct, sQv_struct, sV_struct, sP_struct = (
             smem_struct_align(dtype, layout, disabled)
             for dtype, layout, disabled in [
                 (self.dtype_Q, self.sQ_layout_staged, not self.has_qk),
@@ -276,7 +280,9 @@ class FlashAttentionMLAForwardSm100:
         )
         sStats_struct = cute.struct.MemRange[Float32, cute.cosize(self.sStats_layout)]
         sScale_struct = cute.struct.MemRange[Float32, cute.cosize(self.sScale_layout)]
-        sBitmask_struct = cute.struct.MemRange[Uint32, cute.cosize(self.sBitmask_layout)]
+        sBitmask_struct = cute.struct.MemRange[
+            Uint32, cute.cosize(self.sBitmask_layout)
+        ]
 
         (
             mbar_ptr_Q_struct,
@@ -636,7 +642,7 @@ class FlashAttentionMLAForwardSm100:
         # ==== Tile scheduler ====
 
         TileScheduler = self.TileScheduler
-        
+
         batch_size_for_sched = (
             cute.size(mQv.shape[3]) if const_expr(mCuSeqlensQ is None)
             else cute.size(mCuSeqlensQ.shape[0] - 1) if self.use_varlen_scheduler

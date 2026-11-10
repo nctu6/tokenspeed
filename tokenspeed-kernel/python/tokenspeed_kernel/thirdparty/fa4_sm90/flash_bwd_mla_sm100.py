@@ -5,39 +5,42 @@ from functools import partial
 from typing import Callable, Optional
 
 import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int64, Int32, Boolean, const_expr
 import cutlass.pipeline as pipeline
-from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.utils import ClcDynamicPersistentTileScheduler
-
-from quack import copy_utils, layout_utils
-
-from tokenspeed_kernel.thirdparty.fa4_sm90.pack_gqa import pack_gqa_layout
-from tokenspeed_kernel.thirdparty.fa4_sm90.seqlen_info import SeqlenInfoQK
-from tokenspeed_kernel.thirdparty.fa4_sm90.block_info import BlockInfo
 import tokenspeed_kernel.thirdparty.fa4_sm90.blackwell_helpers as fa_sm100_utils
-from tokenspeed_kernel.thirdparty.fa4_sm90.tile_scheduler import (
-    SchedulerState,
-    SchedulingMode,
-    TileSchedulerArguments,
-    TileSchedulerProtocol,
-    SingleTileScheduler,
-    SingleTileLPTScheduler,
-    SingleTileVarlenScheduler,
-    ParamsBase,
+from cutlass import Boolean, Float32, Int32, Int64, const_expr
+from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.utils import ClcDynamicPersistentTileScheduler
+from quack import copy_utils, layout_utils
+from tokenspeed_kernel.thirdparty.fa4_sm90.block_info import BlockInfo
+from tokenspeed_kernel.thirdparty.fa4_sm90.copy_utils import (
+    atomic_add_fp32x4,
+    tiled_copy_2d,
 )
 from tokenspeed_kernel.thirdparty.fa4_sm90.fa_logging import fa_log, fa_printf
-from tokenspeed_kernel.thirdparty.fa4_sm90.utils import smid, elem_pointer, get_batch_from_cu_tensor
-from tokenspeed_kernel.thirdparty.fa4_sm90.copy_utils import tiled_copy_2d, atomic_add_fp32x4
-
+from tokenspeed_kernel.thirdparty.fa4_sm90.named_barrier import (
+    NamedBarrierBwdSm100_MLA2CTA,
+)
+from tokenspeed_kernel.thirdparty.fa4_sm90.pack_gqa import pack_gqa_layout
+from tokenspeed_kernel.thirdparty.fa4_sm90.seqlen_info import SeqlenInfoQK
+from tokenspeed_kernel.thirdparty.fa4_sm90.tile_scheduler import (
+    ParamsBase,
+    SchedulerState,
+    SchedulingMode,
+    SingleTileLPTScheduler,
+    SingleTileScheduler,
+    SingleTileVarlenScheduler,
+    TileSchedulerArguments,
+    TileSchedulerProtocol,
+)
 from tokenspeed_kernel.thirdparty.fa4_sm90.topk_gather_kv import CpasyncGatherKVManager
-
-
-from tokenspeed_kernel.thirdparty.fa4_sm90.named_barrier import NamedBarrierBwdSm100_MLA2CTA
+from tokenspeed_kernel.thirdparty.fa4_sm90.utils import (
+    elem_pointer,
+    get_batch_from_cu_tensor,
+    smid,
+)
 
 
 class FlashAttentionSparseMLABackwardSm100:
@@ -151,7 +154,9 @@ class FlashAttentionSparseMLABackwardSm100:
         self.tile_n = 64
         self.cta_tiler_mn = (self.tile_m // self.cta_group_size, self.tile_n)
         self.cluster_tile_n = self.cta_group_size * self.tile_n
-        self.num_hdimv_splits = 2  # split hdimv in half for our Qv @ V^T and P @ V mmas.
+        self.num_hdimv_splits = (
+            2  # split hdimv in half for our Qv @ V^T and P @ V mmas.
+        )
 
         self.tile_P = (self.tile_m, self.tile_n)
         self.tile_Pt = (self.tile_n, self.tile_m)
@@ -223,15 +228,17 @@ class FlashAttentionSparseMLABackwardSm100:
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
         self.tmem_cols_dP = self.tile_m // self.cta_group_size
-        self.tmem_cols_dVi = (self.hdimv // self.num_hdimv_splits) // self.cta_group_size
+        self.tmem_cols_dVi = (
+            self.hdimv // self.num_hdimv_splits
+        ) // self.cta_group_size
         self.tmem_offset_dV0 = 0
         self.tmem_offset_dV1 = self.tmem_offset_dV0 + self.tmem_cols_dVi
         self.tmem_offsets_dV = [self.tmem_offset_dV0, self.tmem_offset_dV1]
         self.tmem_offset_dP = self.tmem_offset_dV1 + self.tmem_cols_dVi
         self.total_tmem = self.tmem_offset_dP + self.tmem_cols_dP
-        assert self.total_tmem <= self.tmem_alloc_cols, (
-            f"Total TMEM columns allocated {self.total_tmem} exceeds capacity {self.tmem_alloc_cols}"
-        )
+        assert (
+            self.total_tmem <= self.tmem_alloc_cols
+        ), f"Total TMEM columns allocated {self.total_tmem} exceeds capacity {self.tmem_alloc_cols}"
 
     def _get_shared_storage_cls(self):
         self.buffer_align_bytes = 1024
@@ -532,7 +539,7 @@ class FlashAttentionSparseMLABackwardSm100:
         )
 
         # ==== TMA store ====
-        tma_store_op = cpasync.CopyBulkTensorTileS2GOp()  
+        tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
 
         self.dS_layout_major = cutlass.utils.LayoutEnum.from_tensor(mdS)
         self.dV_layout_major = cutlass.utils.LayoutEnum.from_tensor(mdV)

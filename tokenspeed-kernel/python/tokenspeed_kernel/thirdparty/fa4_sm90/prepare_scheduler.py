@@ -1,15 +1,16 @@
 # A reimplementation of https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_prepare_scheduler.cu
 # from CUTLASS C++ to Cute-DSL.
 
-from typing import Tuple, Optional, NamedTuple
 import operator
-import torch
+from typing import NamedTuple, Optional, Tuple
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, const_expr, Float32
-from cutlass.cute import FastDivmodDivisor
 import tokenspeed_kernel.thirdparty.fa4_sm90.utils as utils
+import torch
+from cutlass import Float32, Int32, const_expr
+from cutlass.cute import FastDivmodDivisor
 
 
 class SchedulerMetadataTensorsTorch(NamedTuple):
@@ -70,7 +71,11 @@ class FlashPrepareScheduler:
             else (
                 2
                 if self.qhead_per_khead <= 2
-                else (4 if self.qhead_per_khead <= 4 else (8 if self.qhead_per_khead <= 8 else 16))
+                else (
+                    4
+                    if self.qhead_per_khead <= 4
+                    else (8 if self.qhead_per_khead <= 8 else 16)
+                )
             )
         )
         self.size_l2 = (32 * 1024 * 1024) // self.size_l2_divisor
@@ -241,7 +246,9 @@ class FlashPrepareScheduler:
 
                 total_blocks = total_blocks_smem[0]
 
-                sm_margin = max(Float32(num_sm) / 128 + 0.001, 1.1)  # e.g. 148/128 = 1.15625
+                sm_margin = max(
+                    Float32(num_sm) / 128 + 0.001, 1.1
+                )  # e.g. 148/128 = 1.15625
                 blocks_per_sm = cutlass.max(
                     Int32(
                         (
@@ -353,7 +360,9 @@ class FlashPrepareScheduler:
             cur_cu_seqlen_new = Int32(0)
             if batch_idx <= num_batch:
                 cur_cu_seqlen_new = mCuSeqlensKNew[batch_idx]
-            next_cu_seqlen_new = cute.arch.shuffle_sync_down(cur_cu_seqlen_new, offset=1)
+            next_cu_seqlen_new = cute.arch.shuffle_sync_down(
+                cur_cu_seqlen_new, offset=1
+            )
             seqlen_new = next_cu_seqlen_new - cur_cu_seqlen_new
         else:
             seqlen_new = seqlen_k_new_static

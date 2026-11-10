@@ -64,7 +64,11 @@ def _select(head_dim: int, fa4_env: str) -> str:
     env.pop("TOKENSPEED_FLASHINFER_FA2_EXTEND", None)
     env.pop("TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_MHA_EXTEND_WITH_KVCACHE", None)
     out = subprocess.run(
-        [sys.executable, "-c", code], check=True, capture_output=True, text=True, env=env
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
     )
     return out.stdout.strip().splitlines()[-1]
 

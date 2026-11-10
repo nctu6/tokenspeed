@@ -354,9 +354,7 @@ def test_runtime_and_draft_setup_reach_attention_leaves(attention_root):
             cache_group_specs=(
                 SimpleNamespace(group_id=FULL_ATTENTION, shard_count=1),
             ),
-            runtime_contract=SimpleNamespace(
-                virtual_block_counts={FULL_ATTENTION: 7}
-            ),
+            runtime_contract=SimpleNamespace(virtual_block_counts={FULL_ATTENTION: 7}),
         )
     )
     router._geometry = SimpleNamespace(granularity_of=lambda group_id: 64)

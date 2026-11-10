@@ -80,7 +80,12 @@ def test_dp_path_fits_rows_to_placeholders(extra, max_tokens):
     for rank in range(2):
         e, seen = _dp_embedder(rank, 2, extra)
         out = e._encode_data_parallel(
-            items, None, torch.device("cpu"), WIDTH, torch.float32, max_tokens=max_tokens
+            items,
+            None,
+            torch.device("cpu"),
+            WIDTH,
+            torch.float32,
+            max_tokens=max_tokens,
         )
         assert seen["local_rows"] == assignment.token_counts_by_rank[rank]
         assert [t.shape[0] for t in out] == lens

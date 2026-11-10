@@ -356,9 +356,7 @@ TEST_F(MixedDecodeRefSuite, PrefillShareShrinksWithTheDecodeCount) {
 
 class MixedPrefillFloorSuite : public MixedDecodeRefSuite {
 protected:
-    void SetUp() override {
-        MixedDecodeRefSuite::SetUp();
-    }
+    void SetUp() override { MixedDecodeRefSuite::SetUp(); }
     SchedulerConfig MakeConfig() override {
         // Floor at half a chunk, applied before the scheduler reads it.
         ::setenv("TOKENSPEED_MIXED_PREFILL_FLOOR",

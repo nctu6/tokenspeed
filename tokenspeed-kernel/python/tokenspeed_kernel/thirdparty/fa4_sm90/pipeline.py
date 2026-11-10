@@ -1,20 +1,20 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Optional
 from dataclasses import dataclass
+from typing import Optional
 
 import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
-from cutlass.cutlass_dsl import if_generate, dsl_user_op
-from cutlass.pipeline import PipelineState
-from cutlass.pipeline import PipelineUserType
+from cutlass.cutlass_dsl import dsl_user_op, if_generate
 from cutlass.pipeline import NamedBarrier as NamedBarrierOg
 from cutlass.pipeline import PipelineAsync as PipelineAsyncOg
+from cutlass.pipeline import PipelineAsyncUmma as PipelineAsyncUmmaOg
 from cutlass.pipeline import PipelineCpAsync as PipelineCpAsyncOg
+from cutlass.pipeline import PipelineState
 from cutlass.pipeline import PipelineTmaAsync as PipelineTmaAsyncOg
 from cutlass.pipeline import PipelineTmaUmma as PipelineTmaUmmaOg
 from cutlass.pipeline import PipelineUmmaAsync as PipelineUmmaAsyncOg
-from cutlass.pipeline import PipelineAsyncUmma as PipelineAsyncUmmaOg
+from cutlass.pipeline import PipelineUserType
 
 
 def _override_create(parent_cls, child_cls):
@@ -92,7 +92,9 @@ def make_pipeline_state(type: PipelineUserType, stages: int):
     elif type is PipelineUserType.Consumer:
         return PipelineStateSimple(stages, Int32(0))
     else:
-        assert False, "Error: invalid PipelineUserType specified for make_pipeline_state."
+        assert (
+            False
+        ), "Error: invalid PipelineUserType specified for make_pipeline_state."
 
 
 # ── Shared helpers ───────────────────────────────────────────────────────────
@@ -316,15 +318,21 @@ class PipelineTmaAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
         """
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
+            lambda: self.sync_object_empty.wait(
+                state.index, state.phase, loc=loc, ip=ip
+            ),
             loc=loc,
             ip=ip,
         )
         if const_expr(extra_tx_count == 0):
-            self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip)
+            self.sync_object_full.arrive(
+                state.index, self.producer_mask, loc=loc, ip=ip
+            )
         else:
             tx_count = self.sync_object_full.tx_count + extra_tx_count
-            self.sync_object_full.arrive_and_expect_tx(state.index, tx_count, loc=loc, ip=ip)
+            self.sync_object_full.arrive_and_expect_tx(
+                state.index, tx_count, loc=loc, ip=ip
+            )
 
 
 PipelineTmaAsync.create = _override_create(PipelineTmaAsyncOg, PipelineTmaAsync)
@@ -352,7 +360,9 @@ class PipelineTmaUmma(_PipelineIndexPhaseMixin, PipelineTmaUmmaOg):
         """
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
+            lambda: self.sync_object_empty.wait(
+                state.index, state.phase, loc=loc, ip=ip
+            ),
             loc=loc,
             ip=ip,
         )

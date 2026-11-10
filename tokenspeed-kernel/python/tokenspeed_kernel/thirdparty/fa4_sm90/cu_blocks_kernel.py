@@ -1,11 +1,9 @@
 from typing import Callable, Optional
 
 import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
-
 from tokenspeed_kernel.thirdparty.fa4_sm90.utils import get_batch_from_cu_tensor
 
 
@@ -75,8 +73,12 @@ class CuSeqlensToBlocksKernel:
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
-        warp_block_count = storage.warp_block_count.get_tensor(cute.make_layout(self.num_warps))
-        warp_split_count = storage.warp_split_count.get_tensor(cute.make_layout(self.num_warps))
+        warp_block_count = storage.warp_block_count.get_tensor(
+            cute.make_layout(self.num_warps)
+        )
+        warp_split_count = storage.warp_split_count.get_tensor(
+            cute.make_layout(self.num_warps)
+        )
 
         if tidx == 0:
             mCuBlocks[0] = 0
@@ -109,7 +111,9 @@ class CuSeqlensToBlocksKernel:
             total_split_blocks_for_batch = num_split_blocks
 
             for delta in (1, 2, 4, 8, 16):
-                other = cute.arch.shuffle_sync_up(total_blocks_for_batch, delta, mask_and_clamp=0)
+                other = cute.arch.shuffle_sync_up(
+                    total_blocks_for_batch, delta, mask_and_clamp=0
+                )
                 if const_expr(has_splits):
                     other_splits = cute.arch.shuffle_sync_up(
                         total_split_blocks_for_batch, delta, mask_and_clamp=0
@@ -176,6 +180,10 @@ class CuBlocksToBatchKernel:
         mCuTotalBlocks: cute.Tensor,
         mBlocksToBatchIdx: cute.Tensor,
     ):
-        block_idx = cute.arch.block_idx()[0] * self.num_threads + cute.arch.thread_idx()[0]
+        block_idx = (
+            cute.arch.block_idx()[0] * self.num_threads + cute.arch.thread_idx()[0]
+        )
         if block_idx < mBlocksToBatchIdx.shape[0]:
-            mBlocksToBatchIdx[block_idx] = get_batch_from_cu_tensor(block_idx, mCuTotalBlocks)
+            mBlocksToBatchIdx[block_idx] = get_batch_from_cu_tensor(
+                block_idx, mCuTotalBlocks
+            )

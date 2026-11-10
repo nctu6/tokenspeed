@@ -1,4 +1,5 @@
 # Manage Ahead-of-Time (AOT) compiled kernels
+import ctypes
 import fcntl
 import hashlib
 import os
@@ -10,8 +11,6 @@ from functools import lru_cache
 from getpass import getuser
 from pathlib import Path
 from typing import Hashable, TypeAlias
-
-import ctypes
 
 import cutlass
 import cutlass.cute as cute
@@ -31,7 +30,9 @@ CompileKeyType: TypeAlias = tuple[Hashable, ...]
 CallableFunction: TypeAlias = JitCompiledFunction | tvm_ffi.Function
 
 # Enable cache via `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1`
-CUTE_DSL_CACHE_ENABLED: bool = os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "0") == "1"
+CUTE_DSL_CACHE_ENABLED: bool = (
+    os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "0") == "1"
+)
 
 
 # Customize cache dir via `FLASH_ATTENTION_CUTE_DSL_CACHE_DIR`, default is
@@ -43,7 +44,9 @@ def get_cache_path() -> Path:
     if CUTE_DSL_CACHE_DIR is not None:
         cache_dir = Path(CUTE_DSL_CACHE_DIR)
     else:
-        cache_dir = Path(tempfile.gettempdir()) / getuser() / "flash_attention_cute_dsl_cache"
+        cache_dir = (
+            Path(tempfile.gettempdir()) / getuser() / "flash_attention_cute_dsl_cache"
+        )
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
@@ -115,7 +118,9 @@ class FileLock:
         return f"{kind} {self.label}" if self.label else kind
 
     def __enter__(self) -> "FileLock":
-        open_flags = os.O_WRONLY | os.O_CREAT if self.exclusive else os.O_RDONLY | os.O_CREAT
+        open_flags = (
+            os.O_WRONLY | os.O_CREAT if self.exclusive else os.O_RDONLY | os.O_CREAT
+        )
         lock_type = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
 
         self._fd = os.open(str(self.lock_path), open_flags)
@@ -224,7 +229,9 @@ class JITPersistentCache(JITCache):
                 fa_log(1, f"Cache miss on disk for key hash {sha256_hex}")
         return False
 
-    def _try_export_to_storage(self, key: CompileKeyType, fn: JitCompiledFunction) -> None:
+    def _try_export_to_storage(
+        self, key: CompileKeyType, fn: JitCompiledFunction
+    ) -> None:
         """Export a compiled function to persistent storage under exclusive lock."""
         sha256_hex = self._key_to_hash(key)
         with FileLock(

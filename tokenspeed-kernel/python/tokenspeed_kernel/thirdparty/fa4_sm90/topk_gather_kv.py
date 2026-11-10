@@ -1,18 +1,16 @@
-from typing import Type, Optional
-from dataclasses import dataclass
+import math
 import operator
+from dataclasses import dataclass
+from typing import Optional, Type
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
+from cutlass import Boolean, Int32, Uint32, const_expr
 from cutlass.cute.nvgpu import cpasync
-from cutlass import Int32, Uint32, const_expr, Boolean
-
+from quack.cute_dsl_utils import ParamsBase
 from tokenspeed_kernel.thirdparty.fa4_sm90 import utils
 from tokenspeed_kernel.thirdparty.fa4_sm90.utils import warp_reduce
-from quack.cute_dsl_utils import ParamsBase
-
-import math
 
 
 @dataclass
@@ -97,7 +95,9 @@ class CpasyncGatherKVManager(ParamsBase):
             order=(1, 0),
         )
         val_layout = cute.make_layout((1, async_copy_elems))
-        gmem_tiled_copy_KV = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
+        gmem_tiled_copy_KV = cute.make_tiled_copy_tv(
+            atom_async_copy, thr_layout, val_layout
+        )
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
         topk_indices_per_thread = tile_n // num_threads
 
@@ -225,8 +225,14 @@ class CpasyncGatherKVManager(ParamsBase):
         d_offset: int = 0,
     ):
         assert K_or_V in ("K", "V")
-        cta_tile_n = self.tile_n if const_expr(transpose) else self.tile_n // self.cta_group_size
-        head_dim = self.hdim if const_expr(K_or_V == "K") else self.hdim_v // self.num_hdimv_splits
+        cta_tile_n = (
+            self.tile_n if const_expr(transpose) else self.tile_n // self.cta_group_size
+        )
+        head_dim = (
+            self.hdim
+            if const_expr(K_or_V == "K")
+            else self.hdim_v // self.num_hdimv_splits
+        )
         if const_expr(transpose):
             head_dim = head_dim // self.cta_group_size
         order = (1, 0) if const_expr(transpose) else (0, 1)
@@ -241,7 +247,9 @@ class CpasyncGatherKVManager(ParamsBase):
         tPrXPtr, tPrRowValid = self.compute_X_ptr(mX, transpose, d_offset)
 
         if const_expr(not transpose):
-            offset = self.cta_rank_in_cluster * (self.gmem_threads_per_row // self.cta_group_size)
+            offset = self.cta_rank_in_cluster * (
+                self.gmem_threads_per_row // self.cta_group_size
+            )
         else:
             offset = 0
 
@@ -269,7 +277,9 @@ class CpasyncGatherKVManager(ParamsBase):
                 ki = tXcX[0, 0, k][1] // self.async_copy_elems
                 mX_cur_copy_ki = mX_cur_copy[None, ki]
                 tXsX_k = tXsX[None, m, k]
-                mX_cur_copy_ki = cute.make_tensor(mX_cur_copy_ki.iterator, tXsX_k.layout)
+                mX_cur_copy_ki = cute.make_tensor(
+                    mX_cur_copy_ki.iterator, tXsX_k.layout
+                )
                 cute.copy(
                     self.gmem_tiled_copy_KV,
                     mX_cur_copy_ki,

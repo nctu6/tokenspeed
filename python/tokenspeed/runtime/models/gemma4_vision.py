@@ -179,8 +179,12 @@ def encode_gemma4_images(
     pooling_k2 = int(getattr(vision_tower.config, "pooling_kernel_size", 3)) ** 2
 
     pixel_list, pos_list = _gemma4_iter_views(items)
-    pixel_list = [p.to(device=device, dtype=dtype, non_blocking=True) for p in pixel_list]
-    pos_list = [p.to(device=device, dtype=torch.long, non_blocking=True) for p in pos_list]
+    pixel_list = [
+        p.to(device=device, dtype=dtype, non_blocking=True) for p in pixel_list
+    ]
+    pos_list = [
+        p.to(device=device, dtype=torch.long, non_blocking=True) for p in pos_list
+    ]
 
     # Drop padded patch rows before encode/pool. SMG feature_token_counts use
     # n_valid // pooling_k2; leaving max_patches padding in makes the pooler
@@ -318,7 +322,9 @@ def encode_gemma4_audio(
                 mask = mask.squeeze(0)
             length = int(mask.to(torch.bool).sum().item())
         elif "audio_feature_lengths" in item.model_specific_data:
-            length = int(item.model_specific_data["audio_feature_lengths"].reshape(-1)[0])
+            length = int(
+                item.model_specific_data["audio_feature_lengths"].reshape(-1)[0]
+            )
         else:
             length = int(feat.shape[-1])
         feats.append(feat.to(device=device, dtype=dtype, non_blocking=True))

@@ -523,13 +523,13 @@ class LogitsProcessor(nn.Module):
         if self.tp_group is None:
             return False
 
-        from tokenspeed.runtime.distributed.nvls_multicast import (
-            nvls_multicast_mapping_usable,
-        )
         from tokenspeed_kernel.ops.communication.fabric import (
             group_has_fabric,
         )
 
+        from tokenspeed.runtime.distributed.nvls_multicast import (
+            nvls_multicast_mapping_usable,
+        )
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
         # Hosts that advertise multicast but fail cuMulticastBindMem leave a

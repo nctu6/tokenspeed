@@ -129,7 +129,7 @@ class TorchAOConfig(QuantizationConfig):
         except ImportError as err:
             raise ImportError(
                 "Loading a torchao-quantized checkpoint requires the torchao "
-                "package. Install it with `pip install \"torchao>=0.10.0\"` "
+                'package. Install it with `pip install "torchao>=0.10.0"` '
                 "(install.sh does this for the venv)."
             ) from err
 
@@ -140,9 +140,9 @@ class TorchAOConfig(QuantizationConfig):
 
         quant_type = cls.get_from_keys_or(config, ["quant_type"], None)
         assert quant_type is not None, "quant_type must be specified"
-        assert len(quant_type) == 1 and "default" in quant_type, (
-            "Expected exactly one key 'default' in the torchao quant_type"
-        )
+        assert (
+            len(quant_type) == 1 and "default" in quant_type
+        ), "Expected exactly one key 'default' in the torchao quant_type"
         ao_config = config_from_dict(quant_type["default"])
 
         # Modules the checkpoint marks as not-to-convert stay unquantized.

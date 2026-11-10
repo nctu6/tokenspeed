@@ -67,6 +67,10 @@ def test_residency_device_split_default_usp_and_rejections():
     with pytest.raises(ValueError, match="residency=ulysses requires"):
         H3Config(model_path="/tmp", num_gpus=2, residency="ulysses").resolve_residency()
     with pytest.raises(ValueError, match="device_split requires"):
-        H3Config(model_path="/tmp", num_gpus=1, residency="device_split").resolve_residency()
+        H3Config(
+            model_path="/tmp", num_gpus=1, residency="device_split"
+        ).resolve_residency()
     with pytest.raises(ValueError, match="text encoder"):
-        H3Config(model_path="/tmp", num_gpus=2, text_encoder_tp_size=2).resolve_residency()
+        H3Config(
+            model_path="/tmp", num_gpus=2, text_encoder_tp_size=2
+        ).resolve_residency()

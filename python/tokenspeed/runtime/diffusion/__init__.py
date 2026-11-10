@@ -42,8 +42,8 @@ __all__ = [
 
 from tokenspeed.runtime.diffusion.config import (
     AUDIO_SIGMA_SHIFT,
-    H3Config,
     VIDEO_SIGMA_SHIFT,
+    H3Config,
     resolve_diffusion_checkpoint,
 )
 

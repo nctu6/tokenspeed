@@ -387,9 +387,7 @@ class Gemma3Attention(nn.Module):
         # positions must pass ``sliding_window - 1`` here. gpt_oss, dflash and
         # inkling all subtract one for the same reason; matching HF exactly is
         # what keeps the local-layer attention span token-for-token correct.
-        sliding_window_size = (
-            int(config.sliding_window) - 1 if self.is_sliding else -1
-        )
+        sliding_window_size = int(config.sliding_window) - 1 if self.is_sliding else -1
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
@@ -610,7 +608,6 @@ class Gemma3Model(nn.Module):
         return hidden_states, None
 
 
-
 class _Gemma3ScaledEmbedding(nn.Module):
     """VocabParallelEmbedding plus Gemma ``sqrt(hidden_size)`` normalizer.
 
@@ -803,9 +800,10 @@ class Gemma3ForConditionalGeneration(BaseCausalLM):
             elif name.startswith("model.vision_tower."):
                 name = "vision_tower." + name[len("model.vision_tower.") :]
             elif name.startswith("model.multi_modal_projector."):
-                name = "multi_modal_projector." + name[
-                    len("model.multi_modal_projector.") :
-                ]
+                name = (
+                    "multi_modal_projector."
+                    + name[len("model.multi_modal_projector.") :]
+                )
             # HF SiglipVisionModel params are vision_tower.embeddings.*; the
             # checkpoint nests them under vision_tower.vision_model.*.
             if name.startswith("vision_tower.vision_model."):
@@ -841,8 +839,7 @@ class Gemma3ForConditionalGeneration(BaseCausalLM):
         expected = {
             n
             for n in params_dict
-            if not n.startswith("vision_tower.")
-            or self.is_multimodal_active
+            if not n.startswith("vision_tower.") or self.is_multimodal_active
         }
         # Soften: allow unused HF vision head params if present under aliases.
         missing = sorted(expected - loaded)

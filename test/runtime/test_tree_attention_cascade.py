@@ -63,7 +63,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-
 def _require_sm10x(backend: str) -> None:
     # Tree verify needs the TRT-LLM-gen kernels: elsewhere FlashInfer falls
     # back to XQA, which has no LSE output and no multi-token MLA queries, and

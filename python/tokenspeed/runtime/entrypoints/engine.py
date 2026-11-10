@@ -67,8 +67,8 @@ from tokenspeed.runtime.engine.data_parallel_controller import (
 )
 from tokenspeed.runtime.engine.event_loop import run_event_loop
 from tokenspeed.runtime.engine.io_struct import (
-    EmbeddingReqInput,
     DestroyWeightsUpdateGroupReqInput,
+    EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,

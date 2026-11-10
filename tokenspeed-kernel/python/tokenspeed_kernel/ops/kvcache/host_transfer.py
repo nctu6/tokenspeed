@@ -1070,9 +1070,7 @@ def _transfer_dma(
     if memcpy2d:
         stream = torch.cuda.current_stream(device_buffers[0].device).cuda_stream
         host_base = host_buffer.data_ptr()
-        bases = [
-            buffer.data_ptr() for buffer in device_buffers
-        ]
+        bases = [buffer.data_ptr() for buffer in device_buffers]
         for buf, dev, host, width, height, pitch in strided_runs(ranges):
             dev_ptr = bases[buf] + dev
             host_ptr = host_base + host
@@ -1089,9 +1087,12 @@ def _transfer_dma(
     byte_buffers = tuple(
         buffer.view(torch.uint8).reshape(-1) for buffer in device_buffers
     )
-    for device_buffer_index, device_offset, host_offset, num_bytes in (
-        merge_contiguous_ranges(ranges)
-    ):
+    for (
+        device_buffer_index,
+        device_offset,
+        host_offset,
+        num_bytes,
+    ) in merge_contiguous_ranges(ranges):
         device_slice = byte_buffers[device_buffer_index][
             device_offset : device_offset + num_bytes
         ]

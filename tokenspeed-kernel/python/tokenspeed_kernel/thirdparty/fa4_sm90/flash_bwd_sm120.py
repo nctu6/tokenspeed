@@ -7,7 +7,6 @@
 
 import cutlass
 import cutlass.utils as utils_basic
-
 from tokenspeed_kernel.thirdparty.fa4_sm90.flash_bwd import FlashAttentionBackwardSm80
 
 
@@ -45,7 +44,9 @@ class FlashAttentionBackwardSm120(FlashAttentionBackwardSm80):
         smem_usage_K = n_block_size * head_dim * 2
         smem_usage_V = n_block_size * head_dim_v * 2
         smem_usage_QV = (
-            (smem_usage_Q + smem_usage_V) if not V_in_regs else max(smem_usage_Q, smem_usage_V)
+            (smem_usage_Q + smem_usage_V)
+            if not V_in_regs
+            else max(smem_usage_Q, smem_usage_V)
         )
         smem_usage = smem_usage_QV + smem_usage_dO + smem_usage_K
         # SM120 has 99 KB shared memory (vs 163 KB on SM80)

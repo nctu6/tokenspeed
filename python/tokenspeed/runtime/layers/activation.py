@@ -114,7 +114,6 @@ class SiluAndMul(torch.nn.Module):
         return (torch.nn.functional.silu(gate) * up).to(x.dtype)
 
 
-
 class GeluTanhAndMul(torch.nn.Module):
     """GeGLU gated activation over a fused ``[..., gate | up]`` input.
 
@@ -140,9 +139,7 @@ class GeluTanhAndMul(torch.nn.Module):
             except Exception:
                 _gelu_tanh_and_mul = None
             if callable(_gelu_tanh_and_mul):
-                out = torch.empty(
-                    x.shape[:-1] + (d,), dtype=x.dtype, device=x.device
-                )
+                out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
                 try:
                     _gelu_tanh_and_mul(x, out)
                     return out

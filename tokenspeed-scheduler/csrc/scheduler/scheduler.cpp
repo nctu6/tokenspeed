@@ -162,9 +162,8 @@ Scheduler::Scheduler(SchedulerConfig config)
                                 : 0;
         // TOKENSPEED_MIXED_DECODE_REF (default 4, mixed mode only): beside more
         // than this many decodes a round's prefill share shrinks as ref/decodes.
-        mixed_decode_ref_ = config_.enable_mixed_prefill_decode
-                                ? std::max(0, env_int("TOKENSPEED_MIXED_DECODE_REF", 4))
-                                : 0;
+        mixed_decode_ref_ =
+            config_.enable_mixed_prefill_decode ? std::max(0, env_int("TOKENSPEED_MIXED_DECODE_REF", 4)) : 0;
         // TOKENSPEED_MIXED_PREFILL_FLOOR (default: an eighth of a reference
         // chunk): the least prefill a shrunk mixed round keeps. It is separate
         // from the admission floor above: at a quarter chunk it pinned 32

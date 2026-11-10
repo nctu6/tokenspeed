@@ -20,9 +20,10 @@ from typing import Iterable
 
 import torch
 from einops import rearrange
-
 from tokenspeed_kernel.thirdparty.fa4_sm90.benchmark import benchmark_forward
-from tokenspeed_kernel.thirdparty.fa4_sm90.interface import _flash_attn_fwd as flash_attn_cute_fwd
+from tokenspeed_kernel.thirdparty.fa4_sm90.interface import (
+    _flash_attn_fwd as flash_attn_cute_fwd,
+)
 
 try:
     import cudnn
@@ -58,12 +59,18 @@ def attention_pytorch(qkv: torch.Tensor, causal: bool) -> torch.Tensor:
     q = rearrange(q, "b t h d -> (b h) t d")
     k = rearrange(k, "b s h d -> (b h) d s")
     softmax_scale = 1.0 / math.sqrt(d)
-    scores = torch.empty(batch_size * nheads, seqlen, seqlen, dtype=qkv.dtype, device=qkv.device)
+    scores = torch.empty(
+        batch_size * nheads, seqlen, seqlen, dtype=qkv.dtype, device=qkv.device
+    )
     scores = rearrange(
-        torch.baddbmm(scores, q, k, beta=0, alpha=softmax_scale), "(b h) t s -> b h t s", h=nheads
+        torch.baddbmm(scores, q, k, beta=0, alpha=softmax_scale),
+        "(b h) t s -> b h t s",
+        h=nheads,
     )
     if causal:
-        causal_mask = torch.triu(torch.full((seqlen, seqlen), -10000.0, device=scores.device), 1)
+        causal_mask = torch.triu(
+            torch.full((seqlen, seqlen), -10000.0, device=scores.device), 1
+        )
         scores = scores + causal_mask.to(dtype=scores.dtype)
     attention = torch.softmax(scores, dim=-1)
     output = torch.einsum("bhts,bshd->bthd", attention, v)
@@ -107,7 +114,9 @@ def cudnn_sdpa_fp8_setup(qkv: torch.Tensor, seqlen_q: int, seqlen_k: int, causal
     """Minimal cudnn.fp8 sdpa runner (optional)."""
     assert cudnn is not None, "cudnn python bindings not available"
     b, _, _, nheads, headdim = qkv.shape
-    o_gpu = torch.zeros(b, seqlen_q, nheads, headdim, dtype=qkv.dtype, device=qkv.device)
+    o_gpu = torch.zeros(
+        b, seqlen_q, nheads, headdim, dtype=qkv.dtype, device=qkv.device
+    )
     o_gpu_transposed = torch.as_strided(
         o_gpu,
         [b, nheads, seqlen_q, headdim],
@@ -162,7 +171,9 @@ def cudnn_sdpa_fp8_setup(qkv: torch.Tensor, seqlen_q: int, seqlen_k: int, causal
     )
 
     def _scale_tensor():
-        return graph.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
+        return graph.tensor(
+            dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT
+        )
 
     default_scale_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float32, device="cuda")
     descale_q = _scale_tensor()
@@ -187,7 +198,9 @@ def cudnn_sdpa_fp8_setup(qkv: torch.Tensor, seqlen_q: int, seqlen_k: int, causal
         use_causal_mask=causal,
         name="sdpa",
     )
-    o.set_output(True).set_dim(o_gpu_transposed.shape).set_stride(o_gpu_transposed.stride())
+    o.set_output(True).set_dim(o_gpu_transposed.shape).set_stride(
+        o_gpu_transposed.stride()
+    )
     amax_s.set_output(False).set_dim(amax_s_gpu.shape).set_stride(amax_s_gpu.stride())
     amax_o.set_output(False).set_dim(amax_o_gpu.shape).set_stride(amax_o_gpu.stride())
 
@@ -211,7 +224,9 @@ def cudnn_sdpa_fp8_setup(qkv: torch.Tensor, seqlen_q: int, seqlen_k: int, causal
         amax_s: amax_s_gpu,
         amax_o: amax_o_gpu,
     }
-    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    workspace = torch.empty(
+        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
+    )
 
     def run():
         graph.execute(variant_pack, workspace)
@@ -262,7 +277,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     device = "cuda"
     fp8_dtype = _torch_float8_dtype(args.dtype)
     headdim_vals = _parse_int_list(args.headdims)
-    bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
+    bs_seqlen_vals = [
+        (32, 512),
+        (16, 1024),
+        (8, 2048),
+        (4, 4096),
+        (2, 8192),
+        (1, 16384),
+    ]
 
     methods = ["Pytorch", "FA4-CuTe-BF16", "FA4-CuTe-FP8"] + (
         ["cuDNN-FP8"] if args.run_cudnn and cudnn is not None else []
@@ -276,7 +298,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                 torch.cuda.empty_cache()
                 nheads = args.dim // headdim
                 if args.dim % headdim != 0:
-                    raise ValueError(f"--dim must be divisible by headdim ({args.dim=} {headdim=})")
+                    raise ValueError(
+                        f"--dim must be divisible by headdim ({args.dim=} {headdim=})"
+                    )
 
                 q_bf16 = torch.randn(
                     batch, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16
@@ -294,8 +318,12 @@ def main(argv: Iterable[str] | None = None) -> int:
 
                 out_ref_bf16 = None
                 try:
-                    out_ref_bf16 = attention_pytorch(qkv_bf16, causal=causal)  # warmup / reference
-                    t = time_fwd(attention_pytorch, qkv_bf16, causal=causal, repeats=args.repeats)
+                    out_ref_bf16 = attention_pytorch(
+                        qkv_bf16, causal=causal
+                    )  # warmup / reference
+                    t = time_fwd(
+                        attention_pytorch, qkv_bf16, causal=causal, repeats=args.repeats
+                    )
                     times["Pytorch"] = t
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower():
@@ -308,7 +336,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                 try:
                     softmax_scale = headdim**-0.5
                     out_fa4_bf16, *_ = flash_attn_cute_fwd(
-                        q_bf16, k_bf16, v_bf16, softmax_scale=softmax_scale, causal=causal
+                        q_bf16,
+                        k_bf16,
+                        v_bf16,
+                        softmax_scale=softmax_scale,
+                        causal=causal,
                     )  # warmup / compile
                     t = time_fwd(
                         flash_attn_cute_fwd,
@@ -337,25 +369,33 @@ def main(argv: Iterable[str] | None = None) -> int:
                 v_fp8 = v_bf16.to(fp8_dtype)
 
                 # Placeholder descales (FA3-style: per-(batch, kv_head)).
-                q_descale = torch.ones(batch, nheads, device=device, dtype=torch.float32)
-                k_descale = torch.ones(batch, nheads, device=device, dtype=torch.float32)
-                v_descale = torch.ones(batch, nheads, device=device, dtype=torch.float32)
+                q_descale = torch.ones(
+                    batch, nheads, device=device, dtype=torch.float32
+                )
+                k_descale = torch.ones(
+                    batch, nheads, device=device, dtype=torch.float32
+                )
+                v_descale = torch.ones(
+                    batch, nheads, device=device, dtype=torch.float32
+                )
 
                 # Optional: FP8 reference baseline (dequantized FP8 -> PyTorch) for quantization-error-only checks
                 out_ref_fp8 = None
                 if args.check and args.check_quantization_only:
                     try:
                         # Dequantize FP8 inputs back to BF16 (applying descales)
-                        q_ref_fp8 = (q_fp8.to(torch.bfloat16) * q_descale[:, None, :, None]).to(
-                            torch.bfloat16
+                        q_ref_fp8 = (
+                            q_fp8.to(torch.bfloat16) * q_descale[:, None, :, None]
+                        ).to(torch.bfloat16)
+                        k_ref_fp8 = (
+                            k_fp8.to(torch.bfloat16) * k_descale[:, None, :, None]
+                        ).to(torch.bfloat16)
+                        v_ref_fp8 = (
+                            v_fp8.to(torch.bfloat16) * v_descale[:, None, :, None]
+                        ).to(torch.bfloat16)
+                        qkv_ref_fp8 = torch.stack(
+                            [q_ref_fp8, k_ref_fp8, v_ref_fp8], dim=2
                         )
-                        k_ref_fp8 = (k_fp8.to(torch.bfloat16) * k_descale[:, None, :, None]).to(
-                            torch.bfloat16
-                        )
-                        v_ref_fp8 = (v_fp8.to(torch.bfloat16) * v_descale[:, None, :, None]).to(
-                            torch.bfloat16
-                        )
-                        qkv_ref_fp8 = torch.stack([q_ref_fp8, k_ref_fp8, v_ref_fp8], dim=2)
                         out_ref_fp8 = attention_pytorch(qkv_ref_fp8, causal=causal)
                     except RuntimeError as e:
                         if "out of memory" in str(e).lower():
@@ -375,7 +415,9 @@ def main(argv: Iterable[str] | None = None) -> int:
 
                 try:
                     # Warmup/compile (will raise until FP8 is implemented)
-                    out_fa4_fp8, *_ = flash_attn_cute_fwd(q_fp8, k_fp8, v_fp8, **fa4_kwargs)
+                    out_fa4_fp8, *_ = flash_attn_cute_fwd(
+                        q_fp8, k_fp8, v_fp8, **fa4_kwargs
+                    )
                     t = time_fwd(
                         flash_attn_cute_fwd,
                         q_fp8,
@@ -405,26 +447,36 @@ def main(argv: Iterable[str] | None = None) -> int:
 
                 if args.run_cudnn and cudnn is not None:
                     qkv_fp8 = qkv_bf16.to(fp8_dtype)
-                    runner = cudnn_sdpa_fp8_setup(qkv_fp8, seqlen, seqlen, causal=causal)
+                    runner = cudnn_sdpa_fp8_setup(
+                        qkv_fp8, seqlen, seqlen, causal=causal
+                    )
                     _ = runner()  # warmup
                     t = time_fwd(lambda: runner(), repeats=args.repeats)
                     times["cuDNN-FP8"] = t
 
-                print(f"### causal={causal}, headdim={headdim}, batch={batch}, seqlen={seqlen} ###")
+                print(
+                    f"### causal={causal}, headdim={headdim}, batch={batch}, seqlen={seqlen} ###"
+                )
                 for method in methods:
                     t = times.get(method, float("nan"))
-                    speeds[method] = efficiency(flops(batch, seqlen, headdim, nheads, causal), t)
+                    speeds[method] = efficiency(
+                        flops(batch, seqlen, headdim, nheads, causal), t
+                    )
                     if math.isnan(t):
                         print(f"{method} fwd: (skipped)")
                     else:
-                        print(f"{method} fwd: {speeds[method]:.2f} TFLOPs/s, {t * 1e3:.3f} ms")
+                        print(
+                            f"{method} fwd: {speeds[method]:.2f} TFLOPs/s, {t * 1e3:.3f} ms"
+                        )
                 if math.isnan(times.get("FA4-CuTe-FP8", float("nan"))):
                     print("FA4-CuTe-FP8 status: FAILED")
 
     if fp8_failures:
         print(f"\nFP8 failures: {len(fp8_failures)} (showing first 5)")
         for causal, headdim, batch, seqlen, err in fp8_failures[:5]:
-            print(f"- causal={causal} headdim={headdim} batch={batch} seqlen={seqlen}: {err}")
+            print(
+                f"- causal={causal} headdim={headdim} batch={batch} seqlen={seqlen}: {err}"
+            )
         return 1
 
     return 0

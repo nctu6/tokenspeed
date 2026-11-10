@@ -440,8 +440,8 @@ private:
     // of at most short_prompt_tokens_ may be admitted ahead of a resident
     // chunked prefill with more than that left, as long as the round keeps at
     // least long_prefill_floor_ tokens for it. 0 disables.
-    void scheduleShortPromptsAhead(AdmissionFeedback& feedback, PlanBuild& build,
-                                   std::span<Request* const> candidates, std::int32_t decode_reserve);
+    void scheduleShortPromptsAhead(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                                   std::int32_t decode_reserve);
     std::int32_t short_prompt_tokens_{0};
     std::int32_t long_prefill_floor_{0};
     // Mixed mode: a prefill with more than this many tokens left takes at most

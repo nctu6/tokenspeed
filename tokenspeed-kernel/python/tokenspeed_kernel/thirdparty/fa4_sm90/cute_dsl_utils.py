@@ -1,8 +1,8 @@
 # Copyright (c) 2025, Tri Dao.
 
 import os
-from typing import Tuple
 from functools import lru_cache
+from typing import Tuple
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
@@ -14,8 +14,8 @@ except ImportError:
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import NumericMeta
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import NumericMeta
 from quack.compile_utils import make_fake_tensor as fake_tensor
 
 StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
@@ -36,7 +36,9 @@ torch2cute_dtype_map = {
 
 @lru_cache
 def get_max_active_clusters(cluster_size):
-    return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size=cluster_size)
+    return cutlass.utils.HardwareInfo().get_max_active_clusters(
+        cluster_size=cluster_size
+    )
 
 
 @lru_cache
@@ -127,22 +129,22 @@ def maybe_contiguous(tensor: torch.Tensor | None, align_bytes: int = 16):
 def validate_output_layout(tensor: torch.Tensor, name: str, align_bytes: int) -> None:
     """Validate a caller-provided output or SplitKV workspace."""
     if _is_compile_only_tensor_spec(tensor):
-        assert not any(isinstance(stride, int) and stride == 0 for stride in tensor.stride()), (
-            f"{name} must not have broadcast dimensions"
-        )
-        assert _is_aligned_layout(tensor, align_bytes), (
-            f"{name} must have aligned strides and a contiguous last dimension"
-        )
+        assert not any(
+            isinstance(stride, int) and stride == 0 for stride in tensor.stride()
+        ), f"{name} must not have broadcast dimensions"
+        assert _is_aligned_layout(
+            tensor, align_bytes
+        ), f"{name} must have aligned strides and a contiguous last dimension"
         return
     assert 0 not in tensor.stride(), f"{name} must not have broadcast dimensions"
     if tensor.is_contiguous():
-        assert _has_aligned_pointer(tensor, align_bytes), (
-            f"{name} must have aligned strides and a contiguous last dimension"
-        )
+        assert _has_aligned_pointer(
+            tensor, align_bytes
+        ), f"{name} must have aligned strides and a contiguous last dimension"
         return
-    assert _is_aligned_layout(tensor, align_bytes), (
-        f"{name} must have aligned strides and a contiguous last dimension"
-    )
+    assert _is_aligned_layout(
+        tensor, align_bytes
+    ), f"{name} must have aligned strides and a contiguous last dimension"
 
 
 def assume_strides_aligned(t):
@@ -152,7 +154,9 @@ def assume_strides_aligned(t):
     since they're static and don't need alignment assumptions.
     """
     divby = 128 // t.element_type.width
-    strides = tuple(s if isinstance(s, int) else cute.assume(s, divby=divby) for s in t.stride[:-1])
+    strides = tuple(
+        s if isinstance(s, int) else cute.assume(s, divby=divby) for s in t.stride[:-1]
+    )
     return (*strides, t.stride[-1])
 
 
@@ -160,10 +164,14 @@ def assume_tensor_aligned(t):
     """Rebuild a tensor with 128-bit aligned stride assumptions. Passes through None."""
     if t is None:
         return None
-    return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=assume_strides_aligned(t)))
+    return cute.make_tensor(
+        t.iterator, cute.make_layout(t.shape, stride=assume_strides_aligned(t))
+    )
 
 
-def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
+def to_cute_tensor(
+    t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True
+):
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
     if t is None:
         return None
@@ -177,7 +185,9 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
             leading_dim = None
         elif leading_dim == -1:
             leading_dim = ndim - 1
-        divisibility = max(1, assumed_align * 8 // cute_dtype.width) if assumed_align else 1
+        divisibility = (
+            max(1, assumed_align * 8 // cute_dtype.width) if assumed_align else 1
+        )
         return fake_tensor(
             cute_dtype,
             tuple(cute.sym_int() for _ in range(ndim)),
@@ -195,10 +205,14 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
             enable_tvm_ffi=enable_tvm_ffi,
         )
         tensor.element_type = (
-            cutlass.Float8E4M3FN if t.dtype == torch.float8_e4m3fn else cutlass.Float8E5M2
+            cutlass.Float8E4M3FN
+            if t.dtype == torch.float8_e4m3fn
+            else cutlass.Float8E5M2
         )
     else:
-        tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
+        tensor = from_dlpack(
+            t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi
+        )
     if fully_dynamic:
         return tensor.mark_layout_dynamic()
     if leading_dim == -1:
@@ -225,7 +239,9 @@ def to_cute_aux_tensor(t, leading_dim=None, enable_tvm_ffi=True):
     )
 
 
-def _resolve_aux_leading_dim(tensor: torch.Tensor, leading_dim: int | None = None) -> int | None:
+def _resolve_aux_leading_dim(
+    tensor: torch.Tensor, leading_dim: int | None = None
+) -> int | None:
     """Pick the mode CuTe keeps as a static stride-1 leading dimension."""
     if leading_dim is None:
         leading_dim = getattr(tensor, "__leading_dim__", None)
@@ -234,10 +250,14 @@ def _resolve_aux_leading_dim(tensor: torch.Tensor, leading_dim: int | None = Non
             raise ValueError("Scalar aux tensors cannot declare __leading_dim__")
         leading_dim %= tensor.ndim
         if tensor.stride(leading_dim) != 1:
-            raise ValueError("Aux tensor __leading_dim__ must identify a stride-1 dimension")
+            raise ValueError(
+                "Aux tensor __leading_dim__ must identify a stride-1 dimension"
+            )
         return leading_dim
 
-    unit_stride_dims = [dim for dim, stride in enumerate(tensor.stride()) if stride == 1]
+    unit_stride_dims = [
+        dim for dim, stride in enumerate(tensor.stride()) if stride == 1
+    ]
     if len(unit_stride_dims) <= 1:
         return unit_stride_dims[0] if unit_stride_dims else None
     nontrivial_dims = [dim for dim in unit_stride_dims if tensor.shape[dim] > 1]
@@ -260,7 +280,9 @@ def get_aux_tensor_metadata(aux_tensors, aux_tensor_leading_dims=None):
             0 if stride == 0 else 1 if dim == leading_dim else None
             for dim, stride in enumerate(tensor.stride())
         )
-        metadata.append((tensor.dtype, getattr(tensor, "__assumed_align__", None), static_strides))
+        metadata.append(
+            (tensor.dtype, getattr(tensor, "__assumed_align__", None), static_strides)
+        )
     return tuple(metadata)
 
 
@@ -280,18 +302,22 @@ def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
 
 # credit: monellz (https://github.com/NVIDIA/cutlass/issues/2658#issuecomment-3630564264)
 def dump_kernel_attributes(compiled_kernel):
+    import torch
     from cuda.bindings import driver
     from cutlass.utils import HardwareInfo
-    import torch
 
     device_id = torch.cuda.current_device()
     hardware_info = HardwareInfo(device_id=device_id)
     cubin_data = compiled_kernel.artifacts.CUBIN
-    assert cubin_data is not None, "cubin_data is None, need '--keep-cubin' option when compiling"
+    assert (
+        cubin_data is not None
+    ), "cubin_data is None, need '--keep-cubin' option when compiling"
     cuda_library = hardware_info._checkCudaErrors(
         driver.cuLibraryLoadData(cubin_data, None, None, 0, None, None, 0)
     )
-    kernels = hardware_info._checkCudaErrors(driver.cuLibraryEnumerateKernels(1, cuda_library))
+    kernels = hardware_info._checkCudaErrors(
+        driver.cuLibraryEnumerateKernels(1, cuda_library)
+    )
     kernel = hardware_info._checkCudaErrors(driver.cuKernelGetFunction(kernels[0]))
     # more metrics: https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXEC.html#group__CUDA__EXEC_1g5e92a1b0d8d1b82cb00dcfb2de15961b
     local_size_bytes = hardware_info._checkCudaErrors(

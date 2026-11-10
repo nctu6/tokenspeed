@@ -44,11 +44,10 @@ import subprocess
 import sys
 import threading
 import time
+from test.runtime.launch_guard import launch_skip_reason, role_gpu_skip_reason
 
 import pytest
 import requests
-
-from test.runtime.launch_guard import launch_skip_reason, role_gpu_skip_reason
 from PIL import Image, ImageDraw, ImageFont
 
 SERVE_SCRIPT = os.path.join(
@@ -62,7 +61,9 @@ LB_PORT = int(os.environ.get("LB_PORT", "19345"))
 MODEL = os.environ.get("MODEL", "nvidia/Qwen3.5-122B-A10B-NVFP4")
 SERVED_MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", MODEL)
 
-_SKIP_REASON = role_gpu_skip_reason({"ENCODE_GPUS": "0", "PREFILL_GPUS": "1", "DECODE0_GPUS": "2", "DECODE1_GPUS": "3"}) or launch_skip_reason(MODEL)
+_SKIP_REASON = role_gpu_skip_reason(
+    {"ENCODE_GPUS": "0", "PREFILL_GPUS": "1", "DECODE0_GPUS": "2", "DECODE1_GPUS": "3"}
+) or launch_skip_reason(MODEL)
 pytestmark = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or "")
 STARTUP_TIMEOUT = int(os.environ.get("EPD_STARTUP_TIMEOUT", "7200"))
 LOG_DIR = os.environ.get("EPD_CI_LOG_DIR", ".ci-artifacts/epd-qwen35-122b-1e1p2d")

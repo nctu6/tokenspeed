@@ -333,9 +333,7 @@ def _oracle_proportional_inv_freq(
     """
     rope_angles = rotary_dim // 2
     nope_angles = (head_size // 2) - rope_angles
-    freq_exponents = (
-        torch.arange(0, 2 * rope_angles, 2, dtype=torch.float) / head_size
-    )
+    freq_exponents = torch.arange(0, 2 * rope_angles, 2, dtype=torch.float) / head_size
     inv_freq = 1.0 / (base**freq_exponents)
     if nope_angles > 0:
         inv_freq = torch.cat([inv_freq, torch.zeros(nope_angles, dtype=torch.float)])
@@ -376,9 +374,7 @@ def test_full_rope_inv_freq_matches_the_hand_proportional_formula():
         _FULL_ROPE_THETA
         ** (torch.arange(0, _FULL_ROTARY_DIM, 2, dtype=torch.float) / _FULL_HEAD_DIM)
     )
-    hand = torch.cat(
-        [hand_nonzero, torch.zeros(_FULL_NOPE_ANGLES, dtype=torch.float)]
-    )
+    hand = torch.cat([hand_nonzero, torch.zeros(_FULL_NOPE_ANGLES, dtype=torch.float)])
     assert hand.shape == (_FULL_HEAD_DIM // 2,)
     assert hand_nonzero.shape == (_FULL_ROPE_ANGLES,)
 
@@ -428,8 +424,7 @@ def test_sliding_rope_inv_freq_matches_the_plain_hand_formula():
     hand = 1.0 / (
         _SLIDING_ROPE_THETA
         ** (
-            torch.arange(0, _SLIDING_HEAD_DIM, 2, dtype=torch.float)
-            / _SLIDING_HEAD_DIM
+            torch.arange(0, _SLIDING_HEAD_DIM, 2, dtype=torch.float) / _SLIDING_HEAD_DIM
         )
     )
     assert hand.shape == (_SLIDING_HEAD_DIM // 2,)
@@ -446,8 +441,7 @@ def test_sliding_rope_cos_sin_match_the_hand_computation():
     hand_inv_freq = 1.0 / (
         _SLIDING_ROPE_THETA
         ** (
-            torch.arange(0, _SLIDING_HEAD_DIM, 2, dtype=torch.float)
-            / _SLIDING_HEAD_DIM
+            torch.arange(0, _SLIDING_HEAD_DIM, 2, dtype=torch.float) / _SLIDING_HEAD_DIM
         )
     )
     positions = torch.tensor(_SAMPLE_POSITIONS, dtype=torch.float32)
@@ -678,9 +672,7 @@ def test_v_norm_has_no_weight_while_qk_norms_each_have_one() -> None:
 
         # v_norm is weightless: no learnable Parameter at all.
         assert list(attn.v_norm.parameters()) == []
-        assert not any(
-            "v_norm" in name for name, _ in attn.named_parameters()
-        )
+        assert not any("v_norm" in name for name, _ in attn.named_parameters())
 
 
 def test_sliding_layer_window_is_hf_window_minus_one() -> None:
@@ -880,9 +872,7 @@ def test_qkv_norms_read_the_fused_projection_without_copies(
     attn, _, _, _ = _run_forward_with_capture(layer_id, layer_type, 32)
     ref = _RefAttn(attn.num_heads, attn.head_dim)
     attn.attn = ref
-    hidden_states = torch.randn(
-        32, _HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"
-    )
+    hidden_states = torch.randn(32, _HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
     positions = torch.arange(32, dtype=torch.int64, device="cuda")
     attn.forward(positions, hidden_states, ctx=None)  # warm up kernels
     torch.cuda.synchronize()

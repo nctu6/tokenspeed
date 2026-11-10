@@ -88,7 +88,10 @@ def _check_bwd_config(
 
     # SMEM
     mma_dkv_is_rs = (
-        AtomLayoutMSdP == 1 and AtomLayoutNdKV == num_wg and SdP_swapAB and not dKV_swapAB
+        AtomLayoutMSdP == 1
+        and AtomLayoutNdKV == num_wg
+        and SdP_swapAB
+        and not dKV_swapAB
     )
     Q_stage, PdS_stage = 2, 1
 
@@ -217,7 +220,9 @@ def find_feasible_bwd_configs(
                                         if cfg is not None:
                                             results.append(cfg)
 
-    results.sort(key=lambda c: (-c["tile_n"], -c["tile_m"], c["smem_traffic_per_block"]))
+    results.sort(
+        key=lambda c: (-c["tile_n"], -c["tile_m"], c["smem_traffic_per_block"])
+    )
     return results
 
 
@@ -325,7 +330,9 @@ def find_feasible_fwd_configs(
         for tile_n in tile_n_choices:
             for pv_is_rs in (True, False):
                 for overlap_wg in (True, False):
-                    cfg = _check_fwd_config(hdim, hdimv, tile_n, num_wg, pv_is_rs, overlap_wg)
+                    cfg = _check_fwd_config(
+                        hdim, hdimv, tile_n, num_wg, pv_is_rs, overlap_wg
+                    )
                     if cfg is not None:
                         results.append(cfg)
 
@@ -370,9 +377,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Search feasible SM90 MMA configs")
     parser.add_argument("--mode", choices=["fwd", "bwd", "both"], default="both")
     parser.add_argument(
-        "--headdim", type=str, default="128", help="Head dim, or hdim-hdimv (e.g. 192-128)"
+        "--headdim",
+        type=str,
+        default="128",
+        help="Head dim, or hdim-hdimv (e.g. 192-128)",
     )
-    parser.add_argument("--tile-m", type=str, default="64,80,96,112,128", help="Bwd tile_m choices")
+    parser.add_argument(
+        "--tile-m", type=str, default="64,80,96,112,128", help="Bwd tile_m choices"
+    )
     parser.add_argument(
         "--tile-n",
         type=str,
@@ -399,4 +411,6 @@ if __name__ == "__main__":
         tm = tuple(int(x) for x in args.tile_m.split(","))
         tn = tuple(int(x) for x in (args.tile_n or TN_BWD).split(","))
         print(f"=== BWD configs: hdim={hdim}, hdimv={hdimv} ===\n")
-        print_bwd_configs(find_feasible_bwd_configs(hdim, hdimv, tm, tn), args.num_results)
+        print_bwd_configs(
+            find_feasible_bwd_configs(hdim, hdimv, tm, tn), args.num_results
+        )

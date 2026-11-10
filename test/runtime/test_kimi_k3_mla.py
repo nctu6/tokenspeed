@@ -22,8 +22,7 @@ import pytest
 import torch
 
 pytestmark = pytest.mark.skipif(
-    torch.cuda.is_available()
-    and torch.cuda.get_device_capability()[0] not in (9, 10),
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] not in (9, 10),
     reason="MLA prefill/decode kernels are built for SM90/SM100 only",
 )
 from tokenspeed_kernel.platform import current_platform

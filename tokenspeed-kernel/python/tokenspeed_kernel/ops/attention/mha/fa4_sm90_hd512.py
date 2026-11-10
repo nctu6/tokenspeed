@@ -92,14 +92,17 @@ def fa4_sm90_hd512_extend(
     return out[0] if isinstance(out, tuple) else out
 
 
-def warmup_fa4_sm90_hd512(device, *, num_qo_heads: int = 32, num_kv_heads: int = 4,
-                          page_size: int = 64) -> None:
+def warmup_fa4_sm90_hd512(
+    device, *, num_qo_heads: int = 32, num_kv_heads: int = 4, page_size: int = 64
+) -> None:
     """JIT-compile the head_dim 512 causal kernel before serving."""
     if not (_enabled() and _available()):
         return
     device = torch.device(device)
     q = torch.zeros((1, num_qo_heads, 512), dtype=torch.bfloat16, device=device)
-    k = torch.zeros((1, page_size, num_kv_heads, 512), dtype=torch.bfloat16, device=device)
+    k = torch.zeros(
+        (1, page_size, num_kv_heads, 512), dtype=torch.bfloat16, device=device
+    )
     fa4_sm90_hd512_extend(
         q,
         k,
@@ -168,7 +171,15 @@ def _register() -> None:
         enable_pdl: bool = False,
         host_meta=None,
     ) -> torch.Tensor:
-        del cu_seqlens_kv, max_seqlen_k, q_scale, k_scale, v_scale, enable_pdl, host_meta
+        del (
+            cu_seqlens_kv,
+            max_seqlen_k,
+            q_scale,
+            k_scale,
+            v_scale,
+            enable_pdl,
+            host_meta,
+        )
         if return_lse or sinks is not None or (logit_cap and logit_cap != 0.0):
             raise NotImplementedError(
                 "fa4_sm90_hd512 extend supports neither lse, sinks nor logit_cap"

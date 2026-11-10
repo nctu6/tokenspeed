@@ -231,7 +231,6 @@ def split_groups_to_equal_depth(layer_types: Sequence[str]) -> tuple[str, ...]:
     return tuple(out_labels)
 
 
-
 def validate_scheduler_config(
     *,
     attn_backend: object,

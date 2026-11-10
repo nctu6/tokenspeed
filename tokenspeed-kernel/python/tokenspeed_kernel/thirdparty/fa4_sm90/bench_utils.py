@@ -1,6 +1,7 @@
 """Shared benchmark utilities: attention_ref, cuDNN helpers, flops calculation."""
 
 import math
+
 import torch
 
 try:
@@ -31,13 +32,16 @@ def flops(
         else:
             row_idx = torch.arange(seqlen_q, device="cuda")
             col_left = (
-                torch.maximum(row_idx + seqlen_k - seqlen_q - window_size[0], torch.tensor(0))
+                torch.maximum(
+                    row_idx + seqlen_k - seqlen_q - window_size[0], torch.tensor(0)
+                )
                 if window_size[0] is not None
                 else torch.zeros_like(row_idx)
             )
             col_right = (
                 torch.minimum(
-                    row_idx + seqlen_k - seqlen_q + window_size[1], torch.tensor(seqlen_k - 1)
+                    row_idx + seqlen_k - seqlen_q + window_size[1],
+                    torch.tensor(seqlen_k - 1),
                 )
                 if window_size[1] is not None
                 else torch.full_like(row_idx, seqlen_k - 1)
@@ -102,7 +106,8 @@ def attention_ref(q, k, v, causal=False):
     if causal:
         if scores.shape[-2] not in _attention_ref_mask_cache:
             mask = torch.tril(
-                torch.ones(scores.shape[-2:], device=scores.device, dtype=torch.bool), diagonal=0
+                torch.ones(scores.shape[-2:], device=scores.device, dtype=torch.bool),
+                diagonal=0,
             )
             _attention_ref_mask_cache[scores.shape[-2]] = mask
         else:
@@ -139,7 +144,9 @@ def _build_cudnn_graph(io_dtype, tensors, build_fn):
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     graph.check_support()
     graph.build_plans()
-    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    workspace = torch.empty(
+        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
+    )
     return graph, variant_pack, workspace
 
 
@@ -157,7 +164,9 @@ def cudnn_fwd_setup(q, k, v, causal=False, window_size_left=None):
     b, nheads, seqlen_q, headdim = q.shape
     headdim_v = v.shape[-1]
     o_gpu = torch.empty(b, nheads, seqlen_q, headdim_v, dtype=q.dtype, device=q.device)
-    stats_gpu = torch.empty(b, nheads, seqlen_q, 1, dtype=torch.float32, device=q.device)
+    stats_gpu = torch.empty(
+        b, nheads, seqlen_q, 1, dtype=torch.float32, device=q.device
+    )
 
     def build(graph, gt):
         o, stats = graph.sdpa(
@@ -168,15 +177,19 @@ def cudnn_fwd_setup(q, k, v, causal=False, window_size_left=None):
             is_inference=False,
             attn_scale=1.0 / math.sqrt(headdim),
             use_causal_mask=causal or window_size_left is not None,
-            sliding_window_length=window_size_left
-            if window_size_left is not None and not causal
-            else None,
+            sliding_window_length=(
+                window_size_left
+                if window_size_left is not None and not causal
+                else None
+            ),
         )
         o.set_output(True).set_dim(o_gpu.shape).set_stride(o_gpu.stride())
         stats.set_output(True).set_data_type(cudnn.data_type.FLOAT)
         return {gt["q"]: q, gt["k"]: k, gt["v"]: v, o: o_gpu, stats: stats_gpu}
 
-    graph, variant_pack, workspace = _build_cudnn_graph(q.dtype, {"q": q, "k": k, "v": v}, build)
+    graph, variant_pack, workspace = _build_cudnn_graph(
+        q.dtype, {"q": q, "k": k, "v": v}, build
+    )
 
     def fwd_fn():
         graph.execute(variant_pack, workspace)
@@ -197,7 +210,11 @@ def cudnn_bwd_setup(q, k, v, o, g, lse, causal=False, window_size_left=None):
         bwd_fn: zero-arg callable that returns (dq, dk, dv).
     """
     headdim = q.shape[-1]
-    dq_gpu, dk_gpu, dv_gpu = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    dq_gpu, dk_gpu, dv_gpu = (
+        torch.empty_like(q),
+        torch.empty_like(k),
+        torch.empty_like(v),
+    )
 
     def build(graph, gt):
         dq, dk, dv = graph.sdpa_backward(
@@ -210,9 +227,11 @@ def cudnn_bwd_setup(q, k, v, o, g, lse, causal=False, window_size_left=None):
             stats=gt["lse"],
             attn_scale=1.0 / math.sqrt(headdim),
             use_causal_mask=causal or window_size_left is not None,
-            sliding_window_length=window_size_left
-            if window_size_left is not None and not causal
-            else None,
+            sliding_window_length=(
+                window_size_left
+                if window_size_left is not None and not causal
+                else None
+            ),
             use_deterministic_algorithm=False,
         )
         dq.set_output(True).set_dim(dq_gpu.shape).set_stride(dq_gpu.stride())

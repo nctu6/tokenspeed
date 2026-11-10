@@ -33,7 +33,6 @@ no timing number that would catch the bug).
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 
@@ -46,7 +45,9 @@ __all__ = [
 ]
 
 VIDEO_SIGMA_SHIFT = 12.0
-AUDIO_SIGMA_SHIFT = 3.0  # from FL2VA/_minimax_h3.sigma_shift_scales; not in root scheduler
+AUDIO_SIGMA_SHIFT = (
+    3.0  # from FL2VA/_minimax_h3.sigma_shift_scales; not in root scheduler
+)
 SUPPORTED_FPS = 24
 MIN_DURATION_S = 4.0
 MAX_DURATION_S = 15.0

@@ -178,7 +178,9 @@ class _WrapperRing:
         float_ws = ensure_fa2_extend_workspace(device)
         # Force fa2: on Hopper ``auto`` would pick FA3 templates that reject 512.
         self.wrappers = [
-            BatchPrefillWithPagedKVCacheWrapper(float_ws, kv_layout="NHD", backend="fa2")
+            BatchPrefillWithPagedKVCacheWrapper(
+                float_ws, kv_layout="NHD", backend="fa2"
+            )
             for _ in range(size)
         ]
         self.copied: list[torch.cuda.Event | None] = [None] * size
@@ -225,8 +227,7 @@ def _build_paged_plan_tensors(
     batch = len(cache_seqlens_cpu)
     num_pages = [(int(s) + page_size - 1) // page_size for s in cache_seqlens_cpu]
     last_page_len = [
-        (((int(s) - 1) % page_size) + 1) if int(s) > 0 else 0
-        for s in cache_seqlens_cpu
+        (((int(s) - 1) % page_size) + 1) if int(s) > 0 else 0 for s in cache_seqlens_cpu
     ]
     indptr = [0]
     for n in num_pages:

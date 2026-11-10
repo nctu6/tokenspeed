@@ -48,7 +48,10 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+from tokenspeed.runtime.layers.attention.configs.base import (
+    AttnConfig,
+    SoftmaxAttnConfig,
+)
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     _config_bytes_per_token,
@@ -56,11 +59,12 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     _config_layer_fields,
     _mha_layer_fields,
 )
-from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    layer_group_ids,
     group as group_declarations,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    layer_group_ids,
 )
 
 # gemma-4-31B's per-layer-type geometry (num_kv_heads, head_dim), PRE-TP.
@@ -117,7 +121,9 @@ def _kv_shapes(config: AttnConfig, num_layers: int) -> list[tuple[int, ...]]:
     layer_types = tuple(spec.cache_layer_types)
     shapes = []
     for layer_id in range(num_layers):
-        group_id = layer_types[layer_id] if layer_id < len(layer_types) else "full_attention"
+        group_id = (
+            layer_types[layer_id] if layer_id < len(layer_types) else "full_attention"
+        )
         fields = _mha_layer_fields(config, layer_id, layer_id, group_id, 0)
         # fields[0] is the K page; .shape is (prefix_granularity, kv_heads, head_dim)
         shapes.append(tuple(fields[0].shape))
@@ -295,9 +301,7 @@ class TotalCacheBytesPerTokenTest(unittest.TestCase):
         sliding_cell = 16 * 256 * 2 * elem
         full_cell = 4 * 512 * 2 * elem
         expected = (10 * sliding_cell) + (2 * full_cell)
-        self.assertEqual(
-            spec.total_cache_bytes_per_token(config, num_layers), expected
-        )
+        self.assertEqual(spec.total_cache_bytes_per_token(config, num_layers), expected)
 
     def test_per_layer_sum_shards_kv_heads_under_tp(self):
         """TP halves the kv-head count in every per-layer cell; head_dim is
@@ -315,9 +319,7 @@ class TotalCacheBytesPerTokenTest(unittest.TestCase):
         sliding_cell = (16 // 2) * 256 * 2 * elem
         full_cell = (4 // 2) * 512 * 2 * elem
         expected = (10 * sliding_cell) + (2 * full_cell)
-        self.assertEqual(
-            spec.total_cache_bytes_per_token(config, num_layers), expected
-        )
+        self.assertEqual(spec.total_cache_bytes_per_token(config, num_layers), expected)
 
     def test_uniform_total_is_cell_size_times_layers(self):
         """``layer_kv_geometry is None`` sums to exactly cache_cell_size x N,
@@ -516,7 +518,9 @@ class PerLayerGeometryPackingTest(unittest.TestCase):
         layout = _pack_gemma4(_gemma4_split_config(attn_tp_size=1))
         packing = dict(layout.group_packing)
         for k in range(5):
-            self.assertEqual(packing["full_attention"], 2 * packing[f"sliding_attention_{k}"])
+            self.assertEqual(
+                packing["full_attention"], 2 * packing[f"sliding_attention_{k}"]
+            )
 
     def test_tp_preserves_the_byte_ratio_packing(self):
         """TP shards both geometries' kv heads by the same factor, so the full/
@@ -553,6 +557,7 @@ class PoolRowViewWidthTest(unittest.TestCase):
 
     def _build_pool(self, device: str):
         from test.runtime.cache_pool_test_utils import make_arena
+
         from tokenspeed.runtime.layers.attention.kv_cache.mha import (
             MHATokenToKVPool,
         )

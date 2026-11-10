@@ -363,7 +363,6 @@ def _free_port_avoiding_ephemeral_range() -> int:
     return port
 
 
-
 def _gateway_args_with_served_model_aliases(
     gateway_args: list[str], engine_args: list[str]
 ) -> list[str]:
@@ -398,7 +397,11 @@ def _gateway_args_with_served_model_aliases(
         # Skip if already present as --model-alias entry
         skip = False
         for j, tok in enumerate(result):
-            if tok == "--model-alias" and j + 1 < len(result) and result[j + 1] == entry:
+            if (
+                tok == "--model-alias"
+                and j + 1 < len(result)
+                and result[j + 1] == entry
+            ):
                 skip = True
                 break
             if tok == f"--model-alias={entry}":

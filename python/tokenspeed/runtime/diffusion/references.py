@@ -35,8 +35,9 @@ from __future__ import annotations
 import mimetypes
 import os
 import tempfile
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any
 from urllib.parse import urlparse
 
 __all__ = [
@@ -77,7 +78,9 @@ def _suffix(name: str | None) -> str:
     return os.path.splitext(name)[1].lower()
 
 
-def classify_media(*, filename: str | None = None, content_type: str | None = None) -> str:
+def classify_media(
+    *, filename: str | None = None, content_type: str | None = None
+) -> str:
     """Return ``image`` / ``video`` / ``audio`` from MIME or filename suffix."""
     ctype = (content_type or "").split(";")[0].strip().lower()
     if ctype.startswith("image/"):
@@ -115,7 +118,9 @@ def validate_ref2va_counts(kinds: Sequence[str]) -> None:
     if total == 0:
         raise ValueError("ref2va requires at least one image or video reference")
     if total > MAX_REF_TOTAL:
-        raise ValueError(f"ref2va allows at most {MAX_REF_TOTAL} references (got {total})")
+        raise ValueError(
+            f"ref2va allows at most {MAX_REF_TOTAL} references (got {total})"
+        )
     if n_img > MAX_REF_IMAGES:
         raise ValueError(f"ref2va allows at most {MAX_REF_IMAGES} images (got {n_img})")
     if n_vid > MAX_REF_VIDEOS:
@@ -139,11 +144,14 @@ def stage_uploads(
         if not data:
             raise ValueError(f"empty reference upload at index {index}")
         kind = classify_media(filename=filename, content_type=content_type)
-        suffix = _suffix(filename) or {
-            "image": ".png",
-            "video": ".mp4",
-            "audio": ".wav",
-        }[kind]
+        suffix = (
+            _suffix(filename)
+            or {
+                "image": ".png",
+                "video": ".mp4",
+                "audio": ".wav",
+            }[kind]
+        )
         path = os.path.join(base, f"ref_{index:02d}{suffix}")
         with open(path, "wb") as handle:
             handle.write(data)
@@ -194,6 +202,8 @@ def audio_url_from_field(raw: str | None) -> str | None:
     else:
         url = text
     parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https", "file", "data"} and not os.path.isfile(url):
+    if parsed.scheme not in {"http", "https", "file", "data"} and not os.path.isfile(
+        url
+    ):
         raise ValueError(f"unsupported audio_reference URL: {url!r}")
     return url

@@ -1,12 +1,13 @@
 # Copyright (c) 2025, Tri Dao.
-from typing import Type, Union, Optional
+from typing import Optional, Type, Union
+
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32, Boolean, const_expr
+import cutlass.utils.hopper_helpers as sm90_utils_og
+from cutlass import Boolean, Float32, Int32, const_expr
 from cutlass.cute.nvgpu import warpgroup
 from cutlass.cutlass_dsl import Numeric, dsl_user_op
 from cutlass.utils import LayoutEnum
-import cutlass.utils.hopper_helpers as sm90_utils_og
 
 
 @cute.jit
@@ -21,7 +22,15 @@ def gemm(
     swap_AB: cutlass.Constexpr[bool] = False,
 ) -> None:
     if const_expr(swap_AB):
-        gemm(tiled_mma, acc, tCrB, tCrA, zero_init=zero_init, wg_wait=wg_wait, swap_AB=False)
+        gemm(
+            tiled_mma,
+            acc,
+            tCrB,
+            tCrA,
+            zero_init=zero_init,
+            wg_wait=wg_wait,
+            swap_AB=False,
+        )
     else:
         warpgroup.fence()
         # We make a new mma_atom since we'll be modifying its attribute (accumulate).
@@ -70,7 +79,9 @@ def gemm_w_idx(
     swap_AB: bool = False,
 ) -> None:
     if const_expr(swap_AB):
-        gemm_w_idx(tiled_mma, acc, tCrB, tCrA, zero_init, B_idx, A_idx, wg_wait, swap_AB=False)
+        gemm_w_idx(
+            tiled_mma, acc, tCrB, tCrA, zero_init, B_idx, A_idx, wg_wait, swap_AB=False
+        )
     else:
         rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
         rB = tCrB if const_expr(B_idx is None) else tCrB[None, None, None, B_idx]

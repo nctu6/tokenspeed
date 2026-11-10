@@ -99,9 +99,9 @@ def resolve_serving_runtime(model_path: str) -> str:
     # A diffusers ModularPipeline is a *directory of components* described by
     # modular_model_index.json (MiniMax-Music3) and/or model_index.json
     # (MiniMax-H3). Nothing else in this tree ships those files at the root.
-    if os.path.isfile(os.path.join(model_path, "modular_model_index.json")) or os.path.isfile(
-        os.path.join(model_path, "model_index.json")
-    ):
+    if os.path.isfile(
+        os.path.join(model_path, "modular_model_index.json")
+    ) or os.path.isfile(os.path.join(model_path, "model_index.json")):
         return "diffusion"
     # Music3 also declares model_type on a root config.json even when indexes
     # are present; keep this as a belt-and-suspenders signal for incomplete trees.

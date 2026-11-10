@@ -262,9 +262,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             (1, 0),
         )
         prefix_cpu = [int(x) for x in extend_prefix_lens_cpu[:bs].tolist()]
-        cache_seqlens_cpu = [
-            prefix_cpu[i] + extend_seq_lens_cpu[i] for i in range(bs)
-        ]
+        cache_seqlens_cpu = [prefix_cpu[i] + extend_seq_lens_cpu[i] for i in range(bs)]
         self.forward_extend_metadata = MHAExtendMetadata(
             page_table=page_table[:bs],
             seq_lens=seq_lens,
@@ -380,7 +378,11 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         return self._decode_rows(
-            q, layer, token_to_kv_pool, self.forward_decode_metadata, kwargs.get("sinks")
+            q,
+            layer,
+            token_to_kv_pool,
+            self.forward_decode_metadata,
+            kwargs.get("sinks"),
         )
 
     def _decode_rows(

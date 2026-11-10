@@ -4673,9 +4673,9 @@ std::vector<CacheGroupSpec> WritePolicySpecs() {
 TEST(CacheCoordinatorHostWritePolicy, OnReuseHoldsStoresUntilADeviceHit) {
     BlockPool pool(/*num_lcm_blocks=*/16, {1, 1});
     BlockPool host_pool(4, {1, 1});
-    CacheCoordinator coordinator = MakeCoordinator(WritePolicySpecs(), 2, pool, /*enable_l3_storage=*/false,
-                                                   &host_pool, /*snapshot_pool=*/nullptr,
-                                                   /*stream_device_cache_to_host=*/true);
+    CacheCoordinator coordinator =
+        MakeCoordinator(WritePolicySpecs(), 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/true);
     coordinator.SetHostWritePolicy(CacheCoordinator::HostWritePolicy::kOnReuse);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));

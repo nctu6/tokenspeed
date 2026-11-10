@@ -28,8 +28,6 @@ into the text embedding space. Designed for TokenSpeed's
 
 from __future__ import annotations
 
-import math
-
 import torch
 from torch import nn
 
@@ -40,9 +38,15 @@ from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
 class Gemma3MultiModalProjector(nn.Module):
     """Pool SigLIP patches to ``mm_tokens_per_image`` soft tokens and project."""
 
-    def __init__(self, vision_hidden_size: int, text_hidden_size: int,
-                 image_size: int, patch_size: int, mm_tokens_per_image: int,
-                 eps: float = 1e-6) -> None:
+    def __init__(
+        self,
+        vision_hidden_size: int,
+        text_hidden_size: int,
+        image_size: int,
+        patch_size: int,
+        mm_tokens_per_image: int,
+        eps: float = 1e-6,
+    ) -> None:
         super().__init__()
         self.mm_input_projection_weight = nn.Parameter(
             torch.zeros(vision_hidden_size, text_hidden_size)
@@ -145,7 +149,9 @@ def encode_gemma3_images(
         raise ValueError("encode_gemma3_images requires at least one item")
     device = next(vision_tower.parameters()).device
     dtype = next(vision_tower.parameters()).dtype
-    pixels = _gemma3_pixel_batch(items).to(device=device, dtype=dtype, non_blocking=True)
+    pixels = _gemma3_pixel_batch(items).to(
+        device=device, dtype=dtype, non_blocking=True
+    )
     # HF SiglipVisionModel returns BaseModelOutputWithPooling.
     outputs = vision_tower(pixel_values=pixels)
     hidden = outputs.last_hidden_state

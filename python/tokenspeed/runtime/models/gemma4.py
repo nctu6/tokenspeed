@@ -81,22 +81,6 @@ from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.activation import GeluTanhAndMul
-from tokenspeed.runtime.models.gemma4_vision import (
-    Gemma4MultimodalEmbedder,
-    build_gemma4_vision_tower,
-    encode_gemma4_audio,
-    encode_gemma4_images,
-    gemma4_make_image_warmup_items,
-    gemma4_make_video_warmup_items,
-    gemma4_soft_tokens_per_image,
-)
-from tokenspeed.runtime.multimodal.embedder import (
-    EncoderSpec,
-    VisionEmbedder,
-    pad_input_tokens,
-)
-from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalInputs
-
 from tokenspeed.runtime.layers.layernorm import RMSNorm, RMSNormNoWeight
 from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
@@ -115,7 +99,22 @@ from tokenspeed.runtime.layers.rotary_embedding import (
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM
+from tokenspeed.runtime.models.gemma4_vision import (
+    Gemma4MultimodalEmbedder,
+    build_gemma4_vision_tower,
+    encode_gemma4_audio,
+    encode_gemma4_images,
+    gemma4_make_image_warmup_items,
+    gemma4_make_video_warmup_items,
+    gemma4_soft_tokens_per_image,
+)
 from tokenspeed.runtime.models.utils import validate_attention_partition
+from tokenspeed.runtime.multimodal.embedder import (
+    EncoderSpec,
+    VisionEmbedder,
+    pad_input_tokens,
+)
+from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalInputs
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger, make_layers
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -722,7 +721,6 @@ class Gemma4Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
-
     def _fused_qk_rope(self, qkv: torch.Tensor) -> bool:
         rope = self.rotary_emb
         cache = getattr(rope, "cos_sin_cache", None)
@@ -886,9 +884,7 @@ class Gemma4DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(int(text_config.hidden_size), eps=eps)
         self.post_attention_layernorm = RMSNorm(int(text_config.hidden_size), eps=eps)
         self.pre_feedforward_layernorm = RMSNorm(int(text_config.hidden_size), eps=eps)
-        self.post_feedforward_layernorm = RMSNorm(
-            int(text_config.hidden_size), eps=eps
-        )
+        self.post_feedforward_layernorm = RMSNorm(int(text_config.hidden_size), eps=eps)
         # Per-layer output scalar: a [1] buffer loaded from the checkpoint
         # (filled by the weight-load task) and applied to the layer output.
         # Initialised to ones so an unloaded layer is the identity scaling.
@@ -1176,7 +1172,6 @@ class Gemma4Model(nn.Module):
         if residual is None:
             hidden_states = self.norm(hidden_states)
         return hidden_states, None
-
 
 
 class _Gemma4ScaledEmbedding(nn.Module):

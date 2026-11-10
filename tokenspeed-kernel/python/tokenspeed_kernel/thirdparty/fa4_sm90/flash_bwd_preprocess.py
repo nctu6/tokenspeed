@@ -14,26 +14,23 @@
 import math
 import operator
 from functools import partial
-from typing import Callable, Type, Optional
+from typing import Callable, Optional, Type
 
 import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, const_expr
 from cutlass.cutlass_dsl import Arch, BaseDSL
-
 from quack import copy_utils, layout_utils
-
-from tokenspeed_kernel.thirdparty.fa4_sm90 import utils
-from tokenspeed_kernel.thirdparty.fa4_sm90.seqlen_info import SeqlenInfo
 from quack.cute_dsl_utils import ParamsBase
+from tokenspeed_kernel.thirdparty.fa4_sm90 import utils
+from tokenspeed_kernel.thirdparty.fa4_sm90.pack_gqa import pack_gqa_layout
+from tokenspeed_kernel.thirdparty.fa4_sm90.seqlen_info import SeqlenInfo
 from tokenspeed_kernel.thirdparty.fa4_sm90.tile_scheduler import (
     SingleTileScheduler,
     SingleTileVarlenScheduler,
     TileSchedulerArguments,
 )
-from tokenspeed_kernel.thirdparty.fa4_sm90.pack_gqa import pack_gqa_layout
 
 
 class FlashAttentionBackwardPreprocess:
@@ -66,8 +63,12 @@ class FlashAttentionBackwardPreprocess:
         self.tile_m = tile_m
         # padding head_dim to a multiple of 32 as k_block_size
         hdim_multiple_of = 32
-        self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
-        self.head_dim_v_padded = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
+        self.head_dim_padded = int(
+            math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of
+        )
+        self.head_dim_v_padded = int(
+            math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of
+        )
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.num_threads = num_threads
         self.use_padded_offsets = use_padded_offsets
@@ -187,9 +188,13 @@ class FlashAttentionBackwardPreprocess:
 
         # (b, s, h, d)  -> (s, d, h, b)  or
         # (total, h, d) -> (total, d, h)
-        QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
+        QO_layout_transpose = (
+            [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
+        )
         mO, mdO = [
-            cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=QO_layout_transpose))
+            cute.make_tensor(
+                mX.iterator, cute.select(mX.layout, mode=QO_layout_transpose)
+            )
             for mX in (mO, mdO)
         ]
 
@@ -208,7 +213,9 @@ class FlashAttentionBackwardPreprocess:
 
         # (b, s, n, h) => (s, n, h, b) or
         # (total, n, h) == (total, n, h)
-        rowmax_layout_transpose = [1, 2, 3, 0] if const_expr(mCuSeqlensQ is None) else [0, 1, 2]
+        rowmax_layout_transpose = (
+            [1, 2, 3, 0] if const_expr(mCuSeqlensQ is None) else [0, 1, 2]
+        )
         if const_expr(mRowMax is not None):
             mRowMax = layout_utils.select(mRowMax, rowmax_layout_transpose)
         if const_expr(mScaleP is not None):
@@ -217,15 +224,23 @@ class FlashAttentionBackwardPreprocess:
         # pack gqa
         if const_expr(self.pack_gqa):
             mO, mdO, mRowMax, mScaleP = [
-                pack_gqa_layout(mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=2)
-                if mX is not None
-                else None
+                (
+                    pack_gqa_layout(
+                        mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=2
+                    )
+                    if mX is not None
+                    else None
+                )
                 for mX in (mO, mdO, mRowMax, mScaleP)
             ]
             mPdPsum, mLSE, mLSElog2, mdLSE = [
-                pack_gqa_layout(mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=1)
-                if mX is not None
-                else None
+                (
+                    pack_gqa_layout(
+                        mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=1
+                    )
+                    if mX is not None
+                    else None
+                )
                 for mX in (mPdPsum, mLSE, mLSElog2, mdLSE)
             ]
 
@@ -247,13 +262,17 @@ class FlashAttentionBackwardPreprocess:
             seqlen_k=0,
             headdim=0,
             headdim_v=mO.shape[1],
-            total_q=cute.size(mO.shape[0])
-            if const_expr(mCuSeqlensQ is not None)
-            else cute.size(mO.shape[0]) * cute.size(mO.shape[3]),
+            total_q=(
+                cute.size(mO.shape[0])
+                if const_expr(mCuSeqlensQ is not None)
+                else cute.size(mO.shape[0]) * cute.size(mO.shape[3])
+            ),
             tile_shape_mn=(self.tile_m, 1),
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
-            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            qhead_per_kvhead_packgqa=(
+                self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+            ),
             cu_total_m_blocks_ptr=mCuTotalMBlocks,
         )
 
@@ -326,13 +345,16 @@ class FlashAttentionBackwardPreprocess:
             # ///////////////////////////////////////////////////////////////////////////////
             # Get the appropriate tiles for this thread block.
             # ///////////////////////////////////////////////////////////////////////////////
-            seqlen_static = mO.shape[0] if const_expr(not self.pack_gqa) else mO.shape[0][1]
+            seqlen_static = (
+                mO.shape[0] if const_expr(not self.pack_gqa) else mO.shape[0][1]
+            )
             seqlen = SeqlenInfo.create(
                 batch_idx, seqlen_static, mCuSeqlensQ, mSeqUsedQ, tile=self.tile_m
             )
             # (seqlen, dv)
             mO_cur, mdO_cur = [
-                seqlen.offset_batch(mX, batch_idx, dim=3)[None, None, head_idx] for mX in (mO, mdO)
+                seqlen.offset_batch(mX, batch_idx, dim=3)[None, None, head_idx]
+                for mX in (mO, mdO)
             ]
             mPdPsum_cur = seqlen.offset_batch(
                 mPdPsum, batch_idx, dim=2, padded=self.use_padded_offsets

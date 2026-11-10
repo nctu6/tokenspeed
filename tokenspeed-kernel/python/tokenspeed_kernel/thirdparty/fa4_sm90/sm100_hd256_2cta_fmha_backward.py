@@ -10,19 +10,21 @@ Constraints:
 """
 
 import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Int32
-
-from tokenspeed_kernel.thirdparty.fa4_sm90.sm100_hd256_2cta_fmha_backward_dqkernel import (
-    BlackwellFusedMultiHeadAttentionBackwardDQKernel,
-)
+from tokenspeed_kernel.thirdparty.fa4_sm90.cute_dsl_utils import assume_tensor_aligned
 from tokenspeed_kernel.thirdparty.fa4_sm90.sm100_hd256_2cta_fmha_backward_dkdvkernel import (
     BlackwellFusedMultiHeadAttentionBackwardDKDVKernel,
 )
-from tokenspeed_kernel.thirdparty.fa4_sm90.cute_dsl_utils import assume_tensor_aligned
-from tokenspeed_kernel.thirdparty.fa4_sm90.utils import AuxData, as_bshkrd_tensor, as_shhb_tensor
+from tokenspeed_kernel.thirdparty.fa4_sm90.sm100_hd256_2cta_fmha_backward_dqkernel import (
+    BlackwellFusedMultiHeadAttentionBackwardDQKernel,
+)
+from tokenspeed_kernel.thirdparty.fa4_sm90.utils import (
+    AuxData,
+    as_bshkrd_tensor,
+    as_shhb_tensor,
+)
 
 
 class BlackwellFusedMultiHeadAttentionBackward:
@@ -54,37 +56,48 @@ class BlackwellFusedMultiHeadAttentionBackward:
     ):
         """Initialization."""
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
-        assert head_dim == 256 and head_dim_v == 256, (
-            "SM100 dedicated backward kernel only supports (head_dim, head_dim_v) = (256, 256)"
-        )
-        assert not is_local, "SM100 backward with head_dim=256 does not support local attention"
-        assert tile_m_dq == 128 and tile_n_dq == 128, (
-            "SM100 dedicated backward kernel only supports tile_m_dq=128 and tile_n_dq=128"
-        )
-        assert tile_m_dkdv == 128 and tile_n_dkdv == 64, (
-            "SM100 dedicated backward kernel only supports tile_m_dkdv=128 and tile_n_dkdv=64"
-        )
-        assert score_mod is None and score_mod_bwd is None and mask_mod is None, (
-            "SM100 backward with head_dim=256 does not support score_mod/mask_mod"
-        )
-        assert not deterministic, (
-            "SM100 backward with head_dim=256 does not support deterministic mode"
-        )
-        assert not has_aux_tensors, "SM100 backward with head_dim=256 does not support aux_tensors"
-        assert cluster_size in (1, 2), (
-            "SM100 backward with head_dim=256 only supports cluster_size in {1, 2}"
-        )
-        assert use_2cta_instrs, "SM100 backward with head_dim=256 requires use_2cta_instrs=True"
+        assert (
+            head_dim == 256 and head_dim_v == 256
+        ), "SM100 dedicated backward kernel only supports (head_dim, head_dim_v) = (256, 256)"
+        assert (
+            not is_local
+        ), "SM100 backward with head_dim=256 does not support local attention"
+        assert (
+            tile_m_dq == 128 and tile_n_dq == 128
+        ), "SM100 dedicated backward kernel only supports tile_m_dq=128 and tile_n_dq=128"
+        assert (
+            tile_m_dkdv == 128 and tile_n_dkdv == 64
+        ), "SM100 dedicated backward kernel only supports tile_m_dkdv=128 and tile_n_dkdv=64"
+        assert (
+            score_mod is None and score_mod_bwd is None and mask_mod is None
+        ), "SM100 backward with head_dim=256 does not support score_mod/mask_mod"
+        assert (
+            not deterministic
+        ), "SM100 backward with head_dim=256 does not support deterministic mode"
+        assert (
+            not has_aux_tensors
+        ), "SM100 backward with head_dim=256 does not support aux_tensors"
+        assert cluster_size in (
+            1,
+            2,
+        ), "SM100 backward with head_dim=256 only supports cluster_size in {1, 2}"
+        assert (
+            use_2cta_instrs
+        ), "SM100 backward with head_dim=256 requires use_2cta_instrs=True"
         # q_subtile_factor is accepted for interface parity with FlashAttentionBackwardSm100,
         # but this dedicated kernel uses fixed internal behavior.
 
         self.acc_dtype = cutlass.Float32
         self.is_causal = is_causal
         self.window_size_left = (
-            None if (window_size_left is None or window_size_left < 0) else window_size_left
+            None
+            if (window_size_left is None or window_size_left < 0)
+            else window_size_left
         )
         self.window_size_right = (
-            None if (window_size_right is None or window_size_right < 0) else window_size_right
+            None
+            if (window_size_right is None or window_size_right < 0)
+            else window_size_right
         )
         self.tile_m_dq = tile_m_dq
         self.tile_n_dq = tile_n_dq
@@ -138,27 +151,27 @@ class BlackwellFusedMultiHeadAttentionBackward:
         stream: cuda.CUstream = None,
     ):
         """Host function to launch CuTeDSL kernel."""
-        assert seqused_q is None and seqused_k is None, (
-            "SM100 backward with head_dim=256 does not support seqused_q/seqused_k"
-        )
-        assert window_size_left is None and window_size_right is None, (
-            "SM100 backward with head_dim=256 uses constructor-provided window sizes"
-        )
-        assert dQ_semaphore is None and dK_semaphore is None and dV_semaphore is None, (
-            "SM100 backward with head_dim=256 does not use semaphores"
-        )
-        assert block_sparse_tensors is None, (
-            "SM100 backward with head_dim=256 does not support block sparse tensors"
-        )
-        assert aux_data.tensors is None or len(aux_data.tensors) == 0, (
-            "SM100 backward with head_dim=256 does not support aux_tensors"
-        )
-        assert aux_data.scalars is None or len(aux_data.scalars) == 0, (
-            "SM100 backward with head_dim=256 does not support aux_scalars"
-        )
-        assert dQ_accum is not None, (
-            "SM100 backward with head_dim=256 expects dQ tensor at dQ_accum slot"
-        )
+        assert (
+            seqused_q is None and seqused_k is None
+        ), "SM100 backward with head_dim=256 does not support seqused_q/seqused_k"
+        assert (
+            window_size_left is None and window_size_right is None
+        ), "SM100 backward with head_dim=256 uses constructor-provided window sizes"
+        assert (
+            dQ_semaphore is None and dK_semaphore is None and dV_semaphore is None
+        ), "SM100 backward with head_dim=256 does not use semaphores"
+        assert (
+            block_sparse_tensors is None
+        ), "SM100 backward with head_dim=256 does not support block sparse tensors"
+        assert (
+            aux_data.tensors is None or len(aux_data.tensors) == 0
+        ), "SM100 backward with head_dim=256 does not support aux_tensors"
+        assert (
+            aux_data.scalars is None or len(aux_data.scalars) == 0
+        ), "SM100 backward with head_dim=256 does not support aux_scalars"
+        assert (
+            dQ_accum is not None
+        ), "SM100 backward with head_dim=256 expects dQ tensor at dQ_accum slot"
         dQ = dQ_accum
         varlen = cumulative_s_q is not None or cumulative_s_k is not None
         q_rank = cute.rank(Q.layout)
@@ -183,7 +196,9 @@ class BlackwellFusedMultiHeadAttentionBackward:
         else:
             b = Q.shape[0]
 
-        Q, K, V, dQ, dK, dV, dO = [assume_tensor_aligned(t) for t in (Q, K, V, dQ, dK, dV, dO)]
+        Q, K, V, dQ, dK, dV, dO = [
+            assume_tensor_aligned(t) for t in (Q, K, V, dQ, dK, dV, dO)
+        ]
 
         Q = as_bshkrd_tensor(Q, h_k, h_r, varlen)
         K = as_bshkrd_tensor(K, h_k, 1, varlen)

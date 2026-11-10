@@ -28,23 +28,22 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 from typing import Callable, Optional, Tuple, Union
-import cuda.bindings.driver as cuda
 
+import cuda.bindings.driver as cuda
 import cutlass
-from cutlass import Int32, const_expr
-from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.cute as cute
 import cutlass.cute.testing as testing
+import cutlass.pipeline as pipeline
 import cutlass.utils as utils
+from cutlass import Int32, const_expr
+from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils.gemm.sm100 import (
-    transform_partitioned_tensor_layout,
     epilogue_smem_copy_and_partition,
     epilogue_tmem_copy_and_partition,
+    transform_partitioned_tensor_layout,
 )
-import cutlass.pipeline as pipeline
-from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass.cute.nvgpu import cpasync, tcgen05
-
 from tokenspeed_kernel.thirdparty.fa4_sm90.utils import get_batch_from_cu_tensor
 
 
@@ -96,7 +95,9 @@ class dKGemmKernel:
         else:
             self.cluster_shape_mn = (1, 1)
             self.use_2cta_instrs = False
-        self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
+        self.cta_group = (
+            tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
+        )
         self.atom_thr_size = 2 if self.use_2cta_instrs else 1
         self.cta_tile_shape_mnk = (128, 64, 1)
         self.mma_tiler_dK = (
@@ -141,7 +142,9 @@ class dKGemmKernel:
         if const_expr(self.ab_dtype != Q.element_type):
             raise TypeError(f"Type must match: {self.ab_dtype} != {Q.element_type}")
         if const_expr(self.c_dtype != dKaccum.element_type):
-            raise TypeError(f"Type must match: {self.c_dtype} != {dKaccum.element_type}")
+            raise TypeError(
+                f"Type must match: {self.c_dtype} != {dKaccum.element_type}"
+            )
 
         if const_expr(self.varlen):
             assert cuSeqlensQ is not None
@@ -161,7 +164,9 @@ class dKGemmKernel:
         dS_mkl = cute.make_tensor(dS.iterator, cute.select(dS.layout, [2, 1, 0]))
         I_ml = cute.make_tensor(I.iterator, cute.select(I.layout, [1, 0]))
         Q_nkl = cute.make_tensor(Q.iterator, cute.select(Q.layout, [2, 1, 0]))
-        dKaccum_nl = cute.make_tensor(dKaccum.iterator, cute.select(dKaccum.layout, [1, 0]))
+        dKaccum_nl = cute.make_tensor(
+            dKaccum.iterator, cute.select(dKaccum.layout, [1, 0])
+        )
 
         # Configure tiled mma
         self.tiled_mma_dK = utils.sm100.make_trivial_tiled_mma(
@@ -228,7 +233,10 @@ class dKGemmKernel:
         Q_smem_layout_stage_one = utils.sm100.make_smem_layout_b(
             self.tiled_mma_dK, self.mma_tiler_dK, self.ab_dtype, 1
         )
-        Q_bytes = cute.size_in_bytes(self.ab_dtype, Q_smem_layout_stage_one) * self.num_Q_stage
+        Q_bytes = (
+            cute.size_in_bytes(self.ab_dtype, Q_smem_layout_stage_one)
+            * self.num_Q_stage
+        )
 
         # TMA store-reduce dK
         self.num_c_stage = 2
@@ -252,7 +260,8 @@ class dKGemmKernel:
 
         # Increase dS stages to fill SMEM
         self.num_dS_stage = (
-            smem_capacity // self.occupancy - (mbar_helpers_bytes + dK_bytes + Q_bytes + I_bytes)
+            smem_capacity // self.occupancy
+            - (mbar_helpers_bytes + dK_bytes + Q_bytes + I_bytes)
         ) // dS_bytes_per_stage
         dS_bytes = self.num_dS_stage * dS_bytes_per_stage
 
@@ -279,7 +288,9 @@ class dKGemmKernel:
         dS_op = utils.sm100.cluster_shape_to_tma_atom_A(
             self.cluster_shape_mn, self.tiled_mma_dK.thr_id
         )
-        self.dS_smem_layout = cute.slice_(self.dS_smem_layout_staged, (None, None, None, 0))
+        self.dS_smem_layout = cute.slice_(
+            self.dS_smem_layout_staged, (None, None, None, 0)
+        )
         tma_atom_dS, tma_tensor_dS = cute.nvgpu.make_tiled_tma_atom_A(
             dS_op,
             dS_mkl,
@@ -293,7 +304,9 @@ class dKGemmKernel:
         Q_op = utils.sm100.cluster_shape_to_tma_atom_B(
             self.cluster_shape_mn, self.tiled_mma_dK.thr_id
         )
-        self.Q_smem_layout = cute.slice_(self.Q_smem_layout_staged, (None, None, None, 0))
+        self.Q_smem_layout = cute.slice_(
+            self.Q_smem_layout_staged, (None, None, None, 0)
+        )
         tma_atom_Q, tma_tensor_Q = cute.nvgpu.make_tiled_tma_atom_B(
             Q_op,
             Q_nkl,
@@ -311,7 +324,9 @@ class dKGemmKernel:
         )
 
         # coalesced store for dKaccum: 1 warp copies 1 epi tile row
-        vector_width_dK = self.epi_tile_dK_width * self.c_dtype.width // cute.arch.WARP_SIZE
+        vector_width_dK = (
+            self.epi_tile_dK_width * self.c_dtype.width // cute.arch.WARP_SIZE
+        )
         copy_atom_dK = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             self.c_dtype,
@@ -320,7 +335,9 @@ class dKGemmKernel:
         vector_elts_dK = vector_width_dK // self.c_dtype.width
         thr_layout_dK = cute.make_layout((cute.arch.WARP_SIZE,))
         val_layout_dK = cute.make_layout((vector_elts_dK,))
-        tiled_copy_dK = cute.make_tiled_copy_tv(copy_atom_dK, thr_layout_dK, val_layout_dK)
+        tiled_copy_dK = cute.make_tiled_copy_tv(
+            copy_atom_dK, thr_layout_dK, val_layout_dK
+        )
 
         # cp.async load I: 1 warp copies 32 values, 4 warps copy 128 values
         copy_atom_I = cute.make_copy_atom(
@@ -346,7 +363,9 @@ class dKGemmKernel:
         self.tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
             num_ctas_mnl, cluster_shape_mnl
         )
-        grid = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(self.tile_sched_params)
+        grid = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(
+            self.tile_sched_params
+        )
 
         # Define shared storage for kernel
         buffer_align_bytes = 1024
@@ -355,25 +374,35 @@ class dKGemmKernel:
         class SharedStorage:
             dS_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_dS_stage * 2]
             Q_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_Q_stage * 2]
-            acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
+            acc_full_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.num_acc_stage * 2
+            ]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
             clc_response: cute.struct.MemRange[cutlass.Int32, 4]
             sI: cute.struct.Align[
-                cute.struct.MemRange[self.idx_dtype, cute.cosize(self.I_smem_layout_staged)],
+                cute.struct.MemRange[
+                    self.idx_dtype, cute.cosize(self.I_smem_layout_staged)
+                ],
                 buffer_align_bytes,
             ]
             sdS: cute.struct.Align[
-                cute.struct.MemRange[self.ab_dtype, cute.cosize(self.dS_smem_layout_staged)],
+                cute.struct.MemRange[
+                    self.ab_dtype, cute.cosize(self.dS_smem_layout_staged)
+                ],
                 buffer_align_bytes,
             ]
             sQ: cute.struct.Align[
-                cute.struct.MemRange[self.ab_dtype, cute.cosize(self.Q_smem_layout_staged)],
+                cute.struct.MemRange[
+                    self.ab_dtype, cute.cosize(self.Q_smem_layout_staged)
+                ],
                 buffer_align_bytes,
             ]
             sdK: cute.struct.Align[
-                cute.struct.MemRange[self.c_dtype, cute.cosize(self.dK_smem_layout_staged)],
+                cute.struct.MemRange[
+                    self.c_dtype, cute.cosize(self.dK_smem_layout_staged)
+                ],
                 buffer_align_bytes,
             ]
 
@@ -448,9 +477,13 @@ class dKGemmKernel:
         bidx, bidy, bidz = cute.arch.block_idx()
         mma_tile_coord_v = bidx % self.atom_thr_size
         is_leader_cta = mma_tile_coord_v == 0
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(
+            cute.arch.block_idx_in_cluster()
+        )
         is_first_cta_in_cluster = cta_rank_in_cluster == 0
-        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
+        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
+            cta_rank_in_cluster
+        )
         # Coord inside cta
         tidx, _, _ = cute.arch.thread_idx()
 
@@ -493,7 +526,9 @@ class dKGemmKernel:
 
         # Initialize acc_pipeline (barrier) and states
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_acc_consumer_threads = len(self.epilogue_warp_id) * (2 if self.use_2cta_instrs else 1)
+        num_acc_consumer_threads = len(self.epilogue_warp_id) * (
+            2 if self.use_2cta_instrs else 1
+        )
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
         )
@@ -509,7 +544,9 @@ class dKGemmKernel:
         # Initialize clc_pipeline (barrier) and states
         clc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         cluster_size = cute.size(self.cluster_shape_mn)
-        num_clc_consumer_threads = 32 * (1 + cluster_size * (1 + len(self.epilogue_warp_id) + 1))
+        num_clc_consumer_threads = 32 * (
+            1 + cluster_size * (1 + len(self.epilogue_warp_id) + 1)
+        )
         clc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_clc_consumer_threads
         )
@@ -587,7 +624,9 @@ class dKGemmKernel:
             mdS_mkl, cute.slice_(self.mma_tiler_dK, (None, 0, None)), (None, None, None)
         )
         # (bM, RestM, RestL)
-        gI_ml = cute.local_tile(mI_ml, cute.slice_(self.mma_tiler_dK, (None, 0, 0)), (None, None))
+        gI_ml = cute.local_tile(
+            mI_ml, cute.slice_(self.mma_tiler_dK, (None, 0, 0)), (None, None)
+        )
         # (bN, bK, RestN, RestK, RestL)
         gQ_nkl = cute.local_tile(
             mQ_nkl,
@@ -616,7 +655,9 @@ class dKGemmKernel:
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgdKaccum_fake = thr_mma_dK.partition_C(
             cute.make_identity_tensor(
-                cute.append(cute.slice_(self.mma_tiler_dK, (None, None, 0)), 1, up_to_rank=5)
+                cute.append(
+                    cute.slice_(self.mma_tiler_dK, (None, None, 0)), 1, up_to_rank=5
+                )
             )
         )
 
@@ -627,7 +668,9 @@ class dKGemmKernel:
         # Partition global/shared tensor for TMA load A/B
         #
         # TMA load A partition_S/D
-        a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
+        a_cta_layout = cute.make_layout(
+            cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
+        )
         # ((atom_v, rest_v), STAGE)
         # ((atom_v, rest_v), RestM, RestK, RestL)
         tAsdS, tAgdS = cpasync.tma_partition(
@@ -638,7 +681,9 @@ class dKGemmKernel:
             cute.group_modes(tCgdS, 0, 3),
         )
         # TMA load B partition_S/D
-        b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
+        b_cta_layout = cute.make_layout(
+            cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
+        )
         # ((atom_v, rest_v), RestM, RestK, RestL)
         tBsQ, tBgQ = cpasync.tma_partition(
             tma_atom_Q,
@@ -658,7 +703,9 @@ class dKGemmKernel:
         # (MMA, MMA_M, MMA_N)
         acc_shape_dK = tiled_mma_dK.partition_shape_C(self.mma_tiler_dK[:2])
         # (MMA, MMA_M, MMA_N, STAGE)
-        tCtdK_fake = tiled_mma_dK.make_fragment_C(cute.append(acc_shape_dK, self.num_acc_stage))
+        tCtdK_fake = tiled_mma_dK.make_fragment_C(
+            cute.append(acc_shape_dK, self.num_acc_stage)
+        )
 
         #
         # Cluster wait before tensor memory alloc
@@ -726,7 +773,9 @@ class dKGemmKernel:
                         # TMA load Q only on first m-tile
                         for n_tile in cutlass.range_constexpr(n_tile_cnt):
                             Q_pipeline.producer_acquire(Q_producer_state)
-                            Q_load_barrier = Q_pipeline.producer_get_barrier(Q_producer_state)
+                            Q_load_barrier = Q_pipeline.producer_get_barrier(
+                                Q_producer_state
+                            )
                             cute.copy(
                                 tma_atom_Q,
                                 tBgQ_slice[(None, n_tile, 0)],
@@ -818,7 +867,9 @@ class dKGemmKernel:
                         # Conditionally wait for AB buffer full
                         dS_handle = dS_consumer.wait_and_advance(peek_dS_full_status)
                         for n_tile in cutlass.range_constexpr(n_tile_cnt):
-                            tCtdK = tCtdK_base[(None, None, None, acc_producer_state.index)]
+                            tCtdK = tCtdK_base[
+                                (None, None, None, acc_producer_state.index)
+                            ]
                             tiled_mma_dK.set(tcgen05.Field.ACCUMULATE, False)
                             acc_pipeline.producer_acquire(acc_producer_state)
 
@@ -827,7 +878,9 @@ class dKGemmKernel:
                                 Q_consumer_state_wait.advance()
 
                             num_kblocks = cute.size(tCrdS, mode=[2])
-                            for kblk_idx in cutlass.range(num_kblocks, unroll_full=True):
+                            for kblk_idx in cutlass.range(
+                                num_kblocks, unroll_full=True
+                            ):
                                 cute.gemm(
                                     tiled_mma_dK,
                                     tCtdK,
@@ -928,7 +981,9 @@ class dKGemmKernel:
 
                 # Prefetch load I
                 I_load_barrier.arrive_and_wait()
-                for m_tile in cutlass.range_constexpr(min(m_tile_cnt, self.num_I_stage - 1)):
+                for m_tile in cutlass.range_constexpr(
+                    min(m_tile_cnt, self.num_I_stage - 1)
+                ):
                     cute.copy(
                         tiled_copy_I,
                         tIgI[(None, None, m_tile, token)],
@@ -977,7 +1032,9 @@ class dKGemmKernel:
                             acc_consumer_state,
                             acc_pipeline,
                         )
-                        num_subtiles_executed += self.mma_tiler_dK[1] // cute.size(epi_tile_dK[1])
+                        num_subtiles_executed += self.mma_tiler_dK[1] // cute.size(
+                            epi_tile_dK[1]
+                        )
                     # Advance I consumer pipeline
                     sI_read_stage = (sI_read_stage + 1) % self.num_I_stage
 
@@ -1064,7 +1121,9 @@ class dKGemmKernel:
 
         # Set tensor memory buffer for current tile
         # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
-        tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_consumer_state.index)]
+        tTR_tAcc = tTR_tAcc_base[
+            (None, None, None, None, None, acc_consumer_state.index)
+        ]
 
         #
         # Wait for accumulator buffer full
@@ -1144,7 +1203,9 @@ class dKGemmKernel:
         :raises testing.CantImplementError: If the mma tiler, cluster shape, or alignments are invalid
         """
         if self.dim != 64:
-            raise testing.CantImplementError(f"Only dim = 64 supported for dK gemm, got {self.dim}")
+            raise testing.CantImplementError(
+                f"Only dim = 64 supported for dK gemm, got {self.dim}"
+            )
         # Check valid MMA tile shape and cluster shape
         if not (
             (not self.use_2cta_instrs and self.mma_tiler_dK[0] in [64, 128])
@@ -1154,10 +1215,14 @@ class dKGemmKernel:
                 f"Invalid mma tiler & use_2cta_instrs: {self.mma_tiler_dK}, {self.use_2cta_instrs}"
             )
         if self.mma_tiler_dK[1] not in range(32, 257, 32):
-            raise testing.CantImplementError(f"Invalid mma tiler N: {self.mma_tiler_dK[1]}")
+            raise testing.CantImplementError(
+                f"Invalid mma tiler N: {self.mma_tiler_dK[1]}"
+            )
         # Skip illegal cluster shape
         if self.cluster_shape_mn[0] % (2 if self.use_2cta_instrs else 1) != 0:
-            raise testing.CantImplementError(f"Invalid cluster shape M: {self.cluster_shape_mn[0]}")
+            raise testing.CantImplementError(
+                f"Invalid cluster shape M: {self.cluster_shape_mn[0]}"
+            )
         # Skip invalid cluster shape
         is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
         if (
@@ -1167,7 +1232,9 @@ class dKGemmKernel:
             or not is_power_of_2(self.cluster_shape_mn[0])
             or not is_power_of_2(self.cluster_shape_mn[1])
         ):
-            raise testing.CantImplementError(f"Invalid cluster shape: {self.cluster_shape_mn}")
+            raise testing.CantImplementError(
+                f"Invalid cluster shape: {self.cluster_shape_mn}"
+            )
 
         # Check that all tensors are 16B aligned for TMA
 

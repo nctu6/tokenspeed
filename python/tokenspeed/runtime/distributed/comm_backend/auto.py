@@ -241,10 +241,11 @@ class AutoBackend(CommBackend):
         Triton RSAG multimem path or they illegal-memory-access; see
         ``nvls_multicast_mapping_usable``.
         """
+        from tokenspeed_kernel.ops.communication.fabric import group_has_fabric
+
         from tokenspeed.runtime.distributed.nvls_multicast import (
             nvls_multicast_mapping_usable,
         )
-        from tokenspeed_kernel.ops.communication.fabric import group_has_fabric
 
         if nvls_multicast_mapping_usable() is False:
             return False
