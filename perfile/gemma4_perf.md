@@ -268,10 +268,10 @@ xe_split (C32, defaults before fix; cols duration inTok outTok/s meanTTFT medTPO
 
 ```
 cols: duration inTok outTok/s meanTTFT medTPOT medITL
-TS dec 50.11 2048 1307.96 188.63 24.31 24.23 
-TS pre 55.01 524288 9.31 3344.05 0.00 1.71 
-vLLM dec 52.28 2048 1253.64 2086.27 23.51 23.47 
-vLLM pre 56.01 524288 9.14 3422.18 0.00 0.00 
+TS dec 50.11 2048 1307.96 188.63 24.31 24.23
+TS pre 55.01 524288 9.31 3344.05 0.00 1.71
+vLLM dec 52.28 2048 1253.64 2086.27 23.51 23.47
+vLLM pre 56.01 524288 9.14 3422.18 0.00 0.00
 XSPLITDONE
 ```
 
@@ -280,12 +280,12 @@ xe_dprof (eager bs32 decode, per-kernel): GEMMs identical to vLLM (same nvjet ti
 After fix (xe_chain5, cols tok/s meanTTFT P99TTFT meanTPOT P99TPOT P99ITL):
 
 ```
-dec Benchmark duration (s): 49.02  Output token throughput (tok/s): 1336.84  Median TPOT (ms): 23.80  Median ITL (ms): 23.70  
-xqkn 1K c1 51.12 124.61 138.71 19.15 19.26 22.30 
-xqkn 1K c8 328.60 813.23 6223.00 21.24 23.03 27.05 
-xqkn 1K c32 788.15 1297.06 3494.24 35.62 39.37 423.16 
-xqkn 128K c1 7.17 29137.93 29204.81 25.75 25.77 30.10 
-xqkn 128K c4 8.16 56342.17 117604.54 266.39 365.32 730.10 
+dec Benchmark duration (s): 49.02  Output token throughput (tok/s): 1336.84  Median TPOT (ms): 23.80  Median ITL (ms): 23.70
+xqkn 1K c1 51.12 124.61 138.71 19.15 19.26 22.30
+xqkn 1K c8 328.60 813.23 6223.00 21.24 23.03 27.05
+xqkn 1K c32 788.15 1297.06 3494.24 35.62 39.37 423.16
+xqkn 128K c1 7.17 29137.93 29204.81 25.75 25.77 30.10
+xqkn 128K c4 8.16 56342.17 117604.54 266.39 365.32 730.10
   graph:: 512 replayed (362 mixed), 0 eager, padding 5.3% of replayed tokens (prefill_graph.py:1565)[0m
 XC5DONE
 ```
@@ -293,10 +293,10 @@ XC5DONE
 Mixed-round chunk sweep (xe_chain6) and master:
 
 ```
-xch2048 1K c8 330.26 539.73 2819.33 22.16 23.72 118.65 
-xch2048 1K c32 794.60 920.88 3537.67 36.72 39.51 223.11 
-xch8192 1K c8 328.59 667.20 900.83 21.81 22.79 30.96 
-xch8192 1K c32 786.33 1887.12 3401.38 33.42 37.92 55.49 
+xch2048 1K c8 330.26 539.73 2819.33 22.16 23.72 118.65
+xch2048 1K c32 794.60 920.88 3537.67 36.72 39.51 223.11
+xch8192 1K c8 328.59 667.20 900.83 21.81 22.79 30.96
+xch8192 1K c32 786.33 1887.12 3401.38 33.42 37.92 55.49
 XC6DONE
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
 58 passed, 5 skipped, 52 warnings in 9.63s
@@ -437,10 +437,10 @@ xe_split (C32, defaults before fix; cols duration inTok outTok/s meanTTFT medTPO
 
 ```
 cols: duration inTok outTok/s meanTTFT medTPOT medITL
-TS dec 50.11 2048 1307.96 188.63 24.31 24.23 
-TS pre 55.01 524288 9.31 3344.05 0.00 1.71 
-vLLM dec 52.28 2048 1253.64 2086.27 23.51 23.47 
-vLLM pre 56.01 524288 9.14 3422.18 0.00 0.00 
+TS dec 50.11 2048 1307.96 188.63 24.31 24.23
+TS pre 55.01 524288 9.31 3344.05 0.00 1.71
+vLLM dec 52.28 2048 1253.64 2086.27 23.51 23.47
+vLLM pre 56.01 524288 9.14 3422.18 0.00 0.00
 XSPLITDONE
 ```
 
@@ -449,12 +449,12 @@ xe_dprof (eager bs32 decode, per-kernel): GEMMs identical to vLLM (same nvjet ti
 After fix (xe_chain5, cols tok/s meanTTFT P99TTFT meanTPOT P99TPOT P99ITL):
 
 ```
-dec Benchmark duration (s): 49.02  Output token throughput (tok/s): 1336.84  Median TPOT (ms): 23.80  Median ITL (ms): 23.70  
-xqkn 1K c1 51.12 124.61 138.71 19.15 19.26 22.30 
-xqkn 1K c8 328.60 813.23 6223.00 21.24 23.03 27.05 
-xqkn 1K c32 788.15 1297.06 3494.24 35.62 39.37 423.16 
-xqkn 128K c1 7.17 29137.93 29204.81 25.75 25.77 30.10 
-xqkn 128K c4 8.16 56342.17 117604.54 266.39 365.32 730.10 
+dec Benchmark duration (s): 49.02  Output token throughput (tok/s): 1336.84  Median TPOT (ms): 23.80  Median ITL (ms): 23.70
+xqkn 1K c1 51.12 124.61 138.71 19.15 19.26 22.30
+xqkn 1K c8 328.60 813.23 6223.00 21.24 23.03 27.05
+xqkn 1K c32 788.15 1297.06 3494.24 35.62 39.37 423.16
+xqkn 128K c1 7.17 29137.93 29204.81 25.75 25.77 30.10
+xqkn 128K c4 8.16 56342.17 117604.54 266.39 365.32 730.10
   graph:: 512 replayed (362 mixed), 0 eager, padding 5.3% of replayed tokens (prefill_graph.py:1565)[0m
 XC5DONE
 ```
@@ -462,10 +462,10 @@ XC5DONE
 Mixed-round chunk sweep (xe_chain6) and master:
 
 ```
-xch2048 1K c8 330.26 539.73 2819.33 22.16 23.72 118.65 
-xch2048 1K c32 794.60 920.88 3537.67 36.72 39.51 223.11 
-xch8192 1K c8 328.59 667.20 900.83 21.81 22.79 30.96 
-xch8192 1K c32 786.33 1887.12 3401.38 33.42 37.92 55.49 
+xch2048 1K c8 330.26 539.73 2819.33 22.16 23.72 118.65
+xch2048 1K c32 794.60 920.88 3537.67 36.72 39.51 223.11
+xch8192 1K c8 328.59 667.20 900.83 21.81 22.79 30.96
+xch8192 1K c32 786.33 1887.12 3401.38 33.42 37.92 55.49
 XC6DONE
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
 58 passed, 5 skipped, 52 warnings in 9.63s
