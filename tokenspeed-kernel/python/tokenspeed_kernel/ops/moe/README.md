@@ -410,7 +410,9 @@ section 9.26.
 ### Token layouts (`moe_plan(ep_token_layout=...)`)
 
 The plan names how the tokens meet the experts, and the leaf runs the same
-kernels either way:
+kernels either way. `ep_token_layout` is a required argument of `moe_plan` (and
+of `MoELayer`); `None` means no kernel of the plan owns the token exchange, and
+this leaf refuses it:
 
 - `scattered` (attention DP): each rank brings its own tokens. The call is the
   push / barrier / dispatch / GEMMs / return / combine protocol above and returns
