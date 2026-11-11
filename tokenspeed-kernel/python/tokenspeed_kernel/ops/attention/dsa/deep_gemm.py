@@ -197,6 +197,33 @@ def _check_out(
     return out, lens_out
 
 
+def _dense(tensor: torch.Tensor, device: torch.device, dtype: torch.dtype):
+    """``tensor`` as a contiguous ``dtype`` tensor on ``device``.
+
+    Converts only what differs: ``.to`` and ``.contiguous`` return the tensor
+    itself when nothing changes, but each call still costs host time, once per
+    argument and layer.
+    """
+    if tensor.dtype != dtype or tensor.device != device:
+        tensor = tensor.to(device=device, dtype=dtype)
+    return tensor if tensor.is_contiguous() else tensor.contiguous()
+
+
+def _rows(tensor: torch.Tensor, start: int, end: int) -> torch.Tensor:
+    """Rows ``start:end`` of ``tensor``; the tensor itself if they are all of it.
+
+    A tile that covers every row (a chunk that fits one logits budget, the
+    common case) skips the slice, which is host time for nothing.
+    """
+    return tensor if end - start == tensor.shape[0] else tensor[start:end]
+
+
+def _tile_rows(tensor: torch.Tensor, start: int, end: int) -> torch.Tensor:
+    """Rows ``start:end`` of ``tensor`` as a contiguous tensor."""
+    tensor = _rows(tensor, start, end)
+    return tensor if tensor.is_contiguous() else tensor.contiguous()
+
+
 def _resolve_prefill_tile_max_seqlen_k(
     candidate_lens: torch.Tensor,
     candidate_lens_cpu: torch.Tensor | None,
@@ -206,7 +233,7 @@ def _resolve_prefill_tile_max_seqlen_k(
     max_seqlen_k: int | None,
 ) -> int:
     if candidate_lens_cpu is not None:
-        return int(candidate_lens_cpu[start:end].max().item())
+        return int(_rows(candidate_lens_cpu, start, end).max().item())
     if max_seqlen_k is not None:
         return int(max_seqlen_k)
     return int(candidate_lens[start:end].max().item())
@@ -565,9 +592,9 @@ if platform.is_hopper_plus:
         batch_invariant: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        q = q.contiguous()
-        row_starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
-        row_ends = row_ends.to(device=q.device, dtype=torch.int32).contiguous()
+        q = _dense(q, q.device, q.dtype)
+        row_starts = _dense(row_starts, q.device, torch.int32)
+        row_ends = _dense(row_ends, q.device, torch.int32)
         tokens = q.shape[0]
         out, lens_out = _check_out(
             out,
@@ -604,9 +631,7 @@ if platform.is_hopper_plus:
                 out_heads=32 if q.shape[1] == 16 else q.shape[1],
                 index_k_cache=index_k_cache if gather else None,
                 kv_workspace_slots=(
-                    kv_workspace_slots.to(device=q.device, dtype=torch.long)
-                    if gather
-                    else None
+                    _dense(kv_workspace_slots, q.device, torch.long) if gather else None
                 ),
                 page_size=page_size,
             )
@@ -673,11 +698,11 @@ if platform.is_hopper_plus:
             if deep_gemm.get_pdl() != pdl_enabled():
                 deep_gemm.set_pdl(pdl_enabled())
             logits = deep_gemm.fp8_mqa_logits(
-                q_fp8[start:end].contiguous(),
+                _tile_rows(q_fp8, start, end),
                 kv_fp8,
-                scaled_weights[start:end].contiguous(),
-                row_starts[start:end],
-                row_ends[start:end],
+                _tile_rows(scaled_weights, start, end),
+                _tile_rows(row_starts, start, end),
+                _tile_rows(row_ends, start, end),
                 clean_logits=False,
                 max_seqlen_k=max(tile_max_seqlen_k, 1),
             )
@@ -686,24 +711,24 @@ if platform.is_hopper_plus:
             )
             mark_forced_initial_local_logits(
                 logits,
-                candidate_lens[start:end],
+                _rows(candidate_lens, start, end),
                 initial_tokens=initial_tokens,
                 local_tokens=local_tokens,
             )
-            tile_out = out[start:end]
-            tile_starts = row_starts[start:end]
+            tile_out = _rows(out, start, end)
+            tile_starts = _rows(row_starts, start, end)
             if not batch_invariant and deepselect_supports(logits, int(topk)):
                 # Reports workspace rows directly: local offset + row start.
                 deepselect_local_topk(
                     logits,
-                    candidate_lens[start:end],
+                    _rows(candidate_lens, start, end),
                     topk,
                     tile_out,
                     index_base=tile_starts,
                 )
                 continue
             if batch_invariant:
-                tile_lens = candidate_lens[start:end]
+                tile_lens = _rows(candidate_lens, start, end)
                 tile_out.fill_(-1)
                 _row_invariant_topk(logits, tile_lens, tile_out, topk)
                 tile_out.masked_fill_(tile_out >= tile_lens.view(-1, 1), -1)
@@ -714,7 +739,7 @@ if platform.is_hopper_plus:
                 torch.ops.trtllm.indexer_topk_prefill(
                     logits.contiguous(),
                     local_starts_i32[start:end],
-                    candidate_lens[start:end].to(torch.int32).contiguous(),
+                    _rows(candidate_lens, start, end).to(torch.int32).contiguous(),
                     tile_out,
                     int(topk),
                 )
@@ -724,7 +749,7 @@ if platform.is_hopper_plus:
                     triton_topk_from_logits(
                         logits,
                         int(topk),
-                        seq_lens=candidate_lens[start:end],
+                        seq_lens=_rows(candidate_lens, start, end),
                         enable_pdl=pdl_enabled(),
                     )
                 )

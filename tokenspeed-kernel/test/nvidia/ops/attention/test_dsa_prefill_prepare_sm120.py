@@ -198,6 +198,29 @@ def test_leaf_selects_what_the_framework_ops_select(
     assert (fused[fused >= 0] < sum(prefixes) + tokens * len(prefixes)).all()
 
 
+@pytest.mark.parametrize("heads", [32, 64])
+def test_logits_budget_tiles_select_what_one_call_selects(heads):
+    """A budget that splits the chunk into several launches changes no row.
+
+    A tile that covers the whole chunk takes the tensors as they are, a split
+    one slices them; both must score and select every row the same way.
+    """
+    from tokenspeed_kernel.ops.attention.dsa import deep_gemm as dsa_deep_gemm
+
+    tokens, prefix = 200, 900
+    cache = _index_cache(math.ceil((prefix + tokens) / PAGE))
+    leaf = dsa_deep_gemm.deep_gemm_dsa_prefill_topk
+    whole = _prefill(leaf, tokens, [prefix], heads=heads, cache=cache, seed=5)
+
+    def tiled(*args, **kwargs):
+        # Tiles of 64, 64, 64 and 8 rows: 64 rows of fp32 logits per key.
+        return leaf(*args, max_logits_bytes=(prefix + tokens) * 4 * 64, **kwargs)
+
+    split = _prefill(tiled, tokens, [prefix], heads=heads, cache=cache, seed=5)
+    assert torch.equal(whole[0], split[0])
+    assert torch.equal(whole[1], split[1])
+
+
 def test_tiny_chunk_launches_a_handful_of_kernels():
     """The host-bound regime: the leaf is a few launches, not a dozen small ones."""
     from tokenspeed_kernel.ops.attention.dsa import deep_gemm as dsa_deep_gemm

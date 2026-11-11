@@ -244,21 +244,33 @@ def deepselect_local_topk(
         raise RuntimeError("DeepSelect row top-k is unavailable on this platform")
     # Compiles on first use, so run it once eagerly before CUDA-graph capture.
     capacity = _row_select.capacity_for(topk)
-    lengths = lengths.to(torch.int32).contiguous()
+    if lengths.dtype != torch.int32 or not lengths.is_contiguous():
+        lengths = lengths.to(torch.int32).contiguous()
+    rows, width = logits.shape
+    # The SM count only matters to rows wide enough to split across a cluster.
+    sm_count = (
+        current_platform().sm_count if width >= _row_select.CLUSTER_MIN_WIDTH else 0
+    )
     # One CUDA grid row per score row, at most 65535 of them per launch.
-    for begin in range(0, logits.shape[0], _MAX_GRID_ROWS):
-        end = min(begin + _MAX_GRID_ROWS, logits.shape[0])
+    for begin in range(0, rows, _MAX_GRID_ROWS):
+        end = min(begin + _MAX_GRID_ROWS, rows)
         cluster_size = _row_select.choose_cluster_size(
-            end - begin, logits.shape[1], capacity, current_platform().sm_count
+            end - begin, width, capacity, sm_count
         )
+        # A launch that covers every row takes the tensors as they are.
+        whole = end - begin == rows
         _row_select.deepselect_topk(
-            logits[begin:end],
-            lengths[begin:end],
+            logits if whole else logits[begin:end],
+            lengths if whole else lengths[begin:end],
             topk,
             capacity=capacity,
             cluster_size=cluster_size,
-            indices=out[begin:end],
-            index_base=None if index_base is None else index_base[begin:end],
+            indices=out if whole else out[begin:end],
+            index_base=(
+                None
+                if index_base is None
+                else (index_base if whole else index_base[begin:end])
+            ),
         )
     return out
 

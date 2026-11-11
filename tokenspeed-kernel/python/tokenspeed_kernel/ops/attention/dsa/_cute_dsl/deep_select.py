@@ -1177,6 +1177,7 @@ MAX_TOPK = SUPPORTED_MAX_TOPK[-1]
 SCORE_ALIGNMENT = 4
 
 
+@functools.cache
 def capacity_for(topk: int) -> int:
     """The smallest compiled survivor capacity that serves ``topk``."""
     for capacity in SUPPORTED_MAX_TOPK:
@@ -1185,6 +1186,7 @@ def capacity_for(topk: int) -> int:
     raise ValueError(f"topk must be in [1, {MAX_TOPK}], got {topk}")
 
 
+@functools.cache
 def cluster_sizes_for(capacity: int) -> tuple[int, ...]:
     """Cluster sizes whose gathered survivors fit the candidate buffer."""
     return tuple(
@@ -1339,20 +1341,27 @@ def deepselect_topk(
     """
     if scores.ndim != 2 or scores.dtype != torch.float32 or not scores.is_cuda:
         raise ValueError("scores must be a CUDA FP32 [rows, width] matrix")
+    rows, width = scores.shape
+    row_stride, column_stride = scores.stride()
     if (
-        scores.stride(1) != 1
-        or scores.stride(0) % SCORE_ALIGNMENT
-        or scores.stride(0) < scores.shape[1]
+        column_stride != 1
+        or row_stride % SCORE_ALIGNMENT
+        or row_stride < width
         or scores.data_ptr() % (SCORE_ALIGNMENT * 4)
     ):
         raise ValueError(
             f"scores rows must be unit-stride with a stride multiple of {SCORE_ALIGNMENT} "
             "elements from a 16-byte aligned base"
         )
-    rows = scores.shape[0]
-    if ends.shape != (rows,) or ends.dtype != torch.int32 or not ends.is_contiguous():
+    device = scores.device
+    if (
+        ends.ndim != 1
+        or ends.shape[0] != rows
+        or ends.dtype != torch.int32
+        or not ends.is_contiguous()
+    ):
         raise ValueError("ends must be contiguous int32 [rows]")
-    if ends.device != scores.device:
+    if ends.device != device:
         raise ValueError("ends must live on the scores device")
     if capacity not in SUPPORTED_MAX_TOPK or not 1 <= topk <= capacity:
         raise ValueError(
@@ -1365,37 +1374,47 @@ def deepselect_topk(
             f"choose from {cluster_sizes_for(capacity)}"
         )
     if indices is None:
-        indices = torch.empty((rows, topk), dtype=torch.int32, device=scores.device)
+        indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    elif not _is_dense(indices, torch.int32, rows, topk, device):
+        raise ValueError(
+            f"indices must be a contiguous {torch.int32} [rows, topk] tensor on the scores device"
+        )
     if values is None:
-        values = torch.empty((rows, topk), dtype=torch.float32, device=scores.device)
-    for name, tensor, dtype in (
-        ("indices", indices, torch.int32),
-        ("values", values, torch.float32),
-    ):
-        if (
-            tensor.shape != (rows, topk)
-            or tensor.dtype != dtype
-            or not tensor.is_contiguous()
-            or tensor.device != scores.device
-        ):
-            raise ValueError(
-                f"{name} must be a contiguous {dtype} [rows, topk] tensor on the scores device"
-            )
+        values = torch.empty((rows, topk), dtype=torch.float32, device=device)
+    elif not _is_dense(values, torch.float32, rows, topk, device):
+        raise ValueError(
+            f"values must be a contiguous {torch.float32} [rows, topk] tensor on the scores device"
+        )
     if index_base is None:
-        index_base = _zero_bases(rows, scores.device)
+        index_base = _zero_bases(rows, device)
     elif (
-        index_base.shape != (rows,)
+        index_base.ndim != 1
+        or index_base.shape[0] != rows
         or index_base.dtype != torch.int32
         or not index_base.is_contiguous()
-        or index_base.device != scores.device
+        or index_base.device != device
     ):
         raise ValueError("index_base must be a contiguous int32 [rows] tensor")
     if rows == 0:
         return indices, values
-    compiled_selector(capacity, cluster_size, scores.device.index)(
+    compiled_selector(capacity, cluster_size, device.index)(
         scores, ends, indices, values, index_base
     )
     return indices, values
+
+
+def _is_dense(
+    tensor: torch.Tensor, dtype: torch.dtype, rows: int, topk: int, device: torch.device
+) -> bool:
+    """Whether ``tensor`` is a contiguous ``[rows, topk]`` tensor of ``dtype`` on ``device``."""
+    return (
+        tensor.ndim == 2
+        and tensor.shape[0] == rows
+        and tensor.shape[1] == topk
+        and tensor.dtype == dtype
+        and tensor.is_contiguous()
+        and tensor.device == device
+    )
 
 
 _ZERO_BASES: dict[torch.device, torch.Tensor] = {}
