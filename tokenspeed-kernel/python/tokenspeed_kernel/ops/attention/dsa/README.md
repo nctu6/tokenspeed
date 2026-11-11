@@ -222,6 +222,18 @@ index-key row format and the selector that follows.
   1.35-6.0x, 1024 tokens 21x, 2K-8K tokens with prefixes 54-98x;
   `scripts/sm120_dsa_vs_tokenspeed.py` in DeepGEMM). The launch rule is "one
   path": no chunk-size rule exists or is needed.
+  The two launches left around `dsa_prefill_prepare` are trimmed of host work
+  without changing a bit (`scripts/sm120_bench_host_dsa.py` in DeepGEMM, 128
+  tokens, 64 heads): `fp8_mqa_logits` finds its kernel by the template integers
+  instead of hashing the generated source on every call (DeepGEMM
+  `kernel_lookup.hpp`) and returns its view with one `as_strided` (8.6 -> 5.6 us
+  per call); the leaf does not slice or copy a tile that covers the whole chunk,
+  and `deepselect_local_topk` launches the whole `[rows, width]` tensors, skips
+  the platform query for rows too narrow to split across a cluster, and
+  validates once (17.2 -> 9.1 us). The leaf's host time falls from 116 to 87 us.
+  What is left of DeepSelect's 9 us is the TVM-FFI call (~3.5 us, one DLPack
+  conversion per tensor) and the `values` allocation (~2 us), which the kernel
+  fills although this caller discards it.
 - **V4.1 `dsv41_index_topk`.** SM120 stores the checkpoint's 68-byte rows
   (`cache_format="v41"`: 64 bytes of E2M1 pairs, then one UE8M0 word with the
   four 32-element scales, page-planar). One leaf, `deep_gemm_sm120_dsv41_index_topk`
