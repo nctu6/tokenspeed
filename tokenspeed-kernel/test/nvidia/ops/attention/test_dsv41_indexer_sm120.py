@@ -206,13 +206,14 @@ def _run(q, weights, cache, table, visible, solution, candidates, candidate_topk
 
 @pytest.mark.parametrize(
     ("rows", "history", "shared_table"),
-    # The last case's Reindex pass reads only the pool (see the rule test)
+    # The last two cases' Reindex passes read only the pool (see the rule test)
     [
         (1, 700, False),
         (8, 4096, False),
         (33, 20000, False),
         (96, 4096, True),
         (64, 33000, False),
+        (96, 33000, True),
     ],
 )
 def test_packed_rows_select_the_exact_topk(rows, history, shared_table):
@@ -258,22 +259,18 @@ def test_packed_rows_select_the_exact_topk(rows, history, shared_table):
         )
 
 
-def test_packed_reindex_scores_only_the_pool_where_that_wins():
+def test_packed_reindex_scores_only_the_pool_from_twice_its_size():
     from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import _sparse_reindex_wins
 
     pool = 2048 * 8
-    # Histories within the pool, and few scores, score the history densely
-    assert not _sparse_reindex_wins(128, 16384, pool, False)
-    assert not _sparse_reindex_wins(32, 49152, pool, False)
-    assert not _sparse_reindex_wins(8, 131072, pool, False)
-    # Long paged histories of many rows read only the pool
-    assert _sparse_reindex_wins(32, 65536, pool, False)
-    assert _sparse_reindex_wins(128, 32768, pool, False)
-    assert _sparse_reindex_wins(64, 33088, pool, False)
-    # One request's chunk: the contiguous scorer holds out longer
-    assert not _sparse_reindex_wins(1024, 65536, pool, True)
-    assert _sparse_reindex_wins(128, 65536, pool, True)
-    assert _sparse_reindex_wins(4096, 131072, pool, True)
+    # A history within the pool is taken whole, and below twice the pool the
+    # dense scorers are as fast or faster
+    assert not _sparse_reindex_wins(16384, pool)
+    assert not _sparse_reindex_wins(24576, pool)
+    # From twice the pool the pool-only scorer wins, for any number of rows
+    assert _sparse_reindex_wins(32768, pool)
+    assert _sparse_reindex_wins(33088, pool)
+    assert _sparse_reindex_wins(131072, pool)
 
 
 def test_packed_reindex_takes_a_small_pool_whole():
@@ -363,7 +360,7 @@ def test_packed_rows_reuse_the_compiled_kernels_across_shapes():
         # pick the launches
         rows, history, shared = shape
         cls = 1 if rows == 1 else (16 if rows % 16 == 0 else 0)
-        sparse = history > 16384 and rows * history >= 1 << 21
+        sparse = history >= 32768
         return cls, rows < 16, rows > 64, shared, sparse
 
     sweep = [
@@ -375,6 +372,7 @@ def test_packed_rows_reuse_the_compiled_kernels_across_shapes():
         (40, 34000, False),
         (5, 2000, True),
         (33, 4096, True),
+        (21, 36000, True),
     ]
     pool = [
         (1, 700, False),
@@ -384,6 +382,7 @@ def test_packed_rows_reuse_the_compiled_kernels_across_shapes():
         (80, 1024, False),
         (16, 1024, True),
         (17, 2048, True),
+        (17, 33000, True),
         (4, 1024, False),
         (4, 1024, True),
     ]

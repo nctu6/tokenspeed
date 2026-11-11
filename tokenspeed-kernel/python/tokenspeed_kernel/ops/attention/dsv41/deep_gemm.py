@@ -717,24 +717,23 @@ def _packed_dense_scores(
 _SPARSE_SCORE_ALIGNMENT = 32
 
 
-def _sparse_reindex_wins(rows: int, capacity: int, pool_rows: int, broadcast: bool):
+def _sparse_reindex_wins(capacity: int, pool_rows: int) -> bool:
     """Whether a packed Reindex pass should score only its pool.
 
     The alternative scores the whole history with the paged (or, for one
-    request's chunk, the contiguous) kernel and gathers the pool from it. That
-    is cheap here, while the sparse kernel runs in one wave of CTAs and costs
-    about 85 us at any size. Measured on an RTX PRO 6000 with 32 heads and a
-    2048-block pool (16384 rows), dense / sparse time: 0.31-0.70 for every
-    history up to the pool; paged 0.40-0.59 below 2^21 scores, 1.05-3.49 from
-    there once the history exceeds the pool; broadcast 0.46-1.04 at twice the
-    pool, 0.74-0.90 at four times with 1024 or more queries, 1.47 there with
-    128 queries, 2.05-2.81 at eight times.
+    request's chunk, the contiguous) kernel and gathers the pool from it. The
+    sparse kernel splits the pool's blocks evenly over the SMs and overlaps its
+    gather with the MMAs, so its time follows the pool; the dense scorers follow
+    the history. Measured on an RTX PRO 6000 with 32 heads and a 2048-block pool
+    (16384 rows), dense / sparse time of the whole leaf (CUDA graph; decode of
+    8-128 requests, one request's chunk of 128-1024 queries): 0.94-1.9x at twice
+    the pool, 1.2-3.2x at four times and 1.7-7x at eight times. Between one and
+    two pools the dense scorers win by up to 1.3x for 8-32 requests or 512-1024
+    queries and the sparse kernel by up to 1.65x for 128 of either, so the
+    sparse kernel starts at twice the pool. A history within the pool is taken
+    whole and never needs it.
     """
-    if capacity <= pool_rows:
-        return False
-    if broadcast:
-        return capacity >= 8 * pool_rows or (capacity >= 4 * pool_rows and rows <= 128)
-    return rows * capacity >= 1 << 21
+    return capacity >= 2 * pool_rows
 
 
 def _packed_index_topk(
@@ -762,7 +761,7 @@ def _packed_index_topk(
     broadcast = page_table.stride(0) == 0 and n > 1
     sparse = _use_sparse_candidate_scores(
         index_cache, candidate_blocks, candidate_topk, 128
-    ) and _sparse_reindex_wins(n, capacity, candidate_blocks.shape[1] * 8, broadcast)
+    ) and _sparse_reindex_wins(capacity, candidate_blocks.shape[1] * 8)
     dense = not sparse and broadcast
     tile = query_chunk_size
     if not sparse:
