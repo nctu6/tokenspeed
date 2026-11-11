@@ -74,8 +74,9 @@ if _sparse_mma is not None:
         CuTe core: 1.5-7.9x over the workspace route and 1.4-3.0x over the
         Triton direct reader (docs: analysis 9.40). A window-only layer (FP8
         rows alone) is 1.4-7.6x over the workspace route and 1.16x geomean over
-        the Triton direct reader (0.94-1.77x: ties at 32-128 heads and 1-4 or
-        1024+ tokens, a few tenths of a microsecond when launch-bound).
+        the Triton direct reader (0.94-1.77x: ties of 0.94-1.06x at 32-128 heads for
+        1-4 tokens and from 256 or 1024 tokens, a few tenths of a microsecond
+        when launch-bound).
         Workspace prefill and any layout the kernel's vector loads cannot
         address run ``triton_dsv41_mma_selected_attention``; every choice
         follows the layer's cache layout alone, never the batch, so a row stays
