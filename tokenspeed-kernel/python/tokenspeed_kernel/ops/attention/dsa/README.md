@@ -247,17 +247,21 @@ index-key row format and the selector that follows.
   | Reindex over the pool | 2.2-22x | 6.8-22x |
 
   Every pass wins, so packed rows have no shape rule against the Triton leaf.
-  Inside the leaf, a Reindex pass scores the whole history and gathers the pool
-  unless the pool-only sparse kernel wins (`_sparse_reindex_wins`): that kernel
-  runs in one wave of CTAs and costs about 85 us at any size, while the packed
-  history scorers are cheap (dense over sparse time 0.31-0.70 up to the pool's
-  16384 rows; sparse wins 1.05-3.5x on paged histories past the pool from 2^21
-  scores, and on one request's chunk from four times the pool at 128 queries or
-  eight times otherwise). For FP8 rows no pool-only scorer exists on SM120 (the
-  sparse kernel reads MX rows only), so `fp8_indexer_wins` still keeps long FP8
-  Reindex passes on Triton. TP-sharded index scoring (`index_candidates`) still
-  takes FP8 rows only.
-
+  Inside the leaf, a Reindex pass reads only the candidate pool with the sparse
+  kernel when the history is at least twice the pool (`_sparse_reindex_wins`,
+  one threshold), and otherwise scores the whole history and gathers the pool.
+  The sparse kernel gives each CTA an even share of the pool's blocks, gathers
+  them with one `cp.async` per lane and overlaps the gather with the MMAs, so
+  its time follows the pool: 8 / 32 / 128 requests of 32K rows take 21 / 45 /
+  146 us (was 82 / 94 / 252) and a chunk of 128 / 1024 / 4096 queries 43 / 243
+  / 912 us (was 140 / 710 / 2770). For the whole leaf (CUDA graph, 2048-block
+  pool of 16384 rows) the sparse over the dense time is 0.94-1.9x at twice the
+  pool, 1.2-3.2x at four times and 1.7-7x at eight times; between one and two
+  pools the dense scorers win by up to 1.3x for 8-32 requests or 512-1024
+  queries, hence the threshold. For FP8 rows no pool-only scorer exists on SM120
+  (the sparse kernel reads MX rows only), so `fp8_indexer_wins` still keeps long
+  FP8 Reindex passes on Triton. TP-sharded index scoring (`index_candidates`)
+  still takes FP8 rows only.
 ## Tensor-core sparse attention on SM120 (`_triton/sparse_mma.py`)
 
 `triton_dsa_mma_decode` and `triton_dsa_mma_prefill` (priority `PERFORMANT`,
