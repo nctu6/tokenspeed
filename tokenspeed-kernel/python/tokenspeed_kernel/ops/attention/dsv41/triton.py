@@ -815,7 +815,9 @@ def selected_attention(
 
 # SM120 has no FlashMLA, so decode runs the portable gather above. The kernel
 # below reads the packed rows itself (see ``dsv4/_triton/paged_mma.py``); its
-# result is bitwise the portable route's.
+# result is bitwise the portable route's. Where the CuTe DSL is built,
+# ``cute_dsl_dsv41_mma_selected_attention`` (``cute_dsl_attention.py``) outranks
+# it and falls back to it for the layouts it cannot read.
 _MMA_CAPABILITY = CapabilityRequirement(
     min_arch_version=ArchVersion(12, 0),
     max_arch_version=ArchVersion(12, 9),
@@ -905,6 +907,47 @@ def mma_selected_attention(
             lse,
             solution=None,
         )
+    segments = direct_segments(*args[:8], out, lse, prefill_indices)
+    if segments is None:
+        return selected_attention(*args, lse=lse)
+    from tokenspeed_kernel.ops.attention.dsv4._triton import paged_mma
+
+    swa, extra = segments
+    out = _output(out, q.shape, q.dtype, q.device)
+    paged_mma.paged_mma_decode(
+        q,
+        swa,
+        extra,
+        attn_sink,
+        out,
+        lse,
+        softmax_scale=softmax_scale,
+    )
+    return out
+
+
+def direct_segments(
+    q,
+    swa_cache,
+    swa_slots,
+    swa_lens,
+    global_cache,
+    global_slots,
+    global_lens,
+    attn_sink,
+    out,
+    lse,
+    prefill_indices,
+):
+    """``(swa, extra)`` segments the direct readers can attend, or None.
+
+    Each segment is ``(cache, format, slots, lens, page_rows)`` as
+    ``dsv4/_triton/paged_mma.py`` takes them (``extra`` is None without a
+    compressed cache). None means the inputs need the portable gather: another
+    layout, a window that is not a whole number of tiles, a partial-attention
+    LSE with a sink, and so on. The answer follows the tensors' layout alone,
+    never the batch contents.
+    """
     if (
         prefill_indices is not None
         or q.ndim != 3
@@ -931,8 +974,8 @@ def mma_selected_attention(
             and (out.shape != q.shape or out.dtype != q.dtype or out.stride(-1) != 1)
         )
     ):
-        return selected_attention(*args, lse=lse)
-    from tokenspeed_kernel.ops.attention.dsv4._triton import paged_mma, sparse_mma
+        return None
+    from tokenspeed_kernel.ops.attention.dsv4._triton import sparse_mma
 
     tokens = q.shape[0]
     swa = _paged_segment(swa_cache, swa_slots, swa_lens, "swa", tokens)
@@ -942,16 +985,16 @@ def mma_selected_attention(
             global_cache, global_slots, global_lens, "global", tokens
         )
         if extra is None:
-            return selected_attention(*args, lse=lse)
+            return None
     elif global_slots is not None or global_lens is not None:
-        return selected_attention(*args, lse=lse)
+        return None
     # A tile of the selection must belong to one segment, and there must be rows
     if (
         swa is None
         or swa[2].shape[1] % sparse_mma.BLOCK_N
         or swa[2].shape[1] + (0 if extra is None else extra[2].shape[1]) == 0
     ):
-        return selected_attention(*args, lse=lse)
+        return None
     _same_device(
         q,
         (
@@ -966,17 +1009,7 @@ def mma_selected_attention(
             lse,
         ),
     )
-    out = _output(out, q.shape, q.dtype, q.device)
-    paged_mma.paged_mma_decode(
-        q,
-        swa,
-        extra,
-        attn_sink,
-        out,
-        lse,
-        softmax_scale=softmax_scale,
-    )
-    return out
+    return swa, extra
 
 
 def _score(q, weights, cache, slots, process_group):

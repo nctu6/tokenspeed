@@ -1288,6 +1288,7 @@ def merge_index_candidates(packed, rows, lengths):
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.dsv41.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsv41.cute_dsl_attention  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41._triton.rope  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_select  # noqa: E402,F401

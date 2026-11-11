@@ -70,6 +70,20 @@ tokens are whole or split never changes a row's bits.
 Batch-varying values (token count, head count, width, strides, chunk and split
 counts) are runtime arguments; a binary is keyed by dtype, head tile, rank and
 RoPE width only.
+
+Packed caches (V4 variant, BF16 path). Instead of copying BF16 workspace rows,
+the CTA can read the DeepSeek V4 / V4.1 page-planar caches (:data:`PACKED_FORMATS`:
+FP8 with UE8M0 scales, FP8 with a BF16 RoPE tail, FP4 with E4M3 scales) and
+dequantize them into the same BF16 ring tile. Each of the 8 threads of a row
+owns every 8th 16-byte chunk of it. A thread loads its packed bytes (and the
+row's scales) into registers one tile ahead (predicated loads, nothing branches
+on a loaded value), converts them after the next barrier, which is the tile
+the previous iteration's MMAs freed, and stores 16 bytes at a time. The
+conversion is exact (:func:`_fp8_pair_bf16x2`, :func:`_fp4_word_bf16x2`) and the
+rows equal the workspace's, so the scores, softmax, fold and combine below are
+untouched and the result is bitwise the workspace route's. The selection is the
+first cache's columns, then the second's (each with its own slots, lengths,
+page size and row count); a tile belongs to one of them.
 """
 
 from __future__ import annotations
@@ -83,6 +97,14 @@ import torch
 from cutlass.memory import SmemAllocator
 
 CHANNEL_WARPS = 4  # warps that split the channels of one head group
+# Packed page-planar cache rows a V4 CTA can dequantize (name: (data bytes per
+# row, scale bytes per row)). A page holds ``page_rows`` data rows, then
+# ``page_rows`` scale rows.
+#   fp8_v4:  448 E4M3 values with a UE8M0 scale per 64, then 64 BF16 RoPE values
+#   fp8_g32: 512 E4M3 values with a UE8M0 scale per 32 (V4.1 ``swa``)
+#   fp4_g16: 512 E2M1 nibbles with an E4M3 scale per 16 (V4.1 ``global``)
+PACKED_FORMATS = {"fp8_v4": (576, 8), "fp8_g32": (512, 16), "fp4_g16": (256, 32)}
+_RAW_WORDS = 20  # registers a thread holds for the next tile's packed bytes
 _LN2 = 0.6931471805599453
 _NEG_INF = -math.inf
 
@@ -125,6 +147,88 @@ def _ldg_f32(addr):
         "ld.global.b32 {$w0}, [{$r0}];",
         write_only_types=[cutlass.Float32],
         read_only_args=[addr],
+    )
+
+
+@cute.jit
+def _ldg_s32_if(addr, live):
+    """Load an int32 where ``live`` is nonzero, else -1 (nothing is read)."""
+    return cute.arch.inline_ptx(
+        "{ .reg .pred p; setp.ne.s32 p, {$r1}, 0; mov.s32 {$w0}, -1; "
+        "@p ld.global.nc.b32 {$w0}, [{$r0}]; }",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[addr, live],
+    )
+
+
+@cute.jit
+def _ldg_s64_if(addr, live):
+    """Load an int64 where ``live`` is nonzero, else -1 (nothing is read)."""
+    return cute.arch.inline_ptx(
+        "{ .reg .pred p; setp.ne.s32 p, {$r1}, 0; mov.s64 {$w0}, -1; "
+        "@p ld.global.nc.b64 {$w0}, [{$r0}]; }",
+        write_only_types=[cutlass.Int64],
+        read_only_args=[addr, live],
+    )
+
+
+@cute.jit
+def _ldg_u32_if(addr, live):
+    """Load a word where ``live`` is nonzero, else 0."""
+    return cute.arch.inline_ptx(
+        "{ .reg .pred p; setp.ne.s32 p, {$r1}, 0; mov.b32 {$w0}, 0; "
+        "@p ld.global.nc.b32 {$w0}, [{$r0}]; }",
+        write_only_types=[cutlass.Uint32],
+        read_only_args=[addr, live],
+    )
+
+
+@cute.jit
+def _ldg_v2_u32_if(addr, live):
+    """Load two words where ``live`` is nonzero, else zeros."""
+    return cute.arch.inline_ptx(
+        "{ .reg .pred p; setp.ne.s32 p, {$r1}, 0; mov.b32 {$w0}, 0; mov.b32 {$w1}, 0; "
+        "@p ld.global.nc.v2.b32 {{$w0}, {$w1}}, [{$r0}]; }",
+        write_only_types=[cutlass.Uint32] * 2,
+        read_only_args=[addr, live],
+    )
+
+
+@cute.jit
+def _ldg_v4_u32_if(addr, live):
+    """Load four words where ``live`` is nonzero, else zeros."""
+    return cute.arch.inline_ptx(
+        "{ .reg .pred p; setp.ne.s32 p, {$r1}, 0; "
+        "mov.b32 {$w0}, 0; mov.b32 {$w1}, 0; mov.b32 {$w2}, 0; mov.b32 {$w3}, 0; "
+        "@p ld.global.nc.v4.b32 {{$w0}, {$w1}, {$w2}, {$w3}}, [{$r0}]; }",
+        write_only_types=[cutlass.Uint32] * 4,
+        read_only_args=[addr, live],
+    )
+
+
+@cute.jit
+def _ldg_v2_u32(addr):
+    return cute.arch.inline_ptx(
+        "ld.global.nc.v2.b32 {{$w0}, {$w1}}, [{$r0}];",
+        write_only_types=[cutlass.Uint32] * 2,
+        read_only_args=[addr],
+    )
+
+
+@cute.jit
+def _ldg_v4_u32(addr):
+    return cute.arch.inline_ptx(
+        "ld.global.nc.v4.b32 {{$w0}, {$w1}, {$w2}, {$w3}}, [{$r0}];",
+        write_only_types=[cutlass.Uint32] * 4,
+        read_only_args=[addr],
+    )
+
+
+@cute.jit
+def _sts_v4_u32(addr, a, b, c, d):
+    cute.arch.inline_ptx(
+        "st.shared.v4.b32 [{$r0}], {{$r1}, {$r2}, {$r3}, {$r4}};",
+        read_only_args=[addr, a, b, c, d],
     )
 
 
@@ -306,6 +410,104 @@ def _prmt(a, b, selector: cutlass.Constexpr):
     )
 
 
+# ---------------------------------------------------------------------------
+# Dequantizing a packed cache row into BF16 (V4 / V4.1 page-planar rows)
+#
+# Every value is an E4M3 byte or an E2M1 nibble times a power of two or an E4M3
+# scale, so it has at most six significant bits and BF16 holds it exactly; the
+# BF16 rows are the ones the workspace route (gather, FP32 product, round to
+# BF16) writes, bit for bit. The conversions use no float instruction but the
+# BF16x2 multiply: the code's exponent and mantissa bits are placed into a BF16
+# word whose exponent field is too small by a constant (``2**120`` for E4M3,
+# ``2**126`` for E2M1, which also covers the subnormal codes), and one exact
+# multiply by that constant, then one by the group scale, finish the value.
+# ---------------------------------------------------------------------------
+
+
+@cute.jit
+def _byte_at(word, pos):
+    """Byte of ``word`` starting at bit ``pos``."""
+    return cute.arch.inline_ptx(
+        "bfe.u32 {$w0}, {$r0}, {$r1}, 8;",
+        write_only_types=[cutlass.Uint32],
+        read_only_args=[word, pos],
+    )
+
+
+@cute.jit
+def _ue8m0_pair(code):
+    """``2**(code - 127)`` as a BF16 pair (code 0 is the subnormal ``2**-127``)."""
+    return cute.arch.inline_ptx(
+        "{ .reg .b32 s, t; .reg .pred p; shl.b32 s, {$r0}, 7; "
+        "setp.eq.u32 p, {$r0}, 0; @p mov.b32 s, 0x40; "
+        "shl.b32 t, s, 16; or.b32 {$w0}, s, t; }",
+        write_only_types=[cutlass.Uint32],
+        read_only_args=[code],
+    )
+
+
+@cute.jit
+def _e4m3_pair(code):
+    """The E4M3 byte ``code`` as a BF16 pair."""
+    return cute.arch.inline_ptx(
+        "{ .reg .b32 x, y, k; and.b32 x, {$r0}, 0x7F; shl.b32 x, x, 4; "
+        "and.b32 y, {$r0}, 0x80; shl.b32 y, y, 8; or.b32 x, x, y; "
+        "shl.b32 y, x, 16; or.b32 x, x, y; "
+        "mov.b32 k, 0x7B807B80; mul.rn.bf16x2 {$w0}, x, k; }",
+        write_only_types=[cutlass.Uint32],
+        read_only_args=[code],
+    )
+
+
+@cute.jit
+def _fp8_pair_bf16x2(word, sel: cutlass.Constexpr, scale2):
+    """Two E4M3 bytes of ``word`` (``sel`` names them) times ``scale2``, as BF16x2."""
+    ptx = (
+        "{ .reg .b32 t, m, s, k; prmt.b32 t, {$r0}, 0, SEL; "
+        "shr.u32 m, t, 4; and.b32 m, m, 0x07F007F0; and.b32 s, t, 0x80008000; "
+        "or.b32 m, m, s; mov.b32 k, 0x7B807B80; mul.rn.bf16x2 m, m, k; "
+        "mul.rn.bf16x2 {$w0}, m, {$r1}; }"
+    ).replace("SEL", f"0x{sel:04x}")
+    return cute.arch.inline_ptx(
+        ptx, write_only_types=[cutlass.Uint32], read_only_args=[word, scale2]
+    )
+
+
+def _fp4_word_ptx() -> str:
+    ptx = (
+        "{ .reg .b32 e, o, u, a, b, k; and.b32 e, {$r0}, 0x0F0F0F0F; "
+        "shr.u32 o, {$r0}, 4; and.b32 o, o, 0x0F0F0F0F; mov.b32 k, 0x7E807E80; "
+    )
+    for p in range(4):
+        # Bytes (e_p, 0, o_p, 0): the zero bytes replicate the sign of a byte
+        # whose top bit is clear.
+        sel = ((8 | (4 + p)) << 12) | ((4 + p) << 8) | ((8 | p) << 4) | p
+        ptx += (
+            f"prmt.b32 u, e, o, 0x{sel:04x}; shl.b32 a, u, 6; "
+            "and.b32 a, a, 0x01C001C0; shl.b32 b, u, 12; and.b32 b, b, 0x80008000; "
+            "or.b32 a, a, b; mul.rn.bf16x2 a, a, k; "
+            "mul.rn.bf16x2 {$w%d}, a, {$r1}; " % p
+        )
+    return ptx + "}"
+
+
+_FP4_WORD_PTX = _fp4_word_ptx()
+
+
+@cute.jit
+def _fp4_word_bf16x2(word, scale2):
+    """The eight E2M1 nibbles of ``word`` times ``scale2``, as four BF16x2 words.
+
+    Nibble 2k is the low half of output word k (the codec stores the even
+    channel in the low nibble).
+    """
+    return cute.arch.inline_ptx(
+        _FP4_WORD_PTX,
+        write_only_types=[cutlass.Uint32] * 4,
+        read_only_args=[word, scale2],
+    )
+
+
 @cute.jit
 def _mulhi(x, magic):
     """``x // d`` for ``magic = ceil(2**32 / d)``, ``d >= 2`` and ``x < 2**20``."""
@@ -438,8 +640,16 @@ class _SparseMma:
         stages: int,
         v4: tuple[bool, bool] | None = None,
         cwarps: int = CHANNEL_WARPS,
+        packed: tuple[str, str | None, bool] | None = None,
     ):
         assert block_h in (16, 32) and rank in (128, 512) and rope in (0, 64)
+        # ``packed`` = (swa format, extra format or None, extra ids are int64)
+        # makes a V4 CTA read its rows straight from page-planar packed caches
+        # (see :data:`PACKED_FORMATS`) and dequantize them into the BF16 ring
+        # instead of copying a BF16 workspace row.
+        assert packed is None or (v4 is not None and not fp8 and rank == 512)
+        self.packed = packed
+        self.packed_extra = packed is not None and packed[1] is not None
         # ``cwarps`` warps of a head group split the output channels of
         # ``O += P V``: 4, or 8 for a 16-head BF16 CTA without RoPE (V4). The
         # scores always sum four channel quarters, so both give the same bits.
@@ -456,6 +666,8 @@ class _SparseMma:
         self.sink = bool(v4 and v4[0])
         self.wide_ids = bool(v4 and v4[1])
         self.id_bytes = 8 if self.wide_ids else 4
+        # Both segments' slot matrices share one id width.
+        assert not self.packed_extra or packed[2] == self.wide_ids
         self.fp8 = fp8
         self.block_h = block_h
         self.rank = rank
@@ -501,6 +713,8 @@ class _SparseMma:
         self.qk_steps = (self.head_dim // 32) if fp8 else (self.score_ch // 16)
         self.chunks_per_row = self.row_bytes // 16
         self.threads_per_row = self.num_threads // self.rows
+        # A packed row is dequantized by 8 threads, thread p owning chunks p + 8 j.
+        assert packed is None or self.threads_per_row == 8
         self.copies_per_thread = -(-self.chunks_per_row // self.threads_per_row)
         ring = stages * self.rows * self.row_stride
         if fp8:
@@ -547,6 +761,14 @@ class _SparseMma:
         out_stride_head: cutlass.Int64,
         grid_x: cutlass.Int32,
         grid_y: cutlass.Int32,
+        extra_kv_addr: cutlass.Int64,
+        extra_slots: cute.Tensor,
+        extra_lens: cute.Tensor,
+        extra_slot_stride: cutlass.Int32,
+        extra_page_stride: cutlass.Int64,
+        extra_page_size: cutlass.Int32,
+        extra_rows: cutlass.Int32,
+        swa_width: cutlass.Int32,
         stream,
     ):
         self.kernel(
@@ -578,6 +800,14 @@ class _SparseMma:
             q_stride_head,
             out_stride_token,
             out_stride_head,
+            extra_kv_addr,
+            extra_slots,
+            extra_lens,
+            extra_slot_stride,
+            extra_page_stride,
+            extra_page_size,
+            extra_rows,
+            swa_width,
         ).launch(
             grid=(grid_x, grid_y, 1),
             block=(self.num_threads, 1, 1),
@@ -601,6 +831,227 @@ class _SparseMma:
             return slot
         else:
             return _ldg_s32(slot_row + cutlass.Int64(col) * 4)
+
+    # ---- Packed caches: gather the packed bytes, dequantize into the ring ----
+
+    @cute.jit
+    def _slot_raw(self, col, width, swa_row, extra_row, swa_len, extra_len, swa_width):
+        """The id stored at selection column ``col`` (Int64), -1 for an empty column.
+
+        Columns ``[0, swa_width)`` name rows of the first cache, the rest rows
+        of the second; a column past its segment's length holds nothing. The
+        load is predicated, and nothing branches on its value (that is
+        :meth:`_slot_check`, one iteration later), so a miss does not stall.
+        """
+        live = cutlass.Int32(0)
+        addr = swa_row + cutlass.Int64(col) * self.id_bytes
+        if col < swa_width:
+            if (col < width) & (col < swa_len):
+                live = cutlass.Int32(1)
+        else:
+            if cutlass.const_expr(self.packed_extra):
+                local = col - swa_width
+                addr = extra_row + cutlass.Int64(local) * self.id_bytes
+                if (col < width) & (local < extra_len):
+                    live = cutlass.Int32(1)
+        raw = cutlass.Int64(-1)
+        if cutlass.const_expr(self.wide_ids):
+            raw = _ldg_s64_if(addr, live)
+        else:
+            raw = cutlass.Int64(_ldg_s32_if(addr, live))
+        return raw
+
+    @cute.jit
+    def _slot_check(self, raw, in_swa, swa_rows, extra_rows):
+        """The cache row ``raw`` names, or -1 if it is empty or outside the cache."""
+        rows = swa_rows
+        if cutlass.const_expr(self.packed_extra):
+            rows = extra_rows
+            if in_swa:
+                rows = swa_rows
+        slot = cutlass.Int32(-1)
+        if (raw >= cutlass.Int64(0)) & (raw < cutlass.Int64(rows)):
+            slot = cutlass.Int32(raw)
+        return slot
+
+    @cute.jit
+    def _fetch_fmt(
+        self, fmt: cutlass.Constexpr, raw, cache, page_stride, page_shift, slot, part
+    ):
+        """Load the packed bytes of cache row ``slot`` this thread dequantizes.
+
+        Thread ``part`` of a row's 8 threads owns the 16-byte BF16 chunks
+        ``part + 8 j`` (8 channels each), so a row's threads read consecutive
+        bytes. ``raw`` receives the row's scales and those chunks' packed
+        values (``fmt`` fixes the layout); where ``slot`` is negative nothing is
+        read and ``raw`` is zero, which dequantizes to an empty row.
+        """
+        data_bytes = cutlass.const_expr(PACKED_FORMATS[fmt][0])
+        scale_bytes = cutlass.const_expr(PACKED_FORMATS[fmt][1])
+        live = cutlass.Int32(0)
+        if slot >= 0:
+            live = cutlass.Int32(1)
+        safe = cutlass.max(slot, cutlass.Int32(0))
+        page = safe >> page_shift
+        in_page = safe - (page << page_shift)
+        base = cache + cutlass.Int64(page) * page_stride
+        data = base + cutlass.Int64(in_page) * data_bytes
+        scales = (
+            base
+            + (cutlass.Int64(1) << cutlass.Int64(page_shift)) * data_bytes
+            + cutlass.Int64(in_page) * scale_bytes
+        )
+        if cutlass.const_expr(fmt == "fp8_v4"):
+            a, b = _ldg_v2_u32_if(scales, live)
+            raw[0] = a
+            raw[1] = b
+            for j in cutlass.range_constexpr(7):
+                a, b = _ldg_v2_u32_if(data + cutlass.Int64(part) * 8 + 64 * j, live)
+                raw[2 + 2 * j] = a
+                raw[3 + 2 * j] = b
+            a, b, c, d = _ldg_v4_u32_if(data + 448 + cutlass.Int64(part) * 16, live)
+            raw[16] = a
+            raw[17] = b
+            raw[18] = c
+            raw[19] = d
+        elif cutlass.const_expr(fmt == "fp8_g32"):
+            a, b, c, d = _ldg_v4_u32_if(scales, live)
+            raw[0] = a
+            raw[1] = b
+            raw[2] = c
+            raw[3] = d
+            for j in cutlass.range_constexpr(8):
+                a, b = _ldg_v2_u32_if(data + cutlass.Int64(part) * 8 + 64 * j, live)
+                raw[4 + 2 * j] = a
+                raw[5 + 2 * j] = b
+        else:
+            a, b, c, d = _ldg_v4_u32_if(scales, live)
+            raw[0] = a
+            raw[1] = b
+            raw[2] = c
+            raw[3] = d
+            a, b, c, d = _ldg_v4_u32_if(scales + 16, live)
+            raw[4] = a
+            raw[5] = b
+            raw[6] = c
+            raw[7] = d
+            for j in cutlass.range_constexpr(8):
+                raw[8 + j] = _ldg_u32_if(data + cutlass.Int64(part) * 4 + 32 * j, live)
+
+    @cute.jit
+    def _fetch_packed(
+        self,
+        in_swa,
+        slot,
+        raw,
+        meta,
+        swa_cache,
+        swa_page_stride,
+        swa_page_shift,
+        extra_cache,
+        extra_page_stride,
+        extra_page_shift,
+        part,
+    ):
+        """Start loading this thread's packed bytes of the row ``slot`` (zeros if -1)."""
+        meta[0] = slot
+        if cutlass.const_expr(
+            not self.packed_extra or self.packed[0] == self.packed[1]
+        ):
+            cache = swa_cache
+            page_stride = swa_page_stride
+            page_shift = swa_page_shift
+            if cutlass.const_expr(self.packed_extra):
+                cache = extra_cache
+                page_stride = extra_page_stride
+                page_shift = extra_page_shift
+                if in_swa:
+                    cache = swa_cache
+                    page_stride = swa_page_stride
+                    page_shift = swa_page_shift
+            self._fetch_fmt(
+                self.packed[0], raw, cache, page_stride, page_shift, slot, part
+            )
+        else:
+            if in_swa:
+                self._fetch_fmt(
+                    self.packed[0],
+                    raw,
+                    swa_cache,
+                    swa_page_stride,
+                    swa_page_shift,
+                    slot,
+                    part,
+                )
+            else:
+                self._fetch_fmt(
+                    self.packed[1],
+                    raw,
+                    extra_cache,
+                    extra_page_stride,
+                    extra_page_shift,
+                    slot,
+                    part,
+                )
+
+    @cute.jit
+    def _store_fmt(self, fmt: cutlass.Constexpr, raw, dst_row, part):
+        """Dequantize ``raw`` into this thread's BF16 chunks of the row at ``dst_row``."""
+        tpr = cutlass.const_expr(self.threads_per_row)
+        for j in cutlass.range_constexpr(8):
+            dst = dst_row + (part + tpr * j) * 16
+            if cutlass.const_expr(fmt == "fp8_v4"):
+                if cutlass.const_expr(j < 7):
+                    scale2 = _ue8m0_pair(
+                        _byte_at(raw[j // 4], cutlass.Int32(8 * (j % 4)))
+                    )
+                    w0 = raw[2 + 2 * j]
+                    w1 = raw[3 + 2 * j]
+                    _sts_v4_u32(
+                        dst,
+                        _fp8_pair_bf16x2(w0, 0x1404, scale2),
+                        _fp8_pair_bf16x2(w0, 0x3424, scale2),
+                        _fp8_pair_bf16x2(w1, 0x1404, scale2),
+                        _fp8_pair_bf16x2(w1, 0x3424, scale2),
+                    )
+                else:
+                    # The 64 RoPE channels are stored as BF16.
+                    _sts_v4_u32(dst, raw[16], raw[17], raw[18], raw[19])
+            elif cutlass.const_expr(fmt == "fp8_g32"):
+                shift = cutlass.Int32(16 * (j % 2)) + (part // 4) * 8
+                scale2 = _ue8m0_pair(_byte_at(raw[j // 2], shift))
+                w0 = raw[4 + 2 * j]
+                w1 = raw[5 + 2 * j]
+                _sts_v4_u32(
+                    dst,
+                    _fp8_pair_bf16x2(w0, 0x1404, scale2),
+                    _fp8_pair_bf16x2(w0, 0x3424, scale2),
+                    _fp8_pair_bf16x2(w1, 0x1404, scale2),
+                    _fp8_pair_bf16x2(w1, 0x3424, scale2),
+                )
+            else:
+                scale2 = _e4m3_pair(_byte_at(raw[j], (part // 2) * 8))
+                o0, o1, o2, o3 = _fp4_word_bf16x2(raw[8 + j], scale2)
+                _sts_v4_u32(dst, o0, o1, o2, o3)
+
+    @cute.jit
+    def _store_packed(self, in_swa, raw, meta, stage, ring_addr, slot_addr, tidx):
+        """Dequantize the fetched row into ``stage`` and mark the row's slot."""
+        rows = cutlass.const_expr(self.rows)
+        row = tidx // self.threads_per_row
+        part = tidx % self.threads_per_row
+        dst_row = ring_addr + stage * (rows * self.row_stride) + row * self.row_stride
+        if cutlass.const_expr(
+            not self.packed_extra or self.packed[0] == self.packed[1]
+        ):
+            self._store_fmt(self.packed[0], raw, dst_row, part)
+        else:
+            if in_swa:
+                self._store_fmt(self.packed[0], raw, dst_row, part)
+            else:
+                self._store_fmt(self.packed[1], raw, dst_row, part)
+        if part == 0:
+            _sts_s32(slot_addr + (stage * rows + row) * 4, meta[0])
 
     @cute.jit
     def _chunk_offset(self, row, chunk):
@@ -991,6 +1442,14 @@ class _SparseMma:
         q_stride_head: cutlass.Int64,
         out_stride_token: cutlass.Int64,
         out_stride_head: cutlass.Int64,
+        extra_kv_addr: cutlass.Int64,
+        extra_slots: cute.Tensor,
+        extra_lens: cute.Tensor,
+        extra_slot_stride: cutlass.Int32,
+        extra_page_stride: cutlass.Int64,
+        extra_page_size: cutlass.Int32,
+        extra_rows: cutlass.Int32,
+        swa_width: cutlass.Int32,
     ):
         fp8 = cutlass.const_expr(self.fp8)
         rank = cutlass.const_expr(self.rank)
@@ -1040,6 +1499,16 @@ class _SparseMma:
         valid_len = cutlass.min(cutlass.Int32(lens[token]), topk)
         if cutlass.const_expr(self.v4):
             valid_len = cutlass.max(valid_len, cutlass.Int32(0))
+        # Packed caches: ``lens`` is the first segment's length and
+        # ``extra_lens`` the second's; the selection is always ``topk`` wide
+        # (columns past a length are empty rows, as in the workspace route).
+        swa_len = cutlass.Int32(0)
+        extra_len = cutlass.Int32(0)
+        if cutlass.const_expr(self.packed is not None):
+            valid_len = topk
+            swa_len = cutlass.Int32(lens[token])
+            if cutlass.const_expr(self.packed_extra):
+                extra_len = cutlass.Int32(extra_lens[token])
         num_tiles = (valid_len + (rows - 1)) // rows
         chunk_begin = cutlass.Int32(0)
         chunk_end = cutlass.max(
@@ -1056,6 +1525,11 @@ class _SparseMma:
             + cutlass.Int64(token) * cutlass.Int64(slot_stride) * self.id_bytes
         )
         my_row = tidx // self.threads_per_row
+        extra_row = slot_row
+        if cutlass.const_expr(self.packed_extra):
+            extra_row = extra_slots.iterator.toint() + cutlass.Int64(
+                token
+            ) * cutlass.Int64(extra_slot_stride) * (8 if self.packed[2] else 4)
 
         head0 = head_tile * self.block_h + hg * 16 + g
         head1 = head0 + 8
@@ -1206,60 +1680,183 @@ class _SparseMma:
             v_off[0] = v_row * rs + (cw * self.warp_chunks + lane // 16) * 16
 
         # ---- Prologue: STAGES - 1 tiles in flight ----
-        for st in cutlass.range_constexpr(stages - 1):
-            tile = tile_lo + st
-            col = tile * rows + my_row
-            slot = cutlass.Int32(-1)
-            if (tile < tile_hi) & (col < valid_len):
-                slot = self._load_slot(slot_row, col, num_rows)
-            self._issue_tile(
-                tile,
-                tile_hi,
-                valid_len,
+        if cutlass.const_expr(self.packed is not None):
+            # Packed caches: a thread loads its packed bytes into registers
+            # one tile ahead of the store that dequantizes them into the ring,
+            # so the loads overlap the previous tile's MMAs. Tiles
+            # ``tile_lo .. tile_lo + STAGES - 2`` are stored here, the next
+            # one is fetched, and the slot after it is read.
+            raw = cute.make_rmem_tensor((_RAW_WORDS,), cutlass.Uint32)
+            meta = cute.make_rmem_tensor((1,), cutlass.Int32)
+            part = tidx % self.threads_per_row
+            # Columns at or past ``col_limit`` are never loaded.
+            col_limit = cutlass.min(topk, tile_hi * rows)
+            for st in cutlass.range_constexpr(stages - 1):
+                tile = tile_lo + st
+                in_swa = tile * rows < swa_width
+                slot = self._slot_check(
+                    self._slot_raw(
+                        tile * rows + my_row,
+                        col_limit,
+                        slot_row,
+                        extra_row,
+                        swa_len,
+                        extra_len,
+                        swa_width,
+                    ),
+                    in_swa,
+                    num_rows,
+                    extra_rows,
+                )
+                self._fetch_packed(
+                    in_swa,
+                    slot,
+                    raw,
+                    meta,
+                    kv_addr,
+                    page_stride,
+                    page_size,
+                    extra_kv_addr,
+                    extra_page_stride,
+                    extra_page_size,
+                    part,
+                )
+                self._store_packed(
+                    in_swa, raw, meta, cutlass.Int32(st), ring_addr, slot_addr, tidx
+                )
+            first = tile_lo + (stages - 1)
+            slot = self._slot_check(
+                self._slot_raw(
+                    first * rows + my_row,
+                    col_limit,
+                    slot_row,
+                    extra_row,
+                    swa_len,
+                    extra_len,
+                    swa_width,
+                ),
+                first * rows < swa_width,
+                num_rows,
+                extra_rows,
+            )
+            self._fetch_packed(
+                first * rows < swa_width,
                 slot,
-                cutlass.Int32(st),
+                raw,
+                meta,
                 kv_addr,
                 page_stride,
-                token_stride,
                 page_size,
-                ring_addr,
-                slot_addr,
-                tidx,
+                extra_kv_addr,
+                extra_page_stride,
+                extra_page_size,
+                part,
             )
-            cute.arch.cp_async_commit_group()
-        # The slot of the next tile to issue, loaded one iteration early.
-        next_tile = tile_lo + (stages - 1)
-        next_col = next_tile * rows + my_row
-        next_slot = cutlass.Int32(-1)
-        if (next_tile < tile_hi) & (next_col < valid_len):
-            next_slot = self._load_slot(slot_row, next_col, num_rows)
+            next_tile = first + 1
+            next_raw = self._slot_raw(
+                next_tile * rows + my_row,
+                col_limit,
+                slot_row,
+                extra_row,
+                swa_len,
+                extra_len,
+                swa_width,
+            )
+        else:
+            for st in cutlass.range_constexpr(stages - 1):
+                tile = tile_lo + st
+                col = tile * rows + my_row
+                slot = cutlass.Int32(-1)
+                if (tile < tile_hi) & (col < valid_len):
+                    slot = self._load_slot(slot_row, col, num_rows)
+                self._issue_tile(
+                    tile,
+                    tile_hi,
+                    valid_len,
+                    slot,
+                    cutlass.Int32(st),
+                    kv_addr,
+                    page_stride,
+                    token_stride,
+                    page_size,
+                    ring_addr,
+                    slot_addr,
+                    tidx,
+                )
+                cute.arch.cp_async_commit_group()
+            # The slot of the next tile to issue, loaded one iteration early.
+            next_tile = tile_lo + (stages - 1)
+            next_col = next_tile * rows + my_row
+            next_slot = cutlass.Int32(-1)
+            if (next_tile < tile_hi) & (next_col < valid_len):
+                next_slot = self._load_slot(slot_row, next_col, num_rows)
 
         for tile in range(tile_lo, tile_hi):
             i = tile - tile_lo
             stage = i % stages
-            cute.arch.cp_async_wait_group(stages - 2)
-            cute.arch.barrier()
-            # Refill the stage tile - 1 used; every warp is past it.
-            issue = tile + (stages - 1)
-            self._issue_tile(
-                issue,
-                tile_hi,
-                valid_len,
-                next_slot,
-                (i + stages - 1) % stages,
-                kv_addr,
-                page_stride,
-                token_stride,
-                page_size,
-                ring_addr,
-                slot_addr,
-                tidx,
-            )
-            cute.arch.cp_async_commit_group()
-            next_col = (issue + 1) * rows + my_row
-            next_slot = cutlass.Int32(-1)
-            if (issue + 1 < tile_hi) & (next_col < valid_len):
-                next_slot = self._load_slot(slot_row, next_col, num_rows)
+            if cutlass.const_expr(self.packed is not None):
+                cute.arch.barrier()
+                # Dequantize the row fetched last iteration into the stage tile
+                # - 1 used (every warp is past it), then fetch the one after.
+                # Past the last tile both are empty rows nobody reads.
+                issue = tile + (stages - 1)
+                self._store_packed(
+                    issue * rows < swa_width,
+                    raw,
+                    meta,
+                    (i + stages - 1) % stages,
+                    ring_addr,
+                    slot_addr,
+                    tidx,
+                )
+                fetch_in_swa = (issue + 1) * rows < swa_width
+                slot = self._slot_check(next_raw, fetch_in_swa, num_rows, extra_rows)
+                self._fetch_packed(
+                    fetch_in_swa,
+                    slot,
+                    raw,
+                    meta,
+                    kv_addr,
+                    page_stride,
+                    page_size,
+                    extra_kv_addr,
+                    extra_page_stride,
+                    extra_page_size,
+                    part,
+                )
+                next_raw = self._slot_raw(
+                    (issue + 2) * rows + my_row,
+                    col_limit,
+                    slot_row,
+                    extra_row,
+                    swa_len,
+                    extra_len,
+                    swa_width,
+                )
+            else:
+                cute.arch.cp_async_wait_group(stages - 2)
+                cute.arch.barrier()
+                # Refill the stage tile - 1 used; every warp is past it.
+                issue = tile + (stages - 1)
+                self._issue_tile(
+                    issue,
+                    tile_hi,
+                    valid_len,
+                    next_slot,
+                    (i + stages - 1) % stages,
+                    kv_addr,
+                    page_stride,
+                    token_stride,
+                    page_size,
+                    ring_addr,
+                    slot_addr,
+                    tidx,
+                )
+                cute.arch.cp_async_commit_group()
+                next_col = (issue + 1) * rows + my_row
+                next_slot = cutlass.Int32(-1)
+                if (issue + 1 < tile_hi) & (next_col < valid_len):
+                    next_slot = self._load_slot(slot_row, next_col, num_rows)
 
             base = ring_addr + stage * (rows * rs)
             # ---- Full scores of the head group ----
@@ -1819,10 +2416,11 @@ def stages_for(
     rope: int,
     v4: tuple[bool, bool] | None = None,
     cwarps: int = CHANNEL_WARPS,
+    packed: tuple[str, str | None, bool] | None = None,
 ) -> int:
     """Ring depth: the most tiles (at most 4) that fit 99 KiB of shared memory."""
     for stages in (4, 3, 2):
-        core = _SparseMma(fp8, block_h, rank, rope, stages, v4, cwarps)
+        core = _SparseMma(fp8, block_h, rank, rope, stages, v4, cwarps, packed)
         if core.smem_bytes <= 99 * 1024:
             return stages
     raise ValueError("no ring depth fits the shared memory")
@@ -1847,20 +2445,38 @@ def compiled_attention(
     device_index: int,
     v4: tuple[bool, bool, bool] | None = None,
     cwarps: int = CHANNEL_WARPS,
+    packed: tuple[str, str | None, bool, bool] | None = None,
 ):
     """Compile (once per dtype, head tile, rank and RoPE width) the attention kernel.
 
     ``v4`` is None for the DSA kernel and ``(sink, wide_ids, wide_lens)`` for the
     DeepSeek V4 variant (``dsv4/_cute_dsl/sparse_mma.py``), whose metadata
-    dtypes and sink are compile-time choices.
+    dtypes and sink are compile-time choices. ``packed`` =
+    ``(first format, second format or None, second ids int64, second lengths
+    int64)`` makes the V4 variant read packed page-planar caches directly (the
+    formats of :data:`PACKED_FORMATS`); ids and lengths of the first segment
+    follow ``v4``.
     """
-    stages = stages_for(fp8, block_h, rank, rope, v4 and v4[:2], cwarps)
+    stages = stages_for(
+        fp8, block_h, rank, rope, v4 and v4[:2], cwarps, packed and packed[:3]
+    )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     wide_ids = bool(v4 and v4[1])
     wide_lens = bool(v4 and v4[2])
+    extra_wide_ids = bool(packed and packed[2])
+    extra_wide_lens = bool(packed and packed[3])
     with torch.cuda.device(device_index):
         return cute.compile(
-            _SparseMma(fp8, block_h, rank, rope, stages, v4 and v4[:2], cwarps),
+            _SparseMma(
+                fp8,
+                block_h,
+                rank,
+                rope,
+                stages,
+                v4 and v4[:2],
+                cwarps,
+                packed and packed[:3],
+            ),
             # The V4 variant takes the query and output as addresses.
             cutlass.Int64(0) if v4 else _fake(cutlass.Uint8, 16),
             cutlass.Int64(0),
@@ -1892,6 +2508,21 @@ def compiled_attention(
             cutlass.Int64(0),
             cutlass.Int32(1),
             cutlass.Int32(1),
+            # The second cache of a packed launch (unused otherwise).
+            cutlass.Int64(0),
+            _fake(
+                cutlass.Int64 if extra_wide_ids else cutlass.Int32,
+                8 if extra_wide_ids else 4,
+            ),
+            _fake(
+                cutlass.Int64 if extra_wide_lens else cutlass.Int32,
+                8 if extra_wide_lens else 4,
+            ),
+            cutlass.Int32(0),
+            cutlass.Int64(0),
+            cutlass.Int32(1),
+            cutlass.Int32(0),
+            cutlass.Int32(0),
             stream=stream,
             options="--enable-tvm-ffi",
         )
@@ -2074,6 +2705,14 @@ def sparse_mma_attention(
         kv_lora_rank * 2,
         head_tiles,
         full_tokens + tail_tokens * num_splits,
+        0,
+        part_ml.reshape(-1).view(torch.int32),
+        part_ml.reshape(-1).view(torch.int32),
+        0,
+        0,
+        1,
+        0,
+        0,
     )
     if split:
         compiled_combine(kv_lora_rank, device_index)(

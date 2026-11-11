@@ -281,7 +281,8 @@ _DSV41_PACKED_INDEX = {
     "native_indexer": True,
 }
 # The CuTe DSL attention leaves (DSA cores, MLA decode, V4 prefill from 17
-# heads) outrank the Triton ones where the CuTe DSL imports.
+# heads, V4 decode and V4.1 selected attention that read the packed rows)
+# outrank the Triton ones where the CuTe DSL imports.
 _DSA_CORE = (
     "cute_dsl"
     if importlib.util.find_spec("cutlass") is not None
@@ -319,7 +320,7 @@ _SM120_LEAVES = [
         "dsv4_decode",
         ("q", "swa_kv_cache"),
         _DSV4_DECODE,
-        "triton_dsv4_mma_decode",
+        f"{_DSA_CORE}_dsv4_mma_decode",
         "flashmla_dsv4_decode",
     ),
     (
@@ -327,7 +328,7 @@ _SM120_LEAVES = [
         "dsv41_selected_attention",
         ("x",),
         {"flashmla_eligible": False},
-        "triton_dsv41_mma_selected_attention",
+        f"{_DSA_CORE}_dsv41_mma_selected_attention",
         "flashmla_dsv41_selected_attention",
     ),
     (

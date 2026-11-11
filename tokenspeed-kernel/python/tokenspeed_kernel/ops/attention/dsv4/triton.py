@@ -808,13 +808,16 @@ def _selection_rows(values: torch.Tensor, tokens: int) -> torch.Tensor:
             )
         }
     ),
-    # Selected where it wins (RTX PRO 6000, graph, 128 window + 512 compressed
-    # rows). With more than 16 heads the CuTe DSL dense leaf is 1.1-1.6x faster
-    # than the Triton one this kernel extends, which outweighs the saved
-    # workspace (64 heads 0.7-1.1x, 128 heads 0.73-0.77x of the workspace
-    # route). With 16 heads both routes run the Triton dense kernel, so the
-    # choice never changes a result: the saving shows from 32 tokens (1.24x at
-    # 32, 1.57x at 128, 2.23x at 256) and a handful of tokens is 0.8x.
+    # The fallback where the CuTe DSL is not built (``cute_dsl_dsv4_mma_decode``
+    # reads the same rows in the CuTe core and outranks this leaf at every head
+    # count). Selected where it wins (RTX PRO 6000, graph, 128 window + 512
+    # compressed rows). With more than 16 heads the CuTe DSL dense leaf is
+    # 1.1-1.6x faster than the Triton one this kernel extends, which outweighs
+    # the saved workspace (64 heads 0.7-1.1x, 128 heads 0.73-0.77x of the
+    # workspace route). With 16 heads both routes run the Triton dense kernel,
+    # so the choice never changes a result: the saving shows from 32 tokens
+    # (1.24x at 32, 1.57x at 128, 2.23x at 256) and a handful of tokens is
+    # 0.8x.
     traits={
         "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
         "num_q_heads_max": frozenset({16}),

@@ -518,9 +518,9 @@ def test_window_attention_kernel_matches_reference():
     )
     # Expect what the registry can serve here: FlashMLA inside its declared
     # arch window (sm90-sm103, not sm107) when importable, a specialized Gluon
-    # kernel on the AMD parts that register one, the Triton kernel that reads
-    # the packed rows itself on SM120, the portable Triton kernel everywhere
-    # else.
+    # kernel on the AMD parts that register one, the CuTe DSL kernel (or, without
+    # it, the Triton kernel) that reads the packed rows itself on SM120, the
+    # portable Triton kernel everywhere else.
     registry, platform = KernelRegistry.get(), current_platform()
 
     def _registered_here(name: str) -> bool:
@@ -542,6 +542,8 @@ def test_window_attention_kernel_matches_reference():
         ]
         if specialized:
             expected = specialized[0]
+        elif _registered_here("cute_dsl_dsv41_mma_selected_attention"):
+            expected = "cute_dsl_dsv41_mma_selected_attention"
         elif _registered_here("triton_dsv41_mma_selected_attention"):
             expected = "triton_dsv41_mma_selected_attention"
         else:
