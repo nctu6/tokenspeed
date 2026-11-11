@@ -470,7 +470,10 @@ lane-constant swizzled addresses took it from 5.1 to 3.5 ms. Tests: the shared
 bitwise rows across batches, any width, zero RoPE), plus split and head-tile
 invariance, recompile guard, `out=` and cache layouts, and the mixed-dtype
 route. The V4 prefill and MLA decode CuTe leaves reuse this kernel class
-(`dsv4/_cute_dsl/`, `mla/_cute_dsl/`). Still open: the BF16 path at 42-48% of
+(`dsv4/_cute_dsl/`, `mla/_cute_dsl/`). The V4 variant can also read the V4 / V4.1
+page-planar FP8 / FP4 caches instead of a BF16 workspace: a thread loads its
+packed bytes a tile ahead and dequantizes them exactly into the same ring tile
+(`packed` formats of `_SparseMma`, `dsv4/README.md`). Still open: the BF16 path at 42-48% of
 the 16-bit floor (channel-split partial scores; a register-resident query with
 a key split as in E4M3, or a smaller ring, are untried), and decode of one
 request, bound by its 8 width chunks (20 us BF16 / 13 us E4M3: 5.3 / 4.6 us

@@ -11,9 +11,11 @@ into a workspace and calls it too, so both models and both phases share this lea
 | Leaf | Where | Notes |
 |---|---|---|
 | `flashmla_dsv4_prefill` / `flashmla_dsv4_decode` | SM90-SM109 | FlashMLA sparse kernels (wgmma/tcgen05); capped off SM120. |
+| `cute_dsl_dsv4_mma_decode` | SM120, any head count | The CuTe DSL core reading the FP8 page-planar rows itself: a dequantizing gather into its BF16 ring, no workspace (below), `PERFORMANT + 1`. |
+| `cute_dsl_dsv41_mma_selected_attention` (V4.1 `dsv41_selected_attention`) | SM120, any head count | The same for the V4.1 `swa` (FP8) and `global` (FP4) rows, `PERFORMANT + 1`; workspace prefill and unreadable layouts run the Triton direct reader. |
 | `cute_dsl_dsv4_mma_prefill` | SM120, more than 16 heads | CuTe DSL port of the next row (same contract, traits and batch invariance), `PERFORMANT + 1`. |
 | `triton_dsv4_mma_prefill` | SM120 | Tensor-core kernel, any head count, int32/int64 metadata, sink and/or LSE, batch-invariant. |
-| `triton_dsv4_mma_decode` | SM120, 16 heads from 32 tokens | Dequantizes the FP8 page-planar rows in the tile loop of the Triton kernel; no BF16 workspace. |
+| `triton_dsv4_mma_decode` | SM120, 16 heads from 32 tokens | Dequantizes the FP8 page-planar rows in the tile loop of the Triton kernel; no BF16 workspace. The fallback where the CuTe DSL is not built. |
 | `triton_dsv4_prefill`, `triton_dsv4_decode` | any NVIDIA/AMD | CUDA cores; decode dequantizes into a BF16 workspace first. |
 
 ## SM120 (`_triton/sparse_mma.py`)
@@ -91,8 +93,9 @@ tile belongs to one segment, so `swa_width` is a multiple of 32).
   faster than this Triton one, and beats the direct reader (64 heads 0.69-1.11x,
   128 heads 0.72-0.79x of the workspace route; one token 17 vs 22 us); a few
   tokens at 16 heads is 0.75-0.8x. With 16 heads both routes run the Triton
-  kernel, so the choice never changes a bit. Open: the same dequantizing tile in
-  the CuTe DSL kernel, which would win above 16 heads too.
+  kernel, so the choice never changes a bit. The same dequantizing tile in the
+  CuTe DSL kernel (next sections) wins at every head count, and outranks both
+  where it is built.
 `bench_dsv41_paged_sm120.py v41|v4` reproduces the tables;
 `test_dsv4_paged_mma_sm120.py` checks bit equality with the portable route (both
 formats, 16-128 heads, holes, out-of-cache and short lengths), strided page
@@ -203,3 +206,95 @@ invariance; Triton recompile guard; CuTe sink-with-LSE and empty rows, compile
 cache guard; selection by head count) and
 `ops/test_attention_dsv4*.py`; `test_dsv4_paged_mma_sm120.py::test_prefill_workspace_runs_the_registry_choice`
 covers the V4.1 prefill route; `bench_dsv4_mma_sm120.py` reproduces the tables.
+
+## CuTe DSL reader of packed caches (`_cute_dsl/sparse_mma.py`, `paged_attention`)
+
+The workspace route writes every selected row dequantized to BF16 (1 KiB a
+row) and the CuTe core reads it back: the gather and dequantization are 16-65%
+of the route's time for V4 FP8 rows and 30-80% for the V4.1 rows (glue
+included) at 32-128 heads, 1-2048 tokens and widths 128 / 640 / 1152, which
+bounds what dropping the workspace can win at 1.2-5x. `paged_attention` drops
+it: the core of `cute_dsl_dsv4_mma_prefill` reads the page-planar caches
+itself and dequantizes them into the BF16 ring tile its MMAs already use. The
+rows it builds are the rows the workspace holds, and the scores, softmax, fold
+and combine are the same code, so the result is bitwise the workspace route's
+and batch invariant (`cute_dsl_dsv4_mma_decode`, `cute_dsl_dsv41_mma_selected_attention`).
+
+How a tile is built (8 threads per row; thread p owns the 16-byte BF16 chunks
+p, p + 8, ...). Per tile, each thread loads its packed bytes and the row's
+scales into 20 registers one iteration ahead (predicated loads: nothing
+branches on a value just loaded; the first version branched on the slot id it
+had just read, and on its validity around the row loads, and was 1.04-1.23x
+slower). After the loop's
+barrier it converts them and stores 16 bytes at a time into the stage the
+previous tile freed, then fetches the next row. Formats (`PACKED_FORMATS`,
+page-planar: a page holds the data rows, then the scale rows): `fp8_v4` (448
+E4M3 with a UE8M0 scale per 64, then 64 BF16 RoPE values; V4 decode), `fp8_g32`
+(512 E4M3, UE8M0 per 32; V4.1 `swa`) and `fp4_g16` (512 E2M1 nibbles, E4M3
+scale per 16; V4.1 `global`). The conversion is exact and uses no float
+instruction but the BF16x2 multiply: an E4M3 code is placed in a BF16 word
+whose exponent is too small by `2**120` (the subnormal codes come out right
+too), an E2M1 nibble by `2**126`, and one multiply by that constant, one by the
+scale, finish it. Every value has at most six significant bits, so both are
+exact and equal the FP32 product rounded to BF16 (`test_fp8_g32_rows_dequantize_exactly`
+and the two others read a row back through the kernel for every E4M3 byte and
+every UE8M0 / E4M3 scale code it can hold, the subnormal `2**-127` included).
+E4M3 NaN codes (never produced by the codec) are not NaN here.
+
+The selection is the first cache's columns, then the second's, each with its
+own slots, lengths, page size and row count (the window width is a multiple of
+32 so a tile belongs to one cache); a slot that is negative or past its cache
+and a column past its length are empty rows, as in the gather. A page is
+read with a shift (power-of-two rows per page), the cache bytes must be
+contiguous within a page and 16-byte aligned (`supports_paged`); other layouts
+run the portable route (V4) or the Triton reader (V4.1), a choice that
+follows the layout alone. Binaries are keyed by the two formats, the id dtype
+(both caches share it), the length dtypes, the sink and the head tile; token
+count, width, pages, strides and splits are runtime values
+(`test_binaries_are_keyed_by_format_and_id_dtypes_only`). `plan_paged` is the
+V4 planner with the packed tile times: a 16-head CTA 5.3 + 1.45 us per tile
+(V4) or 6.6 + 1.9 (V4.1), a 32-head CTA 8.2 + 2.2 or 10.0 + 2.63, fitted to one
+token at 1 / 2 / 4 splits of widths 128-1152. Against the best of a grid of
+plans (112 points: 16 / 32 / 64 / 128 heads x 14 token counts of 1-500, width
+640, both models) it is 1.007x behind on average; 6 points are more than 1.05x
+behind, the worst 1.12x (V4.1, 128 heads, 24 tokens).
+
+Measured on an RTX PRO 6000 (CUDA graph, cold caches, best of 5; 8 / 16 / 32 /
+64 / 128 heads x widths 128, 640, 1152 (window + 0 / 512 / 1024 compressed rows)
+x 1-2048 tokens = 105 points per model, `bench_dsv4_cute_paged_sm120.py v4|v41`).
+`workspace` is `triton_dsv4_decode` for V4 (its core is the CuTe one above 16
+heads) and the V4.1 gather glue followed by `cute_dsl_dsv4_mma_prefill`;
+`triton` is the direct reader of the Triton section above:
+
+| model | heads | vs workspace | vs Triton direct |
+|---|---:|---|---|
+| V4 | 8 | 2.31x (1.19-5.14x) | 1.81x (1.19-2.20x) |
+| V4 | 16 | 2.20x (1.15-4.98x) | 1.73x (1.12-2.23x) |
+| V4 | 32 | 1.83x (1.14-3.26x) | 1.67x (1.14-2.16x) |
+| V4 | 64 | 1.45x (1.09-2.14x) | 1.62x (1.13-2.23x) |
+| V4 | 128 | 1.23x (1.06-1.48x) | 1.71x (1.17-2.14x) |
+| V4.1 | 8 | 4.37x (1.98-7.93x) | 1.71x (0.95-3.02x) |
+| V4.1 | 16 | 4.14x (1.99-7.78x) | 1.68x (0.95-2.95x) |
+| V4.1 | 32 | 3.39x (1.94-5.49x) | 1.58x (0.98-2.22x) |
+| V4.1 | 64 | 2.48x (1.74-3.46x) | 1.52x (0.94-2.24x) |
+| V4.1 | 128 | 1.95x (1.43-3.35x) | 1.61x (0.97-2.18x) |
+
+V4 overall: 1.75x geomean over the workspace route (1.06-5.14x) and 1.71x over
+the Triton reader (1.12-2.23x). V4.1 overall: 3.12x (1.43-7.93x) and 1.62x
+(0.94-3.02x); with a compressed cache (widths 640 / 1152) 1.92x over the
+Triton reader (1.36-3.02x), window-only layers (width 128) 1.16x (0.94-1.77x:
+ties of 0.94-1.06x at 32-128 heads for 1-4 tokens and from 256 (64 and 128
+heads) or 1024 tokens (32 heads), 0.4 us when launch bound). Per
+head count V4.1 at 128 heads and 2048 tokens: 640 rows 2.81 ms against 5.40 ms
+workspace and 5.83 ms Triton; V4 at 32 heads: 740 us against 2236 and 1189 at
+640 rows. Selection: every head count and both caches, so the rule is by
+format alone (`cute_dsl_dsv4_mma_decode`, `cute_dsl_dsv41_mma_selected_attention`,
+`PERFORMANT + 1`); the Triton readers stay as the fallback.
+
+Not shipped / left: moving the dequantize and fetch after the PV MMAs, to let
+ptxas interleave them with that chain, was 1.1-1.2x slower (2884 against 2512
+us at 128 heads, 2048 tokens). The 32-head CTA spills (V4: 168 bytes of stack;
+V4.1: 120 bytes; 255 registers, the 20 of the next tile among them) and the
+16-head CTA does not (224 / 244 registers); the fitted 32-head tile time is
+2.2-2.6 us against 1.9 us for the workspace core. A raw-byte staging in shared
+memory does not fit next to the ring and exchange buffer (99 KiB).
