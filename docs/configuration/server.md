@@ -601,6 +601,17 @@ model's `tokenizer_config.json` declares a `response_template` and no other
 `tokenspeed-smg` gateway selects both parsers from that template. Naming any
 parser option keeps its existing behavior.
 
+Gemma 4 checkpoints (`gemma-4` ids, `gemma4` model type, or
+`Gemma4ForConditionalGeneration` / `Gemma4ForCausalLM`) get
+`--tool-call-parser gemma4` unless one is named. Their template's
+`tool_calls` field is rejected by the gateway's template parsers (every chat
+request answers HTTP 400 `invalid_parser_configuration`), so the template
+default does not apply to them.
+
+Gemma 4's tokenizer adds no BOS to raw `/v1/completions` prompts (the same as
+the Hugging Face tokenizer); start such prompts with `<bos>`. Chat requests get
+exactly one BOS from the chat template.
+
 ## Speculative decoding
 
 | Parameter | Purpose |
