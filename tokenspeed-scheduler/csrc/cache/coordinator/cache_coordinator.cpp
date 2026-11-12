@@ -227,6 +227,13 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
     _assert(tail_tokens >= 0 && tail_tokens < prefix_granularity_, "a tail lies strictly inside a prefix page");
     std::int32_t cached = 0;
     std::int32_t total = 0;
+    // State checkpoints cached under the boundary's hash. A checkpoint exists
+    // only at a natural point, so it never counts toward "complete"; but while
+    // it is cached the boundary still holds a child, so it is not "none".
+    // Evicting a boundary's KV cannot take a checkpoint a request still pins
+    // (evictCachedBlock / evictTailEntries leave it indexed), so a checkpoint
+    // can outlive every KV block of its boundary.
+    std::int32_t cached_states = 0;
     for (std::size_t group_index = 0; group_index < groups_.size(); ++group_index) {
         // A replayable group never holds an entry, so it would keep every
         // boundary permanently partial.
@@ -234,10 +241,17 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
             continue;
         }
         // A State group has no token span: its two-slot table is not prefix-
-        // indexed by page, so it has no boundary pages to count here (and
-        // BlockGranularity() would assert). Boundary residency is a
-        // token-spanned-group question.
+        // indexed by page, so it has no boundary pages to count (and
+        // BlockGranularity() would assert). Its one checkpoint entry sits at
+        // page_offset 0.
         if (GroupIsState(group_index)) {
+            const CacheKey key{
+                .namespace_id = boundary.namespace_id,
+                .group_id = groups_[group_index].Id(),
+                .content_hash = boundary.content_hash,
+                .page_offset = 0,
+            };
+            cached_states += groups_[group_index].Index().Contains(pool_, key) ? 1 : 0;
             continue;
         }
         const std::int32_t pages_per_prefix_hash =
@@ -256,10 +270,10 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
             ++total;
         }
     }
-    if (cached == 0) {
+    if (cached == 0 && cached_states == 0) {
         return BoundaryResidency::kNone;
     }
-    return cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
+    return cached > 0 && cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
 }
 
 std::vector<CacheKey> CacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,

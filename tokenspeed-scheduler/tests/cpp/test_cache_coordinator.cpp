@@ -1273,6 +1273,42 @@ TEST(CacheCoordinatorAdmissionTest, MixedGroupTieEvictsNonClosedBeforeFullHistor
     EXPECT_TRUE(coordinator.GroupPrefixIndex(2).Contains(pool, Key(hashes[2], 2)));
 }
 
+// A State group's checkpoint sits at page_offset 0 of its boundary. KV
+// eviction cannot take a checkpoint a request still pins, so it may be the only
+// child left: that boundary is partially resident, not gone, and the scheduler
+// must keep the token descriptor its eventual eviction reports against.
+TEST(CacheCoordinatorAdmissionTest, ACheckpointAloneKeepsItsBoundaryResident) {
+    BlockPool pool(4, {1, 1});
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        {.attn_kind = AttnKind::kState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
+    const std::vector<std::string> hashes = ContentHashes({{1, 1, 1, 1}, {2, 2, 2, 2}});
+    const auto residency = [&](const std::string& hash) {
+        return coordinator.DeviceBoundaryResidency(Key(hash, 0), /*tail_tokens=*/0);
+    };
+
+    EXPECT_EQ(residency(hashes[0]), CacheCoordinator::BoundaryResidency::kNone);
+
+    CacheBoundaryForGroup(coordinator, pool, hashes[0], /*group_id=*/1, /*access_epoch=*/1,
+                          /*logical_block_index=*/1, CacheBoundaryKind::kEndpoint);
+    EXPECT_EQ(residency(hashes[0]), CacheCoordinator::BoundaryResidency::kPartial)
+        << "a checkpoint with no KV is a cached child, not an empty boundary";
+
+    CacheBoundaryForGroup(coordinator, pool, hashes[0], /*group_id=*/0, /*access_epoch=*/2,
+                          /*logical_block_index=*/0);
+    EXPECT_EQ(residency(hashes[0]), CacheCoordinator::BoundaryResidency::kComplete);
+
+    // A boundary whose KV is cached without a checkpoint stays complete: a
+    // checkpoint exists only at a natural point.
+    CacheBoundaryForGroup(coordinator, pool, hashes[1], /*group_id=*/0, /*access_epoch=*/3,
+                          /*logical_block_index=*/1);
+    EXPECT_EQ(residency(hashes[1]), CacheCoordinator::BoundaryResidency::kComplete);
+}
+
 TEST(CacheCoordinatorAdmissionTest, RetriesWithFreshCursorsAfterPinnedAdmissionFails) {
     BlockPool pool(3, {1, 1, 1});
     const std::vector<CacheGroupSpec> specs = {
