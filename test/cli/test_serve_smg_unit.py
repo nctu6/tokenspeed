@@ -44,6 +44,7 @@ from tokenspeed.cli.serve_smg import (
     DEEPSEEK_V4_REASONING_PARSER,
     DEEPSEEK_V4_TOOL_CALL_PARSER,
     DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+    GEMMA4_TOOL_CALL_PARSER,
     GRPC_MAX_MESSAGE_BYTES_ENV,
     INKLING_ATTENTION_BACKEND,
     INKLING_REASONING_PARSER,
@@ -68,6 +69,7 @@ from tokenspeed.cli.serve_smg import (
     _gateway_args_with_smg_disable_defaults,
     _get_from_args,
     _is_deepseek_v4_model,
+    _is_gemma4_model,
     _is_inkling_model,
     _is_kimi_k3_model,
     _is_muse_spark_model,
@@ -1671,6 +1673,68 @@ def test_template_tokenizer_without_parsers_gets_hf_parsers(
 
     assert gateway_args == [*args, *expected]
     assert ("response_template" in capsys.readouterr().out) is (declares and not named)
+
+
+def _make_gemma4_model_dir(path, architectures=("Gemma4ForConditionalGeneration",)):
+    """A gemma-4 checkpoint dir: its tokenizer declares a response_template."""
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "config.json").write_text(
+        json.dumps({"model_type": "gemma4", "architectures": list(architectures)})
+    )
+    return _tokenizer_dir(path, response_template=_RESPONSE_TEMPLATE)
+
+
+def _launch_gateway_args(model, *extra):
+    """Gateway argv as ``ts serve`` builds it: split, model defaults, gateway defaults."""
+    split = split_argv(["--model", model, *extra])
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        split.engine, split.gateway
+    )
+    tokenizer = _template_tokenizer(engine_args, gateway_args)
+    return _gateway_args_with_defaults(gateway_args, tokenizer)
+
+
+def test_gemma4_is_detected_from_id_or_local_config(tmp_path):
+    assert _is_gemma4_model("google/gemma-4-31B-it")
+    assert _is_gemma4_model(_make_gemma4_model_dir(tmp_path / "mm"))
+    # A bare text release has no architectures, only the text model type.
+    text_dir = tmp_path / "text"
+    text_dir.mkdir()
+    (text_dir / "config.json").write_text(json.dumps({"model_type": "gemma4_text"}))
+    assert _is_gemma4_model(str(text_dir))
+    assert not _is_gemma4_model("google/gemma-3-27b-it")
+    assert not _is_gemma4_model(None)
+
+
+def test_gemma4_default_launch_names_the_gemma4_tool_parser(tmp_path, capsys):
+    # With the response_template default the gateway answered every chat request
+    # with HTTP 400; the family default names a tool-call parser instead.
+    model = _make_gemma4_model_dir(tmp_path)
+
+    gateway_args = _launch_gateway_args(model)
+
+    assert _get_from_args(gateway_args, "--tool-call-parser") == GEMMA4_TOOL_CALL_PARSER
+    assert "--parser" not in gateway_args
+    assert _get_from_args(gateway_args, "--reasoning-parser") == "passthrough"
+    assert "response_template" not in capsys.readouterr().out
+
+
+def test_gemma4_default_keeps_an_explicit_tool_parser(tmp_path):
+    model = _make_gemma4_model_dir(tmp_path)
+
+    gateway_args = _launch_gateway_args(model, "--tool-call-parser", "json")
+
+    assert gateway_args.count("--tool-call-parser") == 1
+    assert _get_from_args(gateway_args, "--tool-call-parser") == "json"
+
+
+def test_other_response_template_models_still_get_the_hf_parsers(tmp_path):
+    model = _tokenizer_dir(tmp_path, response_template=_RESPONSE_TEMPLATE)
+
+    gateway_args = _launch_gateway_args(model)
+
+    assert _get_from_args(gateway_args, "--parser") == "symphony"
+    assert _get_from_args(gateway_args, "--tool-call-parser") == "hf"
 
 
 def test_template_is_an_object_beside_a_tokenizer_json(tmp_path):
