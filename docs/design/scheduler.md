@@ -966,11 +966,16 @@ harmless.
 **KV-event descriptors.** With `enable_kv_cache_events`, every Device
 publication is a mutation of a boundary that must already have its token
 descriptor (`registerKvEventPrefixPages`), and `DrainKvEvents` drops the
-descriptor of a boundary with no cached child. A boundary is `BlockStored`
-only while every group holds its child -- the State groups included, whose
-checkpoint exists only at a natural point -- so a hybrid model emits
-`BlockStored` for its prompt end, its finish and its junction cuts, never
-for an interior chunk end's chain hash; a tail's descriptor carries the
+descriptor of a boundary with no cached child in any group. A boundary is
+`BlockStored` only while every KV group holds its child. A State group's
+checkpoint exists only at a natural point, so it does not gate `BlockStored`
+(a hybrid model publishes KV pages only at its prompt end, its finish and its
+junction cuts, never at an interior chunk end), but a cached checkpoint is a
+child: eviction of a boundary's KV cannot take a checkpoint a request still
+pins, so the checkpoint can outlive every KV block of its boundary, and the
+boundary then stays partially resident (no event is out for it) until the
+checkpoint itself is evicted and reports its removal against the surviving
+descriptor. A tail's descriptor carries the
 rows below `T` and the residency check counts a tail's blocks from it. Retraction publishes twice
 without an admission: `retractVictim` registers the newly hashed pages before
 `CacheCompletedBlocks` (as the finish-time publication does), and the
