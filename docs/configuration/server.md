@@ -495,6 +495,21 @@ minimum request count that fits each token bucket within the model context.
 `--max-num-batched-tokens`: in TokenSpeed it is the scheduler's per-iteration
 issue budget, while `--max-total-tokens` controls the global token pool.
 
+The longest prompt the engine accepts (`max_input` in the startup line
+`Single-request token limit`, also `max_req_input_len` in the gateway's worker
+info) is `min(--max-model-len, what the KV pool holds for one request) - 1`.
+For a model with sliding-window layers the pool term depends on the chunk
+size: every sliding group keeps one whole prefill chunk resident beside its
+window, so the default 8192-token chunk takes about a third of a small pool
+away from the full-attention group
+([scheduler design 1.4](../design/scheduler.md)). gemma-4-31B-it at TP1 on a
+96 GB GPU at `--gpu-memory-utilization 0.90` holds 199,614 tokens with the
+default chunk and cannot serve 256K prompts. Either `--kv-cache-dtype fp8`
+(twice the parents; the cache holds 496,831 tokens for one request) or
+`--chunked-prefill-size 1024` (276,927) reaches `--max-model-len 262144`; `2048` falls 1.2K tokens
+short. Read the startup line to check a configuration. A prompt above the
+limit is rejected per request with a `ValueError` in the input processor.
+
 ## Parallelism
 
 | Parameter | Purpose |
