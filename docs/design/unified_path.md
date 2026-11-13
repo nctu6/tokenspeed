@@ -95,6 +95,18 @@ C=256. Explicit `--max-cudagraph-capture-size` / `--cudagraph-capture-sizes` are
 used as given; a ladder that stops below `max_num_seqs` logs a warning at
 startup.
 
+The longer ladder is not made memory-aware. Its KV cost is the graph reserve
+that grows with the ladder (V4.1 TP2: 5.3 -> 7.4 GB per rank, KV tokens -9.8%;
+Qwen3.8-27B-FP8 TP1: 1.5 -> 2.6 GB, -1.9%). Where KV binds (V4.1 RAG with 288
+prompts of ~150K tokens at C=192; agentX full mode C=16/64 at ~90-110K tokens;
+KV pages 98-100% used, requests queue) the old cap 160 and the default ladder
+served the same work within run-to-run spread (output tok/s 0.99-1.01x, wall
+2718 s vs 2685 s on V4.1, no errors, no retractions), because the batch there is
+set by KV pages (at most ~190 running requests), not by graph coverage. A cap
+that scales with the KV budget would only re-create the eager step cost above
+the cap at the batch sizes where KV does not bind, so the default stays
+`max_num_seqs`. Pass `--max-cudagraph-capture-size` to trade graphs for KV.
+
 ### Ascend context-parallel decode
 
 Ascend DSA context-parallel decode uses one prepared communicator for fused
