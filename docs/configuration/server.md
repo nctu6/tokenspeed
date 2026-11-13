@@ -469,7 +469,7 @@ for gateway discovery.
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
 | `--disable-kda-prefill-graph` | Disable KDA prefill CUDA graphs while retaining ordinary prefill and decode graph settings. Enabled by default for supported `cutedsl_kda` prefill attention when prefill graphs are enabled. |
 | `--disable-cudagraph-memory-reserve` | Size the KV cache from free memory instead of reserving what the device graphs will cost and, on CUDA, what startup keeps resident. |
-| `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. |
+| `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. Defaults to `--max-num-seqs` (160 or 80 with `--disable-cudagraph-memory-reserve`; 8 or 80 on GPUs under 25 GB). Larger decode batches run eagerly and a startup warning names the range. |
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
 | `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
 | `--prefill-graph-capture-batch-sizes` | Request capacities for inline KDA prefill capture. Replay selects the smallest compatible capacity that fits the batch. |

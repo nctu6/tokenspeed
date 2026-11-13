@@ -82,6 +82,19 @@ unconditionally at wrapper construction, `enforce_eager` included. A decode
 above the ladder runs the same refresh with no graph; it is a first-class
 path, not a fallback.
 
+The ladder still defaults to cover `max_num_seqs`: an unset
+`--max-cudagraph-capture-size` becomes `--max-num-seqs` (HBM under 25 GB keeps
+its small memory clamp; `--disable-cudagraph-memory-reserve` keeps 160/80
+because the graphs are then paid from headroom, not priced into the KV budget),
+and the default ladder steps 8 up to 160, 16 up to 256 and 32 above, ending at
+`max_num_seqs`. The KV budget probe below samples that ladder, so the extra
+graphs are paid before the cache is sized. Real V4.1 TP2 (2026-11) showed why:
+with the cap at 160 and `--max-num-seqs 512`, decode steps cost 55 ms at batch
+128-159 and 129 ms at 224-287 (eager launch), which dipped RAG throughput at
+C=256. Explicit `--max-cudagraph-capture-size` / `--cudagraph-capture-sizes` are
+used as given; a ladder that stops below `max_num_seqs` logs a warning at
+startup.
+
 ### Ascend context-parallel decode
 
 Ascend DSA context-parallel decode uses one prepared communicator for fused
