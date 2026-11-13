@@ -1064,7 +1064,16 @@ class ServerArgs:
         if self.chunked_prefill_size is None:
             self.chunked_prefill_size = 8192
 
-        # Set CUDA graph max capture size.
+        # Set max number of sequences.
+        if self.max_num_seqs is None:
+            if self.speculative_algorithm:
+                self.max_num_seqs = 80
+            else:
+                self.max_num_seqs = 160
+
+        # Set CUDA graph max capture size. Decode batches above it run the
+        # same refresh path without a graph (docs/design/unified_path.md), at
+        # eager launch cost, so by default the ladder reaches max_num_seqs.
         if self.max_cudagraph_capture_size is None:
             # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable CUDA graph or set max_cudagraph_capture_size to a very small value to reduce graph memory overhead, with almost no impact on performance. TP4/TP8 serving still needs CUDA graph for high performance, and 80 is enough for lower-end GPUs.
             if gpu_mem is not None and gpu_mem < 25_000:
@@ -1072,17 +1081,18 @@ class ServerArgs:
                     self.max_cudagraph_capture_size = 8
                 else:
                     self.max_cudagraph_capture_size = 80
-            elif self.speculative_algorithm:
-                self.max_cudagraph_capture_size = 80
+            elif self.disable_cudagraph_memory_reserve:
+                # Without the reserve the graphs are paid from the utilization
+                # headroom, not priced into the KV budget: keep the small
+                # default instead of growing it with --max-num-seqs.
+                self.max_cudagraph_capture_size = (
+                    80 if self.speculative_algorithm else 160
+                )
             else:
-                self.max_cudagraph_capture_size = 160
-
-        # Set max number of sequences.
-        if self.max_num_seqs is None:
-            if self.speculative_algorithm:
-                self.max_num_seqs = 80
-            else:
-                self.max_num_seqs = 160
+                # The KV budget probe captures and prices the ladder before
+                # the cache is sized, so the larger ladder costs KV pages
+                # rather than headroom.
+                self.max_cudagraph_capture_size = self.max_num_seqs
 
     def resolve_kernel_backends(self):
         _require_choice(

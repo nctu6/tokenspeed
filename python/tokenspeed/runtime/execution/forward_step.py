@@ -108,20 +108,53 @@ def freeze_gc(enable_cudagraph_gc: bool):
             gc.collect()
 
 
+# Default decode ladder: the first graphs (up to 160) keep their historical
+# spacing; past it the step widens (16 up to 256, 32 above) so a large
+# --max-num-seqs adds a handful of graphs, not one per 8 requests. From 81
+# requests up, a padded batch wastes under 11% of its rows.
+_LADDER_FINE_TOP = 160
+_LADDER_MID_TOP = 256
+
+
+def _default_capture_ladder(
+    max_bs: int, *, disable_cuda_graph_padding: bool
+) -> list[int]:
+    """Default decode capture sizes for batches up to ``max_bs`` requests."""
+    if disable_cuda_graph_padding:
+        # Exact-size replay only: sparse beyond 32, 32 apart past the old top.
+        ladder = list(range(1, 33)) + [64, 96, 128, _LADDER_FINE_TOP]
+        ladder += range(_LADDER_FINE_TOP + 32, max_bs + 1, 32)
+    else:
+        ladder = [1, 2, 4] + [i * 8 for i in range(1, _LADDER_FINE_TOP // 8 + 1)]
+        ladder += range(_LADDER_FINE_TOP + 16, min(max_bs, _LADDER_MID_TOP) + 1, 16)
+        ladder += range(_LADDER_MID_TOP + 32, max_bs + 1, 32)
+    return ladder
+
+
 def get_batch_sizes_to_capture(config: ModelExecutorConfig):
+    """Ascending decode batch sizes to capture a graph for.
+
+    ``cudagraph_capture_sizes`` is taken as given, bounded by
+    ``max_cudagraph_capture_size`` and the per-rank ``max_num_seqs``. Without
+    it the default ladder runs up to the bound, and ends exactly at
+    ``max_num_seqs`` when the cap reaches it, so no decode batch lands above
+    the top graph.
+    """
     capture_bs = config.cudagraph_capture_sizes
     max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
+    effective_max = min(config.max_cudagraph_capture_size, max_bs)
 
     if capture_bs is None:
-        if config.disable_cuda_graph_padding:
-            capture_bs = list(range(1, 33)) + [64, 96, 128, 160]
-        else:
-            capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+        capture_bs = _default_capture_ladder(
+            effective_max,
+            disable_cuda_graph_padding=config.disable_cuda_graph_padding,
+        )
+        if config.max_cudagraph_capture_size >= max_bs > _LADDER_FINE_TOP:
+            capture_bs = capture_bs + [max_bs]
 
     if max(capture_bs) > max_bs:
         capture_bs = list(sorted(set(capture_bs + [max_bs - 1] + [max_bs])))
 
-    effective_max = min(config.max_cudagraph_capture_size, max_bs)
     # Ascending and unique: padding bisects the ladder for a batch's graph.
     return sorted({bs for bs in capture_bs if 0 < bs <= effective_max})
 
@@ -247,6 +280,17 @@ class ForwardStepRunner:
             config.max_num_seqs // max(config.data_parallel_size, 1),
             self.max_capture_bs,
         )
+        if self.max_decode_bs > self.max_capture_bs and not config.enforce_eager:
+            logger.warning(
+                f"Decode batches of {self.max_capture_bs + 1}..{self.max_decode_bs} "
+                f"requests run without a CUDA graph: the largest captured size is "
+                f"{self.max_capture_bs} (--max-cudagraph-capture-size "
+                f"{config.max_cudagraph_capture_size}, --cudagraph-capture-sizes "
+                f"{config.cudagraph_capture_sizes}) and --max-num-seqs allows "
+                f"{self.max_decode_bs} per rank. Step time past the largest graph "
+                f"can be several times higher; raise --max-cudagraph-capture-size to "
+                f"cover it."
+            )
         self.max_tokens_per_req = (
             config.spec_num_tokens if config.spec_algo is not None else 1
         )

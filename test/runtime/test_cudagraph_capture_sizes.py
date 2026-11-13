@@ -40,9 +40,17 @@ from tokenspeed.runtime.execution.forward_step import (  # noqa: E402
 from tokenspeed.runtime.execution.model_executor import (  # noqa: E402
     ModelExecutorConfig,
 )
+from tokenspeed.runtime.utils.common import get_nvgpu_memory_capacity  # noqa: E402
+from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 
 
-def _config(sizes: list[int], *, max_num_seqs: int, max_capture: int):
+def _config(
+    sizes: list[int] | None,
+    *,
+    max_num_seqs: int,
+    max_capture: int,
+    disable_padding: bool = False,
+):
     return ModelExecutorConfig(
         max_req_pool_size=max_num_seqs + 1,
         output_length=1,
@@ -57,7 +65,7 @@ def _config(sizes: list[int], *, max_num_seqs: int, max_capture: int):
         gpu_id=0,
         global_rank=0,
         cudagraph_capture_sizes=sizes,
-        disable_cuda_graph_padding=False,
+        disable_cuda_graph_padding=disable_padding,
         spec_topk=1,
         max_cudagraph_capture_size=max_capture,
         model_is_mrope=False,
@@ -90,3 +98,71 @@ def test_the_ladder_ascends_whatever_order_the_sizes_come_in(
 ) -> None:
     config = _config(sizes, max_num_seqs=max_num_seqs, max_capture=max_capture)
     assert get_batch_sizes_to_capture(config) == ladder
+
+
+def test_default_ladder_below_the_old_cap_is_unchanged() -> None:
+    config = _config(None, max_num_seqs=160, max_capture=160)
+    assert get_batch_sizes_to_capture(config) == [1, 2, 4] + list(range(8, 161, 8))
+
+
+def test_default_ladder_reaches_max_num_seqs() -> None:
+    config = _config(None, max_num_seqs=512, max_capture=512)
+    ladder = get_batch_sizes_to_capture(config)
+    assert ladder[-1] == 512
+    assert ladder[: len(range(8, 161, 8)) + 3] == [1, 2, 4] + list(range(8, 161, 8))
+    assert ladder[-9:] == [256] + list(range(288, 513, 32))
+    # From 81 requests up, a batch pads to a graph with under 11% waste.
+    for bs in range(81, 513):
+        top = min(size for size in ladder if size >= bs)
+        assert (top - bs) / top < 0.11, (bs, top)
+
+
+def test_default_ladder_ends_at_an_unaligned_max_num_seqs() -> None:
+    config = _config(None, max_num_seqs=300, max_capture=300)
+    assert get_batch_sizes_to_capture(config)[-3:] == [256, 288, 300]
+
+
+def test_default_ladder_honours_an_explicit_cap() -> None:
+    config = _config(None, max_num_seqs=512, max_capture=160)
+    assert get_batch_sizes_to_capture(config)[-1] == 160
+    config = _config(None, max_num_seqs=512, max_capture=200)
+    assert get_batch_sizes_to_capture(config)[-3:] == [160, 176, 192]
+
+
+def test_explicit_sizes_are_not_extended() -> None:
+    config = _config([1, 8, 160], max_num_seqs=512, max_capture=512)
+    assert get_batch_sizes_to_capture(config) == [1, 8, 160]
+
+
+def test_unpadded_default_ladder_reaches_max_num_seqs() -> None:
+    config = _config(None, max_num_seqs=256, max_capture=256, disable_padding=True)
+    ladder = get_batch_sizes_to_capture(config)
+    assert ladder[-4:] == [160, 192, 224, 256]
+    assert ladder[:32] == list(range(1, 33))
+
+
+def _server_args(**kwargs) -> ServerArgs:
+    return ServerArgs(
+        model="unused", disable_kvstore=True, enable_prefix_caching=False, **kwargs
+    )
+
+
+@pytest.mark.parametrize("max_num_seqs", [64, 160, 512])
+def test_server_args_capture_size_follows_max_num_seqs(max_num_seqs) -> None:
+    if (get_nvgpu_memory_capacity() or 0) < 25_000:
+        pytest.skip("small GPUs clamp the capture size by memory")
+    assert _server_args(max_num_seqs=max_num_seqs).max_cudagraph_capture_size == (
+        max_num_seqs
+    )
+
+
+def test_server_args_keep_an_explicit_capture_size() -> None:
+    args = _server_args(max_num_seqs=512, max_cudagraph_capture_size=160)
+    assert args.max_cudagraph_capture_size == 160
+
+
+def test_server_args_without_the_memory_reserve_keep_the_old_default() -> None:
+    if (get_nvgpu_memory_capacity() or 0) < 25_000:
+        pytest.skip("small GPUs clamp the capture size by memory")
+    args = _server_args(max_num_seqs=512, disable_cudagraph_memory_reserve=True)
+    assert args.max_cudagraph_capture_size == 160
