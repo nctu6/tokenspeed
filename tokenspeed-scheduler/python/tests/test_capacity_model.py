@@ -200,3 +200,35 @@ def test_pool_sized_by_the_model_admits_what_the_scheduler_bounds(
             pages,
             usable_lcm_blocks,
         )
+
+
+def _gemma4_31b_config(chunk_tokens: int) -> "ts.SchedulerConfig":
+    """gemma-4-31B-it at TP1: five sliding groups (window 1024) and one full
+    group packing two 64-token blocks per parent, 512 live requests."""
+    groups = [_sliding(f"sliding_{i}", 64, 1024, 1) for i in range(5)]
+    groups.append(_full("full", 64, 2))
+    return _sizing_config(
+        role=ts.SchedulerConfig.Role.Fused,
+        prefix_granularity=64,
+        max_scheduled_tokens=chunk_tokens,
+        max_batch_size=512,
+        decode_input_tokens=1,
+        overlap_schedule_depth=1,
+        groups=groups,
+    )
+
+
+@pytest.mark.parametrize(
+    ("chunk_tokens", "limit"),
+    [(8192, 199_487), (4096, 240_447), (1024, 271_167)],
+)
+def test_sliding_groups_reserve_one_prefill_chunk_of_the_pool(
+    chunk_tokens: int, limit: int
+) -> None:
+    """Each sliding group keeps a whole prefill chunk resident beside its
+    lookback, so on the 2294 usable 10 MiB parents a 96 GB card holds at
+    0.90 (22.4 GiB of KV) a single request is bounded by the chunk size: the
+    default 8192-token chunk reserves a third of the pool and caps the request
+    below 256K, a smaller chunk gives the parents back to the full group."""
+    scheduler = ts.Scheduler(_sized(_gemma4_31b_config(chunk_tokens), 2294))
+    assert scheduler.max_single_request_tokens() == limit
