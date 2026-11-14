@@ -618,10 +618,14 @@ parser option keeps its existing behavior.
 
 Gemma 4 checkpoints (`gemma-4` ids, `gemma4` model type, or
 `Gemma4ForConditionalGeneration` / `Gemma4ForCausalLM`) get
-`--tool-call-parser gemma4` unless one is named. Their template's
-`tool_calls` field is rejected by the gateway's template parsers (every chat
-request answers HTTP 400 `invalid_parser_configuration`), so the template
-default does not apply to them.
+`--reasoning-parser gemma4` (engine and gateway) and `--tool-call-parser gemma4`
+unless one is named. Their template's `tool_calls` field is rejected by the
+gateway's template parsers (every chat request answers HTTP 400
+`invalid_parser_configuration`), so the template default does not apply to
+them. With `chat_template_kwargs: {"enable_thinking": true}` the model writes
+its thinking between `<|channel>thought` and `<channel|>`; the `gemma4`
+reasoning parser moves it to `reasoning_content`, and without it the thinking
+stays in `content`.
 
 Gemma 4's tokenizer adds no BOS to raw `/v1/completions` prompts (the same as
 the Hugging Face tokenizer); start such prompts with `<bos>`. Chat requests get
