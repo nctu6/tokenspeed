@@ -392,7 +392,8 @@ to a single rank holding all experts. Calls that share the buffer must be
 ordered on one stream per rank. The SM120 leaf keeps the scale rows in order
 (no UTCCP transpose). V4.1's 2304-wide experts are not padded to 2560 there.
 
-MegaMoE stays opt-in: `--moe-backend mega_moe`. Against what the default path
+`--moe-backend mega_moe` selects it explicitly; `auto` resolves to it for V4.1
+under the gates below. Against what the default path
 runs at EP 2 on SM120,
 Marlin W4A16 plus its all-reduce or all-gather / reduce-scatter, at the same
 served tokens (cold weights, CUDA graph, GPUs on one PCIe switch):
@@ -406,6 +407,29 @@ served tokens (cold weights, CUDA graph, GPUs on one PCIe switch):
 At EP 2 a V4 rank holds 70 GB of routed experts; V4.1 needs at least 4 ranks.
 Details and the per-size table are in DeepGEMM `deepgemm-analysis.md`
 section 9.26.
+
+### Gates for `--moe-backend auto`
+
+`auto` cannot find MegaMoE through `moe_plan` alone: the layer must be built
+around it (token layout, persistent symmetric buffer, scratch the KV planner
+counts after the warm-up), so the runtime asks `mega_moe_auto_available` first
+and then names `mega_moe` (`deepseek_v41_default_moe_backend`,
+`runtime/configs/model_config.py`). The function runs the registry's own
+selection, so each gate is a trait or feature the leaf declares:
+
+| Gate | Declared by the SM120 leaf |
+|---|---|
+| widths | `moe_ranks` {1, 2} (TP x EP; a TP shard has `ep_size` 1), `ep_size` {1, 2} |
+| geometry | `hidden_alignment` 512, `ispp_alignment` 128 |
+| scratch and buffer | `persistent_workspace` (the plan carries a token capacity) |
+| numerics | no `batch_invariant`: FP8 activations and an unverified batch-shape invariance keep it out of every bitwise envelope (`--numerics rl-bitwise`) |
+| measured win | `auto_default`, declared only because it beat Marlin on real V4.1 |
+
+The runtime adds what is not a kernel trait: replicated tokens (attention TP
+equals MoE TP x EP), MXFP4 routed experts, and no all-to-all backend, EPLB,
+redundant experts, speculative decoding or PD disaggregation (not verified with
+this leaf). Tests: `test/test_mega_moe_auto_gates.py` (kernel) and
+`test/runtime/test_deepseek_v41_moe_default.py`.
 
 ### Token layouts (`moe_plan(ep_token_layout=...)`)
 

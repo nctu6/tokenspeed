@@ -273,7 +273,13 @@ the experts alone and the usual TP all-reduce sums the partials: the shard is
 half of every expert's intermediate width (MoE TP 2, the default) or half of the
 experts (`--ep-size 2`). On real V4.1 weights the TP layouts prefill 1.11-1.12x
 faster than Marlin TP2 and decode within 0-5% of it (MoE TP 2 ties); attention DP
-prefills 1.26x faster and decodes 1.3x slower. `--moe-backend auto` keeps Marlin.
+prefills 1.26x faster and decodes 1.3x slower. `--moe-backend auto` resolves to
+`mega_moe` for V4.1 on SM120 only in the attention TP layouts (attention TP equal
+to MoE TP x EP, 1 or 2 ranks), without an all-to-all backend, EPLB, redundant
+experts, speculative decoding, PD disaggregation or a bitwise `--numerics`
+envelope; every other launch keeps Marlin. Real V4.1 (128 experts, TP2, 3
+repeats): MegaMoE is 1.15x Marlin output tokens/s at 128 concurrent requests and
+about 1-2% faster at one request.
 See [MegaMoE on SM120](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/README.md#megamoe-on-sm120).
 
 #### Tensor-parallel subgroups within DP
