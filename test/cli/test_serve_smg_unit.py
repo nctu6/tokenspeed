@@ -44,6 +44,7 @@ from tokenspeed.cli.serve_smg import (
     DEEPSEEK_V4_REASONING_PARSER,
     DEEPSEEK_V4_TOOL_CALL_PARSER,
     DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+    GEMMA4_REASONING_PARSER,
     GEMMA4_TOOL_CALL_PARSER,
     GRPC_MAX_MESSAGE_BYTES_ENV,
     INKLING_ATTENTION_BACKEND,
@@ -1715,8 +1716,27 @@ def test_gemma4_default_launch_names_the_gemma4_tool_parser(tmp_path, capsys):
 
     assert _get_from_args(gateway_args, "--tool-call-parser") == GEMMA4_TOOL_CALL_PARSER
     assert "--parser" not in gateway_args
-    assert _get_from_args(gateway_args, "--reasoning-parser") == "passthrough"
+    assert _get_from_args(gateway_args, "--reasoning-parser") == GEMMA4_REASONING_PARSER
     assert "response_template" not in capsys.readouterr().out
+
+
+def test_gemma4_default_names_the_reasoning_parser_in_engine_and_gateway(tmp_path):
+    model = _make_gemma4_model_dir(tmp_path)
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model], ["--model", model]
+    )
+    assert _get_from_args(engine_args, "--reasoning-parser") == GEMMA4_REASONING_PARSER
+    assert _get_from_args(gateway_args, "--reasoning-parser") == GEMMA4_REASONING_PARSER
+
+
+def test_gemma4_default_keeps_an_explicit_reasoning_parser(tmp_path):
+    model = _make_gemma4_model_dir(tmp_path)
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model, "--reasoning-parser", "passthrough"], ["--model", model]
+    )
+    assert engine_args.count("--reasoning-parser") == 1
+    assert _get_from_args(engine_args, "--reasoning-parser") == "passthrough"
+    assert "--reasoning-parser" not in gateway_args
 
 
 def test_gemma4_default_keeps_an_explicit_tool_parser(tmp_path):
