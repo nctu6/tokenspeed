@@ -1417,6 +1417,32 @@ def _is_dense(
     )
 
 
+_VALUES_SINK: dict[torch.device, torch.Tensor] = {}
+_VALUES_SINK_ELEMENTS = 1024 * 2048
+
+
+def values_sink(rows: int, topk: int, device: torch.device) -> torch.Tensor:
+    """A ``[rows, topk]`` FP32 destination for ``values`` that the caller never reads.
+
+    The selector writes the scores of what it selects; a caller that wants
+    only the indices still pays an allocation of ``rows * topk`` floats per
+    call, host time that a small chunk cannot hide. Up to ``1024 * 2048``
+    elements are views of one buffer per device (created on the first eager
+    call, like :func:`_zero_bases`); its contents are undefined, and kernels
+    in flight on other streams may overwrite them. Larger requests, and any
+    request while a capture has no buffer yet, get a fresh tensor.
+    """
+    sink = _VALUES_SINK.get(device)
+    if rows * topk > _VALUES_SINK_ELEMENTS or (
+        sink is None and torch.cuda.is_current_stream_capturing()
+    ):
+        return torch.empty((rows, topk), dtype=torch.float32, device=device)
+    if sink is None:
+        sink = torch.empty(_VALUES_SINK_ELEMENTS, dtype=torch.float32, device=device)
+        _VALUES_SINK[device] = sink
+    return sink.as_strided((rows, topk), (topk, 1))
+
+
 _ZERO_BASES: dict[torch.device, torch.Tensor] = {}
 _ZERO_BASES_ROWS = 1 << 16
 

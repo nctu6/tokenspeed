@@ -251,3 +251,60 @@ def test_index_candidates_select_the_top_scores_of_a_shard(monkeypatch, spy, top
         got = scores[row][valid].sort().values
         want = ref_scores[row][ref_offsets[row] >= 0].sort().values
         torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    ("rows", "topk"), [(3, 512), (128, 2048), (1024, 2048), (1025, 2048)]
+)
+def test_deepselect_local_topk_does_not_depend_on_where_values_go(rows, topk):
+    """Indices are the same whether the unused scores land in the shared sink or in a fresh tensor.
+    Up to 1024 x 2048 values come from one buffer per device (the host does not
+    allocate for them); a larger request gets its own tensor.
+    """
+    from tokenspeed_kernel.ops.attention.dsa._cute_dsl import deep_select
+    from tokenspeed_kernel.ops.attention.dsa.cute_dsl import deepselect_local_topk
+
+    torch.manual_seed(rows)
+    width = 4096
+    logits = torch.randn(rows, width, device="cuda")
+    lengths = torch.randint(1, width + 1, (rows,), device="cuda", dtype=torch.int32)
+    out = torch.empty(rows, topk, device="cuda", dtype=torch.int32)
+    deepselect_local_topk(logits, lengths, topk, out)
+    expected, values = deep_select.deepselect_topk(
+        logits,
+        lengths,
+        topk,
+        capacity=deep_select.capacity_for(topk),
+        cluster_size=1,
+        values=torch.empty(rows, topk, device="cuda"),
+    )
+    _assert_exact_topk(out[:64], logits[:64], lengths[:64], topk)
+    # The explicit-values call selects the same score multiset in every row.
+    for row in range(min(rows, 16)):
+        mine = logits[row].gather(0, out[row][out[row] >= 0].long()).sort().values
+        theirs = values[row][expected[row] >= 0].sort().values
+        assert torch.equal(mine, theirs)
+    sink = deep_select.values_sink(rows, topk, logits.device)
+    assert sink.shape == (rows, topk) and sink.is_contiguous()
+    shared = rows * topk <= 1024 * 2048
+    other = deep_select.values_sink(1, 512, logits.device)
+    assert (sink.data_ptr() == other.data_ptr()) is shared
+
+
+def test_values_sink_is_not_created_inside_a_graph_capture(monkeypatch):
+    """A buffer made during a capture would live in the graph's private pool."""
+    from tokenspeed_kernel.ops.attention.dsa._cute_dsl import deep_select
+
+    monkeypatch.setattr(deep_select, "_VALUES_SINK", {})
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        values = deep_select.values_sink(8, 512, torch.device("cuda", 0))
+    assert values.shape == (8, 512)
+    assert deep_select._VALUES_SINK == {}
+    # An eager call creates it, and a later capture shares it.
+    eager = deep_select.values_sink(8, 512, torch.device("cuda", 0))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        captured = deep_select.values_sink(4, 512, torch.device("cuda", 0))
+    assert captured.data_ptr() == eager.data_ptr()

@@ -266,6 +266,7 @@ def deepselect_local_topk(
             capacity=capacity,
             cluster_size=cluster_size,
             indices=out if whole else out[begin:end],
+            values=_row_select.values_sink(end - begin, topk, logits.device),
             index_base=(
                 None
                 if index_base is None

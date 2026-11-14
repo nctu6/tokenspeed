@@ -175,8 +175,9 @@ def dsa_prefill_prepare(
         ``[rows, 128]`` and FP32 ``[rows]`` (else ``None``).
     """
     tokens, heads, head_dim = q.shape
-    device = q.device
     gather = kv_workspace_slots is not None
+    rows = kv_workspace_slots.numel() if gather else 0
+    device = q.device
     q_fp8 = torch.empty(
         (tokens, out_heads, head_dim), dtype=torch.float8_e4m3fn, device=device
     )
@@ -184,13 +185,14 @@ def dsa_prefill_prepare(
         (tokens, out_heads), dtype=torch.float32, device=device
     )
     candidate_lens = torch.empty((tokens,), dtype=torch.int32, device=device)
-    rows = kv_workspace_slots.numel() if gather else 0
     if gather:
         k_fp8 = torch.empty((rows, head_dim), dtype=torch.float8_e4m3fn, device=device)
         k_scale = torch.empty((rows,), dtype=torch.float32, device=device)
     else:
         k_fp8 = k_scale = None
     num_programs = tokens + (triton.cdiv(rows, _GATHER_ROWS) if gather else 0)
+    # Positional arguments and the default launch options: the Triton launcher
+    # spends host time on every keyword.
     _dsa_prefill_prepare_kernel[(num_programs,)](
         q,
         q.stride(0),
@@ -210,13 +212,11 @@ def dsa_prefill_prepare(
         int(topk),
         tokens,
         rows,
-        HEADS=heads,
-        OUT_HEADS=out_heads,
-        HEAD_DIM=head_dim,
-        PAGE_SIZE=int(page_size) if gather else 1,
-        GATHER=gather,
-        GATHER_ROWS=_GATHER_ROWS,
-        num_warps=4,
-        num_stages=1,
+        heads,
+        out_heads,
+        head_dim,
+        int(page_size) if gather else 1,
+        gather,
+        _GATHER_ROWS,
     )
     return q_fp8, scaled_weights, candidate_lens, k_fp8, k_scale
