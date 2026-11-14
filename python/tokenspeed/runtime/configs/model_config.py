@@ -494,6 +494,111 @@ def _apply_beam_moe_default(model_config, server_args: ServerArgs) -> None:
         server_args.moe_backend = backend
 
 
+_DEEPSEEK_V41_ARCHITECTURES = frozenset({"DeepseekV41ForCausalLM"})
+
+
+def deepseek_v41_default_moe_backend(
+    server_args: ServerArgs,
+    hf_text_config: PretrainedConfig,
+    quantization: str | None,
+) -> str | None:
+    """DeepSeek V4.1's ``--moe-backend`` when the launch leaves it ``auto``.
+
+    ``mega_moe`` where the kernel registry offers a MegaMoE leaf declaring
+    ``auto_default`` (``mega_moe_auto_available``: widths, alignments, numerics
+    envelope, persistent scratch) and the launch is one the layer was verified
+    on: attention TP equal to the MoE TP x EP width (replicated tokens), no
+    mixed TP x EP, no all-to-all backend, EPLB, redundant experts, speculative
+    decoding or PD disaggregation, MXFP4 routed experts, and an expert count
+    that divides over EP. Otherwise None: ``auto`` stays, i.e. Marlin on SM120.
+    One INFO line says which, and why.
+    """
+    moe = server_args.mapping.moe
+    attn_tp_size = server_args.mapping.attn.tp_size
+    reason = None
+    if server_args.speculative_algorithm:
+        reason = "speculative decoding"
+    elif server_args.disaggregation_mode != "null":
+        reason = f"--disaggregation-mode {server_args.disaggregation_mode}"
+    elif server_args.all2all_backend != "none":
+        reason = f"--all2all-backend {server_args.all2all_backend}"
+    elif (
+        server_args.enable_eplb
+        or server_args.ep_num_redundant_experts
+        or server_args.init_expert_location != "trivial"
+    ):
+        reason = "EPLB, redundant experts or a non-trivial expert placement"
+    elif server_args.moe_mxfp4_fp8_activation:
+        reason = "--moe-mxfp4-fp8-activation"
+    elif quantization == "fp8" and getattr(hf_text_config, "expert_dtype", None) != (
+        "fp4"
+    ):
+        reason = "block-FP8 routed experts"
+    elif moe.tp_size > 1 and moe.ep_size > 1:
+        reason = f"mixed MoE TP {moe.tp_size} x EP {moe.ep_size}"
+    elif attn_tp_size != moe.tp_ep_size:
+        reason = (
+            f"attention TP {attn_tp_size} differs from the MoE TP x EP width "
+            f"{moe.tp_ep_size} (tokens are not replicated)"
+        )
+    elif hf_text_config.n_routed_experts % moe.ep_size:
+        reason = (
+            f"n_routed_experts {hf_text_config.n_routed_experts} does not divide "
+            f"over EP {moe.ep_size}"
+        )
+    else:
+        from tokenspeed_kernel.ops.moe import (
+            MEGA_MOE_AUTO_FEATURE,
+            mega_moe_auto_available,
+        )
+
+        limit = getattr(hf_text_config, "swiglu_limit", None)
+        if not mega_moe_auto_available(
+            hidden=hf_text_config.hidden_size,
+            ispp=hf_text_config.moe_intermediate_size // moe.tp_size,
+            num_experts=hf_text_config.n_routed_experts,
+            top_k=hf_text_config.num_experts_per_tok,
+            ep_size=moe.ep_size,
+            moe_ranks=moe.tp_ep_size,
+            ep_token_layout="replicated",
+            activation_clamped=limit is not None,
+            features=frozenset({MEGA_MOE_AUTO_FEATURE})
+            | (
+                frozenset({"batch_invariant"})
+                if server_args.numerics in BITWISE_ENVELOPES
+                else frozenset()
+            ),
+        ):
+            reason = "no registered MegaMoE leaf passes every auto gate here"
+    if reason:
+        logger.info(
+            f"DeepSeek V4.1 moe_backend=mega_moe not applied, left auto: {reason}"
+        )
+        return None
+    logger.info(
+        "DeepSeek V4.1 default moe_backend=mega_moe; pass --moe-backend to "
+        "choose another."
+    )
+    return "mega_moe"
+
+
+def _apply_deepseek_v41_moe_default(model_config, server_args: ServerArgs) -> None:
+    """Resolve ``--moe-backend auto`` for DeepSeek V4.1 target models."""
+    architectures = _model_architectures(
+        model_config.hf_config, model_config.hf_text_config
+    )
+    if (
+        _DEEPSEEK_V41_ARCHITECTURES.isdisjoint(architectures)
+        or server_args.moe_backend != "auto"
+    ):
+        return
+    backend = deepseek_v41_default_moe_backend(
+        server_args, model_config.hf_text_config, model_config.quantization
+    )
+    if backend is not None:
+        server_args.moe_backend = backend
+
+
 def _beam_checkpoint_format(model_config) -> str | None:
     """``"bf16"`` without quantization, else the format ``beam_quant_policy``
     admits; None for a checkpoint Beam refuses, which keeps the MoE default
@@ -1206,6 +1311,7 @@ class ModelConfig:
             # After the checkpoint's quantization is known. A draft of Beam
             # resolves to BeamForCausalLMNextN and is not asked.
             _apply_beam_moe_default(self, server_args)
+            _apply_deepseek_v41_moe_default(self, server_args)
 
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()

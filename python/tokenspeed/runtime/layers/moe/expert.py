@@ -532,6 +532,7 @@ class MoELayer(torch.nn.Module):
             ),
             persistent_max_num_tokens_per_gpu=persistent_max_num_tokens_per_gpu,
             ep_token_layout=ep_token_layout,
+            moe_ranks=self.tp_size * self.ep_size,
             features=(
                 frozenset({"batch_invariant"})
                 if global_server_args_dict["numerics"] in BITWISE_ENVELOPES

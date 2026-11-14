@@ -479,6 +479,11 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
     _warmed_configs.add(warmup_key)
 
 
+# Declared by a MegaMoE leaf that is measured to beat the default backend, so
+# ``--moe-backend auto`` may pick it where its other gates hold
+# (``mega_moe_auto_available``).
+MEGA_MOE_AUTO_FEATURE = "auto_default"
+
 _MEGA_MOE_TRAITS = {
     "weight_dtype": frozenset({"mxfp4"}),
     "activation": frozenset({"swiglu"}),
@@ -614,10 +619,19 @@ if _MEGA_MOE_AVAILABLE:
                 # The SM120 gather moves 16-byte chunks of 32 lanes
                 "hidden_alignment": frozenset({512}),
                 "ep_size": _SM120_MEGA_MOE_EP_SIZES | _SM120_MEGA_MOE_REPLICATED_WIDTHS,
+                # TP x EP ranks: a TP shard has ep_size 1, so ep_size alone
+                # would admit any TP width
+                "moe_ranks": _SM120_MEGA_MOE_REPLICATED_WIDTHS,
                 # Also runs as one rank over this rank's shard of the experts
                 # when the MoE ranks hold the same tokens (attention TP)
                 "ep_token_layout": frozenset({_SCATTERED, _REPLICATED}),
             },
+            # No ``batch_invariant``: the FP8-activation leaf's run-to-run and
+            # batch-shape invariance is not verified, so a bitwise numerics
+            # envelope never selects it. ``auto_default``: measured against
+            # Marlin on real V4.1 (docs/serving/parallelism.md), so
+            # ``--moe-backend auto`` may pick it where every gate holds.
+            features={MEGA_MOE_AUTO_FEATURE},
             priority=Priority.SPECIALIZED,
             weight_preprocessor=deep_gemm_mxfp4_mega_moe_process_weights,
         )
