@@ -126,3 +126,11 @@ def test_a_bitwise_envelope_stays_on_auto(expected_default) -> None:
     except (ValueError, TypeError) as error:
         pytest.skip(f"ServerArgs refuses the envelope here: {error}")
     assert _resolve(args) is None
+
+
+def test_a_config_without_a_routed_expert_count_stays_on_auto(
+    expected_default,
+) -> None:
+    config = _config()
+    del config.n_routed_experts
+    assert _resolve(_args(), config) is None

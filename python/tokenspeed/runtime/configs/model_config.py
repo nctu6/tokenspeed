@@ -541,6 +541,8 @@ def deepseek_v41_default_moe_backend(
             f"attention TP {attn_tp_size} differs from the MoE TP x EP width "
             f"{moe.tp_ep_size} (tokens are not replicated)"
         )
+    elif getattr(hf_text_config, "n_routed_experts", None) is None:
+        reason = "the config has no routed expert count"
     elif hf_text_config.n_routed_experts % moe.ep_size:
         reason = (
             f"n_routed_experts {hf_text_config.n_routed_experts} does not divide "
