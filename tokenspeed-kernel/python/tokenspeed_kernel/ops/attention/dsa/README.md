@@ -232,8 +232,13 @@ index-key row format and the selector that follows.
   the platform query for rows too narrow to split across a cluster, and
   validates once (17.2 -> 9.1 us). The leaf's host time falls from 116 to 87 us.
   What is left of DeepSelect's 9 us is the TVM-FFI call (~3.5 us, one DLPack
-  conversion per tensor) and the `values` allocation (~2 us), which the kernel
-  fills although this caller discards it.
+  conversion per tensor); the `values` the kernel fills although this caller
+  discards them go to one 8 MB buffer per device (`values_sink`, requests of at
+  most 1024 x 2048 elements; its contents are undefined) instead of a fresh
+  allocation, and `dsa_prefill_prepare` launches with positional arguments (the
+  Triton launcher spends host time on each keyword): leaf 88.6 -> 86.2 us. What
+  is left in the leaf is mostly a Python floor: the Triton launch (~14 us), the
+  allocator calls (1.9 us each) and `nan_to_num_` (4.6 us).
 - **V4.1 `dsv41_index_topk`.** SM120 stores the checkpoint's 68-byte rows
   (`cache_format="v41"`: 64 bytes of E2M1 pairs, then one UE8M0 word with the
   four 32-element scales, page-planar). One leaf, `deep_gemm_sm120_dsv41_index_topk`
