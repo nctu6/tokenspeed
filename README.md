@@ -25,7 +25,7 @@ TokenSpeed runs natively on SM120 (compute capability 12.0), with no SM100-only 
 
 `scripts/install.sh` builds DeepGEMM from the `DeepGEMM` submodule. Serve with `tokenspeed serve` as in the [Launching a Server](https://lightseek.org/tokenspeed/guides/launching) guide.
 
-- Qwen3.8-27B-FP8 (TP1, RAG): 1.52x output tok/s at C=1 (TPOT p50 31.6 to 20.6 ms) and 1.04x at C=512.
+- Qwen3.8-27B-FP8 (RAG), TP1: 1.52x output tok/s at C=1 (TPOT p50 31.6 to 20.6 ms) and 1.04x at C=512. TP2: 1.47x at C=1 (TPOT p50 17.7 to 11.9 ms) and 1.01x at C=512 (1.27x at C=256).
 - DeepSeek-V4.1-Flash, 128-of-384 expert subset (TP2): 1.6-4.0x output tok/s over the previous image.
 - Qwen3.8-27B-NVFP4 and Qwen3.5-122B-A10B-NVFP4 now serve.
 
@@ -34,13 +34,13 @@ Details: [DeepGEMM report](https://github.com/nctu6/DeepGEMM/blob/nctu6/deepgemm
 <p align="center">
   <img
     src="assets/perf/tokenspeed-sm120-performance.png"
-    alt="TokenSpeed before vs. after on RTX PRO 6000 Blackwell (SM120), RAG workload"
+    alt="Qwen3.8-27B-FP8 TP1 and TP2, before vs. after on RTX PRO 6000 Blackwell (SM120), RAG workload"
     width="800"
   />
 </p>
 
 <p align="center">
-  <em>Output speed per user vs. output throughput per GPU, before vs. after SM120 support (RTX PRO 6000 Blackwell, RAG workload, C=1 to 512)</em>
+  <em>Qwen3.8-27B-FP8, TP1 and TP2: output speed per user vs. output throughput per GPU, before vs. after SM120 support (RTX PRO 6000 Blackwell, RAG workload, C=1 to 512, single run per point; the before image captures CUDA graphs up to batch 160)</em>
 </p>
 
 ## Differentiation
