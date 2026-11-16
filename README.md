@@ -15,6 +15,34 @@ Core components:
 - **Entrypoint**: SMG-integrated AsyncLLM for low-overhead CPU-side request
   handling.
 
+## SM120 (RTX PRO 6000 Blackwell)
+
+TokenSpeed runs natively on SM120 (compute capability 12.0), with no SM100-only fallbacks:
+
+- **GEMMs and indexer**: DeepGEMM SM120 kernels for FP8, MXFP4 and NVFP4 GEMMs, MQA logits, and the DeepSeek-V4.1 indexer.
+- **Attention**: CuTe DSL and Triton tensor-core kernels for DSA, MLA, and DeepSeek-V4.
+- **MoE**: MegaMoE across two PCIe GPUs.
+
+`scripts/install.sh` builds DeepGEMM from the `DeepGEMM` submodule. Serve with `tokenspeed serve` as in the [Launching a Server](https://lightseek.org/tokenspeed/guides/launching) guide.
+
+- Qwen3.8-27B-FP8 (TP1, RAG): 1.52x output tok/s at C=1 (TPOT p50 31.6 to 20.6 ms) and 1.04x at C=512.
+- DeepSeek-V4.1-Flash, 128-of-384 expert subset (TP2): 1.6-4.0x output tok/s over the previous image.
+- Qwen3.8-27B-NVFP4 and Qwen3.5-122B-A10B-NVFP4 now serve.
+
+Details: [DeepGEMM report](https://github.com/nctu6/DeepGEMM/blob/nctu6/deepgemm_report.md) and [benchmarks](https://github.com/nctu6/DeepGEMM/blob/nctu6/deepgemm_benchmark.md).
+
+<p align="center">
+  <img
+    src="assets/perf/tokenspeed-sm120-performance.png"
+    alt="TokenSpeed before vs. after on RTX PRO 6000 Blackwell (SM120), RAG workload"
+    width="800"
+  />
+</p>
+
+<p align="center">
+  <em>Output speed per user vs. output throughput per GPU, before vs. after SM120 support (RTX PRO 6000 Blackwell, RAG workload, C=1 to 512)</em>
+</p>
+
 ## Differentiation
 
 TokenSpeed takes a fundamentally different architectural approach from existing LLM inference engines. The **PyTorch Foundation highlighted these architectural differentiators** when [welcoming TokenSpeed](https://pytorch.org/blog/pytorch-ecosystem-landscape-q3-update/) to the PyTorch Ecosystem Landscape:
