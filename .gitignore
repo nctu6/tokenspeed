@@ -205,3 +205,6 @@ outputs/
 
 # kiro
 .kiro/
+
+# scratch files (logs, baselines, diff stats); never committed
+tmp/
