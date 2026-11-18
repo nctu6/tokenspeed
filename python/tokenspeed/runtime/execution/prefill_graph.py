@@ -203,6 +203,19 @@ def get_prefill_token_buckets(config: ModelExecutorConfig) -> list[int]:
     return sorted(set(buckets))
 
 
+def _release_warmup_cache() -> None:
+    """Wait for a capture's warmup runs and return their freed blocks to the driver.
+
+    The warmups run eagerly, so their temporaries are freed into the default
+    allocator pool, which the capture's private graph pool cannot reuse. At
+    the widest buckets (8192 tokens for DeepSeek V4.1) those cached blocks can
+    exceed what the capture itself needs and leave it out of memory although
+    the memory is free in the process. Graph pools are not released.
+    """
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+
 def _prefill_bucket_step(size: int) -> int:
     """Distance from bucket ``size`` to the next rung.
 
@@ -962,7 +975,7 @@ class PrefillGraph:
             for _ in range(self.num_warmup):
                 spec = _output_spec(CapturedForward(*self._run_inner(bucket)))
             self._reserve_outputs(spec)
-        torch.cuda.synchronize()
+        _release_warmup_cache()
         with observer, cap:
             output = self._land_output(CapturedForward(*self._run_inner(bucket)))
         if self._pool is None:
@@ -987,7 +1000,7 @@ class PrefillGraph:
         with torch.cuda.stream(cap.stream):
             for _ in range(self.num_warmup):
                 self._run_encoder(bucket)
-        torch.cuda.synchronize()
+        _release_warmup_cache()
         with observer, cap:
             state = self._run_encoder(bucket)
         if self._pool is None:
@@ -1024,7 +1037,7 @@ class PrefillGraph:
                     )
                 )
             self._reserve_outputs(spec)
-        torch.cuda.synchronize()
+        _release_warmup_cache()
         rearm()
         with observer, cap:
             output = self._land_output(

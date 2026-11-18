@@ -226,6 +226,48 @@ class TestPrefillCaptureStreamTest:
                 capture.replay()
                 torch.testing.assert_close(output.hidden_states, owner.values * 2)
 
+    def test_capture_reuses_memory_its_warmup_freed(self):
+        """A warmup's freed temporaries must not keep the capture out of memory.
+
+        The eager warmup frees ``size`` bytes into the default allocator pool,
+        and the capture needs ``size`` bytes of its own graph pool. The process
+        may hold 1.5x ``size`` beyond what it holds already, so the capture fits
+        only once the warmup's cache went back to the driver.
+        """
+        import torch
+
+        from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+        if not torch.cuda.is_available():
+            pytest.skip("requires CUDA")
+        size = 256 << 20
+
+        class TransientWarmup(PrefillGraph):
+            def __init__(self):
+                self.num_warmup = 1
+                self._pool = None
+                self._encoder_handoff_storage = {}
+
+            def _run_encoder(self, bucket):
+                scratch = torch.zeros(size, dtype=torch.uint8, device="cuda")
+                return scratch[:bucket].float().sum()
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        device = torch.cuda.current_device()
+        total = torch.cuda.get_device_properties(device).total_memory
+        limit = torch.cuda.memory_reserved() + size * 3 // 2
+        torch.cuda.set_per_process_memory_fraction(limit / total)
+        try:
+            owner = TransientWarmup()
+            result = owner._capture_encoder(
+                8, None, NULL_MEMORY_DELTA_OBSERVER.measure("prefill:encoder")
+            )
+            assert float(result.state) == 0.0
+        finally:
+            torch.cuda.set_per_process_memory_fraction(1.0)
+            torch.cuda.empty_cache()
+
 
 class TestKdaPrefillFallbackTest:
     def test_outer_attention_break_does_not_capture_kda_graphs(self, subtests):
