@@ -224,6 +224,27 @@ def test_ready_response_is_map_encoded():
     assert raw_engine_ready["multimodal_encoder_dtype"] == "bfloat16"
 
 
+def test_the_ready_response_names_the_first_served_model_name():
+    # ServerArgs keeps served_model_name as a list (multi-name serve); the
+    # wire's instance_id is one string.
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    for names, expected in ((None, "m"), (["a", "b"], "a")):
+        server_args = ServerArgs(
+            model="m", served_model_name=names, disaggregation_mode="encode"
+        )
+        ready = zmq_wire.encode_ready_response(
+            server_args=server_args,
+            hf_config=PretrainedConfig(architectures=["Qwen3ForCausalLM"]),
+            dtype="bfloat16",
+            bootstrap=("10.0.0.9", 8998),
+        )
+        raw = msgspec.msgpack.decode(zmq_wire.encode(ready))
+        assert raw["instance_id"] == expected
+
+
 def test_an_encode_server_registers_its_role_bootstrap_and_model_facts():
     from transformers import PretrainedConfig
 

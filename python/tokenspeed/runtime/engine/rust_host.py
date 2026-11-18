@@ -1481,7 +1481,7 @@ class HostBootstrap:
                 metrics_relay_endpoint=metrics_relay_endpoint,
                 engine_metrics=server_args.enable_metrics and attn_tp_rank == 0,
                 transfer_metrics=server_args.enable_metrics,
-                metrics_model_name=server_args.served_model_name,
+                metrics_model_name=server_args.canonical_served_model_name,
                 metrics_app_key=server_args.app_key or "",
                 dp_rank=dp_rank,
                 batch_log=attn_tp_rank == 0
@@ -1659,7 +1659,7 @@ class HostBootstrap:
             return
         self._memory_sampler = MemoryMetricSampler(
             sink=sink,
-            model_name=self._server_args.served_model_name or "",
+            model_name=self._server_args.canonical_served_model_name,
             app_key=self._server_args.app_key or "",
             dp_rank=self._server_args.mapping.attn.dp_rank or 0,
             gpu_id=self._gpu_id,

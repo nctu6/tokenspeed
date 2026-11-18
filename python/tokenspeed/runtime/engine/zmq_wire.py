@@ -383,7 +383,7 @@ def engine_ready_response(
         # chunked_prefill_size=-1 means "disabled"; the wire field is a
         # non-negative integer for the frontend, so clamp to 0 (= no cap).
         max_num_batched_tokens=max(0, server_args.chunked_prefill_size),
-        instance_id=server_args.served_model_name or server_args.model,
+        instance_id=server_args.canonical_served_model_name,
         kv_cache_size_tokens=kv_cache_size_tokens,
         disaggregation_mode=server_args.disaggregation_mode,
         bootstrap_host=host,
@@ -410,7 +410,7 @@ def encode_ready_response(
         dtype=wire_dtype(dtype),
         multimodal_encoder_dtype=wire_dtype(dtype),
         vllm_version=f"tokenspeed-{_tokenspeed_version()}",
-        instance_id=server_args.served_model_name or server_args.model,
+        instance_id=server_args.canonical_served_model_name,
         disaggregation_mode="encode",
         bootstrap_host=host,
         bootstrap_port=port,
