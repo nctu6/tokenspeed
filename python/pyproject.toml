@@ -79,6 +79,7 @@ dependencies = [
     "transformers==5.12.0",
     "uv",
     "uvicorn",
+    "uvloop",
     "xgrammar==0.2.8",
     "viztracer",
 ]
