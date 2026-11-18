@@ -1771,7 +1771,8 @@ def _launch_gateway_args(model, *extra):
     engine_args, gateway_args = _args_with_default_model_parsers(
         split.engine, split.gateway
     )
-    tokenizer = _template_tokenizer(engine_args, gateway_args)
+    gateway_args = _gateway_args_with_engine_identity(engine_args, gateway_args)
+    tokenizer = _template_tokenizer(gateway_args)
     return _gateway_args_with_defaults(gateway_args, tokenizer)
 
 
