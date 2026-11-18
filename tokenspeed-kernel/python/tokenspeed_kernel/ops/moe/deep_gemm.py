@@ -232,8 +232,8 @@ def deep_gemm_mxfp4_mega_moe_process_weights(
     plan: dict,
     w: torch.nn.Module,
 ) -> object:
-    if w.tp_size != 1:
-        raise ValueError("DeepGEMM MXFP4 MegaMoE requires MoE TP=1")
+    # MoE TP is checked per token layout below: scattered tokens need TP 1,
+    # replicated tokens on SM120 may shard the intermediate size over TP.
     w13_weight = w.w13_weight.data
     w13_weight_scale = w.w13_weight_scale.data
     w2_weight = w.w2_weight.data
@@ -355,7 +355,9 @@ def fuse_deep_gemm_mxfp4_mega_moe_shared_expert(
         raise TypeError("invalid DeepGEMM MegaMoE state")
     if state.num_shared_experts:
         raise RuntimeError("MegaMoE already runs a shared expert")
-    hidden, inter = w.hidden_size, w.intermediate_size
+    # Under MoE TP the routed experts hold an intermediate slice; the shared
+    # expert must match that slice.
+    hidden, inter = w.hidden_size, _kernel_intermediate_size(w)
     expected = (
         (gate_up_weight, (2 * inter, hidden), torch.float8_e4m3fn),
         (gate_up_scale, (2 * inter, hidden // _MXFP4_BLOCK_SIZE), torch.uint8),
