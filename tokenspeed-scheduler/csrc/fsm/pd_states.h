@@ -39,10 +39,10 @@ namespace tokenspeed {
 namespace fsm {
 struct Bootstrapping {
     Bootstrapping(TokenContainer* _token_container, std::int32_t _prefix_granularity)
-        : token_container{_token_container}, prefix_granularity{_prefix_granularity} {}
+        : admission{_token_container, _prefix_granularity} {}
+    explicit Bootstrapping(AdmissionResources resources) : admission{std::move(resources)} {}
 
-    TokenContainer* token_container{};
-    std::int32_t prefix_granularity{};
+    AdmissionResources admission;
 };
 
 // The peer node is prefilling this prompt: this engine admitted and holds
@@ -80,6 +80,21 @@ struct PrefillAwaitingResult {
 
 private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
+};
+
+// The request ended on this engine -- aborted, or its transfer failed --
+// while a PD transfer may still read or write its pages: the peer's decode
+// reading a P request's sources, the peer's prefill writing a D request's
+// destinations. The transport was told to stop; the bundle stays whole,
+// pages and all, until it reports that every reader and writer on every rank
+// stopped (TransferStoppedEvent). Nothing is scheduled or published here, and
+// it is no retraction victim.
+struct PdTransferring {
+    explicit PdTransferring(ForwardResources resources) : resources{std::move(resources)} {}
+
+    ForwardResources resources;
+    // A transport stop may arrive before the last local forward result.
+    bool transfer_stopped{false};
 };
 
 }  // namespace fsm

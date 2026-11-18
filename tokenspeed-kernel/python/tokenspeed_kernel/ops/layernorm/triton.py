@@ -15,11 +15,10 @@ from tokenspeed_kernel.ops.quantization.triton import (
     fp8_token_multiplier,
     fp8_token_scale,
 )
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
-
-_FP32_MIN_NORMAL = tl.constexpr(1.1754943508222875e-38)
+from tokenspeed_kernel.warmup import kernel_launcher
 
 
 @triton.jit
@@ -57,6 +56,7 @@ def _rmsnorm_kernel(
     x_scale,
     residual_scale,
     x_row_stride,
+    out_row_stride,
     n_cols: tl.constexpr,
     eps: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -99,7 +99,9 @@ def _rmsnorm_kernel(
     variance = tl.sum(x * x, axis=0) / n_cols
     x *= tl.rsqrt(variance + eps)
     weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    tl.store(out_ptr + row_offsets, x * weight, mask=mask)
+    tl.store(
+        out_ptr + row.to(tl.int64) * out_row_stride + offsets, x * weight, mask=mask
+    )
     if TOKEN_FP8_OUT:
         # The stored row quantized per token (as fp8_quantize_per_token
         # quantizes it): FP8 E4M3 codes and one FP32 dequant scale.
@@ -313,8 +315,9 @@ def rmsnorm(
             f"residual shape {tuple(residual.shape)} does not match input shape {tuple(x.shape)}"
         )
 
-    # Without a residual the kernel reads strided rows (e.g. a column slice of
-    # a fused projection) in place; other layouts are made contiguous.
+    # Without a residual the kernel reads and writes strided rows (e.g. a
+    # column slice of a fused projection) in place; other layouts are made
+    # contiguous.
     strided_rows = residual is None and x.ndim == 2 and x.stride(-1) == 1
     if not x.is_contiguous() and not strided_rows:
         x = x.contiguous()
@@ -326,9 +329,10 @@ def rmsnorm(
     hidden_size = x.shape[-1]
     x_2d = x if strided_rows else x.view(-1, hidden_size)
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device) if out is None else out
-    if not out.is_contiguous():
-        raise ValueError("out must be contiguous")
-    out_2d = out.view(-1, hidden_size)
+    strided_out = residual is None and out.ndim == 2 and out.stride(-1) == 1
+    if not out.is_contiguous() and not strided_out:
+        raise ValueError("out must be contiguous or 2-D rows with unit column stride")
+    out_2d = out if strided_out else out.view(-1, hidden_size)
 
     residual_out = torch.empty_like(x) if residual is not None else None
     if token_fp8_out is not None:
@@ -363,6 +367,7 @@ def rmsnorm(
         x_scale,
         residual_scale,
         x_2d.stride(0),
+        out_2d.stride(0),
         hidden_size,
         eps,
         BLOCK=block,
@@ -496,9 +501,10 @@ def _gated_residual_combine_norm_kernel(
     BLOCK: tl.constexpr,
     PRELOAD_RESIDUAL: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    GROUPS_FIRST: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    group = tl.program_id(1)
+    row = tl.program_id(1 if GROUPS_FIRST else 0)
+    group = tl.program_id(0 if GROUPS_FIRST else 1)
     offsets = tl.arange(0, BLOCK)
     mask = offsets < GROUP_SIZE
     positions = row * WIDTH + group * GROUP_SIZE + offsets
@@ -585,11 +591,22 @@ def gated_residual_combine_norm(
     if block > 65536:
         raise ValueError("group_size is too large for the Triton reduction")
     rows = residual.numel() // width
+    groups_first = (
+        4096 <= rows <= 65535
+        and groups == 4
+        and group_size == 2560
+        and residual.dtype in (torch.bfloat16, torch.float16)
+        and current_platform().is_nvidia
+        and current_platform().arch_version == ArchVersion(10, 7)
+    )
+    # Reuse each row's block output without exceeding CUDA's grid-y limit.
+    grid = (groups, rows) if groups_first else (rows, groups)
+    # Both grid orders are fixed JIT configurations; warm each before serving.
     enable_pdl = pdl_enabled()
     launch_kwargs = (
         {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
     )
-    _gated_residual_combine_norm_kernel[(rows, groups)](
+    _gated_residual_combine_norm_kernel[grid](
         residual,
         block_output,
         inject_logits,
@@ -603,6 +620,7 @@ def gated_residual_combine_norm(
         BLOCK=block,
         PRELOAD_RESIDUAL=preload_residual,
         ENABLE_PDL=enable_pdl,
+        GROUPS_FIRST=groups_first,
         **launch_kwargs,
     )
     return combined, normalized
@@ -1153,11 +1171,10 @@ def _store_nvfp4(
     # fp4_quantize's E4M3-scale recipe, bit for bit: block amax / 6 scaled into E4M3, values into E2M1.
     blocks = tl.reshape(normed, [BLOCK // 16, 16])
     vec_max = tl.max(tl.abs(blocks), axis=1).to(tl.float32)
-    # Its zero test flushes too: a subnormal block amax counts as zero.
-    vec_max = tl.where(vec_max < _FP32_MIN_NORMAL, 0.0, vec_max)
     sf = _mul_ftz(sf_scale, _mul_ftz(vec_max, rcp6)).to(tl.float8e4nv)
+    # A block whose E4M3 scale rounds to zero encodes zero values.
     out_scale = tl.where(
-        vec_max != 0,
+        sf.to(tl.float32) != 0,
         _rcp_approx_ftz(_mul_ftz(sf.to(tl.float32), rcp_sf_scale)),
         0.0,
     )
@@ -1422,6 +1439,51 @@ def add_rmsnorm(
     )
 
 
+@register_kernel(
+    "layernorm",
+    "gemma_rmsnorm",
+    name="triton_gemma_rmsnorm",
+    solution="triton",
+    signatures=format_signatures(
+        "x", "dense", {torch.bfloat16, torch.float16, torch.float32}
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_gemma_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    residual: torch.Tensor | None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Triton kernel of :func:`tokenspeed_kernel.ops.layernorm.gemma_rmsnorm`:
+    ``grouped_gemma_rmsnorm`` with one group per row, or ``add_rmsnorm(gemma=True)``
+    writing the norm into ``x`` and the sum into ``residual``."""
+    if residual is None:
+        return grouped_gemma_rmsnorm(x, weight, int(x.shape[-1]), eps, out=None)
+    # [M, N] rows with dense columns stay as they are (a column slice of a fused
+    # projection stays a view); other layouts become a [rows, N] view or copy.
+    x_rows = x if x.ndim == 2 and x.stride(-1) == 1 else x.reshape(-1, x.shape[-1])
+    residual_rows = (
+        residual
+        if residual.ndim == 2 and residual.stride(-1) == 1
+        else residual.reshape(-1, residual.shape[-1])
+    )
+    add_rmsnorm(
+        x_rows,
+        residual_rows,
+        weight,
+        eps,
+        x2=None,
+        out=x_rows,
+        out_fp8=None,
+        fp8_scale=None,
+        out_fp4=None,
+        fp4_scale=None,
+        gemma=True,
+    )
+    return x_rows.view(x.shape), residual_rows.view(residual.shape)
+
+
 # Rows each gated RMSNorm program normalizes when one warp covers a row.
 GATED_RMSNORM_ROWS_PER_PROGRAM = 4
 
@@ -1479,7 +1541,9 @@ def triton_gated_rmsnorm(
     block_m = GATED_RMSNORM_ROWS_PER_PROGRAM if num_warps == 1 else 1
     grid = (triton.cdiv(M, block_m), ngroups)
     with torch.cuda.device(x.device.index):
-        gated_rmsnorm_kernel[grid](
+        # Pass the heuristic explicitly so startup can retain and load each
+        # compiled binary; the heuristic wrapper discards that return value.
+        kernel_launcher(gated_rmsnorm_kernel.fn, grid)(
             x,
             out,
             weight,
@@ -1493,6 +1557,7 @@ def triton_gated_rmsnorm(
             eps,
             BLOCK_M=block_m,
             BLOCK_N=BLOCK_N,
+            HAS_Z=z is not None,
             NORM_BEFORE_GATE=norm_before_gate,
             SIGMOID_GATE=sigmoid_gate,
             num_warps=block_m * num_warps,
@@ -1514,7 +1579,7 @@ def _dequantize_head_half(in_ptrs, scale_ptrs, out_ptrs, token_scale, mask):
     tl.store(out_ptrs, fp8_dequantize_unscaled(raw, token_scale, scale), mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n_tokens"])
 def _fused_qk_rmsnorm_rope_kernel(
     q_ptr,
     k_ptr,
@@ -1524,6 +1589,7 @@ def _fused_qk_rmsnorm_rope_kernel(
     k_weight_ptr,
     cos_sin_cache_ptr,
     positions_ptr,
+    n_tokens,
     q_stride_t,
     k_stride_t,
     q_out_stride_t,
@@ -1536,6 +1602,8 @@ def _fused_qk_rmsnorm_rope_kernel(
     eps: tl.constexpr,
     INPUT_DTYPE: tl.constexpr,
     HALF_BLOCK: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    TOKEN_BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     token_scale_ptr=None,
     q_scale_ptr=None,
@@ -1552,105 +1620,96 @@ def _fused_qk_rmsnorm_rope_kernel(
     g_out_token_stride=0,
     DEQUANT: tl.constexpr = False,
 ):
-    """Per-head QK RMSNorm then full NeoX RoPE; one program per (token, head).
+    """Per-head QK RMSNorm then full NeoX RoPE; one program per TOKEN_BLOCK
+    tokens and HEAD_BLOCK heads (Q heads, then K heads), one warp per head.
 
     DEQUANT: q and k are an unscaled FP8 GEMM's output, dequantized first (the
-    scaled GEMM's 16-bit output); q programs also write the dequantized output
-    gate head of their index, k programs the V head of theirs."""
+    scaled GEMM's 16-bit output); Q rows also write the dequantized output
+    gate head of their index, K rows the V head of theirs."""
     if ENABLE_PDL:
         # Q and K are the projections' stores, before the first load.
         tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
-    heads = num_q_heads + num_kv_heads
-    row = tl.program_id(0).to(tl.int64)
-    token = row // heads
-    head = row % heads
+    head = (tl.program_id(1) * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK))[:, None]
     is_k = head >= num_q_heads
     local_head = tl.where(is_k, head - num_q_heads, head)
-    offs = tl.arange(0, HALF_BLOCK)
-    mask = offs < half_dim
-    q_mask = mask & ~is_k
-    k_mask = mask & is_k
+    offs = tl.arange(0, HALF_BLOCK)[None, :]
+    half_mask = offs < half_dim
+    head_mask = (head < num_q_heads + num_kv_heads) & half_mask
     offsets = local_head * head_dim + offs
-    q_base = q_ptr + token * q_stride_t + offsets
-    k_base = k_ptr + token * k_stride_t + offsets
-    q1 = tl.load(q_base, mask=q_mask, other=0.0)
-    q2 = tl.load(q_base + half_dim, mask=q_mask, other=0.0)
-    k1 = tl.load(k_base, mask=k_mask, other=0.0)
-    k2 = tl.load(k_base + half_dim, mask=k_mask, other=0.0)
-    if DEQUANT:
-        token_scale = tl.load(token_scale_ptr + token)
-        s1 = tl.where(
-            is_k,
-            tl.load(k_scale_ptr + offsets, mask=k_mask, other=0.0),
-            tl.load(q_scale_ptr + offsets, mask=q_mask, other=0.0),
-        )
-        s2 = tl.where(
-            is_k,
-            tl.load(k_scale_ptr + offsets + half_dim, mask=k_mask, other=0.0),
-            tl.load(q_scale_ptr + offsets + half_dim, mask=q_mask, other=0.0),
-        )
-        x1 = fp8_dequantize_unscaled(tl.where(is_k, k1, q1), token_scale, s1)
-        x2 = fp8_dequantize_unscaled(tl.where(is_k, k2, q2), token_scale, s2)
-        _dequantize_head_half(
-            g_in_ptr + token * g_in_token_stride + offsets,
-            g_scale_ptr + offsets,
-            g_out_ptr + token * g_out_token_stride + offsets,
-            token_scale,
-            q_mask,
-        )
-        _dequantize_head_half(
-            g_in_ptr + token * g_in_token_stride + offsets + half_dim,
-            g_scale_ptr + offsets + half_dim,
-            g_out_ptr + token * g_out_token_stride + offsets + half_dim,
-            token_scale,
-            q_mask,
-        )
-        _dequantize_head_half(
-            v_in_ptr + token * v_in_token_stride + offsets,
-            v_scale_ptr + offsets,
-            v_out_ptr + token * v_out_token_stride + offsets,
-            token_scale,
-            k_mask,
-        )
-        _dequantize_head_half(
-            v_in_ptr + token * v_in_token_stride + offsets + half_dim,
-            v_scale_ptr + offsets + half_dim,
-            v_out_ptr + token * v_out_token_stride + offsets + half_dim,
-            token_scale,
-            k_mask,
-        )
-    else:
-        x1 = tl.where(is_k, k1, q1).to(tl.float32)
-        x2 = tl.where(is_k, k2, q2).to(tl.float32)
-    qw1 = tl.load(q_weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    qw2 = tl.load(q_weight_ptr + half_dim + offs, mask=mask, other=0.0).to(tl.float32)
-    kw1 = tl.load(k_weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    kw2 = tl.load(k_weight_ptr + half_dim + offs, mask=mask, other=0.0).to(tl.float32)
-    w1 = tl.where(is_k, kw1, qw1)
-    w2 = tl.where(is_k, kw2, qw2)
-    var = (tl.sum(x1 * x1, axis=0) + tl.sum(x2 * x2, axis=0)) / head_dim
-    inv_rms = tl.rsqrt(var + eps)
-    # The normalized head is rounded to the input dtype before RoPE.
-    x1_norm = (x1 * inv_rms * w1).to(INPUT_DTYPE).to(tl.float32)
-    x2_norm = (x2 * inv_rms * w2).to(INPUT_DTYPE).to(tl.float32)
-
-    pos = tl.load(positions_ptr + token).to(tl.int64)
-    cache_offset = pos * cache_stride_p
-    cos = tl.load(cos_sin_cache_ptr + cache_offset + offs, mask=mask, other=0.0).to(
+    qw1 = tl.load(q_weight_ptr + offs, mask=half_mask, other=0.0).to(tl.float32)
+    qw2 = tl.load(q_weight_ptr + half_dim + offs, mask=half_mask, other=0.0).to(
         tl.float32
     )
-    sin = tl.load(
-        cos_sin_cache_ptr + cache_offset + half_dim + offs, mask=mask, other=0.0
-    ).to(tl.float32)
-    o1 = x1_norm * cos - x2_norm * sin
-    o2 = x2_norm * cos + x1_norm * sin
-    q_out_base = q_out_ptr + token * q_out_stride_t + offsets
-    k_out_base = k_out_ptr + token * k_out_stride_t + offsets
-    tl.store(q_out_base, o1, mask=q_mask)
-    tl.store(q_out_base + half_dim, o2, mask=q_mask)
-    tl.store(k_out_base, o1, mask=k_mask)
-    tl.store(k_out_base + half_dim, o2, mask=k_mask)
+    kw1 = tl.load(k_weight_ptr + offs, mask=half_mask, other=0.0).to(tl.float32)
+    kw2 = tl.load(k_weight_ptr + half_dim + offs, mask=half_mask, other=0.0).to(
+        tl.float32
+    )
+    w1 = tl.where(is_k, kw1, qw1)
+    w2 = tl.where(is_k, kw2, qw2)
+    for t in tl.static_range(TOKEN_BLOCK):
+        token = tl.program_id(0).to(tl.int64) * TOKEN_BLOCK + t
+        live = token < n_tokens
+        mask = head_mask & live
+        src = tl.where(is_k, k_ptr + token * k_stride_t, q_ptr + token * q_stride_t)
+        x1 = tl.load(src + offsets, mask=mask, other=0.0)
+        x2 = tl.load(src + offsets + half_dim, mask=mask, other=0.0)
+        if DEQUANT:
+            token_scale = tl.load(token_scale_ptr + token, mask=live, other=0.0)
+            scales = tl.where(is_k, k_scale_ptr, q_scale_ptr) + offsets
+            s1 = tl.load(scales, mask=mask, other=0.0)
+            s2 = tl.load(scales + half_dim, mask=mask, other=0.0)
+            x1 = fp8_dequantize_unscaled(x1, token_scale, s1)
+            x2 = fp8_dequantize_unscaled(x2, token_scale, s2)
+            pass_in = tl.where(
+                is_k,
+                v_in_ptr + token * v_in_token_stride,
+                g_in_ptr + token * g_in_token_stride,
+            )
+            pass_scale = tl.where(is_k, v_scale_ptr, g_scale_ptr)
+            pass_out = tl.where(
+                is_k,
+                v_out_ptr + token * v_out_token_stride,
+                g_out_ptr + token * g_out_token_stride,
+            )
+            for half in tl.static_range(2):
+                _dequantize_head_half(
+                    pass_in + offsets + half * half_dim,
+                    pass_scale + offsets + half * half_dim,
+                    pass_out + offsets + half * half_dim,
+                    token_scale,
+                    mask,
+                )
+        else:
+            x1 = x1.to(tl.float32)
+            x2 = x2.to(tl.float32)
+        var = (tl.sum(x1 * x1, axis=1) + tl.sum(x2 * x2, axis=1)) / head_dim
+        inv_rms = tl.rsqrt(var + eps)[:, None]
+        # The normalized head is rounded to the input dtype before RoPE.
+        x1_norm = (x1 * inv_rms * w1).to(INPUT_DTYPE).to(tl.float32)
+        x2_norm = (x2 * inv_rms * w2).to(INPUT_DTYPE).to(tl.float32)
+
+        pos = tl.load(positions_ptr + token, mask=live, other=0).to(tl.int64)
+        cache_offset = pos * cache_stride_p
+        cos = tl.load(
+            cos_sin_cache_ptr + cache_offset + offs, mask=half_mask, other=0.0
+        ).to(tl.float32)
+        sin = tl.load(
+            cos_sin_cache_ptr + cache_offset + half_dim + offs,
+            mask=half_mask,
+            other=0.0,
+        ).to(tl.float32)
+        o1 = x1_norm * cos - x2_norm * sin
+        o2 = x2_norm * cos + x1_norm * sin
+        dst = tl.where(
+            is_k,
+            k_out_ptr + token * k_out_stride_t,
+            q_out_ptr + token * q_out_stride_t,
+        )
+        tl.store(dst + offsets, o1, mask=mask)
+        tl.store(dst + offsets + half_dim, o2, mask=mask)
+    if ENABLE_PDL:
+        # Late trigger: waiting dependents would otherwise hold this launch's SMs.
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def fused_qk_rmsnorm_rope(
@@ -1676,7 +1735,8 @@ def fused_qk_rmsnorm_rope(
     kernel (Beam's sliding layers call it directly) and
     gives its attention layer no norm or rotary step. Where
     ``pdl_enabled()`` it is a programmatic dependent launch that waits on the
-    projection before its first load.
+    projection before its first load and releases its dependents after its
+    last store.
 
     Args:
         q: (n_tokens, num_q_heads * head_dim), rows may be strided
@@ -1716,7 +1776,15 @@ def fused_qk_rmsnorm_rope(
     k_stride = k.stride(0) if k.dim() > 1 else k.shape[-1]
     enable_pdl = pdl_enabled()
     dequant_kwargs = _dequant_launch_kwargs(dequant, q, k, n_tokens)
-    _fused_qk_rmsnorm_rope_kernel[(n_tokens * (num_q_heads + num_kv_heads),)](
+    # One warp per head reduces each half in the same order at any head block.
+    head_block = min(4, triton.next_power_of_2(num_q_heads + num_kv_heads))
+    # Prefill sizes run four tokens per program; fewer programs launch faster (PDL).
+    token_block = 4 if n_tokens >= 512 else 1
+    grid = (
+        triton.cdiv(n_tokens, token_block),
+        triton.cdiv(num_q_heads + num_kv_heads, head_block),
+    )
+    _fused_qk_rmsnorm_rope_kernel[grid](
         q,
         k,
         q_out,
@@ -1725,6 +1793,7 @@ def fused_qk_rmsnorm_rope(
         k_weight,
         cos_sin_cache,
         positions,
+        n_tokens,
         q_stride,
         k_stride,
         q_out.stride(0),
@@ -1737,8 +1806,10 @@ def fused_qk_rmsnorm_rope(
         eps,
         INPUT_DTYPE=tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16,
         HALF_BLOCK=half_block,
+        HEAD_BLOCK=head_block,
+        TOKEN_BLOCK=token_block,
         ENABLE_PDL=enable_pdl,
-        num_warps=max(1, half_block // 64),
+        num_warps=head_block * max(1, half_block // 64),
         num_stages=2,
         **dequant_kwargs,
         **({"launch_pdl": True} if enable_pdl else {}),

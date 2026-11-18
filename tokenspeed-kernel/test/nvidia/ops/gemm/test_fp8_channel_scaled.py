@@ -54,11 +54,15 @@ def _selected(m: int, n: int, k: int, out_dtype=torch.bfloat16) -> str:
 
 def test_channel_scales_select_cutlass_from_the_min_rows_on_aligned_shapes():
     assert _selected(TORCH_FP8_SCALED_MIN_M, 1536, 1024) == "torch_mm_fp8_scaled"
-    # Below it the small-M GEMM takes K in whole 128-element tiles.
-    assert (
-        _selected(TORCH_FP8_SCALED_MIN_M - 1, 1536, 1024)
-        == "triton_mm_fp8_channel_small_m"
+    # Below it the small-M GEMM takes K in whole 128-element tiles. Its tiles
+    # need 120 KiB of shared memory, so SM120 (99 KiB) is not offered it and the
+    # blockscale-capable Triton GEMM takes those rows.
+    small_m = (
+        "triton_mm_fp8_channel_small_m"
+        if kernel_supported("triton_mm_fp8_channel_small_m")
+        else "triton_mm_fp8_scaled"
     )
+    assert _selected(TORCH_FP8_SCALED_MIN_M - 1, 1536, 1024) == small_m
     assert _selected(TORCH_FP8_SCALED_MIN_M - 1, 1536, 1000) == "triton_mm_fp8_scaled"
     assert _selected(TORCH_FP8_SCALED_MIN_M, 1000, 1024) == "triton_mm_fp8_scaled"
     assert _selected(TORCH_FP8_SCALED_MIN_M, 1536, 1000) == "triton_mm_fp8_scaled"

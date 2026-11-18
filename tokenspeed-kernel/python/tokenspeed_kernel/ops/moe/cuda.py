@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.thirdparty.cuda import kimi3_latent_front
+from tokenspeed_kernel.thirdparty.cuda.kimi3_router import sigmoid_bias_topk
 from tokenspeed_kernel.thirdparty.cuda.moe import moe_finalize_fuse_shared
 from tokenspeed_kernel.thirdparty.cuda.routing import (
     hash_softplus_sqrt_topk_flash,
@@ -99,4 +106,131 @@ if routing_available():
     )(cuda_sqrt_softplus_topk)
 
 
-__all__ = ["cuda_sqrt_softplus_topk", "moe_finalize_fuse_shared"]
+@register_kernel(
+    "moe",
+    "sigmoid_bias_topk",
+    name="cuda_kimi3_sigmoid_bias_topk",
+    solution="cuda",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 0),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=frozenset(
+        {format_signature(router_logits=dense_tensor_format(torch.float32))}
+    ),
+    priority=Priority.SPECIALIZED,
+    traits={
+        "tokens_min": frozenset({2560}),
+        "experts": frozenset({896}),
+        "topk": frozenset({16}),
+        "bias_dtype": frozenset({torch.float32}),
+        "inputs_contiguous": frozenset({True}),
+        "normalize_topk_weights": frozenset({True}),
+        "routed_scaling_factor": frozenset({1.0}),
+        "weights_dtype": frozenset({torch.float32}),
+        "ids_dtype": frozenset({torch.int32}),
+        "supports_output_buffers": frozenset({True}),
+    },
+)
+def cuda_kimi3_sigmoid_bias_topk(
+    *,
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    weights_dtype: torch.dtype,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return FP32 normalized top-16 weights and INT32 IDs; see sigmoid_bias_topk."""
+    if (
+        topk != 16
+        or routed_scaling_factor != 1.0
+        or not normalize_topk_weights
+        or (out[0].dtype if out is not None else weights_dtype) != torch.float32
+        or (out is not None and out[1].dtype != torch.int32)
+    ):
+        raise ValueError(
+            "Kimi-K3 CUDA routing requires normalized top-16 weights "
+            "with scale 1, FP32 weights, and INT32 ids"
+        )
+    return sigmoid_bias_topk(router_logits, correction_bias, out=out)
+
+
+__all__ = [
+    "cuda_sqrt_softplus_topk",
+    "cuda_kimi3_sigmoid_bias_topk",
+    "moe_finalize_fuse_shared",
+]
+
+_FRONT_PLATFORM = current_platform()
+if _FRONT_PLATFORM.is_nvidia and kimi3_latent_front.available():
+
+    @register_kernel(
+        "moe",
+        "latent_input",
+        name="cuda_latent_input",
+        solution="cuda",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    hidden_states=dense_tensor_format(torch.bfloat16),
+                    router_weight=dense_tensor_format(torch.bfloat16),
+                    routed_weight=dense_tensor_format(torch.bfloat16),
+                    shared_gate_up_weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            # The fused front pays off from 2048 rows; smaller batches keep the separate
+            # projections (see ops/moe/README.md, "Kimi-K3 front projections"). There is
+            # no upper bound: the plan scales with the row count.
+            "tokens_min": frozenset({2048}),
+            "gate_clamp": frozenset({4.0}),
+            "hidden_size": frozenset({kimi3_latent_front.HIDDEN}),
+            "inputs_contiguous": frozenset({True}),
+            "latent_size": frozenset({kimi3_latent_front.LATENT}),
+            "num_experts": frozenset({kimi3_latent_front.NUM_EXPERTS}),
+            "shared_size": frozenset({kimi3_latent_front.SHARED_INTERMEDIATE}),
+            "up_clamp": frozenset({25.0}),
+        },
+    )
+    def cuda_latent_input(
+        hidden_states: torch.Tensor,
+        router_weight: torch.Tensor,
+        routed_weight: torch.Tensor,
+        shared_gate_up_weight: torch.Tensor,
+        *,
+        gate_clamp: float,
+        up_clamp: float | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fused Kimi-K3 router / latent / shared-input projections; see kimi3_latent_front."""
+        if gate_clamp != 4.0 or up_clamp != 25.0:
+            raise ValueError("the Kimi-K3 CUDA front requires SiTU clamps 4 and 25")
+        rows = hidden_states.shape[0]
+        logits = torch.empty(
+            (rows, router_weight.shape[0]),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+        latent = hidden_states.new_empty((rows, routed_weight.shape[0]))
+        shared_act = hidden_states.new_empty(
+            (rows, shared_gate_up_weight.shape[0] // 2)
+        )
+        return kimi3_latent_front.front(
+            hidden_states,
+            router_weight,
+            routed_weight,
+            shared_gate_up_weight,
+            logits,
+            latent,
+            shared_act,
+        )
+
+    __all__.append("cuda_latent_input")

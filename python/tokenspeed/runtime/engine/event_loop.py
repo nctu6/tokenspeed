@@ -31,8 +31,8 @@ import setproctitle
 import torch
 import torch.distributed as dist
 import zmq
+from tokenspeed_engine.scheduler import Scheduler
 from tokenspeed_kernel.compile_monitor import compile_stats
-from tokenspeed_scheduler import Scheduler
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
@@ -57,13 +57,15 @@ from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks
 from tokenspeed.runtime.engine.load_snapshot import create_load_reporter
 from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
 from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
+from tokenspeed.runtime.engine.rank_setup import (
+    scheduler_config_from_args as rank_setup_scheduler_config,
+)
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     RequestHistoryRows,
     advance_scheduler,
     engram_context_len,
     input_logprob_plan_for_forward,
-    make_config,
     ngram_inputs_for_forward,
     resolve_dspark_prefix_replay_tokens,
     sampled_top_k_for_forward,
@@ -74,8 +76,10 @@ from tokenspeed.runtime.engine.scheduler_utils import (
 from tokenspeed.runtime.epd.prefill_hooks import EpdPrefillHooks
 from tokenspeed.runtime.execution.device import (
     DeviceRole,
+    ForwardThreadDevice,
     arm_data_plane_sync_debug,
     build_device_side,
+    build_kv_transfer,
     maybe_control_plane_guard,
 )
 from tokenspeed.runtime.execution.distributed_initializer import (
@@ -163,51 +167,52 @@ def scheduler_config_from_args(
     *,
     max_scheduled_tokens: int,
     max_batch_size: int,
+    max_resident_requests: int,
     decode_input_tokens: int,
     overlap_schedule_depth: int,
     enable_kv_cache_events: bool,
     prefix_replay_tokens: int,
 ):
-    """The C++ scheduler's config from the server arguments and the device build.
+    """The C++ scheduler's config for this in-process loop.
 
-    One place turns the two into ``make_config``'s arguments, so the knobs an
-    engine does not have -- the L3 prefetch threshold without an L3 store --
-    are translated here, not left as None for the binding.
+    The config is built by ``rank_setup.scheduler_config_from_args`` (the
+    ``tokenspeed_engine`` binding), so the loop and the Rust host's ranks pass
+    ``make_config`` the same arguments. See merge_main_1117.md, C2.
+
+    The scheduler's L3 protocol (``SchedulerConfig.storage_config``) is driven
+    by the engine host's L3 executor, which this loop does not run, so a
+    storage backend is refused instead of enabling a scheduler tier that no one
+    serves.
 
     Args:
         server_args: The resolved server arguments.
-        specs: The ``DeviceSpecs`` of the built device side: the cache
-            geometry, the cache groups and the Host tiers' page counts.
+        specs: The ``DeviceSpecs`` of the built device side.
         max_scheduled_tokens: Per-step prefill token budget.
         max_batch_size: Rank-local batch slots.
+        max_resident_requests: Rank-local resident request slots.
         decode_input_tokens: Verify width per decode step.
         overlap_schedule_depth: Dispatched-but-uncommitted plans allowed.
         enable_kv_cache_events: Whether KV cache events are published.
         prefix_replay_tokens: DSpark prefix replay tokens, 0 without.
     """
-    geometry = specs.cache_geometry
-    has_l3 = server_args.kvstore_storage_backend is not None
-    return make_config(
-        num_device_pages=geometry.num_device_pages,
+    if server_args.kvstore_storage_backend is not None:
+        raise NotImplementedError(
+            "The in-process event loop does not run the L3 storage executor "
+            "that the scheduler's storage protocol needs; serve with "
+            "--kvstore-storage-backend through the engine host "
+            "(merge_main_1117.md, C2)."
+        )
+    return rank_setup_scheduler_config(
+        server_args,
+        specs,
+        storage_config=None,
         max_scheduled_tokens=max_scheduled_tokens,
         max_batch_size=max_batch_size,
-        prefix_granularity=geometry.prefix_granularity,
-        num_host_pages=specs.num_host_pages,
-        disable_l2_cache=not server_args.enable_kvstore,
-        enable_l3_storage=has_l3,
-        role=server_args.disaggregation_mode,
-        num_snapshot_pages=specs.num_snapshot_pages,
-        max_retracted_requests=specs.max_retracted_requests,
-        # The threshold is unset (None) without a store; the binding takes 0.
-        l3_prefetch_min_pages=server_args.kvstore_prefetch_min_pages if has_l3 else 0,
-        debug_force_retraction_interval=server_args.debug_force_retraction_interval,
-        enable_kv_cache_events=enable_kv_cache_events,
+        max_resident_requests=max_resident_requests,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
-        disable_prefix_cache=not server_args.enable_prefix_caching,
+        enable_kv_cache_events=enable_kv_cache_events,
         prefix_replay_tokens=prefix_replay_tokens,
-        cache_groups=specs.cache_groups,
-        enable_mixed_prefill_decode=server_args.enable_mixed_batch,
     )
 
 
@@ -309,8 +314,19 @@ class EventLoop:
             overlap_schedule_depth=self.overlap_schedule_depth,
             decode_input_tokens=decode_input_tokens,
             max_batch_size=per_rank_max_batch,
+            # PD decode keeps extra slots for requests waiting on remote KV.
+            max_resident_requests=(
+                per_rank_max_batch + server_args.disaggregation_decode_extra_slots
+            ),
+            kv_transfer_builder=build_kv_transfer,
         )
-        self._device = device.handle
+        # The one DeviceHandle, run on this engine's forward thread.
+        self._device = ForwardThreadDevice(
+            device.handle,
+            device=server_args.device,
+            kv_transfer=device.transfer,
+            l3_storage=server_args.kvstore_storage_backend is not None,
+        )
         specs = device.specs
         self.multimodal_encoder_dtype = specs.multimodal_encoder_dtype
         self.cache_storage = specs.cache_storage
@@ -421,6 +437,9 @@ class EventLoop:
             specs,
             max_scheduled_tokens=max_scheduled_tokens,
             max_batch_size=per_rank_max_batch,
+            max_resident_requests=(
+                per_rank_max_batch + server_args.disaggregation_decode_extra_slots
+            ),
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=self.overlap_schedule_depth,
             enable_kv_cache_events=self._kv_events_enabled,
@@ -1242,7 +1261,9 @@ class EventLoop:
                     # read that drives the in-flight accounting also yields
                     # the round's preemption count (0 on rounds without
                     # retraction, which are the overwhelming majority).
-                    num_retracted = self._cache_hooks.count_plan_ops(execution_plan)
+                    num_retracted = self._cache_hooks.count_plan_ops(
+                        execution_plan, request_admission=self._admission_id
+                    )
                     if num_retracted:
                         self.metrics.record_preemptions(num_retracted)
                     # A capacity retraction whose victim could not be imaged
@@ -1310,8 +1331,12 @@ class EventLoop:
 
                         self._mark_stats_scheduled(forward_op)
                         self._record_request_queue_time(forward_op)
+                        planned_admission_ids = tuple(
+                            self._admission_id(rid) for rid in forward_op.request_ids
+                        )
                         planned = PlannedForward(
                             forward_op=forward_op,
+                            admission_ids=planned_admission_ids,
                             sampling_params_list=sampling_params_list,
                             dp_metadata=dp_metadata,
                             grammar_inputs=grammar_inputs,
@@ -1327,6 +1352,7 @@ class EventLoop:
                                     forward_op,
                                     self.output_processor.rid_to_state,
                                     self._max_encoder_tokens,
+                                    planned_admission_ids,
                                 )
                                 if self.model_config.is_multimodal_active
                                 else None
@@ -1343,7 +1369,11 @@ class EventLoop:
                     # transfers ride the FIFO first, then the batch the role
                     # routes. ``planned`` is None on idle/empty rounds — the
                     # plan hygiene still runs.
-                    pending = self._device.execute(execution_plan, planned)
+                    pending = self._device.execute(
+                        execution_plan,
+                        planned,
+                        request_admission=self._admission_id,
+                    )
                     if need_idle_forward:
                         self._device.run_idle_forward(dp_metadata)
                     if pending is not None:
@@ -1436,6 +1466,10 @@ class EventLoop:
                 continue
             state.queue_time_recorded = True
             self.metrics.observe_request_queue_time(now - state.scheduler_enqueue_time)
+
+    def _admission_id(self, rid: str) -> int:
+        """The admission identity of a live request (``RequestState``)."""
+        return self.output_processor.rid_to_state[rid].admission_id
 
     def _gather_sampling_params(self, forward_op) -> list[SamplingParams]:
         """Look up per-request SamplingParams from the output processor. The

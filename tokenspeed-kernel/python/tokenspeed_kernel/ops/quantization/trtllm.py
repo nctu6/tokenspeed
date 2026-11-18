@@ -27,43 +27,45 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.thirdparty.cuda.trtllm_fp8_quant import (
+    fp8_quantize_1x128,
+    quantize_e4m3_activation,
+)
 
 platform = current_platform()
+_IS_NVIDIA = platform.is_nvidia
 __all__ = []
 
-if platform.is_nvidia:
-    # DeepEP must initialize before TRT-LLM's static CUDA runtime.
-    import deep_ep  # noqa: F401
-    import trtllm_kernel  # noqa: F401
+
+def _per_token_group_quant_8bit(
+    x: torch.Tensor, group_size: int, use_ue8m0: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if group_size != 128:
+        raise ValueError(
+            "trtllm fp8_quantize_1x128 only supports group_size=128, "
+            f"got {group_size}"
+        )
+    q, scale = fp8_quantize_1x128(x, use_ue8m0)
+    if scale.ndim == 1:
+        # The flat-buffer ABI (also the DeepGEMM TMA buffer some SM90 builds
+        # return) is a flat, over-allocated [groups, rows rounded up to 4]
+        # column-major block. Canonicalize to the contiguous [groups, rows]
+        # view the 2-D form uses.
+        rows = x.numel() // x.shape[-1]
+        groups = x.shape[-1] // group_size
+        aligned = (rows + 3) // 4 * 4
+        scale = scale[: groups * aligned].view(groups, aligned)[:, :rows].contiguous()
+    return q, scale
+
+
+if _IS_NVIDIA:
 
     _FP8_DTYPE = torch.float8_e4m3fn
-
-    def _per_token_group_quant_8bit(
-        x: torch.Tensor, group_size: int, use_ue8m0: bool
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if group_size != 128:
-            raise ValueError(
-                "trtllm fp8_quantize_1x128 only supports group_size=128, "
-                f"got {group_size}"
-            )
-        q, scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
-        if scale.dim() == 1:
-            # Some builds (SM90) return the DeepGEMM TMA buffer: a flat,
-            # over-allocated [groups, rows rounded up to 4] column-major
-            # block. Canonicalize to the contiguous [groups, rows] view the
-            # 2-D form uses.
-            rows = x.numel() // x.shape[-1]
-            groups = x.shape[-1] // group_size
-            aligned = (rows + 3) // 4 * 4
-            scale = (
-                scale[: groups * aligned].view(groups, aligned)[:, :rows].contiguous()
-            )
-        return q, scale
 
     def _per_token_quant_fp8(
         input: torch.Tensor, output: torch.Tensor, scale: torch.Tensor
     ) -> None:
-        q, s = torch.ops.tensorrt_llm.quantize_e4m3_activation(input)
+        q, s = quantize_e4m3_activation(input)
         output.copy_(q)
         scale.copy_(s.float().squeeze(-1))
 
@@ -110,7 +112,7 @@ if platform.is_nvidia:
             # The op's own codes and its scales as FP32 [..., 1]: one launch,
             # no copies into new buffers (the scales are reshaped, or
             # converted only if the op wrote another dtype).
-            q, scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(x)
+            q, scale = quantize_e4m3_activation(x)
             if q.dtype != _FP8_DTYPE:
                 raise ValueError(f"TRT-LLM token FP8 wrote {q.dtype}, not E4M3")
             return q.reshape(x.shape), scale.float().reshape(*x.shape[:-1], 1)

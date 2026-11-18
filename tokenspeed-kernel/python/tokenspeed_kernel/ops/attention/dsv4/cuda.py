@@ -21,6 +21,7 @@
 """CUDA DeepSeek V4 attention kernels."""
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -195,7 +196,7 @@ def _dsv4_fp8_row_bytes(head_dim: int, rope_dim: int = 64) -> int:
     return nope_dim + 2 * int(rope_dim) + nope_dim // 64 + 1
 
 
-if platform.is_nvidia and platform.is_hopper_plus:
+if platform.is_nvidia and platform.is_hopper_plus and has_optional_package("flash_mla"):
 
     @register_kernel(
         "attention",
@@ -292,7 +293,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         return (result, lse) if return_lse else result
 
 
-if platform.is_nvidia and platform.is_hopper_plus:
+if platform.is_nvidia and platform.is_hopper_plus and has_optional_package("flash_mla"):
 
     @register_kernel(
         "attention",

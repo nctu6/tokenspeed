@@ -1,20 +1,163 @@
 # Event loop: design principles
 
-This document records the design principles of the scheduler event loop
-(`python/tokenspeed/runtime/engine/event_loop.py`). It is the reference for
+This document records the design principles of the scheduler event loop: the
+Rust control plane every engine rank runs (`tokenspeed-engine/crates/ts-control`,
+started by the `ts-host` binary) and its boundary to the Python data plane
+(`python/tokenspeed/runtime/engine/rust_host.py`). It is the reference for
 where new logic belongs, how components feed results back into the scheduler,
 and what the loop body itself is allowed to contain. The rules below are
 deliberate; treat deviations as bugs in review.
 
+## The process
+
+One engine rank is one `ts-host` process. Its threads:
+
+| thread | runs | holds |
+| --- | --- | --- |
+| control (`ts-host` main) | `ts_control::event_loop::EventLoop`: the frontend wire, the collectives between ranks, the C++ scheduler, commit post-processing, control operations; the data plane's completion queries | the scheduler, every request's state, the collective mesh; the GIL only during a completion query |
+| forward (`ts-forward`) | the Python `HostDataPlane`'s operations, one at a time in queue order: everything that touches CUDA | the `DeviceHandle`, behind it the executor, models, KV pools, CUDA graphs; takes the GIL per operation |
+
+Peripheral threads stay off the round: the wire's Tokio runtime
+(`ts_control::transport`, which also encodes each round's outputs), the PD
+transfer peer's workers (`ts-pd`), the grammar compilers, the KV event
+publisher, the expert-rebalance solver.
+
+Request traces use a bounded, lossy background queue. Plugins register a provider
+with `register_trace_provider`, selected explicitly by `--trace-provider NAME`.
+The provider maps a request ID to `(trace_id, optional_parent_span_id)` or `None`;
+ID policies belong to plugins. It runs only on the export thread and must be
+short and nonblocking, without I/O or GPU access. Missing or invalid context
+preserves native IDs; span lifecycle and RID sampling remain unchanged.
+
+With `--enable-async-logging`, the Rust tracing writer and Python root logger
+also run off the serving threads. Each has a bounded, lossy queue: a slow
+output stream must not introduce I/O backpressure into a round. The host
+owns Python log cleanup explicitly after serving returns, including errors
+and encode ranks. Returning from Rust does not finalize Python, so an
+`atexit` hook alone cannot drain those records. Cleanup is bounded because
+an output stream can remain stalled.
+
+The ranks of a replica (an attention-TP group, across every pipeline stage)
+run the same scheduler. They talk over `ts-collective`'s TCP mesh, in fixed
+groups (`Ranks`): the replica, the pipeline (one rank per stage), the
+attention-DP world, the EP group. The replica's first member owns the frontend
+connection and relays each round's messages (`relay.rs`), so every member
+admits the same requests in the same round; only it sends outputs. With
+attention DP the replicas' schedulers differ but their forwards run in step:
+each round every rank shares its batch's size, and a rank with none runs an
+idle forward when another has one. A stop request rides those collectives, so
+every rank stops after the same round; a frontend that is gone (its input
+socket closed, which does not reconnect) stops the engine the same way. One
+rank is the same path with groups of one.
+
+The launcher (`entrypoints/engine.py`) starts the ranks through
+`start_rust_host`, whatever the deployment: `ts serve` (SMG's gateway on its
+direct ZMQ lane, which binds the frontend sockets) and `ts serve --headless`
+for an external frontend such as Dynamo's. Each rank dials the frontend's
+handshake socket. An EPD encode node's ranks run the host's encode mode instead
+(`ts-control`'s `encode` loop over `epd/encode_host.py`): no scheduler, no
+event loop. Their first rank dials the frontend the same way and takes
+encode requests.
+
+The launcher snapshots each rank's environment inside its start context so
+allocator preload hooks reach the child along with the native logging defaults.
+
+What an engine registers with tells its frontend what it serves: the
+request types it takes (an encode server takes encode requests only), the
+field order of the positional structs on its wire, its role and, for a
+prefill or encode server, where its bootstrap server listens, and the
+checkpoint facts a frontend computes multimodal positions from. A frontend
+may name a control operation by method (a control call, as SMG's gateway
+calls every scheduler it drives); the transport turns it into the engine's
+own operation and answers it under its call id once the operation's reply
+comes back, so the loop sees only its own operations.
+
+Scheduler load travels on the same output wire, including an empty batch at
+startup and at most once per second without token outputs. Reports carry
+running and waiting counts and resident, active, and total LCM blocks; the
+active count is at most 100 ms old (see the page gauges below). The
+native frontend timestamps receipt and exposes a complete per-rank snapshot
+set to the gateway only while every report is less than three seconds old.
+The gateway converts these allocator counts to capacity ratios; it must not
+interpret an LCM block as a fixed-size token page.
+
+## Request identity and submission failures
+
+The wire identifies a request and its output stream by `rid` alone. A new
+request, including a retry after abort, should use a fresh id. Before ingress
+can publish a refusal or register data-plane state, the loop discards repeated
+ids in the same received round and ids still owned by the output processor.
+The original request keeps its state and stream; a warning records the
+duplicate. Sending a final error for that duplicate would end the original
+stream, since the wire cannot distinguish the two submissions.
+
+Output completion and scheduler retirement are separate fences. After the
+output processor forgets a request, the scheduler may still hold it while
+forward results drain or until the next plan removes its finished entry.
+An id in that interval receives a 409 refusal before data-plane admission.
+The check uses the scheduler's existing request lookup; it does not reclaim
+an id ahead of its in-flight work. Once both owners have released an id, this
+admission guard allows it again.
+
+Each accepted request gets a monotonically increasing admission identity
+before data-plane registration. The output processor allocates it once;
+the Python request record, planned forwards and snapshot/restore operations
+carry that same value. External `rid` remains the wire and scheduler lookup
+key. Reusing it after retirement creates a new admission, while chunks,
+decode steps and retraction keep the existing admission identity. Slot-state
+owners compare admissions so a recycled row cannot retain a previous
+request's stop criteria or sampling state. Identity allocation is independent
+of the sampling seed and does not retain a history of external request IDs.
+
+Cache-op adaptation resolves the admission while the host still holds the
+request record and stores it in the immutable operation. No asynchronous
+completion resolves a potentially recycled `rid` to infer slot ownership.
+The identity is local to the engine lifetime, like its slot-state images;
+it is not a cross-engine or persistent-cache key.
+
+The Rust/C++ submission bridge returns `Result`: native validation exceptions
+must never escape a `noexcept` bridge. The scheduler validates a complete
+submission batch before inserting requests. If it rejects the batch, the
+loop finishes and releases those unscheduled requests with a client error
+and continues serving; it starts PD transfers only after submission succeeds.
+Already running requests remain intact. Other requests in a rejected batch
+also receive its error and can be retried with fresh ids.
+
 ## Principle 1: the loop runs no GPU work, and cannot reach any
 
-The event loop is the **control plane**: ZMQ input, gloo collectives, the C++
-scheduler, commit post-processing. `ForwardThread`
-(`execution/forward_thread.py`) is the **data plane**: one thread per rank,
-FIFO, everything that touches CUDA. A control-plane round is microseconds, so
-the cross-rank collectives that keep the redundant schedulers aligned always
-find every rank promptly, however deep the GPUs are in queued work — a stage's
-launch-queue backpressure stalls only its own forward thread, never the round.
+The event loop is the **control plane**. The forward thread is the **data
+plane**: one thread per rank, FIFO, everything that touches CUDA. A
+control-plane round is microseconds, so the cross-rank collectives that keep
+the redundant schedulers aligned always find every rank promptly, however
+deep the GPUs are in queued work — a stage's launch-queue backpressure stalls
+only its own forward thread, never the round.
+
+The control thread cannot run device work by construction: it is Rust and
+holds no torch object. Its only way to the device is the `DataPlane` trait
+(`event_loop.rs`), which `ts-host`'s `PythonDataPlane` (`data_plane.rs`)
+implements over the Python `HostDataPlane` (`engine/rust_host.py`): every
+operation that issues or orders device work, or changes the data plane's
+state, is queued for the forward thread, and fire-and-forget unless the loop
+needs its answer (a DP idle forward, the low-rate control operations), so a
+slow forward thread delays nothing but its own queue. The completion
+queries — a launched forward's results and the cache acknowledgments — read
+what landed and touch no stream, and the control thread calls them itself,
+taking the GIL for the call: queued,
+the round head would wait for every forward still being launched. A commit
+waits for the forward thread to have launched its forward, then on the
+forward's copy event, which releases the GIL while it waits. Taking the GIL
+can wait for the forward thread's Python, up to the interpreter's switch
+interval; its launches and NCCL waits release it. A round with nothing for
+the device (no batch, no cache op, no remote stream: `plan.needs_device()`)
+queues nothing: a loop waiting on a transfer would otherwise hand the forward
+thread an empty plan per round, each costing a turn of the GIL.
+
+The control thread's Python calls run under a thread-local dispatch guard
+(`maybe_control_plane_guard` in `device.py`, on by default), entered while
+it serves: any CUDA tensor op from it raises. Event waits — the inbound
+channel — and metadata-only view ops pass untouched. Neither submits device
+work. `TOKENSPEED_GUARD_CONTROL_PLANE=0` is the escape hatch for a deployment
+that trips on an unrouted op (report it).
 
 FIFO describes submission ownership, not a promise that every model kernel
 uses one CUDA stream. Model kernels may share main-stream scratch and
@@ -23,17 +166,23 @@ ordered on that stream. Work deliberately forked to a side stream must use
 private storage or establish an ordering edge before touching a shared layout.
 Joining the side stream later does not make concurrent reuse safe.
 
-**Visibility**, not discipline, enforces this. `build_device_side`
+**Visibility**, not discipline, enforces the rest. `build_device_side`
 (`execution/device.py`) constructs the model runners, attention backends, KV
 pools and executor as its own locals, and returns one `DeviceBuild`, split by
 how long the caller may hold each piece:
 
 | | what it is | lifetime |
 | --- | --- | --- |
-| `DeviceSpecs` | plain values the loop plans with: cache geometry, cache groups, speculation widths, capability flags | keep forever |
-| `DeviceHandle` | the running handle: the complete list of what the loop may ask of the device side | the only one stored (`self._device`) |
-| `transfer` | the PD peer's CONTROL face — bootstrap register/abort, event polling — or None outside PD | held by the PD hooks |
+| `DeviceSpecs` | plain values the control plane plans with: cache geometry, cache groups, speculation widths, capability flags | keep forever |
+| `DeviceHandle` | the running handle: the complete list of what the control plane may ask of the device side | held by the data plane (`HostDataPlane`) only |
+| `transfer` | the PD peer's settings and device fences (`pd/host_peer.py`): what the Rust transfer peer starts from, and what hands it each plan's remote stream; None outside PD | handed to `ts-pd` at startup, held by the handle |
+| `host_cache` | shared Host resources, the CPU cache layout and the resolved attention choices; no Device buffers or executor | consumed at startup, by the L3 settings (`cache/l3/factory.py`) |
 | `encoder_model_facts` | a callable resolving the encoder facts EPD admission needs (raises on text-only) | consumed at startup, past the EPD gate |
+
+`HostBootstrap` (`rust_host.py`) turns the build into what the Rust side
+takes: the scheduler, a plain `HostConfig` (with L3, the settings the host
+starts its L3 executor from), and the data plane holding the handle. Nothing
+else of the build crosses.
 
 Encoder facts describe the transferred tensor, independently of the language
 embedding width. A model may declare `get_encoder_output_spec()` as a width and
@@ -47,9 +196,24 @@ ranks have completed admission.
 
 `build_device_side` builds the device side **complete**, not built-then-wired:
 it constructs the transfer peer from its prepared components and startup
-arguments, and reads the engine's role off the peer once, at construction. An
-earlier shape had the loop assemble the peer and hand it back through a setter,
-which left the role mutable after startup for no reason.
+arguments, and reads the engine's role off it once, at construction.
+
+The transfer itself is the host's (`ts-pd`): the routes between unequal rank
+sets, the block manifests read off each plan's block tables, the layerwise
+chunks and the copies are planned there, over the cache transfer contract the
+data plane built at startup. The forward thread stages each plan's remote
+stream with the peer before it hands the plan to the data plane; the data
+plane hands the stream over (`execute`) once its device prerequisites are
+met -- on a Prefill rank behind the drafter's pending round, whose KV goes
+too; on a Decode rank behind the plan's page zeroing, as the Prefill ranks'
+writes are not ordered with the device's -- and the forward thread checks it
+did. On a Prefill rank streaming layerwise, the forward thread arms the
+forward's chunks when it hands the plan over and counts the producer steps;
+the attention backends only tick the device counter (`StepCounter`).
+Each armed producer step gets one tick, after all of its cache writes have
+been queued on the producer stream. Splitting a layer's DSA index-cache write
+into kernel-sized chunks does not add producer steps: only the final chunk
+publishes cache readiness.
 
 Common MoE weight processing reserves persistent DeepEP communication
 storage, before attention/cache construction profiles available memory. The
@@ -63,8 +227,8 @@ backends, pools, cache storage, field placement/readiness and optional logical p
 `build_device_side` consumes this result locally and passes stage field
 placement, producer readiness and `logical_plan` explicitly through PD
 construction to `get_kv_args`.
-These startup dependencies stay within device construction. The event loop
-never sees the build result or its ownership/layout fields.
+These startup dependencies stay within device construction. The control
+plane never sees the build result or its ownership/layout fields.
 
 The handle owns BOTH executors of a scheduler plan, and treats their work
 identically: a model forward runs asynchronously on the GPU, and handing a
@@ -78,57 +242,60 @@ batch slot, and go out even on rounds with no batch at all — everything
 dispatchable dispatches in one round; nothing is ever withheld after
 planning (an L3 object is fetched into Host before its request is admitted,
 so no planned forward or remote stream depends on a fetch that can miss).
-The transfer moves
-KV-pool device memory over RDMA rather than through a CUDA kernel, but it
-needs the same ordering against forwards and page zeroing — so its execution
-face lives behind the handle too, attached once at startup. Its control face
-(bootstrap register/abort, event polling, `pop_*`) stays on the control
-plane, where it feeds Principle 3's tail advance.
+The transfer itself is the Rust peer's (`ts-pd`, over the Mooncake C API):
+its workers write KV-pool device memory over RDMA, ordered against forwards
+and page zeroing because the forward thread hands each remote stream to the
+peer in the plan's own order, behind the forwards and the zeroing. Its control face — request
+registration and abort, the per-round agreement on transfer progress — is the
+loop's `TransferPeer` (`pd.rs`), where it feeds Principle 3's tail advance.
 
 Consequences:
 
-* The loop cannot **name** a model runner, backend or KV pool, so it cannot
-  pass one implicitly or mutate one a forward is still using. Locals count
-  too: a name it can write is a name a later change can keep.
+* The control plane cannot **name** a model runner, backend or KV pool, so it
+  cannot pass one implicitly or mutate one a forward is still using.
 * A new device interaction that runs once at startup belongs **inside the
-  builder**; it belongs on `DeviceHandle` only when the running loop genuinely
-  needs it — the second widens what the loop can do to the GPU mid-flight.
-  Hand over the capability, never the object.
-* Every method on the handle is a **named operation**, with one registered
-  exception: `run_multimodal_work`, because multimodal feature lifecycle is a
-  state machine reached from several control-plane points (EPD admission's
-  stage/drain device half; the commit-side SHM release). A generic "run this
-  closure" slot is the hole this whole design closes, so a second KIND of
-  user does not join it — it gets its own name.
-  L3 adds named Host-tier operations for the existence probe,
-  the prefetch lane's progress and completion (the hooks converge them each
-  round), namespace and weight-version changes, and cache shutdown. These
-  keep the executor and Host buffer hidden; they do not introduce another
-  generic work slot. The
+  builder**; it belongs on `DeviceHandle` (and the `DataPlane` trait) only
+  when the running loop genuinely needs it — the second widens what the loop
+  can do to the GPU mid-flight. Hand over the capability, never the object.
+* Every method on the handle is a **named operation**; a generic "run this
+  closure" slot is the hole this whole design closes. The multimodal feature
+  lifecycle needs none: EPD admission and the release of a request's SHM
+  features are data-plane operations themselves, run on the forward thread.
+  L3 is resolved separately at startup by `cache/l3/factory.py`, using
+  the builder's Host resource and CPU-only payload facts. `DeviceBuild` does
+  not create an L3 schema, namespace, store or workers, and `DeviceSpecs`
+  carries no L3 settings. The factory derives the schema and deployment
+  identity from neutral Host resources and model configuration; see
+  [asynchronous L3](async-l3-cache.md#ownership). The host runs the
+  resulting Host-only executor (`ts-l3`) in Rust; its workers cannot reach
+  the device handle or the interpreter. The control plane submits the
+  storage subset of `plan.cache` to it independently from device work, and
+  its completion facts enter the head feedback point. The
   retraction snapshot pool adds no operation at all: its stores ride
   `execute` with the write-backs, its restores with the load-backs, its ACKs
   `poll_cache_results`, and `shutdown_cache` closes it with L2 -- one
   `HostCacheExecutor` behind the handle, two Host buffers inside it. The
-  plan's cache ops cross the handle through one adapter,
+  plan's cache ops are adapted once, by the data plane, through
   `scheduler_utils.cache_ops_from_plan`: the L2 batches (`Cache.WriteBackOp`,
   `Cache.LoadBackOp`) pass through, and the scheduler's batched
   `Cache.SnapshotOp` / `Cache.RestoreOp` become one per-request `SnapshotOp`
   / `RestoreOp` (`cache/transfer/ops.py`) each -- the executor's unit of
-  work, one slot exported or imported, one ACK. `CacheOpHooks.count_plan_ops`
-  counts through the same adapter, so what is counted is what is submitted;
-  its return value — the plan's per-request `SnapshotOp` count, one per
-  retraction victim — is the round's preemption count, exported as
+  work, one slot exported or imported, one ACK. The control plane counts the
+  plan's Device ops from the same plan (`CacheOps::dispatched`) and
+  `DeviceHandle.execute` consumes the same Device-op tuple, so what is
+  counted is what is submitted; the plan's per-request snapshot store count,
+  one per retraction victim, is the round's preemption count, exported as
   `tokenspeed:num_preemptions_total`.
   The `EXPERT_LOAD` profile activity adds two more named operations,
   `reset_expert_load` and `dump_expert_load`: the routing kernels bump the
   expert placement's load counters on the execution stream, so zeroing and
   reading them back ride the forward thread on that stream (the read-back is
   a deliberate, low-rate host wait, like the other `run_*` methods). The
-  dump is rank-local by contract -- it runs no collective. A profile stop
-  reaches attention-DP workers independently (each DP worker receives
-  `stop_profile`), so a rank reducing inside the request would block in the
-  collective while its peer is still in `_dp_sync_and_check`.
-  `--init-expert-location` sums the ranks' records where it consumes them.
+  dump is rank-local by contract -- it runs no collective: a profile stop
+  reaches every attention-DP engine independently, so a rank reducing inside
+  the request would block in the collective while its peer is still in the
+  round's DP agreement. `--init-expert-location` sums the ranks' records
+  where it consumes them.
   Online expert rebalancing (`--enable-eplb`) adds two more named
   operations on the same counters: `snapshot_expert_load` (read the window
   to the host and zero it, one stream-ordered step) and
@@ -137,64 +304,62 @@ Consequences:
   layer's routing tables switched in place after its slots landed, and a
   final execution-stream synchronization so a P2P failure surfaces in the
   op). Both are rank-local on the handle. The rebalance may reduce the
-  snapshot over the EP group because its ops ride the same-round gate
+  snapshot over the EP group because its steps ride the same-round gate
   (below), unlike the profile's dump.
   Changing this surface requires updating this contract.
-* The role is a **value** (`DeviceRole`), not a class hierarchy. Subclassing
-  per role forced the handle to publish its own internals so the subclasses
-  could call back into it — a reference cycle for about a dozen lines of
-  difference. With every remote op on its own plan stream, the batch needs
-  no per-role reading at all: a `ForwardBatch` is model work, full stop, and
-  a DP rank counts work by asking whether the batch has tokens.
-* Collaborators **receive** the handle in their constructor. Do not reach it
-  through another object (`loop._device...`): a traversal is the seam the next
-  change widens, first to the handle and then to whatever it exposes.
-* On the per-round path only commit waits, through `PendingExecution.result()`:
-  join the forward thread's future (launches issued), then its copy event (D2H
-  landed). Dispatch never waits — it submits model forwards and the peer's
-  remote prefills/decodes alike fire-and-forget, which is what keeps a
-  backpressured stage off the control plane. The remote submissions' only
-  failure surface is a settle at the next round's `execute` (their semantic
-  completion arrives through the transfer events; a submission that RAISED
-  produces none, so the settle must not swallow it). A raise is therefore
-  for broken invariants only: a transfer worker, the bootstrap thread or
-  another Prefill rank can fail a request's transfer while its submission
-  waits on the FIFO, and that submission then does nothing for the request,
-  whose failure arrives as its transfer event. The handle's remaining
-  `run_*` methods do block, deliberately — the DP idle forward, the landing of a
-  completed remote prefill, the KV repair after a wake, the RL weight sync —
-  but each is a low-rate path whose caller cannot proceed without the result
-  (the landing's failure must surface BEFORE the scheduler advances the
-  request into decode). A new blocking method on the per-round path is a bug.
+* The role is a **value** (`DeviceRole`), not a class hierarchy. With every
+  remote op on its own plan stream, the batch needs no per-role reading at
+  all: a `ForwardBatch` is model work, full stop, and a DP rank counts work
+  by asking whether the batch has tokens.
+* On the per-round path only commit waits: for the forward thread to have
+  launched the forward, then on its copy event (D2H landed). Dispatch never
+  waits — it queues model forwards and the peer's remote prefills/decodes
+  alike, which is what keeps a backpressured stage off the control plane. A
+  raise is for broken invariants only: a transfer worker or another Prefill
+  rank can fail a request's transfer while its submission waits, and that
+  submission then does nothing for the request, whose failure arrives as its
+  transfer state. The loop waits for the DP idle forward and the low-rate
+  control operations (memory release and resume, the RL weight sync, the
+  expert rebalance's steps, profiling), whose callers cannot proceed without
+  the result; on the forward thread, the landing of a completed remote
+  prefill and the KV repair after a wake complete before anything queued
+  behind them runs. A new blocking operation on the per-round path is a bug.
 * Keep per-forward state resets asynchronous on the execution stream too.
   Use device-side scalar fills for indexed flags: assigning a Python scalar
   through tensor indexing can stage a CPU tensor and introduce a hidden
   synchronous H2D copy, blocking further forward launches.
 
-A thread-local dispatch mode over the loop also enforces the rule
-mechanically, on by default: it raises on any CUDA tensor op run from the
-control thread. Event waits — the inbound channel — and metadata-only view
-ops pass untouched. Neither submits device work.
-``TOKENSPEED_GUARD_CONTROL_PLANE=0`` is the escape hatch for a deployment
-that trips on an unrouted op (report it). EPD prefill admission, the one
-known violator, now crosses through ``DeviceHandle.run_multimodal_work``:
-receive-buffer allocation, the publish clone/scatter, and the NCCL shard
-reassembly all run on the forward thread — which also puts the reassembly
-broadcasts on the same issuing thread as the model's collectives, restoring
-the cross-rank launch-order guarantee the old non-overlap-loop assumption
-provided.
+An external-encoder receiver's first stage receives each multimodal item's embedding
+through the host's embedding receiver (`ts-pd`'s `epd::receiver`): it looks
+up and registers with the encode ranks, leases each item a slot of the
+receive pools and tells the encode rank where to write, and every round
+reports each staged request's state, which the replica MIN-reduces, so a
+request is admitted, or failed, on every rank in the same round. Later
+pipeline stages hold no receiver and agree with whatever the first decides;
+decode builds none. Aggregated serving opts into the same receive admission with
+--enable-external-encoder: it owns a standalone Mooncake transport and remains
+a Plain execution role, with no P/D KV peer. A PD Prefill receiver shares its
+KV peer transport. The receive pool budget uses the same capability gate as
+allocation. The data plane keeps the device half. It allocates the
+pools (one device buffer, after the cache is sized; the host registers it
+once). `epd_publish` copies the landed rows out of their slots onto the
+items before any forward of the request and, with row sharding, rebuilds
+each image's other rows with NCCL broadcasts — on the forward thread, the
+same issuing thread as the model's collectives, which keeps the cross-rank
+launch order. `epd_released`, a completion query, reports the slots whose
+copies finished, so the receiver leases them again.
 
-With pipeline parallelism, only PP0 receives encoder payloads and reserves
-the receive pool. PP0's attention TP group first agrees on completion;
-`PipelineEpdPrefillAdmission` then broadcasts admitted/failed request IDs
-along the pipeline CPU groups. Every stage submits the same requests in
-the same loop iteration, while later stages hold no encoder receiver or
-payload. Decode does not build this admission controller.
-
-The encoder's TP ranks attach every pixel-SHM segment in a received batch
-before any rank submits it to the encode worker. A CPU-group rendezvous
-protects this ownership transition: submission consumes and unlinks SHM
-on both cache hits and misses, so broadcasting handles alone is insufficient.
+An EPD encode rank's loop is its own, with the same split. Each round the
+attention-TP group's first rank relays the frontend's requests to the
+others, in one exchange that also agrees on the send-ring slots free on
+every rank, so every rank forms the same vision-tower batches (the tower is
+TP-sharded); a room's send concludes on each rank at its own time and only
+frees its slot. The data plane admits requests on the forward thread: the
+ranks open every pixel-SHM segment of the round behind a CPU-group barrier
+before any consumes one, since consuming unlinks it on cache hits and misses
+alike. It embeds each batch and copies every item's rows into its send slot;
+a completion query on the control thread reports the finished copies, whose
+rows the sender (`ts-pd`'s `epd::sender`) then writes to the prefill ranks.
 
 The symmetric rule holds on the data plane: **the forward thread never
 synchronizes with the device on the per-round path.** Every host
@@ -204,50 +369,75 @@ synchronization it performs — `.cpu()`, `.item()`, `.tolist()`,
 the step in flight, so the next step's prologue and graph launch slip
 behind the current step's completion and `in_flight_depth` degrades to 0
 however it is configured. Results cross back through pinned non-blocking
-copies and an event the control plane waits on. Torch's sync-debug mode
-enforces this rule, and `run_event_loop` arms it as its last step before
-entering the round loop (weight loading, tuning, capture, the transfer and
-L2 builders and `EventLoop.__init__` all synchronize on purpose):
-`TOKENSPEED_DATA_PLANE_SYNC_DEBUG=warn` reports each offending site with its
-Python location, `error` raises there. CI runs the serving paths with
-`error`; the control plane's event wait and non-blocking copies pass
-unflagged, so a report is always a real stall.
+copies and an event the commit waits on; host-built metadata goes the other
+way through `host_to_device` (`utils/host_sync.py`), a non-blocking copy from
+contiguous pinned memory. Torch's sync-debug mode enforces this
+rule, and `HostBootstrap.enter_serving` always arms it once the rank finished
+startup and the frontend handshake (weight loading, tuning, capture, the
+transfer and L2 builders all synchronize on purpose); there is no switch to
+leave it off. `TOKENSPEED_DATA_PLANE_SYNC_DEBUG=warn` (the default) reports
+each offending site with its Python location, `error` raises there. CI
+serves every `server_smoke`, `eval`, and `perf` task with `error`, which a
+task cannot relax; the commit's event wait and the non-blocking copies pass
+unflagged, so a report is always a real stall. A deliberate wait off the
+per-round path is wrapped in `allow_host_sync` (`utils/host_sync.py`).
+
+One named exception: a drafter may leave its round pending after the forward
+(`BaseDrafter.finish_round`) and finish it in the next forward's `settle`,
+before `load_round_inputs` (`complete_round`); every other forward-thread task
+finishes it first. A decode settles after the target's decode metadata and
+before the draft's, so what a forward queues before its settle runs beside
+the round and must leave alone what the round uses: `future_*`, the draft KV
+cache and decode metadata, the drafter's buffers, the kernel workspace and
+collective state. EAGLE-Harness chains a round's captured graphs on the GPU,
+behind the decode graph (`BaseDrafter.replay_decode_graph`), so what the
+forward queues after that graph (the verified-state commit, the outputs) runs
+beside the round too; an eager round polls a pinned flag to launch each depth.
 
 A JIT compilation on the forward thread is the same kind of stall, only
 longer: the round waits 100 ms to seconds while a kernel compiles for a new
 compile-cache key. Startup compiles on purpose (graph capture, tuning), so
-`run_event_loop` installs `tokenspeed_kernel.compile_monitor` before building
-anything and marks the end of startup right after arming the sync-debug
-mode. The encode loop marks it after its ready message. From then on the
-monitor logs every Triton compilation with its duration and cause and reports
-by name any compile-time kernel parameter that keeps taking new values from
-one call site -- a per-batch value passed as `tl.constexpr`; the per-round
-metrics call exports the compilation counts and durations as
-`tokenspeed:jit_serving_compiles` /
-`tokenspeed:jit_serving_compile_seconds`. `TOKENSPEED_JIT_COMPILE_CHECK=error`
-raises there instead, and CI serving jobs run with it.
+the bootstrap installs `tokenspeed_kernel.compile_monitor` before building
+anything and `enter_serving` marks the end of startup right after arming the
+sync-debug mode; an encode rank marks it once it reported ready. From then
+on the monitor logs every Triton and CuTe DSL compilation with its duration
+and cause and reports by name any compile-time kernel parameter that keeps
+taking new values from one call site (a per-batch value passed as
+`tl.constexpr` or as a static CuTe DSL dimension), a call site that keeps
+recompiling specializations the kernel already has, and a direct `@cute.jit`
+call, which traces the kernel in Python on every call; each commit reports
+the compilation counts and durations, which the control plane exports as
+`tokenspeed:jit_serving_compiles` / `tokenspeed:jit_serving_compile_seconds`.
+`TOKENSPEED_JIT_COMPILE_CHECK=error` raises there instead, and CI serving
+jobs run with it.
 The same mark closes the kernel package's compile switch
 (`compile_monitor.is_serving()`), installed monitor or not. A kernel whose
-library compiles once per batch shape outside Triton -- FlashInfer's joint BF16
-GEMM and the ll_bf16 router's dot-product kernel compile once per exact row
-count -- runs only before it:
+library compiles once per batch shape with no key to bucket -- FlashInfer's
+joint BF16 GEMM and the ll_bf16 router's dot-product kernel compile once per
+exact row count -- runs only before it:
 graph capture records it, and eager calls after it take a GEMM that never
-compiles instead of compiling on the forward thread.
+compiles instead of compiling on the forward thread. The pinned FlashInfer
+TGV tiles for BF16 decode GEMMs on small weights run only before it too,
+though they compile once per tile, not per shape: their route was measured
+only inside captured graphs, so eager calls after the mark keep cuBLASLt
+(`tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/README.md`).
 
-A full garbage collection is a stall of the same kind, for every thread of the
-process at once. Startup leaves millions of long-lived Python objects behind
-(modules, parameters, captured graphs, kernel caches), and CPython's full
-(generation 2) collection walks all of them in hundreds of milliseconds, at a
-moment each rank's own allocations decide. Since every round waits on the
-whole group, each rank's collection stalls every rank. So `run_event_loop`
-calls `freeze_startup_heap` (`engine/gc_hooks.py`) after the JIT mark: it
-collects once, freezes the survivors (`gc.freeze`: no later collection walks
-them) and raises the generation-2 threshold far enough that CPython does not
-start full collections by itself while the loop runs its own. `GcHooks` runs
-one every `FULL_COLLECTION_INTERVAL` forwarded rounds, a count that is the
-same on every rank, so the ranks collect in the same round and each
-collection walks only what serving keeps alive. The young generations still
-collect automatically.
+A full garbage collection is a stall of the same kind, for every Python
+thread of the process at once. Startup leaves millions of long-lived Python
+objects behind (modules, parameters, captured graphs, kernel caches), and
+CPython's full (generation 2) collection walks all of them in hundreds of
+milliseconds, at a moment each rank's own allocations decide. Since every
+round waits on the whole group, each rank's collection stalls every rank. So
+`enter_serving` calls `freeze_startup_heap` (`engine/gc_hooks.py`) after the
+JIT mark: it collects once, freezes the survivors (`gc.freeze`: no later
+collection walks them) and raises the generation-2 threshold far enough that
+CPython does not start full collections by itself. The data plane's
+`GcHooks` runs one on the forward thread every `FULL_COLLECTION_INTERVAL`
+forwarded rounds, a count that is the same on every rank, so the ranks
+collect in the same round and each collection walks only what serving keeps
+alive. An EPD encode rank does the same and counts its vision-tower batches,
+which every rank of its attention-TP group forms alike. The young
+generations still collect automatically.
 
 ### Profiling the issuing thread
 
@@ -261,85 +451,128 @@ device events within each rank and process rather than clip GPU time to host
 timestamps. Profile startup rejects unsupported capture capabilities instead
 of silently producing an incomplete trace.
 
+The torch profiler sees only torch ops and Python, so a torch profile also
+records the host's own spans (`ts_scheduler::profile`): the round's phases,
+the scheduler calls and their C++ phases (`csrc/core/profile_span.h`), the
+data-plane calls and their waits for the GIL on the control thread, and each
+operation on the forward thread. The profiler merges them into the trace it
+exports, on their threads' lanes, so a forward thread's operation encloses
+the Python it ran; the C++ scheduler's spans are under the `scheduler`
+category, the rest under `host`. The recording follows the torch profiler's window and
+costs one atomic load per span outside it; it keeps only the spans that began
+inside the window, so an operation open as a by-stage profile switches stages
+stays out of the next stage's trace. A trace the merge fails on is written
+without the host spans rather than failing the forward thread. A round that receives nothing,
+hands the data plane and the L3 executor nothing, and commits, acknowledges,
+or answers nothing leaves no spans: a loop waiting on a transfer spins through
+such rounds. A storage operation's outcome counts as an acknowledgment.
+
 ### The capture contract
 
-Information crosses to the data plane **only** inside the submitted closure,
-and freezes once submitted: no attribute rebinding, no in-place edit, no
-releasing a resource the closure captured. Capture plain values or a snapshot,
-and bind at capture time rather than closing over a variable the caller later
-rebinds. Results cross back **only** through `PendingExecution.result()`.
+Information crosses to the data plane **only** as a queued operation's
+arguments: plain values (lists, bytes, the scheduler's plan moved into a
+Python object), from which the forward thread builds what a forward reads.
+What a launched forward reads freezes: no attribute rebinding, no in-place
+edit, no releasing a resource it holds while it may still run. Results cross
+back **only** as the launched forward's result, which the commit reads once
+its copy event landed, as metadata lists and CPU logprob buffer views.
 
-The plan's cache ops follow the same capture rule: `DeviceHandle.execute`
-adapts them once on the control plane and the queued submissions read that
-list, not the live plan. The L3 prefetch lane is a CPU thread with no stream
-at all; its outcome reaches the forward thread through nothing, and the
-control plane only through the executor's progress table.
+The plan's cache ops follow the same capture rule: the data plane adapts
+them once into immutable Device and storage tuples, and
+`DeviceHandle.execute` runs copies from the supplied Device tuple. The L3
+executor's workers receive only Host jobs, with no GPU stream or
+forward-thread access. Their results return to the control plane through
+the executor's completion poll.
 
-`execution/forward_thread.py` states this in full, including the single
-registered exception — grammar matchers, whose ownership splits by path and
-whose overlap the drain registry in Principle 4 breaks instead.
+`execution/device.py` states this in full, including the registered
+exceptions — grammar matchers, whose ownership splits by path and whose
+overlap the drain rules in Principle 4 break instead, and multimodal items.
+
+Completion queries export large logprob columns as CPU buffer views, after
+the result's copy event has landed. The host validates dtype, rank, shape
+and token-ID narrowing, then copies into Rust-owned vectors while Python
+buffer guards retain the storage. No borrowed array escapes the query or
+outlives the result's reuse lease. Buffer guards release on errors and
+unwinding too; no manual export/release pair belongs in the event loop.
 
 ## Principle 2: the event loop is a coordinator, nothing more
 
-`EventLoop.event_loop` sequences components. It does not implement them.
-Domain logic — pause/resume semantics, EPD admission, PD transfer handling,
-L2 cache-op tracking, L3 probing and prefetch convergence, wire handshakes,
-multimodal batch
-assembly — lives in its own module and enters the loop as a **single-line hook**.
-The loop body
-should read, top to bottom, as the schedule of one scheduling round, with no
-feature's internals inlined into it.
+`EventLoop::round` sequences components. It does not implement them. Domain
+logic lives in its own module of `ts-control`, and enters the round as a
+single call:
+
+| module | owns |
+| --- | --- |
+| `ingress` | validating a request against what the engine serves, its sampling defaults and budget, the scheduler request |
+| `output` | committing a forward's results: request state, the scheduler's events, the frontend's outputs, logprobs |
+| `cache_ops` | the open cache-op count and the replica-agreed acknowledgments |
+| `l3` | the replica's agreement on its storage executors' reports: the clock, the forward and storage permissions, the queue pressure, each storage operation's outcome |
+| `control` | pause and resume, memory release and resume, the weight-operation and internal-operation queues |
+| `pd` | the transfer peer as the loop sees it, and the per-round agreement on transfer progress |
+| `grammar` | grammar compilation, its cache, and the matchers |
+| `eplb` | when an expert rebalance runs, the placement solver, the slot moves |
+| `kv_events` | publishing the scheduler's KV cache events |
+| `batch_log`, `request_stats` | the operator's per-round and per-request log lines |
+| `relay`, `transport` | the replica's relay of frontend messages, and the frontend wire |
+
+The round should read, top to bottom, as the schedule of one scheduling
+round, with no feature's internals inlined into it.
 
 Consequences:
 
-* Low-frequency or optional features (pause/resume control, EPD, SMG
-  transport, kvstore) must never make the *normal* scheduling path harder to
-  read. If understanding decode throughput requires skipping over your
-  feature's code, the feature is in the wrong place.
-* When a feature needs several collaborators of the loop, give it a hooks
-  class (see below) instead of weaving branches through the loop and its
-  helpers.
+* Low-frequency or optional features (pause/resume control, EPD, PD, L3)
+  must never make the *normal* scheduling path harder to read. If
+  understanding decode throughput requires skipping over your feature's code,
+  the feature is in the wrong place.
+* A subsystem module owns its state and depends on static configuration and
+  what the round passes it; it holds no reference to the loop. The loop
+  holds it, calls it at a fixed point, and applies what it returns.
 
 ## Principle 3: scheduler feedback is explicit and centralized
 
-`advance_scheduler` (`scheduler_utils.py`) is the **only** caller of
-`scheduler.advance`, and the `event_loop` body **invokes it only explicitly
-and directly — never from helpers**. Helpers RETURN their events. The loop
-applies them. Reading the loop body alone must reveal every point where
-the scheduler's state advances, and why.
+The scheduler advances in exactly two places, both in `EventLoop::round`
+itself — never in a helper or subsystem. Helpers RETURN their events, or push
+them into the round's `events` list. Reading the round alone must reveal
+every point where the scheduler's state advances, and why:
 
-There are exactly two call sites, each with a documented reason:
-
-* **Head of the round** — completed Host cache-op events
-  (`_cache_hooks.poll_ready_events()`: `WriteBackDone`, `LoadBackDone`,
-  `PrefetchDone`, `SnapshotDone`, `RestoreDone`, each replica-intersected).
-  These must advance *before* `next_execution_plan`; otherwise, cache-gated
-  admissions -- a prefetched request's admission, a suspended request's
-  restore, which waits for both of its store ACKs, then its own -- are
-  delayed by a full round.
+* **Head of the round** — completed Host cache ops (`CacheOps::acknowledged`:
+  `WriteBackDone`, `LoadBackDone`, `SnapshotDone`, `RestoreDone`, each
+  replica-intersected), together with the L3 agreement's storage facts
+  (`L3::agree`: the round's tick, the cancellations, the storage operations
+  every owner completed), through one `advance_head`. These must advance
+  *before* `next_execution_plan`; otherwise, cache-gated admissions -- a
+  request whose stored prefix landed in Host, a suspended request's restore,
+  which waits for both of its store ACKs, then its own -- are delayed by a
+  full round.
 * **Tail of the round** — forward results and PD transfer events, funneled
-  through the single `request_changes` list; all events must advance before
-  the *next* round plans.
+  through the round's single `events` list, through `advance`; all events
+  must advance before the *next* round plans.
 
 Anything that produces scheduler events (a new transfer backend, a new async
 op kind) either returns events into one of these two points or adds a new
-explicit call site in the loop body with a comment stating why the existing
-points don't fit. It must not call `advance_scheduler` itself.
+explicit call site in `round` with a comment stating why the existing points
+don't fit. It must not advance the scheduler itself.
 
 ## Principle 4: correctness never depends on the in-flight depth
 
 `in_flight_depth` parameterizes the loop: 0 (classic synchronous
-commit), 1 (the overlap schedule), or `pp_size` (the prefill chunk pipeline).
-Dispatched forwards await commit in the `in_flight` queue. The tail commits
+commit), 1 (one forward ahead of its commit: the overlap schedule on a
+decoding role), or `pp_size` (the prefill chunk pipeline);
+`scheduler_utils.resolve_in_flight_depth` picks it. At PP=1 the prefill role
+runs at 1 too, the chunk pipeline's one-stage case: a round's planning,
+commit, and transfer polling overlap the chunk on the GPU. It still takes no
+overlap schedule, whose decode KV reservation (`overlap_schedule_depth`) it
+never needs. `--disable-overlap-schedule` sets the depth to 0 at PP=1.
+Dispatched forwards await commit in the `in_flight` queue. The round commits
 once the queue exceeds the effective depth (0 when the round dispatched no
 new work, so results never wait on future traffic).
 
 The depth is a performance knob only. Any dispatch whose inputs depend on a
-pending commit's side effects must drain the queue first, and
-`_dispatch_depends_on_pending_commit` is the **single registry** of those
-overlap-breaking dependencies (currently: eager-grammar batches). New rules go
-there, not into `event_loop`. Rounds that run no real forward (pause/freeze,
-DP idle) drain the queue fully.
+pending commit's side effects must commit the queue first, and
+`plan_and_dispatch` holds every such rule in one place (currently: an
+eager-grammar batch, whose bitmask fill reads matchers only a pending commit
+advances). Rounds that run no real forward (a frozen pause, a DP idle forward)
+commit the queue fully.
 
 Prefer removing a dependency over registering one. The P-side remote decode
 was registered here until the C++ scheduler learned to hold it until its
@@ -352,324 +585,655 @@ dependency was real. The right fix was upstream, not a drain.
 
 Depth ≥ 1 also means the loop plans a round *before* the previous round's
 commit, so a batch can contain a request that commit is about to finish.
-Anything the control plane frees on that commit — a request's shared
-multimodal features, for instance — must be released through the handle so
-the FIFO orders it behind the forward that captured it, not inline.
+Anything the data plane frees when a request ends — its grammar matcher, its
+shared multimodal features — is released through the forward thread's queue,
+behind the forwards that read it.
+
+Only a pipeline's last stage samples. Each of its ranks shares the forward's
+results with the other stages of its pipeline before they commit
+(`adopt_last_stage`): the tokens, their logprobs and the prompt logprobs, the
+NaN guard's flags, the next inputs and where the grammars ended. Every stage
+then commits the same result against its own mirrored plan, so its finishes
+and aborts are the last stage's.
 
 ## Principle 5: publishing drains, once per round
 
-`_publish_scheduler_kv_events` has drain semantics: cache mutations
-accumulate inside the C++ scheduler across any number of calls (advance,
-`next_execution_plan`), so a single unconditional call at the loop tail
-publishes everything the round produced, in order, as one batch. The batch
-is the round's net change: a block evicted and cached again within the round
-produces no event. Do not add per-mutation publish calls. They only fragment
-batches.
+KV event publishing has drain semantics: cache mutations accumulate inside
+the C++ scheduler across any number of calls (advance,
+`next_execution_plan`), so a single unconditional `drain_kv_events` after the
+round's last scheduler mutation publishes everything the round produced, in
+order, as one batch. The batch is the round's net change: a block evicted and
+cached again within the round produces no event. Do not add per-mutation
+publish calls. They only fragment batches.
+
+The control thread drains an independent, contiguous event snapshot. The
+publisher takes ownership of that batch; its thread encodes MessagePack, frees
+the snapshot, and sends the payload. It cannot read the scheduler or retain cache
+blocks. Timestamps are taken when the control thread submits the batch, and
+sequence numbers and replay-buffer updates stay with the publisher in FIFO order.
+The Python event-list API and the published wire format remain compatible.
+
+The publisher keeps the existing bounded **batch-count** queue and blocking
+backpressure. A full queue delays its caller; accepted batches are never discarded
+to make room. Eliminating that wait would require an explicit loss/resynchronization
+protocol. A disconnected publisher logs the failed send. Its diagnostic progress
+handle counts outstanding snapshots (including a blocked producer and the active
+worker), their logical bytes and high-water marks, and enqueue-call time. These
+bytes stay charged until the send completes, even after encoding frees a snapshot.
+They exclude allocator slack and encoded replay buffers; process RSS measures
+those separately. The ownership guard releases counts on failed sends and dropped
+queued work as well as normal completion.
 
 The same reasoning fixes the metrics call: the loop records scheduler
 iteration metrics once per round, from the same pre-dispatch snapshot as the
 scheduler stats.
 
-Metric reporters share those collection points. Installed plugins must accept
-scalar observations promptly on the producer thread and perform delivery in the
-background. Plugin discovery and creation happen outside the loop. Reporters
-preserve the engine's worker termination behavior; a forcibly terminated worker
-may lose queued observations without running metrics cleanup. Their event
-channel is separate from load snapshots: counter increments and histogram
-observations cannot be conflated. The metric adapter suppresses unchanged gauge
-assignments before constructing events or distributing them, while retaining
-value changes and refreshing snapshots on subsequent assignments. This policy
-belongs to the metric adapter, not the scheduler loop or individual plugins. See
-[metric output plugins](../metrics-plugins.md) for event semantics, registration,
-and output lifecycle contracts.
+Only ranks with an engine metrics exporter retain per-request timing samples.
+Decode request logs, exported latency metrics, and request traces use the
+arrival of the bootstrap token as the first-token timestamp. Metrics and
+tracing are independently enabled; tracing alone retains no metric samples.
+Decode throughput counts tokens appended to the request, including the stop
+token when present. A speculative suffix discarded at the stop boundary still
+advances the scheduler frontier but contributes no output tokens.
+
+Metric output plugins run in the node's metrics relay process
+(`metrics/relay.py`); the rank's `ts-metrics` hands them every update as an
+event and writes Prometheus' multiprocess files itself, so the loop never
+waits on a plugin. A full relay queue drops events and counts the drops.
+Plugin discovery and creation happen outside the loop. The metrics adapter
+(`ts-metrics`) sends every value change and re-sends an unchanged gauge at
+most once a second; this policy belongs to the adapter, not the scheduler
+loop or individual plugins. See
+[metric output plugins](../metrics-plugins.md) for event semantics,
+registration, and output lifecycle contracts.
 
 Per-request metrics anchor to request lifecycle points instead of the round
 snapshot. `tokenspeed:request_queue_time_seconds` stamps each request's
-waiting-queue entry at `_submit_scheduler_requests` — the single funnel
-normal admission, the EPD drain and the pause resume all submit through —
-and observes it once, when the request first appears in a dispatched forward
-(`_record_request_queue_time`, beside `_mark_stats_scheduled`). A retracted
-request re-enters the C++ waiting queue without passing the funnel again, so
-preemption yields no second observation. The stamp and the recorded flag
-ride `RequestState` and die with it; no cleanup pass exists.
+waiting-queue entry when it is submitted to the scheduler — normal admission,
+the EPD drain and the pause resume all submit through one funnel — and
+observes it once, when the request first appears in a dispatched forward. A
+retracted request re-enters the C++ waiting queue without passing the funnel
+again, so preemption yields no second observation. The stamp rides the
+request's state and dies with it; no cleanup pass exists.
+
+Generation throughput counts tokens committed by decode forwards; on a plain
+worker the first token normally comes from prefill. Completion counts are
+role-local: the bootstrap token appears in both P and D totals. Use decode
+completion totals for a disaggregated service's output-token count.
+L3 query hits count the token span of each successful storage key. Cache
+groups can cover the same prompt positions, so this measures storage hits
+per group rather than unique prompt tokens.
 
 Page gauges count LCM parents, excluding the reserved null parent. The
 per-round sampler reads `empty_lcm_blocks()` and `active_lcm_blocks()`.
 Cached-only parents are `num_usable_pages - empty - active`. Active and cached
 counts are disjoint, even when cache groups pack multiple blocks into a parent.
-`LoadSnapshot.num_used_pages` sums active and cached parents to report all
-resident occupancy, including evictable cache, rather than cache alone.
+The used and free token gauges prorate the recipe's effective token capacity
+by the resident and non-active parent counts, respectively. Round down after
+scaling so a fully free pool reports its full capacity, including packed or
+capacity-limited layouts.
 `available_lcm_blocks()` scans the pool and prefix indexes for reclaimability
 and belongs in diagnostics and leak checks, never in the per-round sampler.
+`active_lcm_blocks()` is O(1): the block tables keep the count as they change
+(see cache-concepts.md). The loop takes it at most once per 100 ms and the
+frontend's load report, the metrics and the batch line share that value; a
+round with no request running takes it again, so an engine that goes idle
+reports none active at once, and does not keep it, so the first round with
+requests takes a fresh one. The
+scheduler's other counts (`sizes()`) are a pass over its requests per state:
+a round takes them for the load report, and as it planned only when the
+metrics or a batch line read them (they share that read); the idle check takes
+them only when the loop holds no request, in-flight forward or open cache op.
 
-## The hooks pattern
+## Subsystems in detail
 
-Loop-side integration of a subsystem is a small class whose methods are the
-subsystem's only entry points from the loop. Two shapes exist:
+**Pause and memory release** (`control`). A pause in `abort` mode aborts what
+runs, `wait` lets it finish; both stop admissions and answer once the
+scheduler drained, including requests parked for PD retirement: both the
+transfer and local forwards must finish even if the output already ended.
+`keep` freezes everything and answers at once: a frozen round commits what is
+dispatched and still joins the attention-DP agreement
+(an idle forward when a peer runs one, but not while memory is released: the
+weights are unmapped; idle forwards count toward the expert rebalance like
+real ones, so the ranks' rebalances stay in step). It plans like any round,
+but the scheduler, which learns the forward permission from the round's
+storage tick, plans only cache and storage work: write-backs and storage
+cancels still drain. With L3 every round carries a tick; without, the loop
+sends one when a freeze starts and when it ends. A memory release drains like
+`wait`, then frees its regions — one release/resume pair per tag, whose
+data-plane half (quiescing copies, the transfer engine's registration, the KV
+repair, NCCL suspend) runs on the forward thread — and freezes until they are
+resumed; a further release drains frozen. A release is refused under a
+`keep` pause (its drain would run the frozen requests, and the wake would end
+the pause), as a pause is under a release. A drain (`abort`, `wait`, a
+release) cancels the admitted requests the scheduler does not hold yet, which
+end toward their clients: those compiling their grammars, and those waiting
+for their images' embeddings, which end once their receives settle — the
+drain waits for those.
+A disaggregated engine refuses new requests while a release is draining or
+memory is released: their transfer registration would name memory the
+release unmaps. On release the prefill peer deregisters its cache regions
+from both receiving and sending engines, and registers them again on resume.
+The decode peer starts a fresh transfer engine and assigns a new random cache
+identity on resume. Registrations carry this identity separately from the
+transport address: reusing an IP and port cannot identify the previous cache.
+A new registration retires old identities at the same control endpoint or
+transport address. Retirement waits for writes already in progress; queued
+writes recheck their identity, and late registrations cannot revive it. When
+a transport address is reused, the sender replaces its private transfer
+engine to discard cached remote memory keys, preserving the public engine
+address used by EPD. A release is refused while transfers are in
+flight, and refused for a paused PD engine with buffered requests, whose
+transfers cannot drain until those requests are admitted; their transfer
+registration is deferred until resume admits them, and aborted buffered
+requests never register one. An empty memory-resume request is a successful
+no-op while a drain is pending; it preserves that drain's admission hold
+until the owning pause or memory-release operation finishes.
 
-* **Glue hooks** hold a loop back-reference and act on its collaborators;
-  they are stateless (or nearly so) because the real state machine lives in a
-  controller the request handler or device drives. The controller DECIDES.
-  The hooks ACT with the loop's collaborators. They receive any capability they
-  need — the `DeviceHandle` above all — in their constructor, per Principle 1.
-* **Self-contained components** own their state outright and depend only on
-  static configuration — they need no loop reference at all. Prefer this
-  shape whenever the subsystem doesn't genuinely need the loop's live state.
+With attention DP, memory release waits for every rank to stop admissions
+and drain its requests, forwards, cancelled embedding receives, cache copies,
+transfers and queued weight operations. A locally drained rank keeps joining
+idle forwards while a peer drains. An idle but unpaused peer prevents release:
+it could admit a request in the next round. Release intent rides the head
+gate, so every rank joins the tail's readiness agreement when any release is
+pending, including ranks without a release of their own. Ordinary rounds add
+no collective. An NCCL release also requires a pending NCCL release on every
+rank: a previously completed KV release does not authorize that collective.
+Other memory regions retain their local release semantics. Readiness is
+MIN-reduced over the replica and then attention DP
+before any release runs on the forward thread.
 
-Current inventory:
+A resume containing NCCL uses the same-round operation gate: it waits until
+every attention-DP engine holds its resume before entering device collectives.
+Other regions still resume locally. A pending collective resume refuses a
+second memory resume until it finishes.
 
-| Attribute      | Class / home                                  | Shape          | Loop entry points |
-| -------------- | --------------------------------------------- | -------------- | ----------------- |
-| `_pause_hooks` | `PauseHooks` — `engine/pause.py`              | glue (PauseController is the state machine) | `apply_transitions`, `withhold_admissions`, `paused_idle_step` |
-| `_epd_hooks`   | `EpdPrefillHooks` — `epd/prefill_hooks.py`    | glue (EpdPrefillAdmission decides)          | `try_stage`, `drain_ready_embeddings`, `assert_embeddings_received` |
-| `_pd_hooks`    | `PdTransferHooks` — `pd/transfer_hooks.py`    | glue (transfer executors decide)            | `poll_transfer_events` |
-| `_cache_hooks` | `CacheOpHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries; counts the Host L2 write-backs/load-backs and the retraction image's snapshot stores/restores alike) | `count_plan_ops`, `poll_ready_events` |
-| `_l3_hooks` | `L3CacheHooks` — `engine/l3_cache_hooks.py` | self-contained (injected scheduler, `DeviceHandle`, static replica groups; no loop reference) | `submit_requests`, `converge_prefetches` |
-| `_eplb_hooks` | `EplbHooks` — `engine/eplb_hooks.py` | glue (`ExpertRebalanceController` in `moe/expert_rebalance.py` is the state machine; handed the `DeviceHandle`, the request handler and the EP gloo group; no loop reference) | `note_round` |
-| `_gc_hooks` | `GcHooks` — `engine/gc_hooks.py` | self-contained (only its interval; no loop reference) | `note_round` |
+The head gate also agrees whether any DP rank still has released regions.
+Until all regions are restored on every rank, it withholds forward permission
+through the scheduler's storage tick and suppresses idle forwards. This covers
+staggered and partial resumes without building a batch that cannot execute;
+control operations and cache acknowledgments continue to progress.
 
-`_pause_hooks` and `_pd_hooks` also receive the `DeviceHandle`: both have
-work that must land on the data plane — the DP idle forward and the work
-around a memory-saver release/wake, and the device writes that land a
-completed remote prefill. `PauseHooks` additionally supplies the
-memory-occupation controller's regions (`memory_regions`: one release/resume
-pair per tag, whose data-plane half — quiescing copies, the PD transfer
-engine's registration, the KV repair, NCCL suspend — rides the handle) and its
-release gates (`reset_caches_for_release`, `transfers_idle_for_release`).
-Those are not loop entry points — they fire on release/wake. A disaggregated
-engine refuses new requests while a release is draining or memory is
-released: their transfer registration would name memory the release unmaps
-(and a decode node re-registers it under a new transfer session on wake).
-Release also waits for both weight-op FIFOs to empty through their usual
-same-round gate. It refuses a paused PD engine with buffered requests, whose
-transfers cannot drain until those requests are admitted. Their handshake
-registration is deferred until resume admits them: polling a handshake before
-its scheduler request exists would lose its completion event and strand the
-request after resume. Aborted buffered requests never register a transfer.
+**The same-round gate** (`EventLoop::gate`, every round on every rank).
+Weight-update `flush_cache` and a standalone flush first MAX-reduce
+flush intent across attention DP so every DP rank enters the same
+collectives — the frontend sends a flush to every engine separately. The
+same reduction gates the weight operations themselves (NCCL group
+init/teardown, distributed, tensor, disk and Mooncake loads): each is queued,
+and the head completes only in a round where every DP rank holds one of the
+same kind at its head (a mismatch is an error — the frontend sends every
+operation to every engine in one order). The device call blocks the control
+thread in a collective the trainer drives or an SDK read; a DP peer that had
+not yet dequeued its copy would keep looping and wait for this rank in the
+per-round agreement, a deadlock. One operation completes per round. Before a
+weight load's cache flush and load, the replica MIN-reduces each rank's device
+prerequisites (weights resident, KV released under discard, an SDK update
+under discard): a refusal on any rank means no rank flushes or loads, so a
+ready rank never enters a loading collective its peer skips, and every rank's
+weights and caches stay untouched for a retry. A refused cache flush likewise
+loads nothing. After the load the replica MIN-reduces its result before the
+loop publishes the L3 weight version or sends the reply, and commits that
+final result on all forward threads before replying. Under the discard
+policy, local loading success is pending: only the successful replica-wide
+commit marks parameters usable. A failed load invalidates every rank,
+including ranks that loaded locally; KV wake and forwarding remain blocked
+until deployment restart. Discard requires both the model and its resolved
+quantization configuration to opt in; quantized post-load derivation must
+rebuild codes and scales in place from the complete new checkpoint, never
+reuse discarded values or mark remapped storage usable on its own.
+The same gate carries the online expert
+rebalance's *internal* steps (snapshot, commit, chunk apply) from a second
+queue with its own columns: frontend operations arrive on different DP
+engines in different rounds while the controller queues internal steps at
+rank-identical rounds, so one shared queue would make the heads differ in
+kind across ranks. When both are ready the frontend operation completes this
+round and the internal step the next — still one blocking device call per
+round. Because every EP rank is inside a gated step at once, the rebalance
+may run a collective over the EP group there (summing the load under
+all-to-all EP, broadcasting the committed placement), which the profile's
+`dump_expert_load` must not. The manual rebalance (`RebalanceExpertsReqInput`)
+is a frontend operation on the first queue that starts the same internal
+sequence. The loop refuses a memory release while a rebalance is in progress
+and, once drained, the release waits while chunk steps still write the
+weights. A cache clear MIN-reduces the scheduler's non-mutating
+`can_clear_cache` across the replica and then across attention DP — DP
+replicas share Mooncake objects — then MIN-reduces an error-returning L3
+namespace deletion, before any rank mutates Device/Host. The frontend
+combines every engine's reply. Independent TokenSpeed jobs that share a tenant are not
+in those groups.
 
-`EplbHooks` is the online expert rebalance (`--enable-eplb`). The
-controller counts the forwards this rank submitted — real or DP-idle, so the
-count is rank-identical — and decides when a rebalance's steps are due. The
-hooks enqueue them as *internal control ops* on the request handler's second
-FIFO and complete them, once the same-round gate (below) agrees, through two
-named handle operations (`snapshot_expert_load`, `apply_expert_placement`)
-and two EP-group gloo agreements (the summed load under all-to-all EP, the
-committed map broadcast from EP rank 0). A spawned CPU worker process derives
-the placement itself on EP rank 0, off both planes and off this process's
-GIL (a Python-bound thread would contend with the forward thread for the
-seconds the greedy packing takes). The loop's one line is
-`note_round(forwarded=...)` after its forward submission. Nothing in the
-loop body knows a rebalance exists.
+**The expert rebalance** (`eplb`, `--enable-eplb`). The controller counts the
+forwards this rank submitted — real or DP-idle, so the count is
+rank-identical — and decides when a rebalance's steps are due; the round
+queues them for the gate. EP rank 0 derives the placement on a solver thread
+of its own, off the round; the other ranks take the broadcast. Nothing in
+the round knows a rebalance exists beyond the one call that notes the
+round's forward.
 
-`L3CacheHooks` owns the two replica-wide L3 decisions: prefix registration at
-submission (the `batch_exists` probe, MIN-reduced so every mirrored scheduler
-registers the same keys) and, once a round, the convergence of the in-flight
-prefetch ops -- the scheduler fetches an L3 hit into Host pages *before* it
-admits the request (`Cache.PrefetchOp`, a CPU lane behind `DeviceHandle`),
-and the hooks MIN-reduce each op's done flag and landed prefix across the
-replica, completing a converged op on the device so its one
-`PrefetchDoneEvent(op_id, landed_pages)` rides the next cache poll. They
-return nothing and never advance the scheduler; no forward is ever skipped
-or retracted because of L3, since only the L3-to-Host leg can miss and it
-runs before admission. With L3 disabled, the same hooks submit requests
-without token hashing, storage probes or replica collectives. Storage state
-and the prefetch lane remain behind `DeviceHandle`; namespace deletion and
-flush coordination stay in `RequestHandler`.
+**Cache-op acknowledgments** (`cache_ops`). The scheduler is mirrored on
+every rank of the replica, so an acknowledgment may only advance once every
+rank holds it: the ranks agree on whether any has work, then intersect what
+they hold. A rank-local ACK would publish a Host block on one mirrored
+scheduler while a peer still has the op pending, and a KVP rank that copied a
+different owned subset of an image completes at a different time. An L3 PUT
+has its own completion and does not delay the D2H ACK. Every rank stays in
+every gather, even when its own part is empty. The poll runs these
+collectives only while a cache op is open: every rank counts the same plans
+and advances the same intersections, so the open count is the same
+everywhere and an idle replica polls nothing.
+The data plane acknowledges each op exactly once, one ACK per op of a batch,
+and the counts rely on it: `acknowledged` takes each polled ACK off the
+in-flight count before it deduplicates, so a repeated ACK breaks the counts.
+A poll then fails with `CacheOpError::Unaccounted` (at once, or once the
+remaining ops land), or the open count reaches zero while another op is in
+flight, and the loop stops polling before that op lands. Only the C++
+scheduler tolerates a repeated ACK.
 
-Per-round dispatch needs no hooks class at all: the loop hands
-`DeviceHandle.execute` the plan and the round's `PlannedForward`, and the
-plan's streams already say who runs what — the batch is the model's, the
-remote streams are the transfer peer's.
+**L3** (`l3`, `--kvstore-storage-backend`). The C++ scheduler owns each
+request's storage transaction: it plans QUERY, GET, PUT and CANCEL
+operations in `plan.cache` ([asynchronous L3](async-l3-cache.md)), which the
+control plane submits to the host's Host-only L3 executor (`ts-l3`) when it
+dispatches the plan, apart from device work; no L3 path takes the GIL. A
+QUERY and
+GET run before admission, only with a storage backend: a request waiting for
+its preparation is skipped before local prefix hashing, so an idle round does
+not rehash a long prompt while native I/O is outstanding. Every round with
+L3, each member's executor report (its clock, queue pressure, completions,
+and an error, if its poll was invalid) rides the round's relay: one
+all-gather carries the first member's messages and every member's report, so
+the replica runs one exchange a round, not two. At the head the replica
+agrees on the reports (`L3::agree`): rank 0's clock and the worst pressure
+become the round's tick, with the forward and storage permissions the
+control state gives, which every member holds alike. A storage operation
+completes once every owner reported it: per key, success and native
+retirement on every owner, an object failure on any. A rank's invalid report
+reaches every rank in the same exchange, and every rank fails after
+gathering it, so no rank strands a peer. A frozen round plans too, with
+forwards and storage forbidden, so detaches and cancels still drain. An
+abort of a request still preparing its storage rides the next head: one that
+holds no pages yet finishes there (the forward path would never reap it),
+any other detaches from its storage work. Without L3 the round runs none of
+this. L3 requires PP=1; the D role receives its missing cache from its
+prefill peer.
 
-Related placements that follow the same principle without a hooks class: the
-SMG startup handshake lives in `zmq_msgpack.connect_msgpack_engine_for_loop`
-(wire-schema helpers in `zmq_wire`), multimodal batch-context assembly in
-`multimodal/inputs.py::multimodal_context_for_forward` (which also snapshots
-each request's multimodal inputs, per Principle 1's capture contract), and
-P-side layerwise KV streaming setup, which happens inside the device builder
-(the step counter is backend surgery; the sender only receives it). The
-Prefill transfer path 2D-packs dest-contiguous CachePD fragments before
-Mooncake WRITE — that CUDA copy is data-plane work, not loop work.
+**PD source retirement.** A terminal status alone does not release source
+pages. The prefill peer counts queued and executing transfer jobs. A failure
+agreed by the replica first stops new work on every rank and reports `Failed`,
+which parks the request without releasing its resources. Every rank must
+retire its jobs before `Stopped` reaches the scheduler. Queued
+jobs for failed rooms are dropped; executing jobs finish or return from the
+synchronous transport call before retiring. Client cancellation keeps the
+request's source ownership until that retirement event. The retirement agreement
+is needed only in rounds with a terminal status.
 
-All hooks obey Principle 3: they return events or decisions. They never call
-`advance_scheduler`.
+**PD output completion.** A prefill's computed finish is not its client's
+final output: the output waits for the transfer's result. A transfer failure
+must publish an abort even after computation finished, unless the client
+already cancelled its stream or a final output was sent. A pause abort still
+notifies the client; repeated transfer events do not repeat the final output.
+This output fence does not retire source pages.
 
-An empty memory-resume request is a successful no-op while a drain is
-pending. It must preserve that drain's admission hold until the owning
-pause or memory-release operation finishes.
+**PD route refresh.** Before attaching a new room, the decode connection worker
+fetches the bootstrap route version. The version changes on bootstrap restart
+and source-rank registration, even when the address stays healthy. A changed
+version invalidates the cached route and target registrations for future rooms;
+existing rooms keep their targets and cancellation retirement fences. Bootstrap
+servers without a version are resolved afresh on each connection. This adds
+one bootstrap lookup per room, off the scheduler and forward threads. It does
+not transparently migrate an in-flight transfer to a replacement prefill peer.
+
+**PD cancellation.** Client aborts and `pause(abort)` cancel the tracked
+transfer as well as marking the request's output. A decode receiver sends a
+cancellation to every prefill target that could write its landing pages.
+Each target stops accepting work for the room and acknowledges only after
+its queued and executing writes retire. The receiver waits for every target,
+then agrees retirement across its replica before reporting `Stopped` to the
+scheduler; `Failed` may already have ended the client request. Failure
+notifications and receive timeouts use the same fence:
+neither proves that remote writes stopped. A receiver that never advertised
+landing pages can retire locally. Cancelled rooms reject delayed registration
+and manifests; repeated cancellation is safe.
+
+`Failed` precedes `Stopped`, but both may arrive in the same poll when the
+transfer has already retired. Consumers accept either one poll or separate
+polls and keep the pages until the retirement event and local forwards complete.
+
+The prefill control receiver handles cancellation even when no native request
+claimed the room or its scheduler is paused. Unclaimed rooms therefore need
+not wait for the bootstrap timeout after the decode request is cancelled.
+P and D must run versions supporting this cancellation protocol. If a target
+cannot acknowledge retirement, the receiver retains its pages and the drain
+remains pending; a transport failure alone cannot make those pages safe to
+reuse. Cancellation tombstones are retired with their destination cache
+identities. A prefill cancellation that never learns a destination identity
+must retain its room tombstone until that peer exits, since an arbitrarily
+late manifest must not revive the transfer.
+
+These records include every prefill failure and bootstrap timeout, not just
+explicit client cancellation. There is currently no count or age limit:
+unbound records last for the prefill peer's lifetime, and bound records can
+last just as long when a healthy decode cache is never superseded. Sustained
+timeouts therefore grow metadata with the number of failed rooms, even after
+all associated jobs and network workers retire. Request timeout bounds do not
+bound this memory. An age or size eviction would allow a delayed manifest to
+revive an ended room; the wire has no enforced message lifetime or retired
+attempt epoch to reject it. Bounded retention needs such a protocol guarantee
+(or a fail-closed admission policy), rather than assuming that a multiple of
+the bootstrap timeout rules out late messages.
+
+A native write error does not prove that its remote DMA stopped. The prefill
+peer marks that room uncertain and withholds cancellation acknowledgments even
+after its queued and executing calls return. Failure notices may still reach
+the receiver, but cannot release its pages. An uncertain room or an unreachable
+writer can therefore keep the receiver's drain pending indefinitely; stalled
+drains are logged periodically. A parked request also keeps operations that
+require a drained engine, such as cache flush, weight replacement and sleep
+with memory release, from completing. Recovery requires verified retirement
+of the writers or transport invalidation that makes further access to these
+registrations impossible; local forwards must also have completed before
+pages are released. A timeout can trigger diagnostics or recovery but cannot
+authorize page reuse; the current protocol provides no forced retirement
+for an uncertain room.
+
+**PD failure isolation.** Control messages use one bounded FIFO per destination
+endpoint. Connect and send each have a five-second deadline; a failed endpoint
+cannot hold another endpoint's registration, manifest or cancellation. An
+identical cancellation or status occupies at most one queued/in-flight entry.
+Queue refusal fails registration/manifest publication; partial publication
+still uses the cancellation fence. Cancellation polling retries refused or
+undelivered notifications. Network delivery itself remains best effort: a
+locally accepted message is not a remote acknowledgment. A connect or send
+failure discards that endpoint's queued backlog and retires its task; it does
+not spend another I/O timeout on every queued message. Requests still use
+their failure/timeout and cancellation paths. After 60 seconds with no queued
+or in-flight message, even a healthy endpoint retires its socket, task and
+registry entry. The next send recreates them. Idle retirement and enqueue
+share a lock so a new message cannot be stranded on a closing FIFO; an old
+task's teardown cannot erase its replacement. Socket retirement does not
+retire cache identities, room tombstones or possible remote writes.
+
+Decode bootstrap lookups are serialized per bootstrap address, with independent
+workers for other addresses. Polling (including idle polls) and registration
+release a lost address's sender once its route is gone and no live request is
+still looking it up. The worker finishes any bounded in-flight HTTP call,
+skips terminal queued requests and exits; a later request creates another
+worker. A first lookup with no route yet keeps its worker so concurrent
+requests for that address stay serialized. Heartbeat failure counters expire
+with the routes too. Cache registration on prefill fences only the
+cache identities being replaced. A replacement waits off the control receive
+path for those native writes, while unrelated registrations and cancellations
+continue. Manifests for the replacement wait until it is installed; queued
+old writes recheck their identity before reaching native I/O. Synchronous data
+writes still use the configured transfer worker pool, and heartbeat probes are
+still sequential; these bounds do not provide native write cancellation or
+writer incarnation discovery.
+
+Bootstrap timeout and other prefill failures retain the same terminal room
+record as explicit cancellation. A late manifest is rejected immediately,
+without another unclaimed timeout. Before manifest publication, decode bounds
+bootstrap and scheduler admission waiting by `waiting_timeout`. Publication
+starts a separate receive budget of the same duration. These phase budgets do
+not constitute an upstream end-to-end deadline. Before publication a failed
+receiver retires locally and notifies known targets; after publication it must
+obtain the normal retirement acknowledgments.
+
+**PD** (`pd`, `ts-pd`). Requests register with the transfer peer when submitted
+to the scheduler, before cache admission. Every round the replica agrees on
+which transfers changed state; their scheduler events join the round's tail feedback, and a failed
+transfer aborts its request on every rank together. A peer keeps state only
+for the rooms of requests the loop tracks (a sleep waits for those alone),
+with one exception on the prefill side: a room the decode node pre-allocated
+for before its request registered here, or one this rank failed first (an
+EPD embedding timeout), waits unclaimed; one still unclaimed after the
+bootstrap timeout is dropped, and the decode ranks that pre-allocated for it
+are told it failed. A decode room whose KV lands without the request's first
+token fails: the first decode feeds on it.
+
+`pd::TransferStoppedEvent` retires the transfer of the parked request. Its
+resources still wait for any outstanding local forward results before release:
+a transport fence does not fence this engine's execution stream. A late success
+retires a parked transfer under the same local-forward condition.
+
+**EPD prefill** (`--disaggregation-mode prefill` with encode nodes). A
+request whose images an encode node embeds is staged at admission; each
+round the replica MIN-reduces which staged requests' embeddings landed on
+every rank, submits those, and fails those whose receive failed or timed out
+on any. The receives settle while paused too: one that lands then is
+withheld, like any admission.
+
+**Grammars** (`grammar`, `--grammar-backend xgrammar`). A constrained
+request waits in the loop's grammar queue until its grammar compiled (off the
+round, on compiler threads) on every replica rank, and fails if it timed out
+on any or does not compile; every rank admits the same ones in the same
+round. The matchers live in Rust (`ts-grammar`); the data plane fills
+bitmasks through their handles, with one C++ fill (`grammar_host.Filler`)
+on both paths: the capturable path's host node runs it inside the forward
+and advances the matchers there; the eager path runs it before the forward
+and the commit advances them.
+
+## Request-token history seeds
+
+The control plane owns each request's committed token list. `HistoryRows`
+tracks slot ownership by admission, not by client request id, and seeds a
+new owner's prefix before its first forward. Consecutive chunks on the
+same owned row append their inputs without reseeding. Prefix-cache hits,
+PD landings, slot reuse and recovery into another slot use this same path.
+Only the most recently used slot can hold a request's current history. Moving
+to another slot invalidates the old ownership claim: a later restore into
+that old slot must seed again, even if no other request has used it.
+
+A model profile may declare `request_token_history_lookback`: the maximum
+number of committed tokens it reads behind its write frontier. Omission
+(`None`) preserves full-prefix seeds; zero permits an empty seed. The host
+uses the maximum bound across target and draft history readers, or full
+history if either reader declares no bound. A finite bound is a model
+correctness contract, not a serving knob: every history read must stay
+within it, including resumed and speculative forwards.
+
+For a prefix of length P and bound L, the seed carries tokens
+`[max(0, P-L), P)`, retaining P as `prefix_lengths`. The Python executor
+places them at their original absolute positions, never at position zero.
+The draft row keeps its existing one-token-left shift: source positions
+`[start+1, P)` populate draft positions `[start, P-1)`. The final draft position is not
+provided by the seed, just as with full-prefix seeding; the model/drafter
+must supply any boundary token it reads. Earlier row contents are
+unspecified and must not be read. This reduces copied and uploaded tokens,
+not the context-sized history allocation or KV-cache storage. Token history
+remains token-derived state, reconstructed rather than included in
+retraction snapshots.
 
 ## Anatomy of a round
 
-For orientation, one iteration of `event_loop`:
+For orientation, one `EventLoop::round`:
 
-1. Receive and admit new requests (`_process_new_requests`), with the pause
-   and EPD admission hooks inline as single lines.
-2. Converge the in-flight L3 prefetches (`_l3_hooks.converge_prefetches`:
-   a replica MIN of each op's landed prefix; a finished op is completed on
-   the device), then poll completed Host cache ops (L2 write-backs/
-   load-backs, prefetches, snapshot stores/restores); **advance the
-   scheduler (head call site)** so this round's plan sees them.
-3. Frozen (`PAUSED_ALL`)? Drain the in-flight queue and run the paused idle
-   step. Otherwise: plan (`next_execution_plan`),
-   count its cache ops, finish the requests the plan aborted
-   (`plan.aborts`: a capacity retraction whose victim could not be imaged
-   aborted the newest resident inside the plan build; the scheduler
-   released its pages in that round and emits nothing further for it, so
-   the output processor finishes it toward the client with
-   `ABORT_CODE.CapacityAbort` and no event flows back -- the one request
-   finish that is not a forward result), derive the forward op, record
-   metrics, DP-sync, and gather per-batch state (draining the in-flight
-   queue first if the dispatch depends on a pending commit, Principle 4).
-4. **One `DeviceHandle.execute(plan, planned)` call per round**, in an order
-   that is itself a correctness contract for same-round page reuse. The
-   handle adapts the plan's cache ops once (`cache_ops_from_plan`, on the
-   control plane), starts the L3 prefetches on the executor's CPU lane
-   (`PrefetchOp`: no stream, no Device page, nothing on the FIFO) and
-   submits, on the FIFO: the Host-bound stores first --
-   `WriteBackOp` and `SnapshotOp`, a retraction image's two legs (the
-   stream-ordered L2 write-back of the victim's hash-complete pages and the
-   snapshot store of its tail pages and slot state) must read the reused
-   pages' old bytes, so they ride the write stream consecutively and ONE
-   completion event fences the forward thread's default stream here, before
-   anything else of the plan is enqueued; an ordinary store's sources are
-   pinned by the scheduler until the ACK, so its copy rides the write stream
-   and fences nothing -- then the plan's Device-to-Device block copies
+1. The frontend's owner receives (waiting briefly only when the whole engine
+   is idle) and relays the round's messages to the replica, with its stop
+   request; with L3 every member's storage executor report rides the same
+   exchange. Admit them in arrival order — a control operation and the
+   requests before it keep their order — then apply the pause edges, admit
+   the grammar queue and the EPD staged requests that are ready, and run the
+   same-round gate.
+2. Agree the L3 reports into the round's storage tick (without L3, a tick
+   only when a freeze starts or ends); while a cache op is open, poll the
+   data plane's acknowledgments and intersect them; then **advance the
+   scheduler (head)** with both, so this round's plan sees them.
+3. Frozen? Commit what is dispatched, plan (the tick forbade forwards, so
+   the plan carries cache and storage work only) and dispatch that work,
+   and join the attention-DP agreement.
+   Otherwise: plan (`next_execution_plan`), count its cache ops, finish the
+   requests the plan aborted (`plan.aborts`: a capacity retraction whose
+   victim could not be imaged aborted the newest resident inside the plan
+   build; the scheduler released its pages in that round and emits nothing
+   further for it, so the request finishes toward the client with a capacity
+   abort and no event flows back -- the one request finish that is not a
+   forward result), record metrics, run the DP agreement, and gather the
+   batch's per-round inputs (n-gram windows, the logprob plan, history seeds,
+   grammar advances), committing the queue first if the dispatch depends on
+   a pending commit (Principle 4).
+4. **One `DataPlane::execute(plan, dispatch)` per round** that has device
+   work, after the control thread submitted the plan's storage operations to
+   the L3 executor (Host workers: no stream, no Device page). The forward
+   thread adapts the plan's cache ops once (`cache_ops_from_plan`), sets the
+   storage subset aside and turns the rest into one
+   `DeviceHandle.execute(plan, planned, cache_ops=...)`, which submits in an
+   order that is itself a correctness contract for same-round page reuse:
+   the Host-bound stores first --
+   `WriteBackOp` and `SnapshotOp`; the stream-ordered ones, a retraction
+   image's two legs (the L2 write-back of the victim's hash-complete pages
+   and the snapshot store of its tail pages and slot state) and, under the
+   Host write-back policy (`--kvstore-write-policy write_back`), the L2
+   write-back of what the plan's admissions and restores evicted, must
+   read the reused pages' old bytes, so they ride the write stream
+   consecutively and ONE completion event fences the forward thread's
+   default stream here, before anything else of the plan is enqueued; an
+   ordinary store's sources (a write-through publication's) are pinned by
+   the scheduler until the ACK, so its copy rides the write stream and
+   fences nothing -- then the plan's Device-to-Device block copies
    (`pages_to_copy`: a prefix hit's private copy of the block holding its
    boundary, an owner's move off the block it published at its prompt end;
    the copy waits on the execution stream and precedes the zeroing because
    a source may be re-granted and zeroed by this very plan -- or re-granted
-   as another copy's destination, which the arena then writes only after the
-   pairs reading it; a destination is never zeroed; no op id, no ACK), then
-   page zeroing (the new
-   owner's sanitization),
-   then L3 prefetches (`PrefetchOp`: Host-lane submissions with no stream
-   dependency, nothing in the round reads their pages), then the
-   Device-bound copies -- `LoadBackOp` and `RestoreOp`, ordered
-   behind the zeroing: a load-back lands on zeroed pages and the forward
-   reads it layer by layer behind the layerwise fences, so the loads start
-   first on the load stream; a restore queues behind them, overwrites its
-   destination blocks whole (the scheduler lists none of them for zeroing),
-   reads both Host tiers under one event and arms no layerwise fence, its
-   request being unschedulable until the ACK -- then the plan's
-   remote streams to the transfer peer (a D-node remote prefill waits on the
-   zeroing fence inside its submission, which the FIFO orders after the
-   store fence), then the plan's batch to the model. A store names the
-   victim's request-pool slot, which the scheduler freed in the same plan
-   build: its next owner first writes it in a forward, and every forward is
-   enqueued behind the store fence, so the slot-state export reads the
-   victim's bytes; a restore names the resumed request's new slot. `planned`
-   is None on idle and empty rounds; the plan's own work (hygiene, the
-   remote streams) still runs. The rebalance hook notes whether this rank
-   forwarded (`_eplb_hooks.note_round`), and so does the garbage-collection
-   hook, which runs a full collection every `FULL_COLLECTION_INTERVAL`
-   forwarded rounds (`_gc_hooks.note_round`). Then commit from the queue head
-   down to the effective depth and poll PD transfer events.
-5. **Advance the scheduler (tail call site)** with the round's
-   `request_changes`, publish KV events (once), and resolve any pending
-   pause/release drain.
+   as another group's copy destination, which the arena writes only after
+   every pair reading those byte ranges; a destination is never zeroed;
+   no op id, no ACK), then
+   page zeroing (the new owner's sanitization of the fresh pages nothing
+   fills whole: a copy destination and a block a remote landing fills are
+   left out), then the Device-bound copies
+   -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing and the
+   forwards in flight, which may still write a block an abort freed and this
+   plan granted (load-back destinations are never zeroed): the forward reads
+   a load-back layer by layer behind the
+   layerwise fences (a prefill graph replay waits on them before each
+   captured segment, which holds none, or, on a pool that does not declare
+   every access fenced, for the whole load instead), so the loads start first
+   on the load stream, and every plan, with cache ops or without, points
+   the fences at its own load or at none; a restore
+   queues behind them, overwrites its destination blocks whole (the
+   scheduler lists none of them for zeroing), reads both Host tiers under one
+   event and arms no layerwise fence, its request being unschedulable until
+   the ACK -- then the plan's remote streams to the transfer peer (a D-node
+   remote prefill submits only its stream-ordered slot preparation here),
+   then the plan's batch to the model, then the D-node remote prefill's
+   pull, which waits on the zeroing fence before its CPU-issued RDMA
+   trigger. The zeroing orders behind the step in flight, so a pull queued
+   ahead of the batch would hold the batch's launch until that step ends. A
+   store names the victim's request-pool slot, which the scheduler
+   freed in the same plan build: its next owner first writes it in a
+   forward, and every forward is enqueued behind the store fence, so the
+   slot-state export reads the victim's bytes; a restore names the resumed
+   request's new slot. The rebalance controller notes whether this rank
+   forwarded, and so does the data plane's garbage-collection hook. Then commit
+   from the queue head down to the effective depth (a pipeline's stages
+   adopting the last stage's results first) and poll the PD transfers.
+5. **Advance the scheduler (tail)** with the round's `events`, publish KV
+   events (once), release the data plane's state for the requests that
+   ended, send the round's outputs with the scheduler's load, resolve any
+   pending pause or release drain, and send the control replies.
+
+## Startup process ownership
+
+The launcher starts every local rank before waiting for readiness, and
+watches their ready channels and process exits together. A rank that fails
+startup tells the launcher and exits; it does not finalize its interpreter,
+so a lingering Python thread cannot keep it alive. EOF remains a failure
+until every rank has reported, even if that rank reported earlier: peers can
+still be blocked in startup collectives.
+
+Readiness detection only reports failure. It never joins or terminates
+ranks, and introduces no shutdown deadline. The owning launcher stops the
+process tree. Child-failure signals unwind the launcher with a nonzero exit
+status. Failure, termination and constructor-error cleanup share one
+process-local shutdown latch: once cleanup starts, later rank notifications
+cannot interrupt it. Signal callbacks do not log or enumerate processes;
+cleanup runs outside the callback.
+
+While serving generation, a fatal control-loop or forward-thread error
+signals the owning launcher once from the thread that detects it. The
+signal requires no Python call and precedes the Rust error log and any wait
+for the forward thread or device cleanup. The launcher can begin stopping
+the local ranks even while the failing rank is still alive. An orderly stop
+still drains the forward thread and closes the data plane.
+
+Concurrent reporters wait only for the native signal attempt, never for
+another thread's log output. The data plane publishes its first failure
+and wakes waiters before logging either the rank failure or a failed signal.
+Later distinct failures and cleanup errors remain visible without replacing
+the original serving error.
+Failures outside generation serving use the same native notifier when
+they reach the host's final error handler; their cleanup timing is unchanged.
+
+### Startup requests
+
+Model warmup runs the model alone on a probe cache. It never reaches the
+request bookkeeping (input preparation, accepted-state commits), and the
+final cache can change kernel specializations it did prepare. With
+`--enable-startup-requests` the host closes both gaps before it registers:
+the loop starts with no frontend and `EventLoop::warm_up` serves requests of
+its own through the ordinary rounds (admission, planning, the data plane,
+commits), on every rank of the replica as a frontend's would be.
+
+`startup::Limits::phases` sizes them from the engine's limits alone: one
+one-token request, one each of a thirty-second of a prefill chunk, a
+sixteenth, one token more, and three sixteenths (the partial forwards that
+short prompts and a long prompt's last chunk run, aligned and not), one of a
+whole chunk, then `max_num_seqs` requests whose prompts cross one chunk
+boundary, each cut to what ingress
+admits and so the whole batch fits the cache. Each phase runs until every
+rank is idle, then its prefixes are flushed, so serving starts from an
+empty cache. Their outputs go nowhere and kernels prepare their compile
+variants as in model warmup. Only
+then does the host complete the frontend handshake and report ready: no
+client request waits behind them or is timed with them.
+
+A disaggregated node is refused (its requests need a peer), and so is an
+L3 store (the flush would delete its shared namespace).
 
 ## Checklist for extending the loop
 
 * New logic that reacts to scheduler/transfer/cache progress: put it in the
-  matching hooks class (or add one), return events, and apply them at an
-  existing advance point.
+  matching `ts-control` module (or add one), return events, and apply them at
+  an existing advance point.
 * New device interaction: if it is startup-only, inside `build_device_side`;
-  if the running loop needs it, `DeviceHandle` — and inject the handle into
-  whoever needs it rather than traversing to it.
-* New reason a dispatch cannot overlap a pending commit: add it to
-  `_dispatch_depends_on_pending_commit`.
-* New per-round work: add a single-line hook call at a fixed position in the
-  loop (rank-identical across ranks if it contains collectives), not a
-  branch of feature code.
-* Never call `scheduler.advance`, `advance_scheduler`, or the KV event
-  publisher from a helper or hooks class.
-* Never issue CUDA work, or hold something that can, from the control plane.
+  if the running loop needs it, a named `DeviceHandle` operation behind a
+  named `DataPlane` operation.
+* New reason a dispatch cannot overlap a pending commit: add it beside the
+  others in `plan_and_dispatch`.
+* New per-round work: a single call at a fixed position in the round
+  (rank-identical across ranks if it contains collectives), not a branch of
+  feature code.
+* Never advance the scheduler or publish KV events from a helper or
+  subsystem module.
+* Never issue CUDA work from the control thread, or hand it something that
+  can.
 * Never synchronize with the device from the data plane's per-round path;
   run with `TOKENSPEED_DATA_PLANE_SYNC_DEBUG=error` while developing on it.
 * Never let a kernel's compile key follow the batch shape; run with
   `TOKENSPEED_JIT_COMPILE_CHECK=error` while developing on the serving path.
-* L3 `batch_exists` registration is on the admit path, but only when
-  `--kvstore-storage-backend` is set. Hashing every admitted prefix on the
-  default (`--disable-kvstore`) path is a control-plane cost the loop must
-  not pay: a round is microseconds, and agentic history is tens of thousands
-  of tokens. When L3 is on, existence is MIN-reduced across every
-  cache-owning rank in the replica (attention TP, then CP, then PP) so
-  those ranks admit the same prefix pages. ``WriteBackDone`` /
-  ``LoadBackDone`` / ``SnapshotDone`` / ``RestoreDone`` completions are
-  intersected the same way before the scheduler sees them: L3 Host
-  backups finish asynchronously, so a rank-local ACK would publish a Host
-  block on one mirrored scheduler while a CP/PP peer still has the op
-  pending, and a KVP rank that copied a different owned subset of an
-  image completes at a different time. A backup future that
-  fails is MAX-reduced on the same replica all_reduce that agrees
-  whether any rank has cache work; every rank raises after that
-  collective instead of one rank raising out of ``poll_results`` while
-  peers wait in ``all_gather_object``. Every rank stays in every
-  replica-group gather, even when an earlier TP/CP intersection is empty;
-  breaking out leaves a peer unmatched on the next ``all_gather_object``.
-  The poll runs these collectives only while a cache op is open (an L3
-  backup runs, and can fail, only while its write-back is): every rank
-  counts the same plans and commits the same intersections, so the open
-  count is the same everywhere and an idle replica polls nothing.
-  Weight-update `flush_cache` and standalone `/flush_cache` first
-  MAX-reduce flush intent across attention DP so every DP worker enters
-  the same collectives — the frontend sends `FlushCacheReqInput`
-  separately, and a rank that reduced inside request handling would wait
-  on a peer still in `_dp_sync_and_check`. The same MAX all-reduce gates
-  the weight ops themselves (NCCL group init/teardown, distributed and
-  Mooncake loads): `RequestHandler` queues each op and completes the
-  head only in a round where every DP rank reports one of the same kind
-  at its head (a mismatch raises — the frontend sends every op to every
-  worker in one order). The device call blocks the control thread in a
-  collective the trainer drives or an SDK read. A DP peer that had not
-  yet dequeued its copy would keep looping and wait for this rank in the
-  per-round all-reduce, a deadlock. One op completes per round, and the
-  replica MIN-reduces its result before the loop publishes the L3 weight
-  version or sends the reply. The same gate carries the online expert
-  rebalance's *internal* ops (`EplbSnapshot`, `EplbCommit`,
-  `EplbApplyChunk`) from a second FIFO with three more lanes: frontend
-  ops arrive on different DP workers in different rounds while the hooks
-  enqueue internal ops at rank-identical rounds, so one shared FIFO would
-  make the heads differ in kind across ranks and trip the mismatch
-  check. Two FIFOs compare kind-for-kind. When both are ready the
-  frontend op completes this round and the internal op the next — still
-  one blocking device call per round. Because every EP rank is inside a
-  gated op at once, the rebalance may run a gloo collective over the EP
-  group there (summing the load under all-to-all EP, broadcasting the
-  committed map), which the profile's `dump_expert_load` must not. The
-  manual `POST /rebalance_experts` is a frontend op on the first FIFO
-  that starts the same internal sequence. The loop refuses a memory-saver
-  release while a rebalance is in progress and, once drained, the release
-  waits while chunk ops still write the weights. They then MIN-reduce a
-  non-mutating `can_clear_cache` probe across the replica (attention TP,
-  then CP, then PP) and then across attention DP — DP replicas share
-  Mooncake objects — then MIN-reduce an error-returning L3
-  `remove_by_prefix`, before any rank mutates Device/Host. The frontend
-  ANDs every DP worker's reply. Independent TokenSpeed jobs that share a
-  tenant are not in those groups.
-  PP fans the request stream across WORLD so every cache-owning rank enters
-  the same exists MIN; without PP the attention-TP broadcast already does.
-  `batch_exists` is not a lease, so the L3 pages are fetched before the
-  request is admitted: the scheduler allocates their Host blocks, emits a
-  `Cache.PrefetchOp`, and holds the request in a pre-admission state
-  (`Prefetching`: no Device page, no request-pool row, admission skips past
-  it) while the executor's lane fills the pages in prefix order, stopping at
-  the first missing object or at the deadline -- which bounds when the next
-  batch may start, not a batch in flight: the store's `batch_get_into` has
-  no timeout, so a hung get holds its active Host pages, namespace deletion
-  and shutdown. The deadline is counted from submission; an expired queued
-  job becomes a zero-page miss only when cancellation proves its worker
-  never started.
-  Active I/O retains its pages until completion. Each round the hooks
-  MIN-reduce every in-flight op's landed prefix across the replica; the
-  converged op is acknowledged once as `PrefetchDoneEvent(op_id,
-  landed_pages)`, the scheduler publishes the landed prefix in the Host
-  tier and forgets the rest of the keys, and the request's next admission
-  is an ordinary Host hit whose Host-to-Device load overlaps its first
-  chunk layer by layer, as any L2 hit's does. No forward is skipped and
-  nothing is retracted; there is no blacklist (a later `batch_exists` hit
-  may register a key again). A backend exception or malformed existence
-  result is a local miss, a lane fault a landing of nothing, so every
-  cache-owning rank still enters the replica MIN; raising would hang healthy
-  peers. Clients are not failed. The D role never prefetches: its admission
-  probes Device only.
+* A collective a rank enters must be entered by every rank of its group in
+  the same round, decided from rank-identical state (counts the ranks keep
+  the same, agreed flags), never from a rank's own view; a rank-local error
+  inside such a sequence goes into the agreement instead of out of the round.
+
+## Frontend load reports
+
+After the round's scheduler mutations and releases, the replica's frontend owner
+publishes its current request and cache load. Token outputs carry that snapshot;
+a changed snapshot is also sent in an empty output batch. Client cancellation
+can reap the final request without producing a final token, so reporting only
+nonempty outputs would leave routing and drain checks with a stale running
+count. An unchanged idle load is sent at most once per second as a heartbeat,
+so the frontend can distinguish an idle engine from a stale connection. The
+active page count in it is reused for up to 100 ms (see the page gauges),
+far inside the three seconds the frontend considers a report fresh.
+
+## Independent execution with shared weights
+
+The device build exports `requires_forward_coordination` as an immutable
+capability derived from execution groups. The host hands the control plane a
+DP coordination group only when forwards span workers, or when a shared L3
+namespace needs agreed flushes. Without one, fully local workers omit the
+per-round DP metadata exchange, peer-induced idle forwards and the DP
+rendezvous for cache flushes while retaining their DP routing identities.
+Sharing immutable expert weights alone does not require forward coordination.
+Weight-copy streams and readiness/release events remain behind the model on
+the data plane; see [distributed immutable weights](distributed-weights.md).

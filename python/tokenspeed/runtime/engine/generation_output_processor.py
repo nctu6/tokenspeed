@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import itertools
 import time
 from typing import TYPE_CHECKING
 
@@ -84,6 +85,10 @@ def resolve_stop_token_ids(
     return frozenset(int(token_id) for token_id in ids)
 
 
+# Process-wide admission identities; see ``RequestState.admission_id``.
+_ADMISSION_IDS = itertools.count(1)
+
+
 class RequestState:
     """Per-request state needed for incremental streaming output.
 
@@ -117,6 +122,10 @@ class RequestState:
                 so it is always stated.
         """
         # --- Extracted from recv_req (immutable) ---
+        # This admission's identity (``PlannedForward.admission_ids``,
+        # ``cache_ops_from_plan``): new for every request, even when a
+        # client reuses its rid, so per-slot device state never carries over.
+        self.admission_id: int = next(_ADMISSION_IDS)
         self.prompt_input_ids: list[int] = prompt_input_ids
         self.prompt_input_ids_unpadded: list[int] = (
             prompt_input_ids_unpadded

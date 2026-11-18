@@ -21,10 +21,15 @@
 """Runtime configuration exports."""
 
 from tokenspeed.runtime.configs.beam_config import BeamConfig
-from tokenspeed.runtime.configs.deepseek_v4_config import DeepseekV4Config
 from tokenspeed.runtime.configs.deepseek_v41_config import (
     DeepseekV41Config,
     DeepseekV41TextConfig,
+)
+from tokenspeed.runtime.configs.inkling2 import (
+    Inkling2MMConfig,
+    Inkling2ModelConfig,
+    Inkling2MTPConfig,
+    Inkling2VisionConfig,
 )
 from tokenspeed.runtime.configs.inkling_config import (
     InklingAudioConfig,
@@ -36,13 +41,13 @@ from tokenspeed.runtime.configs.kimi_k2_config import KimiK2Config
 from tokenspeed.runtime.configs.kimi_k3_config import (
     KimiK3Config,
     KimiK3VisionConfig,
+    KimiK31Config,
     KimiLinearConfig,
 )
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import KimiK3DSparkConfig
 from tokenspeed.runtime.configs.kimi_k25_config import KimiK25Config
 from tokenspeed.runtime.configs.minimax_m3_config import MiniMaxM3Config
 from tokenspeed.runtime.configs.muse_spark_config import MuseSparkConfig
-from tokenspeed.runtime.configs.qwen2_config import Qwen2Config
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
@@ -63,10 +68,8 @@ from tokenspeed.runtime.configs.qwen4_exp_config import (
 
 __all__ = [
     "BeamConfig",
-    "DeepseekV4Config",
     "DeepseekV41Config",
     "DeepseekV41TextConfig",
-    "Qwen2Config",
     "Qwen3Config",
     "Qwen3MoeConfig",
     "Qwen3_5Config",
@@ -82,10 +85,15 @@ __all__ = [
     "KimiK2Config",
     "KimiK25Config",
     "KimiK3Config",
+    "KimiK31Config",
     "KimiK3DSparkConfig",
     "KimiK3VisionConfig",
     "KimiLinearConfig",
     "InklingAudioConfig",
+    "Inkling2MMConfig",
+    "Inkling2ModelConfig",
+    "Inkling2MTPConfig",
+    "Inkling2VisionConfig",
     "InklingMMConfig",
     "InklingModelConfig",
     "InklingVisionConfig",

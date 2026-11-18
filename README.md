@@ -12,8 +12,8 @@ Core components:
 - **Kernels**: pluggable, layered kernel system with a portable public API and
   a centralized registry including one of the fastest **MLA**
   (Multi-head Latent Attention) implementations on Blackwell for agentic workloads.
-- **Entrypoint**: SMG-integrated AsyncLLM for low-overhead CPU-side request
-  handling.
+- **Entrypoint**: SMG and Dynamo drive the engine from Rust over its msgpack
+  wire, with no Python on the request path.
 
 ## SM120 (RTX PRO 6000 Blackwell)
 
@@ -53,6 +53,8 @@ More importantly, TokenSpeed is the **Switzerland** of open-source LLM inference
 
 ## News
 
+- [2026/11] 🔥 331 output tokens/s per GPU on AgentX: Serving Kimi K3 on GB300 with TokenSpeed (Kimi K3 Optimization on GB300 — Part II) [[blog](https://lightseek.org/blog/tokenspeed-kimi-k3-agentx.html)]
+- [2026/11] [Kimi K3.1 Pro](https://huggingface.co/moonshotai/Kimi-K3.1-Pro#4-deployment-and-availability) at Day 0: Sparse attention on the Kimi K3 stack with TokenSpeed. [[blog](https://lightseek.org/blog/tokenspeed-kimi-k3-1.html)]
 - [2026/10] [EAGLE-4](https://blog.eagle.ai/blog/introducing-eagle-4) training and serving with TorchSpec and TokenSpeed. [[blog](https://lightseek.org/blog/eagle-4.html)]
 - [2026/10] Reflection's [Beam](https://developers.reflection.ai/deployment-overview) at day 0: 501B MoE serving in NVFP4 on NVIDIA GB200 with TokenSpeed. [[blog](https://lightseek.org/blog/tokenspeed-reflection-beam.html)]
 - [2026/10] 🔥 [TokenSpeed MLA 2](https://github.com/lightseekorg/tokenspeed/tree/main/tokenspeed-mla#mla-2-decode-benchmarks) for [NVIDIA Vera Rubin](https://www.nvidia.com/en-us/data-center/technologies/rubin/). [[blog](https://lightseek.org/blog/tokenspeed-mla-2.html)]

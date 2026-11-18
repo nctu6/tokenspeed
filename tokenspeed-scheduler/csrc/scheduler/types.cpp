@@ -21,6 +21,7 @@
 #include "scheduler/types.h"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -33,6 +34,12 @@ void validateGroupCapacityInputs(const SchedulerConfig& config, const CacheGroup
     const std::string where = "Cache group '" + group.group_id + "': ";
     if (group.attn_kind != AttnKind::kState && config.prefix_granularity % group.block_granularity != 0) {
         throw std::invalid_argument(where + "block_granularity must divide the scheduler prefix_granularity");
+    }
+    if (group.checkpoint_granularity > 1 && (group.checkpoint_granularity % config.prefix_granularity != 0 ||
+                                             config.max_scheduled_tokens < group.checkpoint_granularity)) {
+        throw std::invalid_argument(where +
+                                    "checkpoint_granularity must be a multiple of prefix_granularity "
+                                    "and fit max_scheduled_tokens");
     }
     if (config.role == Role::kFused) {
         return;
@@ -53,36 +60,102 @@ void validateGroupCapacityInputs(const SchedulerConfig& config, const CacheGroup
 
 void SchedulerConfig::Validate() const {
     ValidateCapacityInputs();
+    if (max_kv_page_num < 0) {
+        throw std::invalid_argument("Scheduler: max_kv_page_num must be >= 0");
+    }
     if (device_allocator.total_pages <= 1) {
         throw std::invalid_argument("Scheduler: device cache must contain a null page and usable capacity");
     }
+    // 0 or 1 is no Host pool; a negative count is no pool size at all.
+    if (host_allocator.total_pages < 0) {
+        throw std::invalid_argument("Scheduler: host_allocator.total_pages (num_host_pages) must be >= 0");
+    }
     for (const CacheGroupConfig& group : cache_groups) {
         group.Validate();
+        // A grain only shapes where the checkpoint lands; the capability to write it stays a hard requirement, so
+        // an aligned group never schedules a checkpoint its consumer cannot fill.
+        if (role != Role::kD && group.checkpoint_granularity > 1 && !state_checkpoint_in_forward) {
+            throw std::invalid_argument(
+                "Scheduler: a State group with checkpoint_granularity > 1 requires state_checkpoint_in_forward");
+        }
+    }
+    if (enable_kv_cache_events && std::none_of(cache_groups.begin(), cache_groups.end(),
+                                               [](const auto& group) { return group.attn_kind == AttnKind::kFull; })) {
+        throw std::invalid_argument(
+            "Scheduler: KV cache events require a continuous Full/history cache group; "
+            "State-only, SWA-only, and State + SWA layouts are unsupported. "
+            "Disable enable_kv_cache_events to use these layouts without KV event routing.");
     }
     if (prefix_replay_tokens < 0) {
         throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
     }
+    if (state_checkpoint_in_forward && disable_prefix_cache && role != Role::kD) {
+        throw std::invalid_argument("Scheduler: state_checkpoint_in_forward requires prefix caching");
+    }
+    if (drop_short_prompt_end_checkpoints && role != Role::kP) {
+        throw std::invalid_argument("Scheduler: drop_short_prompt_end_checkpoints applies to the P role only");
+    }
+    if (drop_short_prompt_end_checkpoints && !state_checkpoint_in_forward) {
+        throw std::invalid_argument(
+            "Scheduler: drop_short_prompt_end_checkpoints requires state_checkpoint_in_forward");
+    }
+    // Only in-forward checkpoints are ever demoted.
+    if (demote_superseded_state_checkpoints && !state_checkpoint_in_forward && role != Role::kD) {
+        throw std::invalid_argument(
+            "Scheduler: demote_superseded_state_checkpoints requires state_checkpoint_in_forward");
+    }
+    if (prefill_chunk_yield_tokens < 0) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_chunk_yield_tokens (--prefill-chunk-yield-tokens) must be >= 0");
+    }
+    // The fused role retracts the largest incomplete prefill first, which a
+    // carried prompt could make the yielding request itself; the D role
+    // computes no prompt.
+    if (prefill_chunk_yield_tokens > 0 && role != Role::kP) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_chunk_yield_tokens (--prefill-chunk-yield-tokens) is for the P role only");
+    }
+    if (prefill_chunk_yield_tokens > max_scheduled_tokens / 2) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_chunk_yield_tokens (--prefill-chunk-yield-tokens) must be at most half of "
+            "max_scheduled_tokens (--chunked-prefill-size)");
+    }
+    if (!enable_l3_storage && storage_config) {
+        throw std::invalid_argument("StorageConfig requires L3 storage to be enabled");
+    }
+    if (enable_l3_storage) {
+        if (!storage_config) throw std::invalid_argument("L3 requires an explicit StorageConfig");
+        storage_config->Validate();
+        if (storage_config->max_host_blocks > host_allocator.NumUsableBlocks()) {
+            throw std::invalid_argument("L3 Host credits must not exceed usable Host parents");
+        }
+    }
     if (enable_l3_storage && !HasHostCache()) {
         throw std::invalid_argument("Scheduler: L3 storage requires Host L2 cache");
     }
-    if (enable_l3_storage && l3_prefetch_min_pages < 1) {
-        throw std::invalid_argument(
-            "Scheduler: L3 storage requires l3_prefetch_min_pages >= 1 (the L3 prefetch threshold, in prefix pages)");
+    if (HasHostCache() && host_write_policy == HostWritePolicy::kUnspecified) {
+        throw std::invalid_argument("Scheduler: a Host L2 cache requires an explicit host_write_policy");
     }
-    if (!enable_l3_storage && l3_prefetch_min_pages != 0) {
-        throw std::invalid_argument(
-            "Scheduler: l3_prefetch_min_pages is an L3 setting; it must be 0 without L3 storage");
-    }
-    if (enable_l3_storage) {
-        // A Host copy keeps its Device block's residue, but an L3 prefetch
-        // allocates its Host page before any Device destination exists.
-        for (const CacheGroupConfig& group : cache_groups) {
-            if (group.shard_count > 1) {
-                throw std::invalid_argument(
-                    "Scheduler: L3 storage is not supported for page-cyclic sharded cache "
-                    "groups (group '" +
-                    group.group_id + "')");
-            }
+    // Write-back needs no KV-parallel check: each Host block takes its Device
+    // block's bucket (docs/design/scheduler.md §5).
+    //
+    // Device copies read their sources before any copy in the plan overwrites
+    // those bytes, including when another group reuses the same LCM block.
+    if (host_write_policy == HostWritePolicy::kWriteBack) {
+        if (!HasHostCache()) {
+            throw std::invalid_argument("Scheduler: host_write_policy WriteBack requires a Host L2 cache");
+        }
+        if (role == Role::kD) {
+            throw std::invalid_argument(
+                "Scheduler: host_write_policy WriteBack is not available on the D role: its Host holds retraction "
+                "images only and remote admission probes the Device alone");
+        }
+        if (enable_l3_storage) {
+            throw std::invalid_argument("Scheduler: host_write_policy WriteBack excludes L3 storage");
+        }
+        // BoundaryTree::Node::written_back_group_bits keeps one bit per group.
+        if (cache_groups.size() > 64) {
+            throw std::invalid_argument("Scheduler: host_write_policy WriteBack supports at most 64 cache groups");
         }
     }
     // The snapshot pool is stated explicitly on every role: the null page
@@ -111,10 +184,52 @@ void SchedulerConfig::Validate() const {
     }
     // The knob retracts through the same path capacity pressure uses, and
     // that path needs somewhere to put the image.
+    // Its magnitude is the period; INT32_MIN has none in int32.
+    if (debug_force_retraction_interval == std::numeric_limits<std::int32_t>::min()) {
+        throw std::invalid_argument(
+            "Scheduler: debug_force_retraction_interval (--debug-force-retraction-interval) must be in "
+            "[-INT32_MAX, INT32_MAX]");
+    }
     if (debug_force_retraction_interval != 0 && !HasSnapshotPool()) {
         throw std::invalid_argument(
             "Scheduler: debug_force_retraction_interval (--debug-force-retraction-interval) requires a snapshot "
             "pool (--retraction-snapshot-host-gb > 0): without one nothing can be retracted");
+    }
+    if (prefill_decode_interval < 0) {
+        throw std::invalid_argument("Scheduler: prefill_decode_interval (--prefill-decode-interval) must be >= 0");
+    }
+    if (prefill_decode_min_interval < 0) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_decode_min_interval (--prefill-decode-min-interval) must be >= 0");
+    }
+    // Only the fused role runs local prefill rounds and decodes on one engine.
+    if (prefill_decode_interval != 0 && role != Role::kFused) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_decode_interval (--prefill-decode-interval) applies to the fused role only: a P "
+            "node runs no decodes and a D node no local prefill");
+    }
+    if (prefill_decode_min_interval != 0 && role != Role::kFused) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_decode_min_interval (--prefill-decode-min-interval) applies to the fused role only: "
+            "a P node runs no decodes and a D node no local prefill");
+    }
+    if (HasHostCache() || HasSnapshotPool()) {
+        if (host_group_packing.size() != cache_groups.size()) {
+            throw std::invalid_argument("Scheduler: Host pools require explicit packing for every cache group");
+        }
+        for (std::size_t i = 0; i < cache_groups.size(); ++i) {
+            const std::int32_t packing = host_group_packing[i];
+            if (packing <= 0 || packing % cache_groups[i].shard_count != 0) {
+                throw std::invalid_argument("Scheduler: Host packing must be positive and divisible by shard_count");
+            }
+            const std::int64_t parents =
+                std::max(host_allocator.NumUsableBlocks(), snapshot_allocator.NumUsableBlocks());
+            if (parents * packing > std::numeric_limits<std::int32_t>::max()) {
+                throw std::invalid_argument("Scheduler: Host cache block ids exceed int32 range");
+            }
+        }
+    } else if (!host_group_packing.empty()) {
+        throw std::invalid_argument("Scheduler: Host packing requires an L2 or snapshot pool");
     }
 }
 
@@ -127,6 +242,23 @@ void SchedulerConfig::ValidateCapacityInputs() const {
     }
     if (max_batch_size < 0) {
         throw std::invalid_argument("Scheduler: max_batch_size must be >= 0");
+    }
+    if (max_resident_requests < max_batch_size ||
+        max_resident_requests > std::numeric_limits<std::int32_t>::max() - 2) {
+        throw std::invalid_argument(
+            "Scheduler: max_resident_requests must cover max_batch_size and leave room for null and padding rows");
+    }
+    if (role != Role::kD && max_resident_requests != max_batch_size) {
+        throw std::invalid_argument("Scheduler: extra resident requests require the decode role");
+    }
+    if (checkpoint_retention_requests &&
+        (*checkpoint_retention_requests < 0 || *checkpoint_retention_requests > kMaxCheckpointRetentionRequests)) {
+        throw std::invalid_argument("Scheduler: checkpoint_retention_requests must be in [0, " +
+                                    std::to_string(kMaxCheckpointRetentionRequests) + "]");
+    }
+    if (checkpoint_retention_leaf_distance < 0 || checkpoint_retention_leaf_distance >= kMaxCheckpointDistance) {
+        throw std::invalid_argument("Scheduler: checkpoint_retention_leaf_distance must be in [0, " +
+                                    std::to_string(kMaxCheckpointDistance - 1) + "]");
     }
     if (decode_input_tokens < 0) {
         throw std::invalid_argument("Scheduler: decode_input_tokens must be >= 0");
@@ -141,17 +273,35 @@ void SchedulerConfig::ValidateCapacityInputs() const {
         throw std::invalid_argument("Scheduler: overlapped decode requires decode_input_tokens > 0");
     }
     std::int32_t replay_window_tokens = 0;
+    std::int32_t checkpoint_granularity = 1;
     for (const CacheGroupConfig& group : cache_groups) {
         validateGroupCapacityInputs(*this, group);
+        if (group.checkpoint_granularity > 1) {
+            if (checkpoint_granularity != 1 && checkpoint_granularity != group.checkpoint_granularity) {
+                throw std::invalid_argument("restricted State groups must use the same checkpoint_granularity");
+            }
+            checkpoint_granularity = group.checkpoint_granularity;
+        }
         if (group.replayable) {
             replay_window_tokens = std::max(replay_window_tokens, *group.sliding_window_tokens);
         }
+        if (group.sink_tokens > 0 && *group.sliding_window_tokens < prefix_granularity) {
+            // The window then needs every block of a tail, so a tail in the
+            // sink's page holds the sink blocks too (CacheCoordinator).
+            throw std::invalid_argument("Cache group '" + group.group_id +
+                                        "': a group with sink_tokens needs sliding_window_tokens >= "
+                                        "prefix_granularity");
+        }
+    }
+    if (replay_window_tokens > 0 && checkpoint_granularity > 1) {
+        throw std::invalid_argument("aligned State checkpoints do not support bounded replay groups");
     }
     if (replay_window_tokens > 0) {
         // A prefix hit re-feeds up to one replay window and must still carry
         // the prompt's final window whole, or at least a prefix page of new
         // tokens when the window is smaller than a page.
-        if (max_scheduled_tokens < replay_window_tokens + std::max(replay_window_tokens, prefix_granularity)) {
+        if (max_scheduled_tokens <
+            std::int64_t{replay_window_tokens} + std::max(replay_window_tokens, prefix_granularity)) {
             throw std::invalid_argument(
                 "Scheduler: max_scheduled_tokens must cover the replayable groups' largest sliding_window_tokens "
                 "plus max(that window, prefix_granularity)");

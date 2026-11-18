@@ -22,13 +22,106 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import AllReduceMailbox
+
 _FLOAT_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
+
+
+@triton.jit
+def _gather_moe_routes_kernel(
+    routes_ptr,
+    map_ptr,
+    output_ptr,
+    numel,
+    row_stride,
+    width: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offsets < numel
+    row = tl.load(map_ptr + offsets // width, mask=valid, other=-1)
+    source = tl.maximum(row, 0).to(tl.int64) * row_stride + offsets % width
+    values = tl.load(routes_ptr + source, mask=valid & (row >= 0), other=0.0)
+    tl.store(output_ptr + offsets, values, mask=valid)
+
+
+@register_kernel(
+    "moe",
+    "gather_moe_routes",
+    name="triton_gather_moe_routes",
+    solution="triton",
+    signatures=format_signatures("routes", "dense", _FLOAT_DTYPES),
+    priority=Priority.PORTABLE,
+)
+def triton_gather_moe_routes(
+    routes: torch.Tensor,
+    route_map: torch.Tensor,
+    num_tokens: int,
+    topk: int,
+    hidden_size: int,
+    output: torch.Tensor | None,
+) -> torch.Tensor:
+    """Triton kernel of :func:`tokenspeed_kernel.ops.moe.gather_moe_routes`."""
+    if routes.ndim != 2 or routes.shape[1] < hidden_size or routes.stride(1) != 1:
+        raise ValueError(
+            "routes must have shape [rows, padded_width] with contiguous columns"
+        )
+    if route_map.shape != (num_tokens * topk,) or not route_map.is_contiguous():
+        raise ValueError("route_map must be contiguous with shape [tokens * topk]")
+    if not routes.is_cuda or route_map.device != routes.device:
+        raise ValueError("routes and route_map must be colocated GPU tensors")
+    if num_tokens < 0 or topk <= 0 or hidden_size <= 0:
+        raise ValueError("tokens must be nonnegative and topk and hidden_size positive")
+    shape = (num_tokens, topk, hidden_size)
+    if output is None:
+        output = torch.empty(shape, device=routes.device, dtype=routes.dtype)
+    elif (
+        output.shape != shape
+        or output.dtype != routes.dtype
+        or output.device != routes.device
+        or not output.is_contiguous()
+    ):
+        raise ValueError(
+            "output must be contiguous [tokens, topk, hidden_size] matching routes"
+        )
+    if output.numel():
+        output_end = output.data_ptr() + output.numel() * output.element_size()
+        if routes.numel():
+            source_end = (
+                routes.data_ptr()
+                + ((routes.shape[0] - 1) * routes.stride(0) + routes.shape[1])
+                * routes.element_size()
+            )
+            if routes.data_ptr() < output_end and output.data_ptr() < source_end:
+                raise ValueError("output must not overlap routes")
+        map_end = route_map.data_ptr() + route_map.numel() * route_map.element_size()
+        if route_map.data_ptr() < output_end and output.data_ptr() < map_end:
+            raise ValueError("output must not overlap route_map")
+    if output.numel() >= 2**31:
+        raise ValueError(
+            f"triton_gather_moe_routes uses 32-bit offsets; got {output.numel()} "
+            "output elements"
+        )
+    if output.numel():
+        _gather_moe_routes_kernel[(triton.cdiv(output.numel(), 1024),)](
+            routes,
+            route_map,
+            output,
+            output.numel(),
+            routes.stride(0),
+            hidden_size,
+            1024,
+        )
+    return output
 
 
 @triton.jit
@@ -142,6 +235,31 @@ def _routed_sum_block(
 ROUTED_SUM_SINGLE_PASS_MAX_TOKENS = 4
 
 
+# CDNA4: one program per token holds a block of up to this many features in
+# registers without spilling (8 waves; a 16384 block spills).
+ROUTED_SUM_SINGLE_PASS_MAX_BLOCK_CDNA4 = 8192
+
+# CDNA4, complete routes: one program per token wins from this many tokens.
+ROUTED_SUM_SINGLE_PASS_MIN_TOKENS_CDNA4 = 152
+
+
+def _routed_sum_single_pass(num_tokens: int, block: int, has_map: bool) -> bool:
+    """Whether one program per token reduces the routes instead of two launches.
+
+    ``has_map`` is True when routes are read through a permute map.
+    """
+    if num_tokens <= ROUTED_SUM_SINGLE_PASS_MAX_TOKENS:
+        return True
+    if current_platform().is_cdna4 and block <= ROUTED_SUM_SINGLE_PASS_MAX_BLOCK_CDNA4:
+        # MI355X, route width 4096, top-8, graph replay: gathered routes (a
+        # permute map with about 1/8 of the routes present) are faster in one
+        # launch at every count from 1 to 8192 tokens. With complete routes
+        # each program reads all of its token's routes: one launch is slower
+        # from 8 to 128 tokens, about even at 136-144 and faster from 152.
+        return has_map or num_tokens >= ROUTED_SUM_SINGLE_PASS_MIN_TOKENS_CDNA4
+    return False
+
+
 @register_kernel(
     "moe",
     "routed_input_scale_rmsnorm_sum",
@@ -157,6 +275,7 @@ def triton_routed_input_scale_rmsnorm_sum(
     eps: float,
     weight_offset: float,
     enable_pdl: bool,
+    output: torch.Tensor | None,
 ) -> torch.Tensor:
     """Triton kernel of :func:`tokenspeed_kernel.ops.moe.routed_input_scale_rmsnorm_sum`."""
     if routes.ndim != 3:
@@ -171,7 +290,25 @@ def triton_routed_input_scale_rmsnorm_sum(
     block = _routed_sum_block(routes, num_tokens, topk, route_weights, norm_weight)
     routes_values = routes.contiguous()
     weights_values = route_weights.contiguous()
-    output = torch.empty((num_tokens, width), dtype=routes.dtype, device=routes.device)
+    if output is None:
+        output = torch.empty(
+            (num_tokens, width), dtype=routes.dtype, device=routes.device
+        )
+    elif (
+        output.shape != (num_tokens, width)
+        or output.dtype != routes.dtype
+        or output.device != routes.device
+        or not output.is_contiguous()
+    ):
+        raise ValueError(
+            "output must be contiguous [tokens, width] matching routes' dtype"
+        )
+    elif output.numel():
+        output_end = output.data_ptr() + output.numel() * output.element_size()
+        for source in (routes_values, weights_values):
+            source_end = source.data_ptr() + source.numel() * source.element_size()
+            if source.data_ptr() < output_end and output.data_ptr() < source_end:
+                raise ValueError("output must not overlap routes or route weights")
     if num_tokens == 0:
         return output
     _launch_routed_input_scale_sum(
@@ -186,7 +323,7 @@ def triton_routed_input_scale_rmsnorm_sum(
         eps,
         weight_offset,
         block,
-        num_tokens <= ROUTED_SUM_SINGLE_PASS_MAX_TOKENS,
+        _routed_sum_single_pass(num_tokens, block, has_map=False),
         enable_pdl,
     )
     return output
@@ -333,8 +470,11 @@ def triton_routed_input_scale_rmsnorm_sum_gathered(
     weight_offset: float,
     enable_pdl: bool,
     output: torch.Tensor | None,
+    all_reduce: AllReduceMailbox | None,
 ) -> torch.Tensor:
     """Triton kernel of the routed normalized reduction dispatcher."""
+    if all_reduce is not None:
+        raise ValueError("an all-reduce mailbox needs the cluster routed sum")
     width = norm_weight.shape[0]
     if gemm2_out.ndim != 2 or gemm2_out.stride(1) != 1 or gemm2_out.shape[1] < width:
         raise ValueError("gemm2_out must be row-major [rows, >= width]")
@@ -372,7 +512,7 @@ def triton_routed_input_scale_rmsnorm_sum_gathered(
         eps,
         weight_offset,
         block,
-        num_tokens <= ROUTED_SUM_SINGLE_PASS_MAX_TOKENS,
+        _routed_sum_single_pass(num_tokens, block, has_map=True),
         enable_pdl,
     )
     return output

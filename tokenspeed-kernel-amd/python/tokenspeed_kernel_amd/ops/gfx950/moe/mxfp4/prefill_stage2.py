@@ -75,6 +75,7 @@ import torch
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
 
 _USES_FP32_ATOMIC: Optional[bool] = None
+_NUM_XCDS = 8
 
 
 def _b_preshuffle_3d(b: torch.Tensor) -> torch.Tensor:
@@ -179,6 +180,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     APPLY_ROUTED_WEIGHT: gl.constexpr = True,
     INPUT_SORTED: gl.constexpr = False,
     A_FORMAT: gl.constexpr = "e2m1",
+    NUM_XCDS: gl.constexpr = 1,
 ):
     """Stage 2 1x2 kernel: 2 waves/CTA, BLOCK_N=256, 2-stage v3 pipeline.
 
@@ -410,6 +412,29 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                 # instead of having every expert update the same N tile.
                 pid_m = flat_tile // num_pid_n
                 pid_n = flat_tile % num_pid_n
+            elif NUM_XCDS != 1:
+                # Keep an expert's N-tile weights in one XCD's L2; empty tiles exit.
+                valid_pid_m = gl.minimum(
+                    gl.cdiv(num_tokens_post_padded, BLOCK_M), num_pid_m
+                )
+                grid_mn = valid_pid_m * num_pid_n
+                pids_per_xcd = (grid_mn + NUM_XCDS - 1) // NUM_XCDS
+                tall_xcds = grid_mn % NUM_XCDS
+                tall_xcds = gl.where(tall_xcds == 0, NUM_XCDS, tall_xcds)
+                xcd = flat_tile % NUM_XCDS
+                local_pid = flat_tile // NUM_XCDS
+                logical = gl.where(
+                    xcd < tall_xcds,
+                    xcd * pids_per_xcd + local_pid,
+                    tall_xcds * pids_per_xcd
+                    + (xcd - tall_xcds) * (pids_per_xcd - 1)
+                    + local_pid,
+                )
+                in_valid = flat_tile < grid_mn
+                pid_m = gl.where(
+                    in_valid, logical % gl.maximum(valid_pid_m, 1), num_pid_m
+                )
+                pid_n = gl.where(in_valid, logical // gl.maximum(valid_pid_m, 1), 0)
             else:
                 pid_m = flat_tile % num_pid_m
                 pid_n = flat_tile // num_pid_m
@@ -1720,6 +1745,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     force_reduce: bool | None = None,
     input_sorted: bool = False,
     a_format: str = "e2m1",
+    deferred_out: torch.Tensor | None = None,
 ):
     """Host-side launcher for Gluon MXFP4 MoE stage 2.
 
@@ -1761,6 +1787,8 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         w2_scale     : (E, D, K_physical // 32) uint8 e8m0; both scale
                        tensors retain physical CDNA4 panel pitches
         out          : (token_num, D) bf16 -- final per-token output
+        deferred_out : optional (token_num * topk, D) bf16 route destination
+                       for do_finalize=False
         sorted_*     : generated with ``sort_block_m`` when it differs
                        from compute ``block_m``; use 16/32/64/128 to mirror
                        FlyDSL sort_block_m
@@ -1788,6 +1816,18 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
             f"got {inter_states.dtype}"
         )
     assert w2.dtype == torch.uint8
+    if deferred_out is not None:
+        # The public entry checks overlap; keep this per-launch check cheap.
+        if (
+            do_finalize
+            or deferred_out.dtype != torch.bfloat16
+            or deferred_out.shape != (out.shape[0] * topk, w2.shape[1])
+            or not deferred_out.is_contiguous()
+        ):
+            raise ValueError(
+                "stage2 deferred_out must be contiguous BF16 routes with "
+                "do_finalize=False"
+            )
     # Step 2: shuffle w2 to MFMA-tile layout if the caller didn't.
     if not b_preshuffled:
         w2 = _b_preshuffle_3d(w2)
@@ -1922,8 +1962,12 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         # a scratch tensor with plain stores (race-free, each cell has
         # exactly one writer CTA), then a small reduce kernel sums the
         # topk dim into `out` with fp32 accumulation.
-        partials = torch.empty(
-            (token_num, topk, N), dtype=torch.bfloat16, device=inter_states.device
+        partials = (
+            torch.empty(
+                (token_num, topk, N), dtype=torch.bfloat16, device=inter_states.device
+            )
+            if deferred_out is None
+            else deferred_out.view(token_num, topk, N)
         )
         if not do_finalize and initialize_unowned_routes:
             partials.zero_()
@@ -1984,6 +2028,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         APPLY_ROUTED_WEIGHT=do_finalize,
         INPUT_SORTED=bool(input_sorted),
         A_FORMAT=a_format,
+        NUM_XCDS=_NUM_XCDS if _use_reduce else 1,
         num_warps=NUM_WARPS,
     )
 

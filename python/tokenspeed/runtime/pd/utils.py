@@ -34,8 +34,6 @@ import torch.distributed as dist
 
 from tokenspeed.runtime.utils import get_colorful_logger
 
-# env var for testing failure, convert to float explicitly
-FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 logger = get_colorful_logger(__name__)
 
 
@@ -44,6 +42,64 @@ class DisaggregationMode(Enum):
     PREFILL = "prefill"
     DECODE = "decode"
     ENCODE = "encode"
+
+
+class TransferBackend(Enum):
+    MOONCAKE = "mooncake"
+
+
+class StepCounter:
+    """The device half of layerwise PD streaming's producer-step counter.
+
+    The attention backends tick it as each producer step's KV lands; the
+    pinned host copy is what the host's transfer workers poll. The host
+    counts the steps it armed itself (``ts-pd``'s ``PrefillOutbox``), modulo
+    ``COUNT_NUM_MAX``.
+    """
+
+    COUNT_NUM_MAX: int = 2**62
+
+    def __init__(self, device: str, gpu_id: int):
+        self.d_ready_cache_step = torch.tensor(
+            0, dtype=torch.int64, device=torch.device(device, gpu_id)
+        )
+        self.h_ready_cache_step = torch.tensor(0, dtype=torch.int64, pin_memory=True)
+        # Host-side counters of the steps the Python prefill executor has armed
+        # (the Rust host keeps its own in ``PrefillOutbox``).
+        self.cache_step: int = 0
+        self.d_ready_aux_step = torch.tensor(
+            0, dtype=torch.int64, device=torch.device(device, gpu_id)
+        )
+        self.h_ready_aux_step = torch.tensor(0, dtype=torch.int64, pin_memory=True)
+        self.aux_step: int = 0
+
+    @classmethod
+    def is_step_ready(cls, current_step: int, target_step: int) -> bool:
+        return (
+            target_step != current_step
+            and (target_step + cls.COUNT_NUM_MAX - current_step) % cls.COUNT_NUM_MAX
+            > cls.COUNT_NUM_MAX / 2
+        )
+
+    def current_step(self) -> tuple[int, int]:
+        return (self.cache_step, self.aux_step)
+
+    def advance_step(self, delta_cache_step: int, delta_aux_step: int):
+        self.cache_step = (self.cache_step + delta_cache_step) % self.COUNT_NUM_MAX
+        self.aux_step = (self.aux_step + delta_aux_step) % self.COUNT_NUM_MAX
+
+    def record_cache(self):
+        self.d_ready_cache_step = (self.d_ready_cache_step + 1) % self.COUNT_NUM_MAX
+        self.h_ready_cache_step.copy_(self.d_ready_cache_step, non_blocking=True)
+
+    def query_ready_cache_step(self) -> int:
+        return ctypes.c_int64.from_address(self.h_ready_cache_step.data_ptr()).value
+
+
+# --- definitions restored from the pre-merge branch (D3-3) ---
+
+# env var for testing failure, convert to float explicitly
+FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 
 
 class FastQueue:
@@ -95,10 +151,6 @@ def poll_and_all_reduce(pollers, gloo_group):
     return tensor_to_reduce.tolist()
 
 
-class TransferBackend(Enum):
-    MOONCAKE = "mooncake"
-
-
 class KVClassType(Enum):
     MANAGER_PREFILL = "manager_prefill"
     MANAGER_DECODE = "manager_decode"
@@ -135,43 +187,3 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
         return class_mapping.get(class_type)
 
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
-
-
-class StepCounter:
-    COUNT_NUM_MAX: int = 2**62
-
-    @classmethod
-    def is_step_ready(cls, current_step: int, target_step: int) -> bool:
-        # because COUNT_NUM_MAX is very large, we can make sure that if diff is > COUNT_NUM_MAX / 2 means the flush is finished
-        # and if the current_sent_count == task_stop_count also means the flush is not finished
-        # so if current_sent_count != task_stop_count and diff < COUNT_NUM_MAX / 2, the flush is not finished
-        return (
-            target_step != current_step
-            and (target_step + cls.COUNT_NUM_MAX - current_step) % cls.COUNT_NUM_MAX
-            > cls.COUNT_NUM_MAX / 2
-        )
-
-    def __init__(self, device: str, gpu_id: int):
-        # utilities for cache step
-        self.d_ready_cache_step = torch.tensor(0, dtype=torch.int64).cuda(gpu_id)
-        self.h_ready_cache_step = torch.tensor(0, dtype=torch.int64, pin_memory=True)
-        self.cache_step: int = 0
-
-        # utilities for aux step
-        self.d_ready_aux_step = torch.tensor(0, dtype=torch.int64).cuda(gpu_id)
-        self.h_ready_aux_step = torch.tensor(0, dtype=torch.int64, pin_memory=True)
-        self.aux_step: int = 0
-
-    def current_step(self) -> tuple[int, int]:
-        return self.cache_step, self.aux_step
-
-    def advance_step(self, delta_cache_step: int, delta_aux_step: int):
-        self.cache_step = (self.cache_step + delta_cache_step) % self.COUNT_NUM_MAX
-        self.aux_step = (self.aux_step + delta_aux_step) % self.COUNT_NUM_MAX
-
-    def record_cache(self):
-        self.d_ready_cache_step = (self.d_ready_cache_step + 1) % self.COUNT_NUM_MAX
-        self.h_ready_cache_step.copy_(self.d_ready_cache_step, non_blocking=True)
-
-    def query_ready_cache_step(self) -> int:
-        return ctypes.c_int64.from_address(self.h_ready_cache_step.data_ptr()).value

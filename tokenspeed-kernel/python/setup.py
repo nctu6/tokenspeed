@@ -76,7 +76,7 @@ from setuptools.command.editable_wheel import editable_wheel
 ROOT = Path(__file__).resolve().parent
 REQUIREMENTS_DIR = ROOT / "requirements"
 THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
-BASE_VERSION = "0.1.4"
+BASE_VERSION = "0.1.5"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm", "npu"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
@@ -155,6 +155,28 @@ def _git_branch() -> str:
         return ""
 
 
+def _nightly_release_candidate() -> str:
+    """Return the release-candidate part of a manual nightly's version, or "".
+
+    TOKENSPEED_KERNEL_RELEASE_CANDIDATE=N (or rcN) adds rcN before the nightly's
+    date suffix. A release candidate sorts below every nightly with the same
+    base version, so it neither collides with the scheduled nightly of its date
+    nor shadows a nightly that satisfies the install.
+
+    Raises:
+        ValueError: If the value is set but is not a release-candidate number.
+    """
+    raw = os.environ.get("TOKENSPEED_KERNEL_RELEASE_CANDIDATE", "")
+    if not raw:
+        return ""
+    match = re.fullmatch(r"(?:rc)?([0-9]+)", raw.strip(), flags=re.IGNORECASE)
+    if match is None:
+        raise ValueError(
+            "Nightly release candidate must be a number such as 1 (or rc1)"
+        )
+    return f"rc{int(match.group(1))}"
+
+
 def _package_version() -> str:
     if os.environ.get("TOKENSPEED_KERNEL_NIGHTLY") == "true":
         version_date = _version_date()
@@ -165,8 +187,12 @@ def _package_version() -> str:
         ):
             raise ValueError("Nightly version date must be YYYYMMDD")
         datetime.strptime(version_date, "%Y%m%d")
-        return f"{BASE_VERSION}.post{version_date}"
+        return f"{BASE_VERSION}{_nightly_release_candidate()}.post{version_date}"
 
+    if os.environ.get("TOKENSPEED_KERNEL_RELEASE_CANDIDATE"):
+        raise ValueError(
+            "TOKENSPEED_KERNEL_RELEASE_CANDIDATE applies to nightly builds only"
+        )
     if _git_branch().startswith("release/"):
         return BASE_VERSION
 
@@ -357,6 +383,11 @@ def _ensure_cuda_compiler() -> None:
         raise RuntimeError(f"CUDA backend selected but nvcc was not found: {NVCC}")
 
 
+# Groups compiled without -use_fast_math, to match torch or Python bit for bit.
+PRECISE_MATH_GROUPS = frozenset(
+    {"eagle_harness_tree", "eagle_harness_policy", "eagle4_candidate"}
+)
+
 # Kernel groups: each entry produces one .so file.
 # Format: (name, [source_files], extra_ldflags) or
 #         (name, [source_files], extra_ldflags, extra_cflags)
@@ -454,6 +485,36 @@ KERNEL_GROUPS = [
         [],
     ),
     (
+        "eagle_harness_tree",
+        [
+            CUDA_CSRC_DIR / "eagle_harness_tree.cu",
+        ],
+        [],
+    ),
+    (
+        "eagle_harness_policy",
+        [
+            CUDA_CSRC_DIR / "eagle_harness_policy.cu",
+        ],
+        [],
+    ),
+    (
+        "eagle4_candidate",
+        [
+            CUDA_CSRC_DIR / "eagle4_candidate.cu",
+        ],
+        [],
+    ),
+    (
+        # Device-side CUDA graph launch needs relocatable device code linked with cudadevrt.
+        "eagle_harness_chain",
+        [
+            CUDA_CSRC_DIR / "eagle_harness_chain.cu",
+        ],
+        ["-lcudadevrt"],
+        ["-rdc=true"],
+    ),
+    (
         "mhc_big_fuse",
         [
             CUDA_CSRC_DIR / "mhc_big_fuse.cu",
@@ -505,6 +566,7 @@ KERNEL_GROUPS = [
         ],
         [],
     ),
+    ("trtllm_mhc", [CUDA_CSRC_DIR / "trtllm_mnnvl_mhc.cu"], []),
     (
         "trtllm_comm",
         [
@@ -524,6 +586,38 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "attn_res_binding.cu",
         ],
         [],
+    ),
+    (
+        "dsv3_fused_a_gemm",
+        [
+            CUDA_CSRC_DIR / "dsv3_fused_a_gemm.cu",
+            CUDA_CSRC_DIR / "dsv3_fused_a_gemm_binding.cu",
+        ],
+        [],
+    ),
+    (
+        "indexer_topk",
+        [
+            CUDA_CSRC_DIR / "indexer_topk.cu",
+            CUDA_CSRC_DIR / "indexer_topk_binding.cu",
+        ],
+        [],
+    ),
+    (
+        "trtllm_fp8_quant",
+        [
+            CUDA_CSRC_DIR / "trtllm_fp8_quant.cu",
+            CUDA_CSRC_DIR / "trtllm_fp8_quant_binding.cu",
+        ],
+        [],
+    ),
+    (
+        "cublaslt_fp4_gemm",
+        [
+            CUDA_CSRC_DIR / "cublaslt_fp4_gemm.cu",
+            CUDA_CSRC_DIR / "cublaslt_fp4_gemm_binding.cu",
+        ],
+        ["-lcublas", "-lcublasLt"],
     ),
 ]
 
@@ -903,6 +997,7 @@ class CudaKernelBuilder:
                 | {
                     "extra_cflags": list(extra_cflags),
                     "extra_ldflags": list(extra_ldflags or []),
+                    "precise_math": name in PRECISE_MATH_GROUPS,
                 }
                 if build_identity is not None
                 else None
@@ -951,6 +1046,11 @@ class CudaKernelBuilder:
             ) in stale_groups:
                 out_dir = so_path.parent
                 objects = []
+                group_nvcc_flags = (
+                    [flag for flag in nvcc_flags if flag != "-use_fast_math"]
+                    if name in PRECISE_MATH_GROUPS
+                    else nvcc_flags
+                )
                 for src in sources:
                     obj = out_dir / (src.stem + ".o")
                     objects.append(obj)
@@ -959,17 +1059,28 @@ class CudaKernelBuilder:
                             self._compile_one,
                             str(src),
                             str(obj),
-                            nvcc_flags,
+                            group_nvcc_flags,
                             include_dirs,
                             extra_cflags,
                         )
                     )
-                group_meta.append((name, objects, extra_ldflags, so_path, identity))
+                group_meta.append(
+                    (name, objects, extra_ldflags, extra_cflags, so_path, identity)
+                )
 
             for future in as_completed(futures):
                 future.result()
 
-        for name, objects, extra_ldflags, so_path, identity in group_meta:
+        for name, objects, extra_ldflags, extra_cflags, so_path, identity in group_meta:
+            if "-rdc=true" in extra_cflags:
+                # Relocatable device code links its device side with nvcc first.
+                dlink = so_path.parent / f"{name}_dlink.o"
+                subprocess.check_call(
+                    [NVCC, *gencode_flags, "--compiler-options=-fPIC", "-dlink"]
+                    + [str(o) for o in objects]
+                    + [*extra_ldflags, "-o", str(dlink)]
+                )
+                objects = [*objects, dlink]
             extra_ldflags = [
                 self._resolve_library_ldflag(ldflag) for ldflag in (extra_ldflags or [])
             ]
@@ -1060,15 +1171,26 @@ setup(
         ],
         "tokenspeed_kernel.thirdparty.cuda": [
             "objs/**/*.so",
+            "csrc/kimi3_router.cu",
+            # Vendored FlashInfer/Cake Kimi-K3 front programs, JIT-built like the router.
+            "csrc/kimi3_latent_front/*.cu",
+            "csrc/kimi3_latent_front/*.h",
             # Vendored Lamport protocol and FFI headers for the optional JIT extension.
             "csrc/tvm_ffi_utils.h",
             "csrc/include/**/*.h",
             "csrc/include/**/*.cuh",
         ],
-        # Optional JIT adapter for fused AllGather quantization.
+        # Vendored sonic-sampler: its license and provenance.
+        "tokenspeed_kernel.thirdparty.sonic_sampler": [
+            "LICENSE",
+            "README.md",
+        ],
+        # Optional JIT adapters: fused AllGather quantization and the
+        # stand-alone block-scaled batched GEMM.
         "tokenspeed_kernel.thirdparty.flashinfer": [
             "allgather_quant.cu",
             "sm90_moe.patch",
+            "trtllm_block_scaled_bmm.cu",
         ],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
         # loaded via the upstream sys.path bootstrap), so ship it as data.
@@ -1085,6 +1207,7 @@ setup(
             "csrc/*.jinja",
             "csrc/include/*",
         ],
+        "tokenspeed_kernel.thirdparty.vllm_recoverssm": ["LICENSE"],
         # Petit Gluon compiles its small HIP VMM binding lazily on first use.
         "tokenspeed_kernel.thirdparty.gluon_petit": [
             "LICENSE.txt",

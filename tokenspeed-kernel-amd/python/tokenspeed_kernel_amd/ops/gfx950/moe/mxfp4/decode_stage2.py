@@ -31,6 +31,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (
+    _direct_mxfp4_k_loop,
     _direct_mxfp4_load_tile,
     _direct_mxfp4_mfma,
     _direct_mxfp4_mfma_layouts,
@@ -82,6 +83,7 @@ def _stage2_mxfp4_direct_mfma_gluon(
     M_DUP: gl.constexpr,
     PIPELINE_K: gl.constexpr,
     DEFER_FINALIZE: gl.constexpr,
+    SLOT_PARALLEL: gl.constexpr,
 ):
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
@@ -128,7 +130,82 @@ def _stage2_mxfp4_direct_mfma_gluon(
     TOTAL_KT: gl.constexpr = gl.cdiv(I_PACKED, BLOCK_K_PACKED)
     acc_total = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
 
-    if token < M:
+    if SLOT_PARALLEL and not DEFER_FINALIZE and token < M:
+        # Short-K decode is bound by the dependent load -> MFMA chain, not by
+        # bandwidth.  Issue every slot's K tile together into per-slot
+        # accumulators; the epilogue keeps the sequential slot order below.
+        owned_slots = ()
+        gates = ()
+        w_offs = ()
+        s_offs = ()
+        accs = ()
+        for slot in gl.static_range(TOPK):
+            expert = (
+                gl.load(topk_ids_ptr + token * stride_tit + slot * stride_tis)
+                - expert_start
+            )
+            owned = (expert >= 0) & (expert < num_local_experts)
+            expert = gl.where(owned, expert, 0)
+            owned_slots = owned_slots + (owned,)
+            gates = gates + (
+                gl.load(topk_weights_ptr + token * stride_twt + slot * stride_tws).to(
+                    gl.float32
+                ),
+            )
+            w_offs = w_offs + (expert.to(gl.int64) * stride_we,)
+            s_offs = s_offs + (expert.to(gl.int64) * stride_se,)
+            accs = accs + (
+                gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout),
+            )
+        for kt in gl.static_range(TOTAL_KT):
+            tiles = ()
+            for slot in gl.static_range(TOPK):
+                row = token * TOPK + slot
+                tiles = tiles + (
+                    _direct_mxfp4_load_tile(
+                        kt,
+                        ak,
+                        bk,
+                        ask,
+                        bsk,
+                        am,
+                        asm,
+                        inter_ptr,
+                        inter_scale_ptr,
+                        w2_ptr,
+                        w2s_ptr,
+                        row.to(gl.int64) * stride_im,
+                        w_offs[slot],
+                        s_offs[slot],
+                        n_cols,
+                        n_cols_s,
+                        row,
+                        stride_ik,
+                        stride_xslin,
+                        stride_xsnb,
+                        stride_slin,
+                        stride_snb,
+                        N_PHYS,
+                        I_DIM,
+                        D,
+                        I_PACKED,
+                        BLOCK_K_PACKED,
+                        BLOCK_K_SCALE,
+                    ),
+                )
+            updated = ()
+            for slot in gl.static_range(TOPK):
+                tile = tiles[slot]
+                updated = updated + (
+                    _direct_mxfp4_mfma(accs[slot], tile[0], tile[1], tile[2], tile[3]),
+                )
+            accs = updated
+        for slot in gl.static_range(TOPK):
+            partial = gl.where(owned_slots[slot], accs[slot], 0.0).to(
+                out_ptr.dtype.element_ty
+            )
+            acc_total += (partial * gates[slot].to(partial.dtype)).to(gl.float32)
+    elif token < M:
         for slot_offset in gl.static_range(0, ROUTES_PER_PROGRAM):
             slot = route_slot + slot_offset
             global_expert = gl.load(
@@ -322,6 +399,7 @@ def invoke_stage2_mxfp4_mfma_decode_gluon(
     BLOCK_K: int = 128,
     M_DUP: int = 4,
     PIPELINE_K: bool = True,
+    SLOT_PARALLEL: bool = False,
 ):
     assert inter_states_mxfp4.dtype == torch.uint8
     assert inter_scale.dtype == torch.uint8
@@ -388,6 +466,7 @@ def invoke_stage2_mxfp4_mfma_decode_gluon(
         M_DUP=M_DUP,
         PIPELINE_K=PIPELINE_K,
         DEFER_FINALIZE=not do_finalize,
+        SLOT_PARALLEL=SLOT_PARALLEL,
         num_warps=1,
     )
     return out
@@ -402,7 +481,19 @@ def _route_tile_launch_metadata(grid, kernel, args):
     return {"name": f"{kernel.name} (routes={args['out'].shape[0]})"}
 
 
-@gluon.jit(launch_metadata=_route_tile_launch_metadata)
+@gluon.jit
+def _issue_here(value):
+    # An empty asm that uses the value keeps the compiler from sinking its
+    # load below the job loop's bound check, so it overlaps the group-count
+    # load instead of following it.
+    # asm: an empty template (no instruction). Gluon has no op that keeps a
+    # value at a program point.
+    return gl.inline_asm("", "=s,0", [value], gl.int32, is_pure=False)
+
+
+@gluon.jit(
+    launch_metadata=_route_tile_launch_metadata, do_not_specialize=["descriptor_rows"]
+)
 def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
     x,
     xscale,
@@ -411,6 +502,7 @@ def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
     sorted_routes,
     descriptors,
     group_count,
+    descriptor_rows,
     out,
     INTERMEDIATE: gl.constexpr,
     OUTPUT: gl.constexpr,
@@ -423,8 +515,15 @@ def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     BLOCK_M: gl.constexpr,
+    PREFETCH_TILES: gl.constexpr,
 ):
-    """Read expert route tiles and return separate token/slot outputs."""
+    """Read expert route tiles and return separate token/slot outputs.
+
+    ``sorted_routes``, ``descriptors`` and ``group_count`` hold the routes
+    grouped by expert, from the route-descriptor kernels or from stage 1
+    (``gluon_mxfp4_moe_stage1_route_tiles_gfx950`` with ``ROUTES_FROM_IDS``);
+    ``descriptor_rows`` is the descriptor table's row count.
+    """
     gl.static_assert(
         INTERMEDIATE % BLOCK_K == 0, "route tiles require complete K tiles"
     )
@@ -432,7 +531,9 @@ def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
     K_PACKED: gl.constexpr = INTERMEDIATE // 2
     KP: gl.constexpr = BLOCK_K // 2
     KS: gl.constexpr = BLOCK_K // 32
-    layouts: gl.constexpr = _direct_mxfp4_mfma_layouts(BLOCK_M, BLOCK_N, KS, 1)
+    layouts: gl.constexpr = _direct_mxfp4_mfma_layouts(
+        BLOCK_M, BLOCK_N, KS, gl.num_warps()
+    )
     mfma: gl.constexpr = layouts[0]
     la: gl.constexpr = layouts[1]
     lb: gl.constexpr = layouts[2]
@@ -446,59 +547,74 @@ def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
     ask = gl.arange(0, KS, layout=gl.SliceLayout(0, lsa))[None, :]
     bsn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, lsb))[:, None]
     bsk = gl.arange(0, KS, layout=gl.SliceLayout(0, lsb))[None, :]
+    # The first job's descriptor is read alongside the group count instead of
+    # after it (a program rarely has a second job), so the route loads wait
+    # for one round trip less. Padding rows repeat the group's last route.
     groups = gl.load(group_count)
+    first_group = gl.minimum(
+        gl.program_id(0) // (OUTPUT // BLOCK_N), descriptor_rows - 1
+    )
+    first_start = gl.load(descriptors + first_group * 3)
+    first_count = gl.load(descriptors + first_group * 3 + 1)
+    first_expert = gl.load(descriptors + first_group * 3 + 2)
+    first_start = _issue_here(first_start)
+    first_count = _issue_here(first_count)
+    first_expert = _issue_here(first_expert)
     for job in range(
         gl.program_id(0), groups * (OUTPUT // BLOCK_N), gl.num_programs(0)
     ):
         group = job // (OUTPUT // BLOCK_N)
         n = job % (OUTPUT // BLOCK_N)
-        start = gl.load(descriptors + group * 3)
-        count = gl.load(descriptors + group * 3 + 1)
-        expert = gl.load(descriptors + group * 3 + 2)
-        first = gl.load(sorted_routes + start)
-        routes = gl.load(sorted_routes + start + am, am < count, other=first)
-        scale_routes = gl.load(sorted_routes + start + asm, asm < count, other=first)
+        if job == gl.program_id(0):
+            start = first_start
+            count = first_count
+            expert = first_expert
+        else:
+            start = gl.load(descriptors + group * 3)
+            count = gl.load(descriptors + group * 3 + 1)
+            expert = gl.load(descriptors + group * 3 + 2)
+        routes = gl.load(sorted_routes + start + gl.minimum(am, count - 1))
+        scale_routes = gl.load(sorted_routes + start + gl.minimum(asm, count - 1))
         xoff = routes.to(gl.int64) * K_PACKED
         woff = expert.to(gl.int64) * WE
         wsoff = expert.to(gl.int64) * SE
         ncols = n * BLOCK_N + bn
         nscols = n * BLOCK_N + bsn
         acc = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, mfma)
-        for kt in range(K_PACKED // KP):
-            a, b, sa, sb = _direct_mxfp4_load_tile(
-                kt,
-                ak,
-                bk,
-                ask,
-                bsk,
-                am,
-                asm,
-                x,
-                xscale,
-                w,
-                wscale,
-                xoff,
-                woff,
-                wsoff,
-                ncols,
-                nscols,
-                scale_routes,
-                1,
-                XS0,
-                XS1,
-                SS0,
-                SS1,
-                OUTPUT,
-                INTERMEDIATE,
-                OUTPUT,
-                K_PACKED,
-                KP,
-                KS,
-            )
-            acc = _direct_mxfp4_mfma(acc, a, b, sa, sb)
+        acc = _direct_mxfp4_k_loop(
+            acc,
+            ak,
+            bk,
+            ask,
+            bsk,
+            am,
+            asm,
+            x,
+            xscale,
+            w,
+            wscale,
+            xoff,
+            woff,
+            wsoff,
+            ncols,
+            nscols,
+            scale_routes,
+            1,
+            XS0,
+            XS1,
+            SS0,
+            SS1,
+            OUTPUT,
+            INTERMEDIATE,
+            OUTPUT,
+            K_PACKED,
+            KP,
+            KS,
+            PREFETCH_TILES,
+        )
         sm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfma))[:, None]
         sn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma))[None, :]
-        destinations = gl.load(sorted_routes + start + sm, sm < count, other=first)
+        destinations = gl.load(sorted_routes + start + gl.minimum(sm, count - 1))
         gl.store(
             out + destinations.to(gl.int64) * OUTPUT + n * BLOCK_N + sn,
             acc.to(gl.bfloat16),

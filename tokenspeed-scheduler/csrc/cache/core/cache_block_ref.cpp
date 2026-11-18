@@ -45,7 +45,25 @@ void CacheBlockControl::release() noexcept {
     FatalCheck(strong_count_ != 0, "CacheBlockControl release requires a live reference");
     --strong_count_;
     if (strong_count_ == 0) {
-        delete this;
+        while (unique_observers_ != nullptr) {
+            unique_observers_->Reset();
+        }
+        object_.OwnerPool().destroyBlockControl(this);
+        return;
+    }
+    if (strong_count_ == 1 && unique_observers_ != nullptr) {
+        // Detach before callbacks: a callback can cancel another observer or
+        // release the last owner, including destroying this control.
+        CacheBlockUniqueObserver* pending = std::exchange(unique_observers_, nullptr);
+        for (auto* observer = pending; observer != nullptr; observer = observer->next_) {
+            observer->head_ = &pending;
+        }
+        while (pending != nullptr) {
+            const auto callback = pending->callback_;
+            void* context = pending->context_;
+            pending->Reset();
+            callback(context);
+        }
     }
 }
 
@@ -83,18 +101,6 @@ CacheBlockRef::~CacheBlockRef() noexcept {
     reset();
 }
 
-const CacheBlock* CacheBlockRef::operator->() const noexcept {
-    return control_ == nullptr ? nullptr : &control_->object();
-}
-
-const CacheBlock& CacheBlockRef::operator*() const noexcept {
-    return control_->object();
-}
-
-std::uint32_t CacheBlockRef::use_count() const noexcept {
-    return control_ == nullptr ? 0 : control_->useCount();
-}
-
 bool CacheBlockRef::IsOwnedBy(const BlockPool& pool) const noexcept {
     return control_ != nullptr && control_->isOwnedBy(pool);
 }
@@ -108,6 +114,42 @@ void CacheBlockRef::reset() noexcept {
 
 void CacheBlockRef::swap(CacheBlockRef& other) noexcept {
     std::swap(control_, other.control_);
+}
+
+void CacheBlockUniqueObserver::Observe(const CacheBlockRef& block, Callback callback, void* context) noexcept {
+    Reset();
+    if (!block) {
+        return;
+    }
+    FatalCheck(callback != nullptr, "a unique-owner observer requires a callback");
+    if (block.unique()) {
+        callback(context);
+        return;
+    }
+    head_ = &block.control_->unique_observers_;
+    next_ = *head_;
+    if (next_ != nullptr) {
+        next_->previous_ = this;
+    }
+    *head_ = this;
+    callback_ = callback;
+    context_ = context;
+}
+
+void CacheBlockUniqueObserver::unlink() noexcept {
+    if (previous_ != nullptr) {
+        previous_->next_ = next_;
+    } else {
+        *head_ = next_;
+    }
+    if (next_ != nullptr) {
+        next_->previous_ = previous_;
+    }
+    head_ = nullptr;
+    previous_ = nullptr;
+    next_ = nullptr;
+    callback_ = nullptr;
+    context_ = nullptr;
 }
 
 }  // namespace tokenspeed

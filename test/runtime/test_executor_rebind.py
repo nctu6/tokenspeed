@@ -37,6 +37,9 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 from tokenspeed.runtime.execution import model_executor as module  # noqa: E402
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter  # noqa: E402
 from tokenspeed.runtime.execution.model_executor import ModelExecutor  # noqa: E402
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import (  # noqa: E402
+    TorchMemorySaverAdapter,
+)
 
 
 def _pool(tag, *, attn_kind="full_history"):
@@ -75,8 +78,13 @@ class _Holder:
 def _executor(monkeypatch, log, *, with_draft: bool):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
+    executor.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
     executor.config = SimpleNamespace(
-        spec_algo=None, enforce_eager=False, pp_size=1, max_req_pool_size=3
+        spec_algo=None,
+        enforce_eager=False,
+        pp_size=1,
+        max_req_pool_size=3,
+        state_checkpoint_in_forward=False,
     )
     executor.model_runner = SimpleNamespace(model="target model")
     executor.attn_backend = _Holder("target", log)
@@ -177,7 +185,11 @@ def test_a_block_drafter_is_rechecked_against_the_targets_new_pool(
     log = []
     executor = _executor(monkeypatch, log, with_draft=True)
     executor.config = SimpleNamespace(
-        spec_algo=spec_algo, enforce_eager=False, pp_size=1, max_req_pool_size=3
+        spec_algo=spec_algo,
+        enforce_eager=False,
+        pp_size=1,
+        max_req_pool_size=3,
+        state_checkpoint_in_forward=False,
     )
     monkeypatch.setattr(
         module, "check_block_drafter_storage", lambda m, p: log.append(("check", m, p))
@@ -202,6 +214,7 @@ def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(
     )
     executor.prefill_graph = SimpleNamespace(
         disable=False,
+        capture_buckets=[16],
         capture=lambda wrapper, *, entries, observer: seen.append(
             ("prefill", entries, observer, wrapper)
         ),
@@ -211,6 +224,7 @@ def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(
         capture_prefill_graph=lambda stream, window: seen.append(
             ("drafter", stream, window)
         ),
+        extend_graph_plan=lambda token_buckets: {},
     )
     monkeypatch.setattr(
         module, "workspace_pool", lambda _d: SimpleNamespace(freeze=lambda: None)
@@ -237,7 +251,9 @@ def test_releasing_frees_both_owners_the_drafter_and_the_workspace(monkeypatch):
         release_graphs=lambda: order.append("prefill")
     )
     executor.drafter = SimpleNamespace(
-        release_prefill_graph=lambda: order.append("drafter")
+        release_prefill_graph=lambda: order.append("drafter"),
+        release_extend_graphs=lambda: order.append("drafter extend"),
+        release_round_graphs=lambda: order.append("drafter rounds"),
     )
     monkeypatch.setattr(
         module,
@@ -250,7 +266,15 @@ def test_releasing_frees_both_owners_the_drafter_and_the_workspace(monkeypatch):
 
     executor.release_graphs()
 
-    assert order == ["decode", "prefill", "drafter", ("unfreeze", "cuda"), "collect"]
+    assert order == [
+        "decode",
+        "prefill",
+        "drafter",
+        "drafter extend",
+        "drafter rounds",
+        ("unfreeze", "cuda"),
+        "collect",
+    ]
 
 
 def test_the_drafter_hooks_take_the_pool_and_drop_what_named_the_old_one(monkeypatch):
@@ -267,11 +291,11 @@ def test_the_drafter_hooks_take_the_pool_and_drop_what_named_the_old_one(monkeyp
     dflash = DFlash.__new__(DFlash)
     rebuilt = []
     dflash._init_fused_kv_helper = lambda: rebuilt.append("fused_kv")
-    dflash._init_incremental_proj = lambda: rebuilt.append("incremental_proj")
+    dflash._init_context_taps = lambda: rebuilt.append("context_taps")
     dflash.set_cache_pool("real")
     assert dflash.token_to_kv_pool == "real"
     assert _dflash_fused_kv._cached_kv_ptrs == {}
-    assert rebuilt == ["fused_kv", "incremental_proj"]
+    assert rebuilt == ["fused_kv", "context_taps"]
 
     # Only the last pipeline stage owns the draft context cache.
     producer = DSparkContextProducer.__new__(DSparkContextProducer)

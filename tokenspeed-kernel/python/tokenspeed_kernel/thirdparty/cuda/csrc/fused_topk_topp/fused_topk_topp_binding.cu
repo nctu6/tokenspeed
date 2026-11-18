@@ -21,6 +21,7 @@ void fused_topk_topp_renorm(
     TensorView workspace,
     int64_t side_stream_handle,
     bool enable_pdl,
+    bool in_place_skip,
     bool skip_identity_rows
 ) {
   CHECK_INPUT(probs);
@@ -49,6 +50,8 @@ void fused_topk_topp_renorm(
   TVM_FFI_ICHECK_EQ(top_ps.size(0), bs);
   TVM_FFI_ICHECK_EQ(out.size(0), bs);
   TVM_FFI_ICHECK_EQ(out.size(1), V);
+  TVM_FFI_ICHECK(!in_place_skip || out.data_ptr() == probs.data_ptr())
+      << "fused_topk_topp_renorm: in-place skip mode writes probs itself";
 
   size_t needed = fused_topk_topp::getWorkspaceSize(bs, V);
   TVM_FFI_ICHECK_GE(static_cast<size_t>(workspace.size(0)), needed)
@@ -80,6 +83,7 @@ void fused_topk_topp_renorm(
       mainStream,
       sideStream,
       enable_pdl,
+      in_place_skip,
       skip_identity_rows);
 }
 

@@ -27,7 +27,8 @@ MHA draft is just layers with two different geometries in one plan.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import math
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from functools import cached_property
 
@@ -40,7 +41,9 @@ from tokenspeed.runtime.layers.attention.configs.base import (
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     DSAConfig,
     dsa_history_gather_workspace_bytes,
+    dsa_kvp_history_prefill,
 )
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import MSA_PAGE_SIZE
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheRecipe,
 )
@@ -55,9 +58,15 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     MXFP8_KV_SCALE_TILE_TOKENS,
     CacheGroupDeclaration,
-    hybrid_slab_group_size,
+    SlidingWindowTokens,
+    layer_attn_kind_windows,
     layer_group_ids,
 )
+
+# The identity grain when no kernel needs a wider page: a flexible kernel runs
+# at the block span, and 64 tokens is the page of the fixed-page MHA, MLA and
+# DSA kernels (kernel_page_sizes.py).
+_MIN_PREFIX_GRANULARITY = 64
 
 
 class OrdinaryRecipe(CacheRecipe):
@@ -79,8 +88,6 @@ class OrdinaryRecipe(CacheRecipe):
         ids = _config_group_ids(self.attn_config, self.num_target_layers)
         if self.draft_attn_config is None:
             return ids
-        if self.draft_attn_config.prefix_granularity != self.prefix_granularity:
-            raise ValueError("target and draft prefix granularities must match")
         return ids + _config_group_ids(self.draft_attn_config, self.num_draft_layers)
 
     @cached_property
@@ -131,6 +138,38 @@ class OrdinaryRecipe(CacheRecipe):
         )
         return target + draft
 
+    @property
+    @override
+    def sliding_window_tokens(self) -> SlidingWindowTokens:
+        """A per-layer target window list covers only the target's layers, so
+        with a draft the target and draft windows are resolved separately and
+        concatenated: each draft layer takes the window given by its own layer
+        type and the draft config. A single target window is returned
+        unchanged and, as before, also applies to sliding draft layers. Block
+        drafters mark their layers full-history, so in neither case does a
+        draft window change how many tokens the cache keeps.
+        """
+        target = self.attn_config.component(SoftmaxAttnConfig).sliding_window_tokens
+        if self.draft_attn_config is None or not isinstance(target, Sequence):
+            return target
+        num_target = self.num_target_layers
+        draft_spec = self.draft_attn_config.component(SoftmaxAttnConfig)
+        # Without one layer type per draft layer, the draft layers default to
+        # full-history and have no window.
+        draft = (
+            draft_spec.sliding_window_tokens
+            if len(tuple(draft_spec.cache_layer_types)) == self.num_draft_layers
+            else None
+        )
+        return tuple(
+            window
+            for labels, windows in (
+                (self.layer_types[:num_target], target),
+                (self.layer_types[num_target:], draft),
+            )
+            for _, window in layer_attn_kind_windows(labels, windows)
+        )
+
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
         groups = super().groups()
@@ -147,14 +186,26 @@ class OrdinaryRecipe(CacheRecipe):
         one whole history of latent rows plus index-K rows packed in the
         plane's format, reserved before the arena is sized
         (``AttnConfig.__post_init__`` has already pinned the family to GPU DSA
-        for ``qcp_size > 1``). One workspace serves the target and the draft
-        (the draft gathers into the target's buffers), so the two must pack
-        index-K rows in the same format; a draft naming another is refused
-        here, where both configs are visible."""
+        for ``qcp_size > 1``). One workspace serves the target and a draft that
+        gathers into the target's buffers, so those two must pack index-K rows
+        in the same format; a draft naming another is refused here, where both
+        configs are visible. A draft that takes no query-context shard
+        (``qcp_size == 1``: its own ordinary attention, as under DFlash) runs
+        no gather and shares no workspace, so its format is not constrained.
+        A KVP prefill over gathered histories (``dsa_kvp_history_prefill``)
+        reserves the same workspace for the target alone."""
+        if dsa_kvp_history_prefill(self.attn_config):
+            return dsa_history_gather_workspace_bytes(
+                self.attn_config, max_model_len=self.attn_config.context_len
+            )
         if self.attn_config.qcp_size == 1:
             return 0
         target = self.attn_config.component(DSAConfig)
-        if self.draft_attn_config is not None and target is not None:
+        if (
+            self.draft_attn_config is not None
+            and self.draft_attn_config.qcp_size > 1
+            and target is not None
+        ):
             draft = self.draft_attn_config.component(DSAConfig)
             draft_format = None if draft is None else draft.index_k_format
             if draft_format != target.index_k_format:
@@ -180,6 +231,26 @@ class OrdinaryRecipe(CacheRecipe):
         return capacity
 
     # ---- geometry ----
+
+    @property
+    @override
+    def prefix_granularity(self) -> int:
+        """The block span, so it holds whole pages of every kernel reading it.
+
+        That is the lcm of a fixed-page leaf's page (the registry pins it on
+        the side's config), the MSA sparse page, and the MXFP8 scale tile,
+        never below ``_MIN_PREFIX_GRANULARITY``.
+        """
+        configs = [self.attn_config]
+        if self.draft_attn_config is not None:
+            configs.append(self.draft_attn_config)
+        pages = [_MIN_PREFIX_GRANULARITY]
+        pages += [c.kernel_page_size for c in configs if c.kernel_page_size is not None]
+        if self.family == "msa":
+            pages.append(MSA_PAGE_SIZE)
+        if any(c.kv_cache_mxfp8 for c in configs):
+            pages.append(MXFP8_KV_SCALE_TILE_TOKENS)
+        return math.lcm(*pages)
 
     @property
     @override
@@ -242,44 +313,26 @@ class OrdinaryRecipe(CacheRecipe):
             local_layer_id = layer_id - self.num_target_layers
         return _config_layer_fields(
             config,
+            prefix_granularity=self.prefix_granularity,
             layer_id=layer_id,
             local_layer_id=local_layer_id,
             group_id=group_id,
             occurrence=occurrence,
         )
 
-    # ---- capacity: profiled bytes per token, not parent size ----
+    # ---- capacity: logical token caps after resident storage sizing ----
 
     @override
-    def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        # A per-layer-geometry model derives per-group packing (its groups
-        # pack at different CacheBlocks-per-parent, so a parent no longer spans
-        # the identity grain), so the shared-slab shortcut below is wrong for
-        # it: defer to the general base formula, which sizes a parent from the
-        # tightest packing it actually carries (``_max_packing(layout) *
-        # prefix_granularity``) and the budget against the packed LCM-block
-        # bytes.
+    def select_num_lcm_blocks(self, layout: CacheLayout, *, max_lcm_blocks: int) -> int:
+        # A per-layer-geometry model (gemma-4) derives per-group packing: its
+        # groups pack at different CacheBlocks per parent, so a parent no longer
+        # spans the identity grain. Defer to the general selection, which caps
+        # parents by the tightest packing the layout carries.
         if self.per_layer_geometry:
-            return super().num_lcm_blocks(layout)
-        bytes_per_token = _config_bytes_per_token(
-            self.attn_config, self.num_target_layers
-        )
-        if self.draft_attn_config is not None:
-            bytes_per_token += _config_bytes_per_token(
-                self.draft_attn_config, self.num_draft_layers
-            )
-        if bytes_per_token <= 0:
-            raise ValueError(
-                f"KV cache cell size must be positive, got {bytes_per_token}"
-            )
-        # Every group packs one CacheBlock per parent, so a parent spans the
-        # identity grain and profiled bytes/token size it directly.
+            return super().select_num_lcm_blocks(layout, max_lcm_blocks=max_lcm_blocks)
         parent_tokens = self.prefix_granularity
-        budgeted = self._budgeted_parents(
-            self.cache_budget_bytes, bytes_per_token * parent_tokens
-        )
         if self.token_limit is None:
-            return budgeted
+            return max_lcm_blocks
         # The KVP shard count, not layout packing: a layout that packs more
         # than one CacheBlock per parent without sharding must keep the
         # unsharded floor semantics of _capped_parents.
@@ -290,8 +343,8 @@ class OrdinaryRecipe(CacheRecipe):
                 raise ValueError(
                     "The configured token limit must hold at least one cache page"
                 )
-            return min(budgeted, (logical_pages + shard_count - 1) // shard_count)
-        return self._capped_parents(budgeted, parent_tokens=parent_tokens)
+            return min(max_lcm_blocks, (logical_pages + shard_count - 1) // shard_count)
+        return self._capped_parents(max_lcm_blocks, parent_tokens=parent_tokens)
 
 
 def _config_kv_head_counts(config, num_layers: int) -> tuple[int, ...] | None:
@@ -305,31 +358,6 @@ def _config_kv_head_counts(config, num_layers: int) -> tuple[int, ...] | None:
     if len(geometry) != num_layers:
         raise ValueError("layer_kv_geometry must cover every layer")
     return tuple(kv_heads for kv_heads, _ in geometry)
-
-
-def _config_bytes_per_token(config, num_layers: int) -> int:
-    """Per-token KV bytes an ordinary config costs across its layers.
-
-    The uniform default charges one cell size times the slab divisor -- the
-    i-th layer of each group shares slab i, so the hybrid full+sliding model
-    pays for the largest group's depth, not every layer. A per-layer model
-    (gemma-4) whose layers differ in head_dim cannot share a slab (the rows
-    are not byte-equal), so it charges each layer's own cell and skips the
-    divisor; ``total_cache_bytes_per_token`` does the summation.
-    """
-    spec = config.component(SoftmaxAttnConfig)
-    if getattr(spec, "layer_kv_geometry", None) is not None:
-        return spec.total_cache_bytes_per_token(config, num_layers)
-    return config.cache_cell_size() * _storage_layers(config, num_layers)
-
-
-def _storage_layers(config, num_layers: int) -> int:
-    spec = config.component(SoftmaxAttnConfig)
-    group_size = hybrid_slab_group_size(
-        spec.cache_layer_types,
-        sliding_window_tokens=spec.sliding_window_tokens,
-    )
-    return group_size if group_size is not None else num_layers
 
 
 def _config_group_ids(config, num_layers: int) -> tuple[str, ...]:
@@ -354,30 +382,42 @@ def _config_group_ids(config, num_layers: int) -> tuple[str, ...]:
 
 
 def _config_layer_fields(
-    config, *, layer_id: int, local_layer_id: int, group_id: str, occurrence: int
+    config,
+    *,
+    prefix_granularity: int,
+    layer_id: int,
+    local_layer_id: int,
+    group_id: str,
+    occurrence: int,
 ) -> tuple[CacheFieldSpec, ...]:
-    """What one layer costs, dispatched on the config that owns the layer."""
+    """What one layer costs, dispatched on the config that owns the layer.
+
+    Every field holds ``prefix_granularity`` rows: one block spans the grain.
+    """
     from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
     from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
     from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
 
     spec = config.component(SoftmaxAttnConfig)
+    rows = prefix_granularity
     if isinstance(spec, DSAConfig):
-        return _mla_layer_fields(config, layer_id, occurrence) + (
-            _index_k_field(config, layer_id),
+        return _mla_layer_fields(config, rows, layer_id, occurrence) + (
+            index_k_field(config, rows, layer_id),
         )
     if isinstance(spec, MSAConfig):
         fields = _mha_layer_fields(
-            config, layer_id, local_layer_id, group_id, occurrence
+            config, rows, layer_id, local_layer_id, group_id, occurrence
         )
         if local_layer_id in spec.sparse_layer_ids:
-            fields += (_index_k_field(config, layer_id),)
+            fields += (index_k_field(config, rows, layer_id),)
         return fields
     if isinstance(spec, MLAConfig):
-        return _mla_layer_fields(config, layer_id, occurrence)
+        return _mla_layer_fields(config, rows, layer_id, occurrence)
     if isinstance(spec, MHAConfig):
-        return _mha_layer_fields(config, layer_id, local_layer_id, group_id, occurrence)
+        return _mha_layer_fields(
+            config, rows, layer_id, local_layer_id, group_id, occurrence
+        )
     raise TypeError(f"no ordinary cache recipe for {type(spec).__name__}")
 
 
@@ -414,21 +454,26 @@ def _mha_plane_prefix(spec, group_id: str) -> str:
 
 
 def _mha_layer_fields(
-    config, layer_id: int, local_layer_id: int, group_id: str, occurrence: int
+    config,
+    rows: int,
+    layer_id: int,
+    local_layer_id: int,
+    group_id: str,
+    occurrence: int,
 ):
     """One MHA layer's K/V pages, with mxfp8 scale planes when enabled."""
     spec = config.component(SoftmaxAttnConfig)
     mxfp8 = bool(config.kv_cache_mxfp8)
-    if mxfp8 and config.prefix_granularity != MXFP8_KV_SCALE_TILE_TOKENS:
+    if mxfp8 and rows != MXFP8_KV_SCALE_TILE_TOKENS:
         raise AssertionError(
-            "mxfp8 KV cache requires --prefix-granularity "
-            f"{MXFP8_KV_SCALE_TILE_TOKENS} (the attention kernel consumes "
-            "the interleaved paged scale layout)"
+            f"mxfp8 KV cache requires {MXFP8_KV_SCALE_TILE_TOKENS}-row pages, "
+            f"got {rows} (the attention kernel consumes the interleaved paged "
+            "scale layout)"
         )
     kv_heads, head_dim = _mha_layer_geometry(spec, local_layer_id)
-    if config.prefix_granularity <= 0 or kv_heads <= 0 or head_dim <= 0:
+    if rows <= 0 or kv_heads <= 0 or head_dim <= 0:
         raise ValueError("MHA full-attention geometry must be positive")
-    shape = (config.prefix_granularity, kv_heads, head_dim)
+    shape = (rows, kv_heads, head_dim)
     kv_dtype = (
         # MXFP8 writes go through dtype-aware kernels, so the arena keeps the
         # fp8 view; the scatter-written paths fall back to uint8.
@@ -452,14 +497,14 @@ def _mha_layer_fields(
         occurrence=occurrence,
         kv_heads=kv_heads,
         head_dim=head_dim,
-        prefix_granularity=config.prefix_granularity,
+        prefix_granularity=rows,
     )
 
 
-def _mla_layer_fields(config, layer_id: int, occurrence: int):
+def _mla_layer_fields(config, rows: int, layer_id: int, occurrence: int):
     """One MLA layer's latent page, split into planes when quantized."""
     spec = config.component(SoftmaxAttnConfig)
-    if config.prefix_granularity <= 0:
+    if rows <= 0:
         raise ValueError("MLA full-attention geometry must be positive")
     if config.kv_cache_quant_method != "per_token_head":
         latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
@@ -467,7 +512,7 @@ def _mla_layer_fields(config, layer_id: int, occurrence: int):
             CacheFieldSpec(
                 f"layer.{layer_id}.latent_kv",
                 f"slot.{occurrence}",
-                (config.prefix_granularity, 1, latent_width),
+                (rows, 1, latent_width),
                 scatter_stored_dtype_name(config.kv_cache_dtype),
             ),
         )
@@ -481,54 +526,57 @@ def _mla_layer_fields(config, layer_id: int, occurrence: int):
         for name, shape, dtype in (
             (
                 "latent_kv",
-                (config.prefix_granularity, 1, spec.kv_lora_rank),
+                (rows, 1, spec.kv_lora_rank),
                 scatter_stored_dtype_name(config.kv_cache_dtype),
             ),
             (
                 "latent_scale",
-                (config.prefix_granularity, 1, 1),
+                (rows, 1, 1),
                 cache_dtype_name(torch.float32),
             ),
             (
                 "rope_k",
-                (config.prefix_granularity, 1, spec.qk_rope_head_dim),
+                (rows, 1, spec.qk_rope_head_dim),
                 cache_dtype_name(config.dtype),
             ),
         )
     )
 
 
-def _index_k_field(config, layer_id: int) -> CacheFieldSpec:
-    """The sparse indexer's key row for one layer (DSA bytes, MSA elements)."""
+def index_k_field(config, rows: int, layer_id: int) -> CacheFieldSpec:
+    """The sparse indexer's key rows for one layer (DSA bytes, MSA elements).
+
+    Args:
+        config: The attention config owning the layer.
+        rows: Token rows per cache page: the recipe's prefix granularity.
+        layer_id: The layer's id in the merged plan.
+    """
     from tokenspeed.runtime.layers.attention.configs.dsa import (
         DSAConfig,
-        dsa_index_k_row_bytes,
         index_k_plane_dtype,
+        index_k_row_bytes,
     )
 
     spec = config.component(SoftmaxAttnConfig)
     if isinstance(spec, DSAConfig):
-        # One plane layout per index_k_format: FP8 keys plus scales as uint8
-        # bytes, or the bf16 keys unquantized (configs/dsa.py).
-        if spec.index_k_format == "fp8_scaled":
+        # One plane layout per index_k_format: FP8 or MXFP4 keys plus scales
+        # as uint8 bytes, or the bf16 keys unquantized (configs/dsa.py).
+        if spec.index_k_format in ("fp8_scaled", "mxfp4"):
             return CacheFieldSpec(
                 f"layer.{layer_id}.index_k",
                 f"layer.{layer_id}.index_k",
-                (
-                    config.prefix_granularity,
-                    dsa_index_k_row_bytes(spec.index_head_dim),
-                ),
+                (rows, index_k_row_bytes(spec.index_head_dim, spec.index_k_format)),
                 "uint8",
             )
         return CacheFieldSpec(
             f"layer.{layer_id}.index_k",
             f"layer.{layer_id}.index_k",
-            (config.prefix_granularity, spec.index_head_dim),
+            (rows, spec.index_head_dim),
             cache_dtype_name(index_k_plane_dtype(spec.index_k_format)),
         )
     return CacheFieldSpec(
         f"layer.{layer_id}.index_k",
         f"layer.{layer_id}.index_k",
-        (config.prefix_granularity, spec.index_head_dim),
+        (rows, spec.index_head_dim),
         cache_dtype_name(config.dtype),
     )

@@ -38,13 +38,16 @@ from tokenspeed.runtime.utils.network import join_host_port
 
 logger = get_colorful_logger(__name__)
 
-from tokenspeed_scheduler import PD, Forward
+from tokenspeed_engine.scheduler import PD, Forward
 
 # A request still bootstrapping this long after registration is reported.
 _BOOTSTRAP_STALL_SECONDS = 10.0
 
 
 class DisaggPrefillExecutor:
+    # The peer role, read by ``execution.device._arm_layerwise_streaming``.
+    mode = "prefill"
+
     def __init__(self, args, kv_args, gloo_group):
         self.cache_layout = kv_args.cache_layout
         self.senders: dict[str, MooncakeKVSender] = {}

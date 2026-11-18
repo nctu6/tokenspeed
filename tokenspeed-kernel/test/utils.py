@@ -20,7 +20,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+import re
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from typing import Any
 from unittest.mock import patch
@@ -110,12 +111,209 @@ def assert_no_triton_compile(*kernels: Any) -> Iterator[None]:
         )
 
 
+def assert_warmup_covers(
+    kernels: Iterable[Any],
+    warm: Callable[[], Any],
+    run: Callable[[Any], Any],
+    sweep: Iterable[Any],
+) -> None:
+    """Fail if ``run`` compiles any of ``kernels`` for a ``sweep`` value after
+    ``warm`` prepared them from empty JIT caches.
+
+    Clearing first keeps binaries an earlier test compiled from standing in
+    for the ones ``warm`` must prepare.
+    """
+    kernels = tuple(kernels)
+    for kernel in kernels:
+        kernel.device_caches.clear()
+    warm()
+    with assert_no_triton_compile(*kernels):
+        for value in sweep:
+            run(value)
+
+
+@contextmanager
+def assert_no_cute_compile() -> Iterator[None]:
+    """Fail if any CuTe DSL kernel is traced or compiled in the block.
+
+    ``cute.compile`` traces and compiles on every call, and calling a
+    ``@cute.jit`` function directly traces it on every call, so launches must
+    reuse the compiled functions their caller cached. Warm the caller's cache
+    before entering, then launch with shapes that vary the way serving does; a
+    trace means the cache keys on a per-batch value or the launch bypasses it.
+    """
+    from cutlass.base_dsl.dsl import BaseDSL
+
+    with patch.object(
+        BaseDSL, "generate_mlir", autospec=True, side_effect=BaseDSL.generate_mlir
+    ) as traces:
+        yield
+    # generate_mlir(dsl, funcBody, ...): the traced @cute.jit function.
+    kernels = sorted({call.args[1].__qualname__ for call in traces.call_args_list})
+    assert not kernels, (
+        f"traced CuTe DSL kernel(s) {', '.join(kernels)} {traces.call_count} "
+        "time(s); a per-batch value likely keys the compile cache"
+    )
+
+
+def move_pages_past_int32(
+    caches: tuple[torch.Tensor, ...], page_table: torch.Tensor
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """Copy paged caches to the far end of pools larger than 2**31 elements.
+
+    Every cache is ``[pages, ...]`` with the same page count. Each returned
+    pool places those pages after more than ``2**31`` elements of unwritten
+    pages, sized by the smallest page so it holds for every cache, and the
+    returned page table points at them, so every page base a kernel computes
+    exceeds the int32 range while only the used pages are written.
+    """
+    pages = caches[0].shape[0]
+    first = 2**31 // min(cache[0].numel() for cache in caches) + 1
+    pools = []
+    for cache in caches:
+        pool = torch.empty(
+            (first + pages, *cache.shape[1:]), dtype=cache.dtype, device=cache.device
+        )
+        pool[first:].copy_(cache)
+        pools.append(pool)
+    return tuple(pools), page_table + first
+
+
 def compiled_kernels(kernel: Any) -> list[Any]:
     """Every binary this process has compiled for a Triton ``kernel``, from its JIT cache."""
     return [
         binary
         for cache in kernel.device_caches.values()
         for binary in cache[0].values()
+    ]
+
+
+def assert_fp8_same_or_adjacent_at_midpoint(
+    x: torch.Tensor,
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+) -> None:
+    """Bound FP8 changes from reciprocal normalization to rounding boundaries."""
+    assert x.shape == actual.shape == reference.shape
+    assert actual.dtype == reference.dtype == torch.float8_e4m3fn
+    actual_bits = actual.view(torch.uint8)
+    reference_bits = reference.view(torch.uint8)
+    differs = actual_bits != reference_bits
+    assert torch.equal(actual_bits >> 7, reference_bits >> 7)
+    code_delta = (actual_bits & 0x7F).to(torch.int16) - (reference_bits & 0x7F).to(
+        torch.int16
+    )
+    assert (code_delta.abs() <= 1).all()
+    if differs.any():
+        midpoint = (actual.float()[differs] + reference.float()[differs]) * 0.5
+        expanded_scales = scales.repeat_interleave(group_size, dim=-1)
+        quotient = x.float()[differs] / expanded_scales[differs]
+        # Allow a few FP32 rounding steps, not an arbitrary neighboring code.
+        tolerance = 8 * torch.finfo(torch.float32).eps * midpoint.abs().clamp_min(1)
+        assert ((quotient - midpoint).abs() <= tolerance).all()
+
+
+def polling_cycles(assembly: str) -> list[list[str]]:
+    """Return each loop of ``assembly`` from its target label to its back branch."""
+    lines = assembly.splitlines()
+    labels = {
+        match[1]: index
+        for index, line in enumerate(lines)
+        if (match := re.match(r"^(\.LBB\w+):", line))
+    }
+    cycles = []
+    for index, line in enumerate(lines):
+        match = re.search(r"\bs_(?:cbranch_\w+|branch)\s+(\.LBB\w+)", line)
+        if match and labels[match[1]] < index:
+            cycles.append(lines[labels[match[1]] : index + 1])
+    return cycles
+
+
+def votes_with_subgroup_mask(cycle: list[str]) -> bool:
+    """Return whether a polling cycle exits on one v_cmp lane mask.
+
+    A cross-lane reduction (DPP steps and a lane read) or a workgroup
+    exchange (LDS and s_barrier) on every retry would delay noticing data.
+    """
+    text = "\n".join(cycle)
+    return (
+        len(re.findall(r"v_cmp_ne_u32_e64 s\[\d+:\d+\], 0, v\d+", text)) == 1
+        and re.search(r"_dpp|v_readlane|v_readfirstlane|s_barrier|\bds_", text) is None
+    )
+
+
+_VECTOR_WRITE = re.compile(r"^\s*(?:buffer|global|flat|scratch)_(?:store|atomic)")
+_VECTOR_LOAD = re.compile(r"^\s*(?:buffer|global|flat|scratch)_load")
+
+
+def vmcnt_zero_before_barrier(
+    assembly: str, kernel: str, target: str
+) -> list[tuple[str, bool, bool]]:
+    """Check that other subgroups' memory accesses finished before ``target``.
+
+    On gfx9 ``s_barrier`` does not wait for any counter, and a one-thread
+    release's ``buffer_wbl2`` and ``s_waitcnt vmcnt(0)`` cover only its own
+    subgroup's stores. Walk every control-flow path of ``kernel`` (branches
+    that skip a block for inactive lanes model the subgroups that do not run
+    it; a call may access memory).
+
+    Returns:
+        One ``(line, waited, barrier)`` per line matching the ``target``
+        regex, each flag true when it holds on all paths reaching the line:
+        ``waited`` when every vector store and atomic is followed by
+        ``s_waitcnt vmcnt(0)`` and then ``s_barrier``, as a payload release
+        needs; ``barrier`` when an ``s_barrier`` follows every vector memory
+        access, as a release reporting completed reads needs.
+    """
+    lines = assembly.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith(f"{kernel}:"))
+    end = next(i for i in range(start, len(lines)) if lines[i].startswith(".Lfunc_end"))
+    labels = {
+        match[1]: index
+        for index in range(start, end)
+        if (match := re.match(r"^(\.LBB\w+):", lines[index]))
+    }
+    # State per line: this subgroup may have stores not yet counted out of
+    # vmcnt; it may have stores, or any access, issued since the last barrier;
+    # some subgroup may have passed the last barrier with stores in vmcnt.
+    seen: dict[int, tuple[bool, ...]] = {}
+    work = [(start + 1, (False,) * 4)]
+    while work:
+        index, state = work.pop()
+        while index < end:
+            old = seen.get(index)
+            new = state if old is None else tuple(a or b for a, b in zip(old, state))
+            if new == old:
+                break
+            seen[index] = new
+            pending, stored, accessed, unsafe = new
+            line = lines[index].split(";")[0]
+            if re.search(r"\bs_waitcnt\b.*\bvmcnt\(0\)", line):
+                pending = False
+            elif _VECTOR_WRITE.search(line) or "s_swappc" in line:
+                pending = stored = accessed = True
+            elif _VECTOR_LOAD.search(line):
+                accessed = True
+            elif re.search(r"\bs_barrier\b", line):
+                unsafe, stored, accessed = pending, False, False
+            state = (pending, stored, accessed, unsafe)
+            if match := re.search(r"\bs_(cbranch_\w+|branch)\s+(\.LBB\w+)", line):
+                work.append((labels[match[2]], state))
+                if match[1] == "branch":
+                    break
+            if re.search(r"\bs_(endpgm|setpc_b64)\b", line):
+                break
+            index += 1
+    return [
+        (
+            lines[index].strip(),
+            not (seen[index][1] or seen[index][3]),
+            not seen[index][2],
+        )
+        for index in sorted(seen)
+        if re.search(target, lines[index].split(";")[0])
     ]
 
 

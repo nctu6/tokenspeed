@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -109,35 +110,66 @@ struct Overloaded : Ts... {
 template <typename... Ts>
 Overloaded(Ts...) -> Overloaded<Ts...>;
 
+namespace detail {
+
+// The checks' failure paths, kept out of line so that a passing check is an
+// inlined compare and branch. Inline, the message formatting, throw and
+// logging make the whole check too large to inline, and every passing check
+// in a hot loop (one per block of every scheduled row) became a call.
+[[noreturn, gnu::cold, gnu::noinline]] inline void AssertFailed(const char* message, SourceLocation loc) {
+    std::string msg = message;
+    msg = msg + " at " + loc.file_name() + ":" + std::to_string(loc.line()) + " in " + loc.function_name();
+    throw std::runtime_error(msg);
+}
+
+[[noreturn, gnu::cold, gnu::noinline]] inline void FatalCheckFailed(const char* message, SourceLocation loc) noexcept {
+    bool logged = false;
+    try {
+        if (auto logger = spdlog::default_logger()) {
+            logger->critical("Fatal check failed: {} at {}:{} in {}", message, loc.file_name(), loc.line(),
+                             loc.function_name());
+            logger->flush();
+            logged = true;
+        }
+    } catch (...) {
+    }
+    if (!logged) {
+        std::fprintf(stderr, "Fatal check failed: %s at %s:%lu in %s\n", message, loc.file_name(),
+                     static_cast<unsigned long>(loc.line()), loc.function_name());
+        std::fflush(stderr);
+    }
+    std::abort();
+}
+
+}  // namespace detail
+
 inline void _assert(bool condition, const char* message = "Assertion failed",
                     SourceLocation loc = SourceLocation::current()) {
     if (!condition) [[unlikely]] {
-        std::string msg = message;
-        msg = msg + " at " + loc.file_name() + ":" + std::to_string(loc.line()) + " in " + loc.function_name();
-        throw std::runtime_error(msg);
+        detail::AssertFailed(message, loc);
     }
 }
 
 inline void FatalCheck(bool condition, const char* message = "Fatal check failed",
                        SourceLocation loc = SourceLocation::current()) noexcept {
     if (!condition) [[unlikely]] {
-        bool logged = false;
-        try {
-            if (auto logger = spdlog::default_logger()) {
-                logger->critical("Fatal check failed: {} at {}:{} in {}", message, loc.file_name(), loc.line(),
-                                 loc.function_name());
-                logger->flush();
-                logged = true;
-            }
-        } catch (...) {
-        }
-        if (!logged) {
-            std::fprintf(stderr, "Fatal check failed: %s at %s:%lu in %s\n", message, loc.file_name(),
-                         static_cast<unsigned long>(loc.line()), loc.function_name());
-            std::fflush(stderr);
-        }
-        std::abort();
+        detail::FatalCheckFailed(message, loc);
     }
+}
+
+// (value + divisor - 1) / divisor, which is ceil(value / divisor) for
+// value >= 0 and divisor > 0, summed in int64: in int32 the sum overflows
+// once value is within divisor - 1 of INT32_MAX. The quotient fits in int32.
+constexpr std::int32_t CeilDiv(std::int32_t value, std::int32_t divisor) noexcept {
+    return static_cast<std::int32_t>((std::int64_t{value} + divisor - 1) / divisor);
+}
+
+// A value computed in int64 narrowed back to int32, where the caller's
+// invariant keeps it in range; _assert()s that it is.
+inline std::int32_t CheckedInt32(std::int64_t value, const char* message = "value exceeds the int32 range",
+                                 SourceLocation loc = SourceLocation::current()) {
+    _assert(std::in_range<std::int32_t>(value), message, loc);
+    return static_cast<std::int32_t>(value);
 }
 
 template <typename T, typename Variant>

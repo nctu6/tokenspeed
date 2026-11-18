@@ -62,6 +62,9 @@ def test_capture_tensor_matches_post_layer_attnres_reference():
         layers_to_capture=[],
         dflash_aux_stream="prefix",
         eagle3_layers_to_capture=(2, 3),
+        decode_final=None,
+        decode_chain=None,
+        peer_weights=None,
     )
 
     with mock.patch.object(

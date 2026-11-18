@@ -50,7 +50,12 @@ the block's ids, positions, HC mix and workspace addressing.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.dsv41._inputs import IndexKeyInput, IndexQueryInput
+from tokenspeed_kernel.ops.attention.dsv41._inputs import (
+    IndexKeyInput,
+    IndexQueryInput,
+    SelectionSlots,
+)
+from tokenspeed_kernel.ops.attention.dsv41._metadata import index_logit_rows
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -59,9 +64,11 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 __all__ = [
     "IndexKeyInput",
     "IndexQueryInput",
+    "SelectionSlots",
     "decode_rows",
     "decode_window",
     "global_slots",
+    "prefill_indices",
     "compact_slots",
     "selection_table",
     "cache_pack",
@@ -74,11 +81,15 @@ __all__ = [
     "index_query_rope_weights",
     "index_query_rope_quant",
     "selected_attention",
+    "selected_attention_fp8",
+    "prepare_fused_decode_weights",
     "selected_attention_rope",
     "new_attention_schedule",
     "index_score",
     "index_topk",
+    "prepare_index_topk",
     "new_index_metadata",
+    "index_logit_rows",
     "index_select_all",
     "local_index_supported",
     "index_candidates",
@@ -89,10 +100,15 @@ __all__ = [
     "swa_rope_scatter",
     "global_rope_scatter",
     "rope_inplace",
+    "rope_weights_inplace",
     "rope_pad_query",
+    "rope_quantize_fp8_grouped",
+    "verify_layout",
     "dspark_rows",
     "dspark_anchors",
     "dspark_block",
+    "dspark_workspace",
+    "history_pack",
 ]
 
 
@@ -355,6 +371,79 @@ def new_attention_schedule() -> object | None:
     return new_flashmla_schedule()
 
 
+def prepare_fused_decode_weights(
+    q_weight: torch.Tensor,
+    q_scales: torch.Tensor,
+    output_weight: torch.Tensor,
+    output_scales: torch.Tensor,
+    num_heads: int,
+    num_groups: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Prepare separate projection weights for fused V4.1 decode attention.
+
+    Q scales are canonical uint8 UE8M0 [N,K/32]; output scales are the
+    packed scales from ``prepare_grouped_fp8_projection``. Returns permuted
+    Q codes/canonical scales and grouped output codes/packed scales, without
+    changing the original tensors. None means this device has no fused kernel.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41.flash_mla import (
+        is_flash_mla_fused_decode_available,
+    )
+
+    if not is_flash_mla_fused_decode_available():
+        return None
+    try:
+        kernel = _kernel("prepare_fused_decode_weights", q_weight)
+    except NoKernelFoundError:
+        return None
+    return kernel(
+        q_weight, q_scales, output_weight, output_scales, num_heads, num_groups
+    )
+
+
+def selected_attention_fp8(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor | None,
+    swa_slots: torch.Tensor | None,
+    swa_lens: torch.Tensor | None,
+    global_cache: torch.Tensor | None,
+    global_slots: torch.Tensor | None,
+    global_lens: torch.Tensor | None,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    num_groups: int,
+    prefill_kv: torch.Tensor | None,
+    prefill_indices: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused Q RoPE, selected attention and inverse RoPE with FP8 output.
+
+    Q is unrotated BF16 [T,H,512] from the prepared Q weight; no extra Q norm
+    is applied. Cache/selection inputs follow ``selected_attention``. A BF16
+    workspace and its indices may replace paged inputs for draft decoding.
+    Returns E4M3 [T,groups,H/groups*512] and packed UE8M0 int32 scales for
+    ``grouped_fp8_projection`` with the prepared output weight. Both prepared
+    projections must be used together; this layout is not the ordinary output.
+    """
+    return _kernel("selected_attention_fp8", q)(
+        q,
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        global_cache,
+        global_slots,
+        global_lens,
+        attn_sink,
+        softmax_scale,
+        positions,
+        cos_sin_cache,
+        num_groups,
+        prefill_kv,
+        prefill_indices,
+    )
+
+
 def selected_attention(
     q: torch.Tensor,
     swa_cache: torch.Tensor,
@@ -559,6 +648,27 @@ def index_score(
     )
 
 
+def prefill_indexer_batching_supported(index_row_bytes: int) -> bool:
+    """Return whether packed MXFP4 histories use the native batched scorer.
+
+    Args:
+        index_row_bytes: Packed index-cache row size; 68 denotes MXFP4.
+
+    Returns:
+        True on Blackwell with DeepGEMM and DeepSelect available.
+        Other row formats and hosts without a CUDA device return False.
+    """
+    if index_row_bytes != 68 or not torch.cuda.is_available():
+        return False
+
+    from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
+        is_native_indexer_available,
+    )
+    from tokenspeed_kernel.thirdparty.deep_select import is_deep_select_available
+
+    return is_native_indexer_available() and is_deep_select_available()
+
+
 def index_topk(
     index_q: torch.Tensor | IndexQueryInput,
     weights: torch.Tensor,
@@ -575,6 +685,7 @@ def index_topk(
     out: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
     solution: str | None,
     index_metadata: object | None = None,
+    slots: SelectionSlots | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bounded Full/Reindex scoring, Top-K rows, and optional source candidates.
 
@@ -605,12 +716,18 @@ def index_topk(
             [T, candidate_topk], [T]), or None to allocate them.
         solution: Optional registered implementation restriction. Pass None for
             automatic kernel selection.
-        index_metadata: Object from new_index_metadata for these exact table and
-            length tensors, shared only within one invocation, or None (default). Native
+        index_metadata: Object from new_index_metadata for these exact table,
+            length and optional request-ID tensors, shared only within one
+            invocation, or None (default). Native
             kernels reuse Full schedules and matching immutable sparse candidate
-            geometry across layers. Table, lengths and candidate contents must
+            geometry across layers. Grouped paged Full reuses KV for consecutive
+            rows of one request. Table, lengths, request IDs and candidate contents must
             not change while sharing this object; graph replay refreshes the
             captured producers. A new invocation needs a fresh object.
+        slots: SelectionSlots covering the T query rows, or None (default)
+            for no slots. Its out then receives global_slots of the selected
+            row IDs. The Blackwell native selection resolves them in its
+            finishing kernel; other kernels run global_slots after selecting.
 
     Returns:
         (logical_row_ids, row_lengths, candidate_block_ids, candidate_lengths).
@@ -629,21 +746,31 @@ def index_topk(
     FP32 scores and int64 IDs use12 bytes per partial entry; capacities round
     to powers of two and at least the score tile width (at most256 lanes).
     With replicated32 heads and compatible Blackwell pages, optional DeepGEMM
-    scores packed FP4 inputs with FP32 accumulation and DeepSelect selects rows
-    and block maxima; on Hopper and SM120, DeepGEMM scores FP8 ``index_v4``
-    rows and the in-tree CuTe DSL DeepSelect kernel selects (SM120 FP8 Reindex
-    passes score the whole history, so they stay portable when that would cost
-    more; see ``fp8_indexer_wins``). SM120 also scores the packed 68-byte rows
-    with DeepGEMM's block-scaled MQA kernels and selects with the same CuTe DSL
-    kernel; its Reindex passes score the whole history and gather the pool,
-    or read only the pool once the history is long enough for that to win.
-    This native
-    accumulation differs from the portable reference's intermediate BF16
-    rounding.
-    Full-scoring query tiles cap logits at 32MiB for paged queries and
-    128MiB for a zero-row-stride request table.
-    That broadcast layout gathers packed history once per call and packs Q
-    once before the score tiles; no payload survives the call. For unsharded
+    scores packed FP4 inputs with FP32 accumulation and BF16 logits, and
+    DeepSelect selects rows and FP32 block maxima; on Hopper, DeepGEMM scores
+    FP8 ``index_v4`` rows into FP32 logits and the in-tree CuTe DSL DeepSelect
+    kernel selects. On SM120, DeepGEMM also scores FP8 ``index_v4`` rows with the
+    same selector (SM120 FP8 Reindex passes score the whole history, so they stay
+    portable when that would cost more; see ``fp8_indexer_wins``), and scores the
+    packed 68-byte rows with its block-scaled MQA kernels, selecting with the same
+    CuTe DSL kernel; its Reindex passes score the whole history and gather the
+    pool, or read only the pool once the history is long enough for that to win.
+    This native accumulation
+    differs from the portable reference's intermediate BF16 rounding.
+    Blackwell paged scoring (decode and verify) uses query_chunk_size and
+    optional request IDs; invalid pages before each row's end are set to -inf
+    in DeepGEMM's own rows, which TopK borrows with exclusive ends (a cleaned
+    copy only when their stride misses DeepSelect's alignment). Blackwell
+    dense scoring (prefill, history_rows) scores the caller's whole batch:
+    packed keys plus per-row
+    cu_seq_len starts, without a 128MiB inner tile. The runtime keeps one
+    call's BF16 logits within index_logit_rows. DeepSelect borrows the MQA
+    view; invalid pages before each row's end are set to -inf in place.
+    Candidate block reduction only writes valid blocks and the final aligned
+    prefetch segment. For paged and candidate-source scoring, native logits
+    and their cleaned copy can coexist. Hopper retains its 32MiB paged /
+    128MiB broadcast budgets. Packed history is gathered once per call and Q
+    is packed once; no payload survives the call. For unsharded
     68-byte MXFP4 caches, AMD Gluon Full similarly caps each FP32 logits query
     tile at 32MiB instead of limiting history width; Reindex scores only the
     candidate rows.
@@ -656,15 +783,11 @@ def index_topk(
     final tiles. Other page strides keep full scoring
     followed by candidate masking. The candidate selection semantics are the
     same; BF16 scores need not produce the FP32 path's exact Top-K at ties.
+    The Blackwell native selection finishes each tile in one kernel: the row
+    and candidate-block picks, their output tiles and the optional slots.
+    Native sparse Reindex skips the candidate mask; that kernel takes a pool
+    that fits topk whole, as the mask's equal scores did.
     """
-    from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
-        fp8_indexer_wins,
-        is_fp8_indexer_available,
-        is_native_indexer_available,
-        is_packed_sm120_indexer_available,
-    )
-    from tokenspeed_kernel.thirdparty.deep_select import is_deep_select_available
-
     if index_metadata is not None:
         from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexMetadata
 
@@ -672,61 +795,24 @@ def index_topk(
             raise TypeError("index_metadata must come from new_index_metadata")
         index_metadata.validate(page_table, visible_lens)
 
-    # Each target scores the index rows its own cache format stores: FP4 with
-    # DeepSelect on Blackwell, FP8 with the CuTe DSL DeepSelect kernel on Hopper,
-    # and either on SM120 (block-scaled DeepGEMM kernels, CuTe DSL DeepSelect).
     query_values = index_q.values if isinstance(index_q, IndexQueryInput) else index_q
-    row_bytes = index_cache.shape[2] if index_cache.ndim == 3 else 0
-    shaped = (
-        query_values.is_cuda
-        and process_group is None
-        and query_values.shape[1] == 32
-        and index_cache.ndim == 3
-        and index_cache.shape[1] == 64
-        and index_cache.stride(1) == row_bytes
-        and index_cache.stride(2) == 1
-        and index_cache.stride(0) < 2**31
-        and index_cache.stride(0) % 16 == 0
-        and index_cache.data_ptr() % 16 == 0
-    )
-    reindex = candidate_blocks is not None and not candidate_topk
-    native = shaped and (
-        (
-            row_bytes == 68
-            and is_native_indexer_available()
-            and is_deep_select_available()
-        )
-        # SM120 beats the portable leaf on every packed pass (2.2-88x measured)
-        or (row_bytes == 68 and is_packed_sm120_indexer_available())
-        or (
-            row_bytes == 132
-            and is_fp8_indexer_available()
-            and fp8_indexer_wins(
-                query_values.shape[0], page_table.shape[1] * 64, reindex
-            )
-        )
-    )
-    index_k_format = {
-        68: "mxfp4",
-        132: "fp8_scaled",
-    }.get(row_bytes, "unknown")
-    index_shards = 1
-    index_heads = query_values.shape[1]
-    if process_group is not None:
-        index_shards = torch.distributed.get_world_size(process_group)
-        index_heads *= index_shards
+    if slots is not None:
+        _validate_selection_slots(slots, query_values.shape[0], topk, page_table)
     kernel = select_kernel(
         "attention",
         "dsv41_index_topk",
         format_signature(x=dense_tensor_format(query_values.dtype)),
         features=None,
         platform=None,
-        traits={
-            "index_heads": index_heads,
-            "index_k_format": index_k_format,
-            "index_shards": index_shards,
-            "native_indexer": native,
-        },
+        traits=_index_topk_traits(
+            query_values.shape[1],
+            query_values.is_cuda,
+            index_cache,
+            process_group,
+            query_values.shape[0],
+            page_table.shape[1] * 64,
+            candidate_blocks is not None and not candidate_topk,
+        ),
         solution=solution,
         override=None,
     )
@@ -744,7 +830,7 @@ def index_topk(
             index_q.cos_sin_cache,
             index_q.weight_scale,
         )
-    return kernel(
+    args = (
         index_q,
         weights,
         index_cache,
@@ -760,6 +846,205 @@ def index_topk(
         out,
         index_metadata,
     )
+    if spec is not None and True in spec.traits.get("supports_selection_slots", ()):
+        return kernel(*args, slots)
+    result = kernel(*args)
+    if slots is not None:
+        # Kernels that take no slots select first; resolve the rows they wrote.
+        slots.out.copy_(
+            global_slots(
+                result[0],
+                slots.positions,
+                slots.requests,
+                slots.table,
+                slots.ratio,
+                slots.pages,
+            )
+        )
+    return result
+
+
+def _validate_selection_slots(slots, tokens, topk, page_table):
+    if not isinstance(slots, SelectionSlots):
+        raise TypeError("slots must be a SelectionSlots")
+    out = slots.out
+    if (
+        out.shape != (tokens, topk)
+        or out.dtype != torch.int32
+        or not out.is_contiguous()
+        or out.device != page_table.device
+    ):
+        raise ValueError(
+            "slots.out must be contiguous int32 [tokens, topk] on the table device"
+        )
+    for name, tensor in (("positions", slots.positions), ("requests", slots.requests)):
+        if (
+            tensor.shape != (tokens,)
+            or tensor.dtype not in (torch.int32, torch.int64)
+            or tensor.device != page_table.device
+        ):
+            raise ValueError(f"slots.{name} must be integer [tokens] on the device")
+    if (
+        slots.table.ndim != 2
+        or slots.table.dtype not in (torch.int32, torch.int64)
+        or slots.table.device != page_table.device
+        or slots.ratio < 1
+        or slots.pages < 0
+    ):
+        raise ValueError(
+            "slots needs an integer [requests, pages] table, ratio >= 1, pages >= 0"
+        )
+
+
+def _index_topk_traits(
+    query_heads, query_is_cuda, index_cache, process_group, rows, capacity, reindex
+):
+    """index_topk's selection traits for its query heads, cache and head group.
+
+    ``rows`` is the query row count, ``capacity`` the history width in rows,
+    and ``reindex`` whether the pass scores a candidate pool and publishes none
+    (``candidate_blocks`` given, ``candidate_topk == 0``); SM120's FP8 indexer
+    chooses by them (``fp8_indexer_wins``).
+    """
+    from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
+        fp8_indexer_wins,
+        is_fp8_indexer_available,
+        is_packed_sm120_indexer_available,
+    )
+
+    # Each target scores the index rows its own cache format stores: FP4 with
+    # DeepSelect on Blackwell, FP8 with the CuTe DSL DeepSelect kernel on Hopper,
+    # and either on SM120 (block-scaled DeepGEMM kernels, CuTe DSL DeepSelect).
+    row_bytes = index_cache.shape[2] if index_cache.ndim == 3 else 0
+    shaped = (
+        query_is_cuda
+        and process_group is None
+        and query_heads == 32
+        and index_cache.ndim == 3
+        and index_cache.shape[1] == 64
+        and index_cache.stride(1) == row_bytes
+        and index_cache.stride(2) == 1
+        and index_cache.stride(0) < 2**31
+        and index_cache.stride(0) % 16 == 0
+        and index_cache.data_ptr() % 16 == 0
+    )
+    native = shaped and (
+        prefill_indexer_batching_supported(row_bytes)
+        # SM120 beats the portable leaf on every packed pass (2.2-88x measured)
+        or (row_bytes == 68 and is_packed_sm120_indexer_available())
+        or (
+            row_bytes == 132
+            and is_fp8_indexer_available()
+            and fp8_indexer_wins(rows, capacity, reindex)
+        )
+    )
+    index_k_format = {
+        68: "mxfp4",
+        132: "fp8_scaled",
+    }.get(row_bytes, "unknown")
+    index_shards = 1
+    index_heads = query_heads
+    if process_group is not None:
+        index_shards = torch.distributed.get_world_size(process_group)
+        index_heads *= index_shards
+    return {
+        "index_heads": index_heads,
+        "index_k_format": index_k_format,
+        "index_shards": index_shards,
+        "native_indexer": native,
+    }
+
+
+def prepare_index_topk(
+    index_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    visible_lens: torch.Tensor,
+    candidate_blocks: torch.Tensor | None,
+    topk: int,
+    candidate_topk: int,
+    query_heads: int,
+    query_dtype: torch.dtype,
+    query_chunk_size: int,
+    index_metadata: object,
+) -> bool:
+    """Build ahead the scoring geometry a later index_topk call reuses.
+
+    Prepares, into index_metadata, the per-tile geometry the scorer index_topk
+    would select builds from page_table, visible_lens and candidate_blocks
+    alone (for DeepGEMM: paged Full scoring's sanitized tables and schedules,
+    or native sparse scoring's normalized candidates and schedule), so it can
+    run earlier, e.g. on another stream, off the scoring call's critical path.
+    The later call then finds it under the same keys instead of building it;
+    consumers on other streams wait for it. The kernels and inputs are the
+    same, so selections are unchanged.
+
+    Args:
+        index_cache, page_table, visible_lens, candidate_blocks, topk,
+        candidate_topk, query_chunk_size: As the later index_topk call
+            receives them; the table, length and candidate tensors must be
+            those very tensors (or views with the same storage, shape and
+            strides), unchanged until it runs.
+        query_heads, query_dtype: Head count and dtype of that call's index
+            query values, which has no head process group (replicated heads);
+            with ``index_cache`` they select the same scorer.
+        index_metadata: That call's object from new_index_metadata.
+
+    Returns:
+        True when the selected scorer has a prepare step and it ran; that step
+        may still decline inputs it does not cover and build nothing. False
+        when the scorer has no prepare step. Either way the call then builds
+        whatever it does not find.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexMetadata
+
+    if not isinstance(index_metadata, IndexMetadata):
+        raise TypeError("index_metadata must come from new_index_metadata")
+    index_metadata.validate(page_table, visible_lens)
+    signature = format_signature(x=dense_tensor_format(query_dtype))
+    traits = _index_topk_traits(
+        query_heads,
+        index_cache.is_cuda,
+        index_cache,
+        None,
+        page_table.shape[0],
+        page_table.shape[1] * 64,
+        candidate_blocks is not None and not candidate_topk,
+    )
+    try:
+        scorer = select_kernel(
+            "attention",
+            "dsv41_index_topk",
+            signature,
+            features=None,
+            platform=None,
+            traits=traits,
+            solution=None,
+            override=None,
+        )
+        prepare = select_kernel(
+            "attention",
+            "dsv41_index_topk_prepare",
+            signature,
+            features=None,
+            platform=None,
+            traits=traits,
+            solution=KernelRegistry.get().get_by_name(scorer.name).solution,
+            override=None,
+        )
+    except NoKernelFoundError:
+        return False
+    prepare(
+        index_cache,
+        page_table,
+        visible_lens,
+        candidate_blocks,
+        topk,
+        candidate_topk,
+        query_heads,
+        query_chunk_size,
+        index_metadata,
+    )
+    return True
 
 
 def _validate_rope(values, positions, cos_sin_cache):
@@ -790,6 +1075,16 @@ def _validate_rope(values, positions, cos_sin_cache):
         raise ValueError("RoPE tensors must share a device")
 
 
+def _validate_writable_rope(values):
+    if any(
+        size > 1 and stride == 0
+        for size, stride in zip(values.shape[:-1], values.stride()[:-1])
+    ):
+        raise ValueError(
+            "In-place V4.1 RoPE requires non-overlapping writable rows/heads"
+        )
+
+
 def rope_inplace(
     values: torch.Tensor,
     positions: torch.Tensor,
@@ -813,13 +1108,7 @@ def rope_inplace(
         are separately rounded before the final low-precision store.
     """
     _validate_rope(values, positions, cos_sin_cache)
-    if any(
-        size > 1 and stride == 0
-        for size, stride in zip(values.shape[:-1], values.stride()[:-1])
-    ):
-        raise ValueError(
-            "In-place V4.1 RoPE requires non-overlapping writable rows/heads"
-        )
+    _validate_writable_rope(values)
     kernel = select_kernel(
         "attention",
         "dsv41_rope_inplace",
@@ -828,6 +1117,64 @@ def rope_inplace(
         solution=solution,
     )
     return kernel(values, positions, cos_sin_cache)
+
+
+def rope_weights_inplace(
+    values: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weights: torch.Tensor,
+    weight_scale: float,
+    solution: str | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate owned index queries and scale owned projection weights.
+
+    Grids up to 4096 token-head pairs combine both operations in one launch.
+    Larger grids retain ordinary RoPE and separately scale weights in place.
+
+    Args:
+        values: Writable BF16/FP16 [tokens,heads,dim], dense in head channels.
+        positions: Int32/int64 [tokens]; negative padding positions use row0.
+        cos_sin_cache: FP32 [max_positions,rotary_dim], cosine then sine halves.
+        weights: Writable [tokens,heads] in values' dtype and device. Rows and
+            heads may be strided, but must not overlap each other or values.
+        weight_scale: FP32 scalar applied after the projection has rounded to
+            weights' dtype. The product rounds once back to that dtype.
+        solution: Optional registered implementation restriction.
+
+    Returns:
+        The same values and weights tensors, updated in place. Call only on
+        fresh projection outputs: neither input may have other live consumers.
+    """
+    _validate_rope(values, positions, cos_sin_cache)
+    _validate_writable_rope(values)
+    if (
+        values.ndim != 3
+        or weights.shape != values.shape[:2]
+        or weights.dtype != values.dtype
+        or weights.device != values.device
+    ):
+        raise ValueError(
+            "Indexer weights must match query tokens, heads, dtype and device"
+        )
+    # For two dimensions, nonoverlap follows when either axis spans the other.
+    n, h = weights.shape
+    w0, w1 = weights.stride()
+    if (
+        (n > 1 and w0 == 0)
+        or (h > 1 and w1 == 0)
+        or (n > 1 and h > 1 and w0 < h * w1 and w1 < n * w0)
+    ):
+        raise ValueError("Indexer weights require non-overlapping writable rows/heads")
+    kernel = select_kernel(
+        "attention",
+        "dsv41_rope_weights_inplace",
+        format_signature(values=dense_tensor_format(values.dtype)),
+        traits={},
+        solution=solution,
+    )
+    kernel(values, positions, cos_sin_cache, weights, weight_scale)
+    return values, weights
 
 
 def rope_pad_query(
@@ -862,6 +1209,35 @@ def rope_pad_query(
     return kernel(values, positions, cos_sin_cache)
 
 
+def rope_quantize_fp8_grouped(
+    values: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    groups: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate each head's interleaved RoPE tail and FP8-quantize grouped heads.
+
+    Args:
+        values: BF16 [T,H,512], unit channel stride, arbitrary token/head
+            strides; H divisible by groups.
+        positions: Int32/int64 [T]; negative positions use table row 0.
+        cos_sin_cache: FP32 [max_positions,64], cosine then sine halves, applied
+            with rope_inplace's formula (pass the inverse table to undo RoPE).
+        groups: Number of output head groups, each D = H/groups*512 wide.
+
+    Returns:
+        codes: FP8 E4M3 [T,groups,D], a view of contiguous [groups,T,D].
+        scales: Int32 [T,groups,D/128], MN-major and TMA-aligned (strides
+            (1, D/128*aligned_T, aligned_T), aligned_T = ceil(T/4)*4). Each
+            element packs four UE8M0 exponents of 32-channel groups, byte j
+            for group 4w+j, matching DeepGEMM's SM100 scale layout. The rotated
+            values are rounded to BF16 before quantizing.
+    """
+    return _kernel("rope_quantize_fp8_grouped", values)(
+        values, positions, cos_sin_cache, groups
+    )
+
+
 def dspark_rows(
     values: torch.Tensor,
     norm_weight: torch.Tensor | None,
@@ -890,6 +1266,53 @@ def dspark_rows(
     return out
 
 
+def dspark_workspace(
+    values: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+    positions: torch.Tensor | None,
+    cos_sin_cache: torch.Tensor | None,
+    window: torch.Tensor,
+    page: torch.Tensor,
+    row: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Gather history and encode current rows directly into an attention workspace.
+
+    Args:
+        values: BF16 ``[batch * block_size, 512]`` current rows, with unit
+            column stride. Optional RoPE and the same all-channel FP8 round
+            trip as ``dspark_rows`` are applied before writing these rows.
+        norm_weight: Optional BF16 RMSNorm weight applied before RoPE.
+        norm_eps: RMSNorm epsilon, present exactly with norm_weight.
+        positions: Integer current-row positions, given exactly with a RoPE
+            table; negative positions use position zero.
+        cos_sin_cache: Optional FP32 interleaved-tail RoPE table.
+        window: BF16 ``[pages, page_rows, 512]`` history field with unit column
+            stride. Page and row strides may include other fields or padding.
+        page: Integer ``[batch, history_width]`` valid history page addresses.
+        row: Integer history row addresses shaped like ``page``. Dummy page
+            addresses are copied verbatim; attention's selection masks them.
+        block_size: Positive number of current rows per request.
+
+    Returns:
+        Fresh contiguous BF16 ``[batch, history_width + block_size, 512]``.
+        Each tile owns one complete output row; no temporary gather or current
+        row buffers are retained or shared with another invocation.
+    """
+    return _kernel("dspark_workspace", values)(
+        values,
+        norm_weight,
+        norm_eps,
+        positions,
+        cos_sin_cache,
+        window,
+        page,
+        row,
+        block_size,
+    )
+
+
 def dspark_anchors(
     output_tokens: torch.Tensor,
     accept_lengths: torch.Tensor,
@@ -900,6 +1323,7 @@ def dspark_anchors(
     start_pos: torch.Tensor,
     *,
     num_prefill_outputs: int,
+    decode_query_indptr: torch.Tensor | None,
 ) -> None:
     """Fill each verify row's bonus token and each decode request's anchor.
 
@@ -909,6 +1333,10 @@ def dspark_anchors(
     remaining extend rows have no tokens and their destinations are untouched;
     ``accept_lengths`` [bs] counts accepted tokens (clamped to 1..width) and
     ``positions`` [num_decodes * width] are the decode rows' positions.
+    With ``decode_query_indptr`` [num_decodes + 1], positions instead contains
+    packed query rows and each interval must have 1..width rows. Its final
+    offset equals the logical row count, which may be below positions.numel()
+    when graph padding follows it. Output token storage still uses width.
     Every column of ``next_tokens`` [bs, spec] (int32) receives its row's
     bonus token, and ``start_pos`` [num_decodes] (int64) the position of the
     last accepted verify row. Only output-bearing request rows are written.
@@ -919,7 +1347,8 @@ def dspark_anchors(
         raise ValueError("DSpark anchors need 0 <= num_extends <= bs and width >= 1")
     if (
         output_tokens.shape != (num_prefill_outputs + num_decodes * width,)
-        or positions.shape != (num_decodes * width,)
+        or positions.ndim != 1
+        or (decode_query_indptr is None and positions.shape != (num_decodes * width,))
         or next_tokens.shape[:1] != (bs,)
         or next_tokens.ndim != 2
         or next_tokens.dtype != torch.int32
@@ -928,18 +1357,40 @@ def dspark_anchors(
         or start_pos.dtype != torch.int64
     ):
         raise ValueError("DSpark anchor tensors do not match the verify layout")
+    if decode_query_indptr is not None and (
+        decode_query_indptr.shape != (num_decodes + 1,)
+        or decode_query_indptr.dtype not in (torch.int32, torch.int64)
+        or not decode_query_indptr.is_contiguous()
+        or decode_query_indptr.device != positions.device
+    ):
+        raise ValueError("DSpark packed query boundaries do not match decode requests")
     for tensor in (output_tokens, accept_lengths, positions, start_pos):
         if tensor.dtype not in (torch.int32, torch.int64) or not tensor.is_contiguous():
             raise ValueError("DSpark anchor inputs must be contiguous integers")
     if not positions.is_cuda:
         rows = torch.arange(num_decodes)
-        accepted = accept_lengths[num_extends:].to(torch.int64).clamp(1, width)
+        if decode_query_indptr is None:
+            offsets = rows * width
+            query_lengths = torch.full_like(rows, width)
+        else:
+            offsets = decode_query_indptr[:-1].to(torch.int64)
+            query_lengths = decode_query_indptr.diff().to(torch.int64)
+            if (
+                decode_query_indptr[0] != 0
+                or decode_query_indptr[-1] > positions.numel()
+                or (query_lengths < 1).any()
+                or (query_lengths > width).any()
+            ):
+                raise ValueError("DSpark query intervals must be nonempty prefixes")
+        accepted = torch.minimum(
+            accept_lengths[num_extends:].to(torch.int64).clamp_min(1), query_lengths
+        )
         verify = num_prefill_outputs + rows * width + accepted - 1
         next_tokens[:num_prefill_outputs].copy_(
             output_tokens[:num_prefill_outputs, None]
         )
         next_tokens[num_extends:].copy_(output_tokens[verify, None])
-        start_pos.copy_(positions[rows * width + accepted - 1])
+        start_pos.copy_(positions[offsets + accepted - 1])
         return
     _kernel("dspark_anchors", positions)(
         output_tokens,
@@ -950,6 +1401,7 @@ def dspark_anchors(
         width,
         next_tokens,
         start_pos,
+        decode_query_indptr,
     )
 
 
@@ -1025,6 +1477,8 @@ def decode_rows(
     actual_bs,
     num_extends,
     width,
+    *,
+    query_start_loc: torch.Tensor | None,
 ):
     """Refresh request-major decode/verify metadata in place; return None.
 
@@ -1032,6 +1486,11 @@ def decode_rows(
     entries. Outputs positions/requests are [bs * width], lengths/pool_rows
     are [bs]. Requests are batch-table rows, never request-pool indices.
     width is a positive token count; live lengths clamp to at least width.
+    When query_start_loc is supplied, its [bs + 1] CSR boundaries pack only
+    selected prefixes; width still denotes the reserved input window included
+    in seq_lens. Returned lengths end at the selected prefix, not the reserved
+    end. Live intervals must contain 1..width rows; padded intervals are empty.
+    Token capacity may include trailing graph padding. Mixed input is unsupported.
     All outputs are overwritten. Padding and leading num_extends requests
     have token coordinates -1; padding also has length 0 and pool row -1.
     """
@@ -1041,7 +1500,8 @@ def decode_rows(
     if not 0 <= num_extends <= actual_bs <= bs:
         raise ValueError("invalid live/decode batch sizes")
     if (
-        positions.shape != (bs * width,)
+        positions.ndim != 1
+        or (query_start_loc is None and positions.shape != (bs * width,))
         or requests.shape != positions.shape
         or lengths.shape != (bs,)
         or pool_rows.shape != (bs,)
@@ -1052,6 +1512,18 @@ def decode_rows(
         raise ValueError(
             "decode metadata requires request-sized and packed token vectors"
         )
+    if query_start_loc is not None:
+        if num_extends:
+            raise ValueError("packed decode queries do not support leading extends")
+        if (
+            query_start_loc.shape != (bs + 1,)
+            or query_start_loc.dtype not in (torch.int32, torch.int64)
+            or not query_start_loc.is_contiguous()
+            or query_start_loc.device != positions.device
+        ):
+            raise ValueError(
+                "packed decode requires integer query boundaries on device"
+            )
     tensors = (seq_lens, request_pool_indices, positions, requests, lengths, pool_rows)
     if any(not tensor.is_contiguous() for tensor in tensors):
         raise ValueError("decode row vectors must be contiguous")
@@ -1060,13 +1532,33 @@ def decode_rows(
     if not positions.is_cuda:
         lengths.zero_()
         lengths[:actual_bs].copy_(seq_lens[:actual_bs].clamp_min(width))
-        positions.view(bs, width).copy_(
-            lengths.to(torch.int64)[:, None] - width + torch.arange(width)
-        )
-        requests.view(bs, width).copy_(torch.arange(bs)[:, None])
-        for tensor in (positions, requests):
-            tensor[: num_extends * width].fill_(-1)
-            tensor[actual_bs * width :].fill_(-1)
+        if query_start_loc is None:
+            positions.view(bs, width).copy_(
+                lengths.to(torch.int64)[:, None] - width + torch.arange(width)
+            )
+            requests.view(bs, width).copy_(torch.arange(bs)[:, None])
+            for tensor in (positions, requests):
+                tensor[: num_extends * width].fill_(-1)
+                tensor[actual_bs * width :].fill_(-1)
+        else:
+            counts = query_start_loc.diff().to(torch.int64)
+            if (
+                query_start_loc[0] != 0
+                or query_start_loc[-1] > positions.numel()
+                or (counts[:actual_bs] < 1).any()
+                or (counts[:actual_bs] > width).any()
+                or (counts[actual_bs:] != 0).any()
+            ):
+                raise ValueError(
+                    "packed query intervals must be live prefixes or padding"
+                )
+            positions.fill_(-1)
+            requests.fill_(-1)
+            for row in range(actual_bs):
+                begin, end = int(query_start_loc[row]), int(query_start_loc[row + 1])
+                positions[begin:end] = lengths[row] - width + torch.arange(end - begin)
+                requests[begin:end] = row
+            lengths[:actual_bs] += counts[:actual_bs].to(lengths.dtype) - width
         pool_rows.fill_(-1)
         pool_rows[:actual_bs].copy_(request_pool_indices[:actual_bs])
         return
@@ -1080,6 +1572,7 @@ def decode_rows(
         actual_bs,
         num_extends,
         width,
+        query_start_loc,
     )
 
 
@@ -1149,6 +1642,55 @@ def global_slots(rows, positions, requests, table, ratio, pages):
         ).to(torch.int32)
     return _kernel("global_slots", positions)(
         rows, positions, requests, table, ratio, pages
+    )
+
+
+def prefill_indices(swa_indices, logical_rows, global_slots, rows, history_base):
+    """Build int32 sparse prefill attention indices into a packed KV workspace.
+
+    Each query's indices are its SWA workspace rows followed by its selected
+    compressed-history rows, shifted to where its request's history starts in
+    the workspace. A selected row that is negative, or whose physical slot is
+    negative, becomes -1.
+
+    Args:
+        swa_indices: Integer [Q, W] SWA workspace rows per query, -1 for none.
+        logical_rows: Integer [T, K] request-local selected history rows.
+        global_slots: Integer [T, K] physical slots of logical_rows; negative
+            marks a row absent from the cache.
+        rows: The Q query rows of logical_rows and global_slots, as a slice
+            with step 1 or an integer [Q] tensor.
+        history_base: Integer [Q] first workspace row of each query's history.
+
+    Returns:
+        Contiguous int32 [Q, W + K] indices.
+    """
+    if logical_rows.shape != global_slots.shape or logical_rows.ndim != 2:
+        raise ValueError("logical_rows and global_slots must share shape [T, K]")
+    if swa_indices.ndim != 2 or history_base.shape != swa_indices.shape[:1]:
+        raise ValueError("swa_indices must be [Q, W] and history_base [Q]")
+    if isinstance(rows, slice):
+        if rows.step not in (None, 1) or rows.start is None:
+            raise ValueError("rows must be a slice with an explicit start and step 1")
+        if len(range(*rows.indices(logical_rows.shape[0]))) != swa_indices.shape[0]:
+            raise ValueError("rows must select one logical row per query")
+    elif rows.shape != history_base.shape:
+        raise ValueError("rows must select one logical row per query")
+    # The kernel reads every row's columns contiguously.
+    swa_indices, logical_rows, global_slots = (
+        x if x.stride(-1) == 1 else x.contiguous()
+        for x in (swa_indices, logical_rows, global_slots)
+    )
+    if not swa_indices.is_cuda:
+        selected, slots = logical_rows[rows], global_slots[rows]
+        history = torch.where(
+            (selected >= 0) & (slots >= 0),
+            selected.to(torch.int64) + history_base[:, None].to(torch.int64),
+            -1,
+        )
+        return torch.cat((swa_indices.to(torch.int64), history), dim=-1).to(torch.int32)
+    return _kernel("prefill_indices", logical_rows)(
+        swa_indices, logical_rows, global_slots, rows, history_base
     )
 
 
@@ -1285,11 +1827,30 @@ def merge_index_candidates(packed, rows, lengths):
     return _kernel("merge_index_candidates", packed)(packed, rows, lengths)
 
 
+def history_pack(cache, table, visible_rows, *, virtual_block_count, degree, rank):
+    """Copy this rank's packed history pages for a byte-wise MAX all-reduce.
+
+    cache is a possibly strided uint8 [local_pages,64,row_bytes] field and
+    table an integer [pages] row of virtual pages, possibly strided. Virtual
+    page v > 0 lives on rank (v - 1) % degree; ids at or past
+    virtual_block_count are invalid. visible_rows is an integer device
+    scalar. Returns contiguous uint8 [pages+1,64,row_bytes]: a zero null page,
+    then each owned, valid page that starts below visible_rows with all its
+    bytes (scales included), and zeros elsewhere. A MAX all-reduce of the
+    owners' results restores every visible page exactly, with shapes fixed
+    for graph replay.
+    """
+    return _kernel("history_pack", cache)(
+        cache, table, visible_rows, virtual_block_count, degree, rank
+    )
+
+
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.dsv41.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.cute_dsl_attention  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41._triton.rope  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsv41._triton.kvp  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_select  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_gemm  # noqa: E402,F401
@@ -1366,19 +1927,46 @@ def index_select_all(page_table, visible_lens, pages, candidate_block_size, out)
     return out
 
 
-def new_index_metadata(page_table: torch.Tensor, visible_lens: torch.Tensor) -> object:
+def new_index_metadata(
+    page_table: torch.Tensor,
+    visible_lens: torch.Tensor,
+    request_indices: torch.Tensor | None,
+    *,
+    history_rows: tuple[int, ...] | None,
+) -> object:
     """Create invocation-owned reusable index geometry for these exact inputs.
 
-    page_table and visible_lens have the index_topk contract and must remain
-    unchanged for this object's lifetime. Share it only between layers of one
-    forward; create a new object for every eager invocation and graph capture.
-    Replay recomputes the captured producers. No KV values or scores are cached.
-    Consumers on other streams wait for metadata producers before reading.
-    Cached geometry is retained until this object is released.
+    page_table and visible_lens have the index_topk contract. request_indices
+    is contiguous int32 [queries] on the same device, or None for independent
+    rows. Equal consecutive IDs group queries of one request: their page tables
+    must match and their visible lengths must be nondecreasing. Rows with a
+    positive visible length must carry nonnegative IDs in that order; the values
+    are not scanned here because a device-to-host check would synchronize the
+    step. Rows whose visible length is 0 are relabeled with distinct negative
+    IDs before the grouped call, whatever ID they carry (decode padding carries
+    -1), so a padding row cannot end an active request's run. All supplied
+    tensors must remain unchanged for this object's lifetime. Share it only
+    between layers of one forward; create a new object for every eager
+    invocation and graph capture. Replay recomputes the captured producers. No
+    KV values or scores are cached. Consumers on other streams wait for metadata
+    producers before reading. Cached geometry is retained until this object is
+    released.
+
+    history_rows selects the Blackwell Full scorer. A tuple gives the number of
+    consecutive query rows that share one request history, in table order, and
+    sums to the table's rows: each history is gathered once into a packed key
+    buffer and scored densely (prefill). None scores every row through the
+    paged page table (decode and verify). request_indices only groups paged
+    scoring; dense scoring ignores it.
     """
     from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexMetadata
 
-    return IndexMetadata(page_table, visible_lens)
+    if history_rows is not None and (
+        any(rows < 1 for rows in history_rows)
+        or sum(history_rows) != page_table.shape[0]
+    ):
+        raise ValueError("history_rows must be positive and cover every query row")
+    return IndexMetadata(page_table, visible_lens, request_indices, history_rows)
 
 
 def compact_slots(slots: torch.Tensor, lengths: torch.Tensor):
@@ -1403,3 +1991,109 @@ def compact_slots(slots: torch.Tensor, lengths: torch.Tensor):
         packed = slots.masked_fill(~valid, -1).gather(1, order)
         return packed, valid.sum(dim=-1, dtype=torch.int32)
     return _kernel("compact_slots", slots)(slots, lengths)
+
+
+def verify_layout(
+    scores: torch.Tensor,
+    *,
+    query_capacity: int,
+    rows_out: torch.Tensor,
+    indptr_out: torch.Tensor,
+    counts_out: torch.Tensor,
+    valid_out: torch.Tensor,
+    latest_scores: torch.Tensor | None,
+    request_slots: torch.Tensor | None,
+    active_count: torch.Tensor | None,
+) -> None:
+    """Allocate a shared query budget to contiguous per-request prefixes.
+
+    FP32 scores [B,D] are conditional confidence logits for D draft tokens;
+    every request receives an anchor. query_capacity is in [B,B*(D+1)].
+    Int64 outputs are packed source rows [query_capacity], CSR [B+1] and
+    counts [B]; valid_out is a scalar bool. Inputs and outputs share a device.
+    Requires GPU scores with unit column stride and B*(D+1) <= 4096.
+    Unsupported layouts raise ValueError.
+    All outputs have stable caller-owned storage and no host readback is used.
+    latest_scores [slots,D] and request_slots [B] select current GPU confidence
+    by request; pass None for both to use the history only. A non-finite latest
+    row uses the entire history row from scores. Supply both or neither; slot
+    indices must address the table.
+
+    active_count, when not None, holds the live prefix length in a device
+    scalar. Its value must be in [0,B]. Padding retains one anchor but receives
+    no draft allocation; the caller masks its state writes and discards its
+    output.
+
+    Non-finite rows require full width. If the budget cannot cover them,
+    valid_out is false and outputs describe anchor-only verification with
+    inactive padding. The caller must treat this as an invalid budget, not a
+    measured successful allocation. Counts never exceed the verified prefixes.
+    """
+    if scores.ndim != 2 or scores.dtype != torch.float32:
+        raise ValueError("verification scores must be FP32 [batch, draft width]")
+    bs, draft_width = scores.shape
+    if not scores.is_cuda:
+        raise ValueError("verification layout requires a CUDA or ROCm GPU")
+    if scores.stride(1) != 1 or (
+        latest_scores is not None
+        and latest_scores.ndim == 2
+        and latest_scores.stride(1) != 1
+    ):
+        raise ValueError("verification scores require unit column stride")
+    if bs * (draft_width + 1) > 4096:
+        raise ValueError(
+            "verification layout requires batch * (draft width + 1) <= 4096"
+        )
+    if (
+        bs < 1
+        or draft_width < 1
+        or type(query_capacity) is not int
+        or not bs <= query_capacity <= bs * (draft_width + 1)
+    ):
+        raise ValueError("invalid verification query capacity")
+    if (latest_scores is None) != (request_slots is None):
+        raise ValueError(
+            "latest confidence and request slots must be supplied together"
+        )
+    if latest_scores is not None and (
+        latest_scores.ndim != 2
+        or latest_scores.shape[1] != draft_width
+        or latest_scores.dtype != torch.float32
+        or latest_scores.device != scores.device
+        or request_slots.shape != (bs,)
+        or request_slots.dtype not in (torch.int32, torch.int64)
+        or request_slots.device != scores.device
+        or not request_slots.is_contiguous()
+    ):
+        raise ValueError("latest confidence must match the history and request slots")
+    if active_count is not None and (
+        active_count.numel() != 1
+        or active_count.dtype not in (torch.float32, torch.int32, torch.int64)
+        or active_count.device != scores.device
+    ):
+        raise ValueError("active count must be a device scalar")
+    for output, shape, dtype in (
+        (rows_out, (query_capacity,), torch.int64),
+        (indptr_out, (bs + 1,), torch.int64),
+        (counts_out, (bs,), torch.int64),
+        (valid_out, (), torch.bool),
+    ):
+        if (
+            output.shape != shape
+            or output.dtype != dtype
+            or output.device != scores.device
+            or not output.is_contiguous()
+        ):
+            raise ValueError("verification output storage does not match the budget")
+    implementation = _kernel("verify_layout", scores)
+    implementation(
+        scores,
+        query_capacity,
+        rows_out,
+        indptr_out,
+        counts_out,
+        valid_out,
+        latest_scores=latest_scores,
+        request_slots=request_slots,
+        active_count=active_count,
+    )

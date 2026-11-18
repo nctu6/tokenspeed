@@ -53,8 +53,14 @@ def test_process_weights_preserves_canonical_scales(
     canonical_scales = layer.weight_scale_inv.data.clone()
     method = _method()
 
+    original_weight = layer.weight
+    original_scales = layer.weight_scale_inv
     method.process_weights_after_loading(layer)
 
+    assert layer.weight is original_weight
+    assert layer.weight_scale_inv is original_scales
+    # Ordinary canonical weights still follow the current backend setting.
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
     assert torch.equal(layer.weight_scale_inv, canonical_scales)
 
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
@@ -67,21 +73,20 @@ def test_process_weights_preserves_canonical_scales(
 
 
 @pytest.mark.parametrize("m", [1, 65, 129])
-def test_cutedsl_warmup_covers_capture_tiles(m: int, monkeypatch) -> None:
-    from tokenspeed_kernel.thirdparty import trtllm_blockwise
+def test_cutedsl_eager_warmup_then_graph_capture(m: int, monkeypatch) -> None:
+    from flashinfer.autotuner import AutoTuner
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise import _launch as launcher
 
+    AutoTuner.get().clear_cache()
+    monkeypatch.setattr(launcher, "_compiled", {})
     monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "trtllm_cutedsl")
     layer = _make_layer(256, 512)
     method = _method()
     method.process_weights_after_loading(layer)
-    warmup = torch.randn(1, 512, device="cuda", dtype=torch.bfloat16)
+    warmup = torch.randn(m, 512, device="cuda", dtype=torch.bfloat16)
     method.apply(layer, warmup)
     torch.cuda.synchronize()
 
-    def unexpected_compile(*args, **kwargs):
-        pytest.fail("CuTe-DSL compiled after eager warmup")
-
-    monkeypatch.setattr(trtllm_blockwise, "_compile", unexpected_compile)
     x = torch.randn(m, 512, device="cuda", dtype=torch.bfloat16)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

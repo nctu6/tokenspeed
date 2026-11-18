@@ -14,9 +14,9 @@ from tokenspeed.runtime.configs.model_config import (
     is_multimodal_model,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.mlp import GatedMLP
 from tokenspeed.runtime.layers.quantization.fp8 import Mxfp8Config
 from tokenspeed.runtime.models.minimax_m3 import (
-    MiniMaxM3MLP,
     MiniMaxM3SparseForConditionalGeneration,
     MiniMaxM3SparseMoeBlock,
 )
@@ -112,6 +112,7 @@ def _build_model(
     *,
     quant_config: Mxfp8Config | None = None,
     is_multimodal_active: bool = False,
+    config: MiniMaxM3Config | None = None,
 ) -> MiniMaxM3SparseForConditionalGeneration:
     mapping = _tp4_mapping()
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
@@ -124,7 +125,7 @@ def _build_model(
     try:
         with torch.device("meta"):
             return MiniMaxM3SparseForConditionalGeneration(
-                _tiny_config(),
+                _tiny_config() if config is None else config,
                 mapping,
                 quant_config=quant_config,
                 is_multimodal_active=is_multimodal_active,
@@ -153,7 +154,6 @@ def test_minimax_m3_attention_family_selects_msa() -> None:
     spec = _resolve_attention_family(config, config.text_config)
     assert spec is not None
     assert spec.name == "MiniMax MSA"
-    assert spec.default_prefix_granularity == 128
     # --attention-backend must keep selecting the dense sub-backend; the
     # top-level backend is pinned by MSAConfig itself.
     assert spec.default_backend is None
@@ -186,8 +186,8 @@ def _msa_server_args(**overrides) -> SimpleNamespace:
         spec_context_pad=0,
         attention_backend="trtllm",
         drafter_attention_backend=None,
-        prefix_granularity=128,
         max_num_seqs=16,
+        disaggregation_decode_extra_slots=0,
         data_parallel_size=1,
         attn_tp_size=4,
         max_cudagraph_capture_size=16,
@@ -236,7 +236,7 @@ def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) 
     )
     model = _build_model(monkeypatch, quant_config=_mxfp8_config())
 
-    assert isinstance(model.model.layers[0].mlp, MiniMaxM3MLP)
+    assert isinstance(model.model.layers[0].mlp, GatedMLP)
     assert isinstance(model.model.layers[3].mlp, MiniMaxM3SparseMoeBlock)
     experts = model.model.layers[3].mlp.experts
     assert experts.w13_weight.shape == (8, 64, 128)
@@ -259,6 +259,28 @@ def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) 
         "model.layers.3.mlp.experts.w13_weight_scale_inv",
         "model.layers.3.self_attn.indexer.q_norm.weight",
     }
+
+
+def test_minimax_m3_layers_open_on_the_previous_layers_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _tiny_config()
+    config.text_config.mlp_layer_types = ["dense", "sparse", "sparse", "dense"]
+
+    layers = _build_model(monkeypatch, config=config).model.layers
+
+    assert [layer.comm_manager.is_moe for layer in layers] == [
+        False,
+        True,
+        True,
+        False,
+    ]
+    assert [layer.comm_manager.prev_is_moe for layer in layers] == [
+        False,
+        False,
+        True,
+        True,
+    ]
 
 
 def _mixed_precision_config() -> "ModelOptMixedConfig":
@@ -376,3 +398,101 @@ def test_minimax_m3_language_only_keeps_vision_modules_disabled(
 
     with pytest.raises(RuntimeError, match="vision tower is disabled"):
         model.get_image_feature([])
+
+
+def test_minimax_m3_mxfp8_nvfp4_quant_dispatch_and_expert_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tokenspeed.runtime.layers.dense import Fp8LinearMethod
+    from tokenspeed.runtime.layers.quantization.mxfp8_nvfp4 import (
+        Mxfp8Nvfp4Config,
+        preprocess_mxfp8_nvfp4_weights,
+    )
+
+    hf_quant_config = {
+        "quant_method": "mxfp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [1, 32],
+        "moe_quant_algo": "NVFP4",
+        "moe_quant_format": "nvfp4-pack-quantized",
+        "group_size": 16,
+    }
+    assert (
+        Mxfp8Nvfp4Config.override_quantization_method(hf_quant_config, None)
+        == "mxfp8_nvfp4"
+    )
+    quant_config = Mxfp8Nvfp4Config.from_config(hf_quant_config)
+    model = _build_model(monkeypatch, quant_config=quant_config)
+    layer = model.model.layers[3]
+    assert isinstance(layer.self_attn.qkv_proj.quant_method, Fp8LinearMethod)
+    assert isinstance(
+        layer.mlp.shared_experts.gate_up_proj.quant_method, Fp8LinearMethod
+    )
+    assert layer.mlp.experts._quant_kind == "nvfp4"
+
+    # compressed-tensors global scales are multipliers; the runtime loads
+    # their reciprocals under the ModelOpt names.
+    expert = "language_model.model.layers.3.block_sparse_moe.experts.0.w1"
+    renamed = dict(
+        preprocess_mxfp8_nvfp4_weights(
+            [
+                (f"{expert}.weight_packed", torch.zeros(4, 8, dtype=torch.uint8)),
+                (f"{expert}.weight_global_scale", torch.tensor([4.0])),
+                (f"{expert}.input_global_scale", torch.tensor([0.5])),
+            ],
+            quant_config,
+        )
+    )
+    assert renamed.keys() == {
+        f"{expert}.weight",
+        f"{expert}.weight_scale_2",
+        f"{expert}.input_scale",
+    }
+    assert renamed[f"{expert}.weight_scale_2"].item() == 0.25
+    assert renamed[f"{expert}.input_scale"].item() == 2.0
+
+
+def test_minimax_m3_dspark_draft_layout_and_checkpoint_names() -> None:
+    from tokenspeed.runtime.models.minimax_m3_dspark import DSparkMiniMaxDraftModel
+
+    config = MiniMaxM3VLTextConfig(
+        vocab_size=96,
+        hidden_size=64,
+        dense_intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        rotary_dim=8,
+        max_position_embeddings=256,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10_000_000,
+            "partial_rotary_factor": 0.5,
+        },
+        layer_types=["sliding_attention"],
+        sliding_window=32,
+        dflash_config={"target_layer_ids": [1, 3], "block_size": 7},
+        dspark_config={"markov_rank": 8, "markov_head_type": "vanilla"},
+    )
+    model = DSparkMiniMaxDraftModel(config, Mapping(rank=0, world_size=1))
+    attn = model.layers[0].self_attn
+
+    # Checkpoint names nest the draft under the target; the loader strips the
+    # nesting, folds k_proj into the fused qkv, renames final_norm to norm, and
+    # skips the unused confidence head.
+    k_proj = torch.randn(32, 64)
+    final_norm = torch.randn(64)
+    model.load_weights(
+        [
+            (
+                "language_model.model.dspark.layers.0.decoder_layer."
+                "self_attn.k_proj.weight",
+                k_proj,
+            ),
+            ("language_model.model.dspark.final_norm.weight", final_norm),
+            ("language_model.model.dspark.confidence_head.proj.weight", torch.ones(1)),
+        ]
+    )
+    torch.testing.assert_close(attn.qkv_proj.weight[64:96], k_proj, atol=0, rtol=0)
+    torch.testing.assert_close(model.norm.weight, final_norm, atol=0, rtol=0)

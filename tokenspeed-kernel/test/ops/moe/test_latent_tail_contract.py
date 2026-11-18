@@ -132,7 +132,9 @@ def test_only_the_down_projection_moved_off_the_upstream_sentinel() -> None:
     }
     assert "NEG_ZERO_F32_BITS" in tail_imports
     down = (package / "ops/moe/_cute_dsl/latent_down.py").read_text()
-    assert "sentinel: int = _DOWN_SENTINEL" in down
+    assert (
+        "sentinel = _DOWN_SENTINEL if fused_producer else HALF_POLLED_SENTINEL" in down
+    )
     assert "_DOWN_SENTINEL = 0x80008000" in down
     # Only the NaN-payload sentinel may poll halves; -0 arming keeps word compares.
     assert "HALF_POLLED_SENTINEL = 0xFFFFFFFF" in down
@@ -358,7 +360,7 @@ def test_the_gather_keeps_every_rank_its_own_host() -> None:
             ),
             mock.patch.object(fabric, "fabric_allocation_supported", return_value=True),
             mock.patch.object(
-                fabric, "_host_identity", return_value=100
+                fabric, "host_identity", return_value=100
             ) as host_identity,
             mock.patch.object(torch.cuda, "current_device", return_value=0),
         ):
@@ -385,9 +387,9 @@ def test_the_host_id_is_stable_across_processes() -> None:
     import subprocess
     import sys
 
-    from tokenspeed_kernel.ops.communication.fabric import _host_identity
+    from tokenspeed_kernel.ops.communication.fabric import host_identity
 
-    here = _host_identity()
+    here = host_identity()
     # int64 is what the gather carries it in; a wider id would wrap to another
     # host's value and merge two machines.
     assert 0 <= here < 2**63
@@ -396,8 +398,8 @@ def test_the_host_id_is_stable_across_processes() -> None:
         [
             sys.executable,
             "-c",
-            "from tokenspeed_kernel.ops.communication.fabric import _host_identity;"
-            "print(_host_identity())",
+            "from tokenspeed_kernel.ops.communication.fabric import host_identity;"
+            "print(host_identity())",
         ],
         capture_output=True,
         text=True,
@@ -420,7 +422,7 @@ def test_two_hosts_do_not_share_one_identity() -> None:
     identities = []
     for boot in ("11111111-1111-1111-1111-111111111111", "22222222-2222"):
         with mock.patch.object(fabric.Path, "read_text", return_value=boot):
-            identities.append(fabric._host_identity())
+            identities.append(fabric.host_identity())
     assert len(set(identities)) == 2
 
 
@@ -438,7 +440,7 @@ def test_a_high_digest_bit_still_fits_the_gathered_int64() -> None:
     with mock.patch.object(
         fabric.hashlib, "blake2b", return_value=mock.Mock(digest=lambda: b"\xff" * 8)
     ):
-        assert fabric._host_identity() < 2**63
+        assert fabric.host_identity() < 2**63
 
 
 def test_a_missing_map_raises_instead_of_gathering_from_dispatch() -> None:

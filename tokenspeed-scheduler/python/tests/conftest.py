@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import os
+
+# The scheduler's Host write policy defaults to "reuse" (pages reach the Host
+# after a second Device hit). Most scheduler tests pin store/op sequences written
+# for eager streaming, so run them eager unless the caller chose a policy.
+os.environ.setdefault("TOKENSPEED_KVSTORE_WRITE_POLICY", "eager")
+
 try:
     import tokenspeed_scheduler as ts
 except ImportError:  # test modules importorskip on their own
@@ -27,6 +34,7 @@ def _make_k3_config() -> "ts.SchedulerConfig":
     cfg.num_snapshot_pages = 1  # never retracts
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.enable_l3_storage = False
     cfg.disable_l2_cache = True
     cfg.disable_prefix_cache = False
@@ -51,6 +59,15 @@ def _spec(request_id: str, tokens: list[int]) -> "ts.RequestSpec":
     spec.request_id = request_id
     spec.tokens = list(tokens)
     return spec
+
+
+def _event(kind: str, request_id: str, **fields):
+    """One ForwardEvent of the named kind, its fields set by keyword."""
+    event = getattr(ts.ForwardEvent, kind)()
+    event.request_id = request_id
+    for name, value in fields.items():
+        setattr(event, name, value)
+    return event
 
 
 def _advance(scheduler, request_id: str, tokens: list[int]) -> None:
@@ -79,3 +96,16 @@ def _find_forward_op(plan):
 
 def _positive(row) -> list[int]:
     return [page for page in row if page > 0]
+
+
+def storage_ops(plan):
+    """The Host-only commands in a scheduler's unified cache plan."""
+    Cache = ts.Cache
+
+    types = (
+        Cache.StorageQueryOp,
+        Cache.StorageGetOp,
+        Cache.StoragePutOp,
+        Cache.StorageCancelOp,
+    )
+    return [operation for operation in plan.cache if isinstance(operation, types)]

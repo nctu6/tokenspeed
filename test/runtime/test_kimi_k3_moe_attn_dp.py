@@ -36,13 +36,15 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
+from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.moe.latent import Kimi3LatentProjection
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import All2AllBackend, MoeBackend
 from tokenspeed.runtime.models import kimi_k3
 from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
 
 
-@pytest.mark.parametrize("dp,ep,world", [(2, 1, 2), (2, 4, 4), (4, 4, 8)])
+@pytest.mark.parametrize("dp,ep,world", [(4, 2, 4), (2, 4, 4), (4, 4, 8)])
 def test_attn_dp_rejects_partial_world_layout_before_backend_setup(
     monkeypatch, dp: int, ep: int, world: int
 ) -> None:
@@ -51,10 +53,8 @@ def test_attn_dp_rejects_partial_world_layout_before_backend_setup(
     with pytest.raises(ValueError, match="attention DP == MoE EP == world size"):
         KimiLinearMoE(
             config=SimpleNamespace(),
-            mapping=SimpleNamespace(
-                world_size=world,
-                attn=SimpleNamespace(dp_size=dp),
-                moe=SimpleNamespace(ep_size=ep),
+            mapping=Mapping(
+                rank=0, world_size=world, attn_dp_size=dp, moe_tp_size=1, moe_ep_size=ep
             ),
             layer_index=0,
             model_scope="test",
@@ -89,6 +89,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
             self.supports_precomputed_topk = True
             self.topk_output_format = TopKOutputFormat.STANDARD
             self.plan = {"a2a_backend": expected_a2a}
+            self.sorted_route_rows = frozenset()
 
     monkeypatch.setattr(
         kimi_k3,
@@ -96,11 +97,13 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
         lambda: MoeBackend(moe_backend),
     )
     plan = kimi_k3.Kimi3MoEExecutionPlan(
-        use_mega_moe=mega_moe,
+        use_mega_moe=moe_backend == "mega_moe",
+        owns_ep_communication=mega_moe,
         use_native=False,
         use_trtllm=not mega_moe,
         overlap_shared_experts=False,
         joint_moe_reduce=False,
+        decode_chain=False,
     )
     forbidden = mock.Mock(side_effect=AssertionError("TP-only setup reached"))
     monkeypatch.setattr(
@@ -311,8 +314,9 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
     gathers = iter([*activation_payloads, ("AG_ids", ids), ("AG_weights", weights)])
     quant_scale = torch.tensor(0.125)
 
-    def quantize(tensor, scale, *, is_sf_swizzled_layout, enable_pdl):
+    def quantize(tensor, scale, *, is_sf_swizzled_layout, enable_pdl, out=None):
         events.append("quantize")
+        assert out is None
         assert scale is quant_scale and not is_sf_swizzled_layout
         torch.testing.assert_close(tensor, latent[rank, :rows])
         return packed[rank, :rows], scales[rank, :rows]
@@ -404,7 +408,7 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
             attn=SimpleNamespace(dp_rank=rank),
             moe=SimpleNamespace(ep_group=group),
         ),
-        execution_plan=SimpleNamespace(use_mega_moe=False),
+        execution_plan=SimpleNamespace(use_mega_moe=False, owns_ep_communication=False),
         moe_alltoall=(
             SimpleNamespace(dispatch=dispatch, combine=combine)
             if use_alltoall
@@ -523,7 +527,9 @@ def test_attn_dp_forward_bypasses_tp_tail() -> None:
     ctx = SimpleNamespace()
     dp_forward = mock.Mock(return_value=hidden)
     layer = SimpleNamespace(
-        mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=2)),
+        mapping=Mapping(
+            rank=0, world_size=2, attn_tp_size=1, moe_tp_size=1, moe_ep_size=2
+        ),
         _forward_attn_dp=dp_forward,
     )
     result = KimiLinearMoE.forward(
@@ -562,7 +568,11 @@ def test_attn_dp_rejects_invalid_token_metadata_before_collectives(
 
 
 def test_attn_dp_forward_requires_context() -> None:
-    layer = SimpleNamespace(mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=2)))
+    layer = SimpleNamespace(
+        mapping=Mapping(
+            rank=0, world_size=2, attn_tp_size=1, moe_tp_size=1, moe_ep_size=2
+        )
+    )
     hidden = torch.ones(1, 4)
     with pytest.raises(ValueError, match="requires a ForwardContext"):
         KimiLinearMoE.forward(
@@ -579,7 +589,7 @@ def test_attn_dp_forward_requires_context() -> None:
 @pytest.mark.parametrize("rows", [0, 2])
 @pytest.mark.parametrize("shared_tp", [False, True])
 @pytest.mark.parametrize("weight_dtype", ["nvfp4", "mxfp4"])
-def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(
+def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
     monkeypatch, rows, shared_tp, weight_dtype
 ):
     hidden = torch.randn(rows, 8, dtype=torch.bfloat16)
@@ -611,9 +621,10 @@ def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(
     routed = mock.Mock(
         side_effect=lambda *args, **kwargs: (events.append("experts"), latent)[1]
     )
-    up = mock.Mock(return_value=hidden + prefix)
+    up = Kimi3LatentProjection(4, 8, params_dtype=torch.bfloat16, solution="torch")
+    up.weight.data.normal_(std=0.1)
     layer = SimpleNamespace(
-        execution_plan=SimpleNamespace(use_mega_moe=True),
+        execution_plan=SimpleNamespace(use_mega_moe=False, owns_ep_communication=True),
         mapping=SimpleNamespace(world_size=2, attn=SimpleNamespace(dp_rank=0)),
         stream_fork=SimpleNamespace(scope=scope),
         topk=mock.Mock(return_value=StandardTopKOutput(weights, ids, None)),
@@ -625,7 +636,7 @@ def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(
         moe_alltoall=None,
         _routed_experts=routed,
         routed_expert_norm=None,
-        routed_expert_up_proj=SimpleNamespace(forward_add3=up),
+        routed_expert_up_proj=up,
         shared_experts=mock.Mock(return_value=hidden),
         routed_hidden=4,
         top_k=2,
@@ -652,10 +663,8 @@ def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(
             "record_gather",
             "join_gather",
             "join",
-            "reduce",
-            "join",
             "experts",
-            "join",
+            "reduce",
         ]
     else:
         assert events == ["experts"]
@@ -670,10 +679,9 @@ def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(
         quantize.assert_not_called()
     if rows:
         assert call.args[0] is (payload if weight_dtype == "nvfp4" else latent)
-        torch.testing.assert_close(result, hidden + prefix)
+        torch.testing.assert_close(result, up.forward_add3(latent, prefix, hidden))
     else:
         assert result is prefix
-        up.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -493,7 +493,7 @@ def test_reporter_factory_selects_the_sink_for_each_mode(
 def test_event_loop_binds_the_output_setter_only_where_it_exists():
     """Non-reporting ranks send through a NullSender with no snapshot setter,
     so the loop must not reach for it while wiring the reporter."""
-    pytest.importorskip("tokenspeed_scheduler")
+    pytest.importorskip("tokenspeed_engine.scheduler")
     from tokenspeed.runtime.engine import event_loop as event_loop_module
 
     class TrapSender:

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import tokenspeed_kernel.ops.moe._triton.routed_norm  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.moe import _bf16_routes_moe_apply, _bf16_routes_moe_warmup
 from tokenspeed_kernel.ops.moe._triton.bf16 import (
     _check_route_tensors as _check_bf16_route_tensors,
 )
@@ -137,6 +138,7 @@ register_kernel(
         "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
     ),
     priority=Priority.PERFORMANT,
+    traits={"supports_output_buffers": frozenset({True})},
 )
 def triton_minimax_sigmoid_bias_topk(
     *,
@@ -146,6 +148,7 @@ def triton_minimax_sigmoid_bias_topk(
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
     weights_dtype: torch.dtype = torch.float32,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused single-kernel routing via the minimax biased-topk Triton kernel.
 
@@ -154,6 +157,10 @@ def triton_minimax_sigmoid_bias_topk(
     (40us vs 13us at [1, 896] topk=16). ``hidden_states`` is only shape-
     validated by the kernel wrapper, so the logits stand in for it.
     """
+    if out is not None and not normalize_topk_weights and out[0].dtype != torch.float32:
+        raise ValueError(
+            "Unnormalized routing output buffers require FP32 weight storage"
+        )
     # The kernel scales only when it renormalizes, so keep fp32 through mul_.
     topk_weights, topk_ids = minimax_biased_grouped_topk(
         router_logits,
@@ -166,15 +173,17 @@ def triton_minimax_sigmoid_bias_topk(
         num_fused_shared_experts=0,
         routed_scaling_factor=routed_scaling_factor,
         weights_dtype=weights_dtype if normalize_topk_weights else torch.float32,
+        out=out,
     )
     if not normalize_topk_weights:
         topk_weights.mul_(routed_scaling_factor)
-        topk_weights = topk_weights.to(weights_dtype)
-    return topk_weights, topk_ids.to(torch.int32)
+        if out is None:
+            topk_weights = topk_weights.to(weights_dtype)
+    return topk_weights, topk_ids if out is not None else topk_ids.to(torch.int32)
 
 
 # ===-----------------------------------------------------------------------===#
-# Routing: Kimi K3 packed sigmoid-bias top-k (NVIDIA, AMD gfx1250)
+# Routing: Kimi K3 packed sigmoid-bias top-k (NVIDIA, AMD gfx950, gfx1250)
 # ===-----------------------------------------------------------------------===#
 
 
@@ -184,9 +193,9 @@ def triton_minimax_sigmoid_bias_topk(
 #: behind by 1024. One row stays with the decode specialist, and the
 #: gfx1250 Gluon remains available on these rows for explicit selection;
 #: the packed registration wins automatic selection by priority.
-#: CDNA4 one-token K3 stays on the decode specialist: on MI355X that kernel
-#: is ahead of packed, and it already covers this shape.
+#: CDNA4 (MI350X, graph replay): beats the gfx950 Gluon row kernel from 2 to 512 rows.
 _PACKED_ROWS_NVIDIA = range(1, 257)
+_PACKED_ROWS_CDNA4 = range(2, 513)
 _PACKED_ROWS_CDNA5 = range(2, 513)
 _PACKED_CONTRACT = {
     "experts": frozenset({896}),
@@ -203,6 +212,7 @@ def _invoke_packed(
     normalize_topk_weights: bool,
     weights_dtype: torch.dtype,
     logical_to_physical_map: torch.Tensor | None = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch the packed K3 specialist after layout/dtype adapters.
 
@@ -225,6 +235,7 @@ def _invoke_packed(
         ),
         weights_dtype=weights_dtype,
         enable_pdl=pdl_enabled(),
+        out=out,
     )
 
 
@@ -239,7 +250,11 @@ _PACKED_SIGNATURES = format_signatures("router_logits", "dense", {torch.float32}
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_PACKED_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    traits={**_PACKED_CONTRACT, "tokens": _PACKED_ROWS_NVIDIA},
+    traits={
+        **_PACKED_CONTRACT,
+        "tokens": _PACKED_ROWS_NVIDIA,
+        "supports_output_buffers": frozenset({True}),
+    },
 )
 def triton_kimi3_packed_sigmoid_bias_topk_nvidia(
     *,
@@ -249,6 +264,7 @@ def triton_kimi3_packed_sigmoid_bias_topk_nvidia(
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
     weights_dtype: torch.dtype,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return packed top-16 weights and ids for FP32 ``[tokens, 896]`` logits.
 
@@ -264,6 +280,7 @@ def triton_kimi3_packed_sigmoid_bias_topk_nvidia(
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
         weights_dtype=weights_dtype,
+        out=out,
     )
 
 
@@ -275,7 +292,11 @@ def triton_kimi3_packed_sigmoid_bias_topk_nvidia(
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_PACKED_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    traits={**_PACKED_CONTRACT, "tokens": _PACKED_ROWS_NVIDIA},
+    traits={
+        **_PACKED_CONTRACT,
+        "tokens": _PACKED_ROWS_NVIDIA,
+        "supports_output_buffers": frozenset({True}),
+    },
 )
 def triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped(
     *,
@@ -286,6 +307,7 @@ def triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped(
     normalize_topk_weights: bool,
     logical_to_physical_map: torch.Tensor,
     weights_dtype: torch.dtype,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return packed top-16 weights and ids for FP32 ``[tokens, 896]`` logits.
 
@@ -301,6 +323,46 @@ def triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped(
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
         logical_to_physical_map=logical_to_physical_map,
+        weights_dtype=weights_dtype,
+        out=out,
+    )
+
+
+@register_kernel(
+    "moe",
+    "sigmoid_bias_topk",
+    name="triton_kimi3_packed_sigmoid_bias_topk_gfx950",
+    solution="triton",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=_PACKED_SIGNATURES,
+    priority=Priority.SPECIALIZED + 1,
+    traits={**_PACKED_CONTRACT, "tokens": _PACKED_ROWS_CDNA4},
+)
+def triton_kimi3_packed_sigmoid_bias_topk_gfx950(
+    *,
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    weights_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return packed top-16 weights and ids for FP32 ``[tokens, 896]`` logits.
+
+    Arguments follow ``kimi3_sigmoid_bias_topk`` with explicit ``topk=16``.
+    Layouts are made contiguous and correction bias is widened to FP32.
+    Returns ``[tokens, 16]`` weights in ``weights_dtype`` and INT32 ids.
+    """
+    return _invoke_packed(
+        router_logits=router_logits,
+        correction_bias=correction_bias,
+        topk=topk,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
         weights_dtype=weights_dtype,
     )
 
@@ -481,6 +543,7 @@ def triton_bf16_moe_routes(
     w2: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_start: int,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Triton kernel of :func:`tokenspeed_kernel.ops.moe.bf16_moe_routes`."""
     _check_bf16_route_tensors(x, w13, w2, topk_ids)
@@ -498,6 +561,7 @@ def triton_bf16_moe_routes(
         None,
         expert_start,
         False,
+        output,
     )
 
 
@@ -570,6 +634,53 @@ def triton_bf16_precomputed_moe_apply(
         plan.get("precision_policy", "default") == "bf16_route_accum_fp32",
         float(plan.get("output_scale", 1.0)),
     )
+
+
+@register_kernel(
+    "moe",
+    "apply",
+    name="triton_bf16_routes_moe_apply",
+    solution="triton",
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    traits={
+        "weight_dtype": frozenset({"unquant"}),
+        "activation": frozenset({"silu"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_finalize": frozenset({False}),
+        "supports_deferred_finalize": frozenset({True}),
+        "deferred_output_is_token_order": frozenset({True}),
+        "supports_deferred_out": frozenset({True}),
+        "supports_ep": frozenset({False, True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "supports_bias": frozenset({False}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_bf16_routes_moe_apply(
+    plan: dict,
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    router_logits: torch.Tensor | None,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    num_tokens_global: int | None = None,
+    max_num_tokens_per_gpu: int | None = None,
+    do_finalize: bool = True,
+    enable_pdl: bool = False,
+    deferred_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, None, None]:
+    """Unfinalized BF16 expert routes through ``bf16_moe_routes``.
+
+    Selected only by layers that defer the finalize; see
+    ``_bf16_routes_moe_apply`` for the arguments and the returned routes.
+    """
+    del plan, router_logits, topk_weights, num_tokens_global
+    del max_num_tokens_per_gpu, enable_pdl
+    return _bf16_routes_moe_apply(x, w, topk_ids, do_finalize, deferred_out)
+
+
+triton_bf16_routes_moe_apply._tokenspeed_warmup = _bf16_routes_moe_warmup  # type: ignore[attr-defined]
 
 
 # ===-----------------------------------------------------------------------===#
@@ -916,6 +1027,10 @@ register_kernel(
     "latent_input",
     name="triton_latent_input_packed",
     solution="triton",
+    # AMD only: on NVIDIA the separate vendor GEMM projections are faster than
+    # this generic packed kernel, so no fused kernel is registered there below
+    # the specialized front's row bound and callers keep the separate path.
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=frozenset(
         {
             format_signature(

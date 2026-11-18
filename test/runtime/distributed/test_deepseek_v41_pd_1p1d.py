@@ -11,6 +11,7 @@ Usage:
 """
 
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -83,15 +84,21 @@ QUALITY_CHECKS = [
 
 
 def _wait_for_server(proc: subprocess.Popen, port: int, timeout: int) -> bool:
-    url = f"http://127.0.0.1:{port}/v1/models"
+    base = f"http://127.0.0.1:{port}"
     deadline = time.time() + timeout
     while time.time() < deadline:
         if proc.poll() is not None:
             return False
         try:
-            resp = requests.get(url, timeout=5)
-            # Require a real model list so a port squatter cannot fake readiness.
-            if resp.status_code == 200 and "data" in resp.json():
+            # Ready once every engine registered with the gateway; require a
+            # real model list too, so a port squatter cannot fake readiness.
+            ready = requests.get(f"{base}/readiness", timeout=5)
+            models = requests.get(f"{base}/v1/models", timeout=5)
+            if (
+                ready.status_code == 200
+                and models.status_code == 200
+                and "data" in models.json()
+            ):
                 return True
         except Exception:
             pass
@@ -164,7 +171,6 @@ def pd_server():
 def test_quality(pd_server):
     assert pd_server.poll() is None, "PD server exited unexpectedly"
     failures = []
-    accepted = 0
     for i, check in enumerate(QUALITY_CHECKS):
         data = _chat(LB_PORT, check["messages"], max_tokens=check["max_tokens"])
         content = data["choices"][0]["message"]["content"]
@@ -176,8 +182,18 @@ def test_quality(pd_server):
             failures.append(
                 f"  check[{i}]: expected {check['expected']!r} in {content!r}"
             )
-        details = (data.get("usage") or {}).get("completion_tokens_details") or {}
-        accepted += int(details.get("accepted_prediction_tokens") or 0)
     assert not failures, "Quality check failures:\n" + "\n".join(failures)
     if ENABLE_DSPARK:
-        assert accepted > 0, "DSpark accepted no draft tokens on the decode node"
+        # The direct gateway lane does not expose speculative counts in usage.
+        # The decode engine logs accepted tokens per verify, including the bonus
+        # token: a value above one proves that it accepted a draft token.
+        with open(os.path.join(LOG_DIR, "decode.log")) as log:
+            accepted_lengths = [
+                float(value)
+                for value in re.findall(
+                    r"Req: \S+ Finish! Accept_num_tokens_avg: ([0-9.]+)", log.read()
+                )
+            ]
+        assert (
+            max(accepted_lengths, default=0) > 1
+        ), f"DSpark accepted no draft tokens on the decode node: {accepted_lengths}"

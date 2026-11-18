@@ -18,18 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Encode-worker control loop for EPD (Python orchestration).
+"""The request an EPD encode server's ranks take: one multimodal item to
+embed and ship to the prefill ranks that wait for it.
 
-This is the body the engine's encode event loop drives: it sits between request
-arrival and the vision tower. On ``submit`` it registers the request's transfer
-peer and, per item, either resolves the embedding from the cache (skip the
-tower, still transfer) or queues it on the scheduler. Each ``step`` pulls one
-deterministic batch off the scheduler, runs the tower + ships it via the
-executor, and populates the cache.
-
-The model load, mooncake manager construction, request transport and the
-event-loop wiring are supplied by the engine integration; this class only
-orchestrates them, so it is unit-testable with fakes.
+The encode server's frontend sends it to the first encode rank over the
+connection that rank dialed; the ranks' host (``ts-host`` in encode mode,
+``epd/encode_host.py``) relays, batches and ships it. This module only
+defines the wire struct.
 """
 
 from __future__ import annotations
@@ -39,26 +34,22 @@ from tokenspeed.runtime.cache.embedding_cache import (
     TieredEmbeddingCache,
 )
 from tokenspeed.runtime.engine.io_struct import BaseReq
-from tokenspeed.runtime.epd.encode_scheduler import (
-    EncodeScheduler,
-    PendingEncodeItem,
-)
+from tokenspeed.runtime.epd.encode_scheduler import EncodeScheduler, PendingEncodeItem
 from tokenspeed.runtime.multimodal.embedder import _item_token_count
 from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
 from tokenspeed.runtime.utils import get_colorful_logger
 
-logger = get_colorful_logger(__name__)
-
 
 class EncodeRequest(BaseReq, kw_only=True):
-    """One encode request: a transfer peer plus its vision items.
+    """One encode request: its prefill peers' rendezvous and its item.
 
-    ``bootstrap_host``/``port``/``room`` identify the prefill peer this
-    request's embeddings are shipped to (assigned upstream, per request).
+    ``bootstrap_host``/``port`` name the encode server's bootstrap server
+    and ``bootstrap_room`` the room the prefill ranks receive the item's
+    embedding under (one room per item, so one item per request).
 
-    A tagged IPC struct (``BaseReq``) because it rides the shared
-    scheduler-input ZMQ channel as msgpack; the multimodal items carry their
-    pixels as ext-encoded tensor buffers or SHM handles.
+    A tagged IPC struct (``BaseReq``): it rides the request channel as
+    msgpack, its item's pixels as ext-encoded tensor buffers or SHM handles
+    (``ts-wire``'s ``EncodeRequest`` decodes it on the host).
     """
 
     request_id: str
@@ -66,6 +57,11 @@ class EncodeRequest(BaseReq, kw_only=True):
     bootstrap_port: int
     bootstrap_room: int
     items: list[MultimodalDataItem]
+
+
+# --- definitions restored from the pre-merge branch (D3-3) ---
+
+logger = get_colorful_logger(__name__)
 
 
 def _nbytes(tensor) -> int:

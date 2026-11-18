@@ -31,16 +31,6 @@ from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexGeometry, Index
 
 @triton.jit(
     do_not_specialize=["X0", "L0", "T0", "T1", "TC", "NP", "CAP", "STRIDE"],
-    do_not_specialize_on_alignment=[
-        "X0",
-        "L0",
-        "T0",
-        "T1",
-        "TC",
-        "NP",
-        "CAP",
-        "STRIDE",
-    ],
 )
 def _clean_logits_block_max(
     X,
@@ -92,7 +82,7 @@ def clean_logits_and_block_max(
 ):
     """Return fully cleaned logits, aligned eight-row maxima and block ends.
 
-    FP32 values and integer lengths follow the internal clean_logits contract;
+    FP32/BF16 values and integer lengths follow the internal clean_logits contract;
     table is the original logical page table (None for unpaged input). Invalid
     pages and future positions are -inf. Both output matrices, including their
     alignment tails, are completely initialized. The newest visible block is
@@ -107,13 +97,13 @@ def clean_logits_and_block_max(
         or values.shape[0] != lengths.numel()
         or values.shape[1] < capacity
         or values.stride(1) != 1
-        or values.dtype != torch.float32
+        or values.dtype not in (torch.float32, torch.bfloat16)
     ):
-        raise RuntimeError("DeepGEMM returned incompatible FP32 score geometry")
+        raise RuntimeError("DeepGEMM returned incompatible score geometry")
     alignment = input_alignment // 4
     stride = triton.cdiv(triton.cdiv(capacity, 8), alignment) * alignment
     cleaned = torch.empty(
-        (values.shape[0], capacity), device=values.device, dtype=torch.float32
+        (values.shape[0], capacity), device=values.device, dtype=values.dtype
     )
     blocks = torch.empty(
         (values.shape[0], stride), device=values.device, dtype=torch.float32
@@ -150,7 +140,6 @@ def clean_logits_and_block_max(
 
 @triton.jit(
     do_not_specialize=["C0", "T0", "N", "NP"],
-    do_not_specialize_on_alignment=["C0", "T0", "N", "NP"],
 )
 def _gather_index_pages(C, T, V, F, C0, T0, N, NP, P: tl.constexpr, B: tl.constexpr):
     row = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
@@ -206,17 +195,6 @@ def gather_index_pages(
 
 @triton.jit(
     do_not_specialize=["C0", "C1", "L0", "T0", "T1", "PAGES", "NC", "CAP", "WIDTH"],
-    do_not_specialize_on_alignment=[
-        "C0",
-        "C1",
-        "L0",
-        "T0",
-        "T1",
-        "PAGES",
-        "NC",
-        "CAP",
-        "WIDTH",
-    ],
 )
 def _normalize_candidate_blocks(
     C,
@@ -272,7 +250,6 @@ def _normalize_candidate_blocks(
 
 @triton.jit(
     do_not_specialize=["S0", "WIDTH"],
-    do_not_specialize_on_alignment=["S0", "WIDTH"],
 )
 def _mask_candidate_logits(
     SCORES,
@@ -323,6 +300,17 @@ def _warmup_sparse_mqa(api, blocks, device, enable_pdl):
     )
 
 
+def _sparse_blocks(count: int, score_alignment: int) -> int:
+    """Native sparse block slots for count candidates, padded to the selector's rows.
+
+    score_alignment is the selector's row alignment in score elements, a
+    multiple of 32 (DeepGEMM pads the pool to whole groups of four 8-row blocks).
+    """
+    if score_alignment % 32:
+        raise ValueError("score_alignment must be a multiple of 32 elements")
+    return triton.cdiv(count, score_alignment // 8) * (score_alignment // 8)
+
+
 def _sparse_candidate_scores(
     queries: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
@@ -352,12 +340,99 @@ def _sparse_candidate_scores(
     multiple of 32 (DeepGEMM pads the pool to whole groups of four 8-row
     blocks); the scored width is padded to it.
     """
+    scores, ends, normalized = _sparse_candidate_logits(
+        queries,
+        weights,
+        cache,
+        page_table,
+        visible,
+        candidates,
+        api,
+        skip_score_topk=skip_score_topk,
+        score_alignment=score_alignment,
+        index_metadata=index_metadata,
+    )
+    tokens, count = candidates.shape
+    width = _sparse_blocks(count, score_alignment) * 8
+    _mask_candidate_logits[(tokens, triton.cdiv(width, 1024))](
+        scores,
+        ends,
+        scores.stride(0),
+        width,
+        skip_score_topk,
+        1024,
+    )
+    return scores, ends, normalized
+
+
+def _sparse_candidate_logits(
+    queries: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cache: torch.Tensor,
+    page_table: torch.Tensor,
+    visible: torch.Tensor,
+    candidates: torch.Tensor,
+    api: object,
+    *,
+    skip_score_topk: int,
+    score_alignment: int,
+    index_metadata: IndexMetadata | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """_sparse_candidate_scores without its candidate mask.
+
+    Only [0, end) of a row whose candidate end exceeds skip_score_topk holds
+    logits; the rest of it, and every row whose pool fits skip_score_topk, is
+    left as the native scorer wrote it (possibly uninitialized). The consumer
+    selects a fitting pool whole without reading its logits
+    (finish_write_selection's short_rows_unscored).
+    """
+    normalized, ends, schedule, blocks = _sparse_geometry(
+        cache,
+        page_table,
+        visible,
+        candidates,
+        api,
+        skip_score_topk=skip_score_topk,
+        score_alignment=score_alignment,
+        index_metadata=index_metadata,
+    )
+    scores = api.fp8_fp4_paged_sparse_mqa_logits(
+        q=(
+            queries[0].contiguous().view(torch.int8).unsqueeze(1),
+            queries[1].contiguous().unsqueeze(1),
+        ),
+        kv_cache=cache.as_strided(
+            (cache.shape[0], 64, 1, 68), (cache.stride(0), 68, 68, 1)
+        ),
+        weights=weights.contiguous(),
+        metadata=schedule,
+        num_max_sparse_blocks=blocks,
+        sparse_block_kv=8,
+    )
+    return scores, ends, normalized
+
+
+def _sparse_geometry(
+    cache: torch.Tensor,
+    page_table: torch.Tensor,
+    visible: torch.Tensor,
+    candidates: torch.Tensor,
+    api: object,
+    *,
+    skip_score_topk: int,
+    score_alignment: int,
+    index_metadata: IndexMetadata | None,
+) -> tuple[torch.Tensor, torch.Tensor, object, int]:
+    """Normalized blocks, candidate-row ends, schedule and block width of a tile.
+
+    The candidate geometry _sparse_candidate_logits scores against, built once
+    per index_metadata for these exact table, length and candidate views
+    (pointer-keyed) and reused by later calls, also from other streams;
+    prepare_index_topk builds it ahead with the same arguments.
+    """
     tokens, count = candidates.shape
     capacity = page_table.shape[1] * 64
-    if score_alignment % 32:
-        raise ValueError("score_alignment must be a multiple of 32 elements")
-    blocks = triton.cdiv(count, score_alignment // 8) * (score_alignment // 8)
-    width = blocks * 8
+    blocks = _sparse_blocks(count, score_alignment)
     _warmup_sparse_mqa(api, blocks, cache.device, api.get_pdl())
     key = (
         cache.shape[0],
@@ -428,25 +503,4 @@ def _sparse_candidate_scores(
             )
     else:
         normalized, ends, schedule, *_ = geometry.acquire()
-    scores = api.fp8_fp4_paged_sparse_mqa_logits(
-        q=(
-            queries[0].contiguous().view(torch.int8).unsqueeze(1),
-            queries[1].contiguous().unsqueeze(1),
-        ),
-        kv_cache=cache.as_strided(
-            (cache.shape[0], 64, 1, 68), (cache.stride(0), 68, 68, 1)
-        ),
-        weights=weights.contiguous(),
-        metadata=schedule,
-        num_max_sparse_blocks=blocks,
-        sparse_block_kv=8,
-    )
-    _mask_candidate_logits[(tokens, triton.cdiv(width, 1024))](
-        scores,
-        ends,
-        scores.stride(0),
-        width,
-        skip_score_topk,
-        1024,
-    )
-    return scores, ends, normalized
+    return normalized, ends, schedule, blocks

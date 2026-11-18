@@ -150,8 +150,19 @@ class HybridLinearAttnBackend(AttentionBackend):
     def cache_placement(self, layer):
         return self._backend_for_layer(layer.layer_id).cache_placement(layer)
 
+    def takes_owned_decode_topk(self, layer):
+        return self._backend_for_layer(layer.layer_id).takes_owned_decode_topk(layer)
+
+    def dcp_decode_query_rider(self, layer, q):
+        return self._backend_for_layer(layer.layer_id).dcp_decode_query_rider(layer, q)
+
     def reads_fp8_kv_scales(self, layer):
         return self._backend_for_layer(layer.layer_id).reads_fp8_kv_scales(layer)
+
+    def query_dtype(self, layer, forward_mode, activation):
+        return self._backend_for_layer(layer.layer_id).query_dtype(
+            layer, forward_mode, activation
+        )
 
     @property
     def cache_consumer_attn_kinds(self) -> frozenset[str]:
@@ -163,6 +174,13 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def child_backends(self):
         return (self.full_attn_backend, self.linear_attn_backend)
+
+    @property
+    def stores_in_forward_state_checkpoints(self) -> bool:
+        return all(
+            backend.stores_in_forward_state_checkpoints
+            for backend in self.child_backends()
+        )
 
     def _backend_for_layer(self, layer_id: int) -> AttentionBackend:
         if layer_id in self.full_attn_layers:
@@ -192,6 +210,11 @@ class HybridLinearAttnBackend(AttentionBackend):
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
         return self.linear_attn_backend.preallocate_verify_workspace(
             max_bs, draft_token_num
+        )
+
+    def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
+        return self.full_attn_backend.preallocate_history_gather_workspace(
+            max_model_len
         )
 
     def register_step_counter(self, step_counter):
@@ -348,14 +371,13 @@ class HybridLinearAttnBackend(AttentionBackend):
     def tree_support(self) -> TreeSupport:
         return TreeSupport(verify_blocker=None, draft_blocker=None)
 
-    def commit_speculative_state_after_verify(
+    def commit_state_after_acceptance(
         self,
         accepted_lengths: torch.Tensor,
         *,
         num_extends: int,
         accepted_path: torch.Tensor | None,
     ) -> None:
-        if num_extends == 0:
-            self.linear_attn_backend.commit_verified_state(
-                accepted_lengths, accepted_path=accepted_path
-            )
+        self.linear_attn_backend.commit_state_after_acceptance(
+            accepted_lengths, num_extends=num_extends, accepted_path=accepted_path
+        )

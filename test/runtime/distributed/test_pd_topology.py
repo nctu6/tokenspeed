@@ -92,7 +92,7 @@ def test_cache_pd_accepts_heterogeneous_tp() -> None:
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
 def test_the_device_builds_the_pd_transfer_peer_from_the_mapping(monkeypatch, role):
-    """The engine's PD start-up path: ``_build_kv_transfer`` derives the
+    """The engine's PD start-up path: ``build_kv_transfer`` derives the
     topology from the real ``Mapping`` and hands it to the transfer factory.
     Runs the device code up to the factory call, so a topology method the
     device still names but the class no longer has fails here, not at the
@@ -130,7 +130,7 @@ def test_the_device_builds_the_pd_transfer_peer_from_the_mapping(monkeypatch, ro
         disaggregation_layerwise_interval=0,
         mapping=mapping,
     )
-    peer = device._build_kv_transfer(
+    peer = device.build_kv_transfer(
         server_args,
         SimpleNamespace(token_to_kv_pool=None),
         cache_fields_by_stage=((),),

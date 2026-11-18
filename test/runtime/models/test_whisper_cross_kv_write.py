@@ -163,7 +163,7 @@ def test_write_launches_are_flat_in_the_request_count_and_never_sync(seed):
         slots = _random_slots(count, generator)
         requests = _requests(slots, seed=seed * 1000 + count, tag=f"s{count}-")
         features = torch.stack([r.audio for r in requests]).cuda()
-        rids = [r.rid for r in requests]
+        rids = [r.admission_id for r in requests]
 
         def encode():
             model.encode_audio(features, slots, rids)
@@ -311,7 +311,7 @@ def test_graphed_encoder_pass_writes_what_the_eager_pass_writes(seed, backend):
         slots = _random_slots(count, generator)
         requests = _requests(slots, seed=seed * 1000 + count, tag=f"g{count}-")
         features = [r.audio for r in requests]
-        rids = [r.rid for r in requests]
+        rids = [r.admission_id for r in requests]
         prior = torch.Generator(device="cuda").manual_seed(seed * 1000 + count)
         cache.k.normal_(generator=prior)
         cache.v.normal_(generator=prior)
@@ -383,7 +383,7 @@ def test_encoder_pass_rejects_a_window_of_the_wrong_shape():
     for runner in (model.audio_encode_runner, _graphed_runner(model)):
         model.audio_encode_runner = runner
         with pytest.raises(ValueError, match="window"):
-            model.encode_audio([short], [1], ["short"])
+            model.encode_audio([short], [1], [7])
         assert model.cross_cache.owner_of(1) is None
 
 

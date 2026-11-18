@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compile the Iris pull all-reduce protocols without launching them."""
+"""Compile an Iris collective without launching it to check its cache policy."""
 
 import re
 
@@ -48,115 +48,55 @@ def _require_iris():
     pytest.importorskip("tokenspeed_kernel.ops.communication._iris")
 
 
-def _aligned(fn, names):
-    """Mark the named pointers and every heap base 16-byte aligned, as at launch."""
-    return {
+def _compile_allgather_columns(arch_name):
+    """Compile the eight-rank column all-gather for ``arch_name`` without launching.
+
+    The input is already published, so the only stores into peer memory are
+    the barrier epochs.
+    """
+    from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel.ops.communication._iris import all_gather as ag
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_arch_policy,
+    )
+
+    policy = iris_arch_policy(_ARCH_VERSIONS[arch_name])
+    subgroup_size = triton.backends.amd.compiler.HIPOptions(arch=arch_name).warp_size
+    fn = ag.iris_pull_allgather_columns
+    pointers = ("input_ptr", "input_sym_ptr", "output_ptr", "ready_flags")
+    signature = {name: "*bf16" for name in pointers[:3]}
+    signature.update({"ready_flags": "*i32", "heaps": ("i64",) * 8})
+    signature["LOCAL_WORDS"] = "i32"
+    constexprs = {
+        "RANK": 0,
+        "WORLD_SIZE": 8,
+        "LOCAL_HIDDEN_WORDS": 256,
+        "TOTAL_HIDDEN_WORDS": 8 * 256,
+        "BLOCK_WORDS": 4 * subgroup_size,
+        "NUM_WARPS": 1,
+        "WORDS_PER_LANE": 4,
+        "INPUT_PUBLISHED": True,
+        "PEER_PAYLOAD_LOAD_CACHE": policy.peer_payload_load,
+        "PEER_SIGNAL_STORE_CACHE": policy.peer_signal_store,
+    }
+    signature.update({name: "constexpr" for name in constexprs})
+    attrs = {
         (index,): [["tt.divisibility", 16]]
         for index, name in enumerate(fn.arg_names)
-        if name in names or name.startswith("heap_base_")
+        if name in pointers
     }
-
-
-def _compile(arch_name, kind, world_size):
-    """Compile one all-reduce protocol for ``arch_name`` without launching it.
-
-    Args:
-        arch_name: Target architecture, "gfx950" or "gfx1250".
-        kind: "staged_oneshot", "pull_oneshot", "pull_twoshot", or
-            "pull_twoshot_exit" (two-shot with the exit barrier).
-        world_size: Number of ranks the protocol is specialized for.
-
-    Returns:
-        The compiled kernel, with its assembly in ``asm["amdgcn"]``.
-    """
-    from tokenspeed_kernel._triton import gl, gluon, triton
-    from tokenspeed_kernel.ops.communication._iris import all_reduce as ar
-
-    arch = ar.pull_all_reduce_arch_config(_ARCH_VERSIONS[arch_name])
-    subgroup_size = triton.backends.amd.compiler.HIPOptions(arch=arch_name).warp_size
-    if kind == "staged_oneshot":
-        fn = ar.iris_pull_oneshot_staged
-        signature = {
-            "input_ptr": "*bf16",
-            "input_sym_ptr": "*bf16",
-            "output_ptr": "*bf16",
-            "ready_flags": "*i32",
-            "heap_bases": "*i64",
-            "NUMEL": "i32",
-        }
-        constexprs = {
-            "RANK": 0,
-            "WORLD_SIZE": world_size,
-            "BLOCK_SIZE": ar.StagedPullOneShot.BLOCK_SIZE,
-            "SLOT_STRIDE": 16 * 7168,
-            "NUM_SLOTS": ar.StagedPullOneShot.INPUT_SLOTS,
-            "PEER_LOAD_CACHE": arch.peer_load_cache,
-        }
-        signature.update({name: "constexpr" for name in constexprs})
-        source = triton.compiler.ASTSource(
-            fn,
-            signature,
-            constexprs=constexprs,
-            attrs=_aligned(fn, set(signature) - set(constexprs)),
-        )
-        num_warps = ar.StagedPullOneShot.NUM_SUBGROUPS
-    else:
-        two_shot = kind.startswith("pull_twoshot")
-        fn = ar.iris_pull_twoshot if two_shot else ar.iris_pull_oneshot
-        pointers = (
-            ("input_sym_ptr", "scratch_sym_ptr", "output_ptr")
-            if two_shot
-            else ("input_sym_ptr", "output_ptr")
-        )
-        signature = {name: "*bf16" for name in pointers}
-        signature["ready_flags"] = "*i32"
-        signature.update(
-            {name: "i64" for name in fn.arg_names if name.startswith("heap_base_")}
-        )
-        sizes = ("PARTITION_WORDS" if two_shot else "TOTAL_NUMEL", "NUM_PROGRAMS")
-        signature.update({name: "i32" for name in (*sizes, "NUM_TILES")})
-        num_warps = (
-            ar._TWO_SHOT_NUM_SUBGROUPS if two_shot else ar.ProducerPull.NUM_SUBGROUPS
-        )
-        constexprs = {
-            "RANK": 0,
-            "WORLD_SIZE": world_size,
-            "NUM_WARPS": num_warps,
-            "WORDS_PER_LANE": ar._PULL_WORDS_PER_LANE,
-            "ELEMENT_DTYPE": gl.bfloat16,
-            "ELEMENTS_PER_WORD": ar._PACKED_WORD_BYTES // 2,
-            "PEER_LOAD_CACHE": arch.peer_load_cache,
-            "REMOTE_STORE_CACHE": arch.remote_store_cache,
-            "residual": None,
-            "post": None,
-            "comb": None,
-            "HIDDEN_WORDS": 0,
-            "HC_POST": False,
-        }
-        if two_shot:
-            constexprs["BLOCK_WORDS"] = (
-                num_warps * subgroup_size * ar._PULL_WORDS_PER_LANE // world_size
-            )
-            constexprs["EXIT_BARRIER"] = kind == "pull_twoshot_exit"
-        else:
-            constexprs["BLOCK_SIZE"] = ar.ProducerPull.BLOCK_SIZE
-            constexprs["PUBLISH_READY"] = False
-        source = gluon._runtime.GluonASTSource(
-            fn,
-            signature,
-            constexprs=constexprs,
-            attrs=_aligned(fn, (*pointers, "ready_flags")),
-        )
-    kernel = triton.compile(
+    source = gluon._runtime.GluonASTSource(
+        fn, signature, constexprs=constexprs, attrs=attrs
+    )
+    return triton.compile(
         source,
         target=triton.backends.compiler.GPUTarget("hip", arch_name, subgroup_size),
-        options={"num_warps": num_warps},
+        options={"num_warps": 1},
     )
-    return kernel
 
 
 _LOAD = re.compile(r"\b(?:global|buffer)_load_(\w+)")
-# Flags are 32-bit; the aligned BF16 payload is always loaded in wider words.
+# Flags are 32-bit; the BF16 payload is always loaded in wider words.
 _FLAG_WIDTHS = ("dword", "b32")
 
 
@@ -165,12 +105,21 @@ def _policy(line):
     return " ".join(re.findall(r"\b(?:sc0|sc1|nt|th:\w+|scope:\w+)\b", line))
 
 
-def _backedge_cycles(lines):
-    """Return the line spans that a backward branch closes.
+def _seeds_atomic_expansion(lines, index):
+    """Return whether the load at ``index`` seeds an expanded atomic.
 
-    A heuristic for retry loops: it catches a poll hoisted above its loop header,
-    but not every block reordering the compiler could produce.
+    LLVM may expand an atomic RMW into a compare-and-swap loop, which opens
+    with a plain load of the current value; that load falls through into the
+    loop header LLVM names ``%atomicrmw.start``.
     """
+    for line in lines[index + 1 :]:
+        if re.match(r"^\.LBB\w+:", line):
+            return "%atomicrmw.start" in line
+    return False
+
+
+def _backedge_cycles(lines):
+    """Return the line spans that a backward branch closes."""
     labels = {
         match[1]: index
         for index, line in enumerate(lines)
@@ -188,80 +137,184 @@ def _backedge_cycles(lines):
 _ISA = {
     "gfx950": {
         "flag_load": "sc0 sc1",
-        # Buffer loads spell the .cg peer loads "sc0 nt"; local loads are plain.
-        "payload_loads": {"", "nt", "sc0 nt"},
+        "payload_loads": {"", "nt"},
+        "flag_store": (r"\bglobal_store_dword\s", "sc0 sc1"),
         "system": r"\bsc1\b",
-        "flag_store": r"\bglobal_store_dword\s",
     },
     "gfx1250": {
         "flag_load": "th:TH_LOAD_NT scope:SCOPE_SYS",
         "payload_loads": {""},
+        "flag_store": (r"\bglobal_store_b32\b", ""),
         "system": r"\bSCOPE_SYS\b",
-        "flag_store": r"\bglobal_store_b32\b",
     },
 }
 
-_KINDS = ("staged_oneshot", "pull_oneshot", "pull_twoshot", "pull_twoshot_exit")
 
-
-def _expected_polls(kind, world_size):
-    """The staged gather polls once per peer, the pull protocols once per barrier."""
-    if kind == "staged_oneshot":
-        return world_size - 1
-    return 3 if kind == "pull_twoshot_exit" else 2
-
-
-@pytest.mark.parametrize("world_size", (2, 4, 8))
-@pytest.mark.parametrize("kind", _KINDS)
 @pytest.mark.parametrize("arch", _ARCHS)
-def test_iris_all_reduce_codegen(arch, kind, world_size, tmp_path):
-    """Peer accesses keep their architecture's cache policy.
+def test_iris_arch_policy_codegen(arch, tmp_path):
+    """Peer accesses carry their architecture's IrisArchPolicy.
 
-    Flag polls and epoch atomics are system-scoped on every architecture, and
-    each poll must stay on its retry backedge. gfx950 reads peer data
-    non-temporally and writes peer flags write-through. On gfx1250 a
-    non-temporal or scoped data load refetches every partially read sector over
-    the fabric, so payload loads carry no cache policy at all.
+    gfx950 reads peer data non-temporally and writes peer barrier epochs
+    write-through. On gfx1250 both carry no cache policy. Flag polls and epoch
+    atomics are system-scoped everywhere, and each poll stays on its retry loop.
+    The pull all-reduce reads the same table and shares the barrier helper, so
+    one kernel demonstrates the policy.
     """
     isa = _ISA[arch]
-    kernel = _compile(arch, kind, world_size)
-    assembly = kernel.asm["amdgcn"]
-    (tmp_path / f"{arch}-{kind}-ws{world_size}.amdgcn").write_text(assembly)
+    assembly = _compile_allgather_columns(arch).asm["amdgcn"]
+    (tmp_path / f"{arch}-allgather-columns.amdgcn").write_text(assembly)
     lines = assembly.splitlines()
 
     loads = [
         (index, match[1])
         for index, line in enumerate(lines)
-        if (match := _LOAD.search(line))
+        if (match := _LOAD.search(line)) and not _seeds_atomic_expansion(lines, index)
     ]
     polls = [index for index, width in loads if width in _FLAG_WIDTHS]
     payload = [lines[index] for index, width in loads if width not in _FLAG_WIDTHS]
-    assert len(polls) == _expected_polls(kind, world_size), [lines[i] for i in polls]
-    assert all(_policy(lines[index]) == isa["flag_load"] for index in polls), [
-        lines[index] for index in polls
-    ]
-    assert payload
+    assert len(polls) == 2, [lines[index] for index in polls]
+    assert all(_policy(lines[index]) == isa["flag_load"] for index in polls)
     assert all(_policy(line) in isa["payload_loads"] for line in payload), payload
     if arch == "gfx950":
-        assert any(
-            "nt" in _policy(line).split() for line in payload
-        ), "peer data loads lost their non-temporal hint"
+        assert any(_policy(line) == "nt" for line in payload), payload
 
     cycles = _backedge_cycles(lines)
     assert all(
         any(start <= poll <= end for start, end in cycles) for poll in polls
     ), "a peer flag poll was hoisted out of its retry loop"
 
-    if kind.startswith("pull_twoshot"):
-        # The 32-bit global stores are the epochs written into peer flag rows.
-        stores = [line for line in lines if re.search(isa["flag_store"], line)]
-        assert stores
-        if arch == "gfx1250":
-            assert not any("th:" in line or "scope:" in line for line in stores), stores
-        else:
-            assert all(re.search(r"\bsc0 sc1\b", line) for line in stores), stores
+    store, store_policy = isa["flag_store"]
+    stores = [line for line in lines if re.search(store, line)]
+    assert stores
+    assert all(_policy(line) == store_policy for line in stores), stores
     atomics = [line for line in lines if re.search(r"\bglobal_atomic_", line)]
     assert atomics
     assert all(re.search(isa["system"], line) for line in atomics), atomics
 
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
+
+
+@pytest.mark.skipif(not current_platform().is_cdna4, reason="gfx950 codegen")
+@pytest.mark.parametrize("exit_barrier", [False, True])
+def test_iris_pull_twoshot_stores_reach_l2_before_release(exit_barrier):
+    """Every subgroup's partition stores reach L2 before the readiness release.
+
+    All eight subgroups store the reduced partition, and the release run by
+    one thread waits only for its own subgroup's stores. Compile without
+    launching and check that, on every path, each subgroup runs
+    s_waitcnt vmcnt(0) before the barrier preceding the entry and partition
+    releases.
+    """
+    from tokenspeed_kernel._triton import gl, gluon, triton
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_arch_policy,
+        iris_pull_twoshot,
+    )
+    from utils import vmcnt_zero_before_barrier
+
+    policy = iris_arch_policy(ArchVersion(9, 5))
+    fn = iris_pull_twoshot
+    pointers = ("input_sym_ptr", "scratch_sym_ptr", "output_ptr", "ready_flags")
+    signature = {name: "*bf16" for name in pointers[:3]}
+    signature["ready_flags"] = "*i32"
+    signature.update({f"heap_base_{peer}": "i64" for peer in range(8)})
+    signature.update({"PARTITION_WORDS": "i32", "NUM_PROGRAMS": "i32"})
+    signature["NUM_TILES"] = "i32"
+    constexprs = {
+        "RANK": 3,
+        "WORLD_SIZE": 8,
+        "BLOCK_WORDS": 128,
+        "NUM_WARPS": 8,
+        "WORDS_PER_LANE": 2,
+        "ELEMENT_DTYPE": gl.bfloat16,
+        "ELEMENTS_PER_WORD": 4,
+        "EXIT_BARRIER": exit_barrier,
+        "PEER_PAYLOAD_LOAD_CACHE": policy.peer_payload_load,
+        "PEER_SIGNAL_STORE_CACHE": policy.peer_signal_store,
+        "WAIT_STORES": policy.wait_stores,
+        "residual": None,
+        "post": None,
+        "comb": None,
+        "HIDDEN_WORDS": 0,
+        "HC_POST": False,
+    }
+    signature.update({name: "constexpr" for name in constexprs})
+    attrs = {
+        (index,): [["tt.divisibility", 16]]
+        for index, name in enumerate(fn.arg_names)
+        if name in pointers
+    }
+    source = gluon._runtime.GluonASTSource(
+        fn, signature, constexprs=constexprs, attrs=attrs
+    )
+    kernel = triton.compile(
+        source,
+        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+        options={"num_warps": 8},
+    )
+    releases = vmcnt_zero_before_barrier(
+        kernel.asm["amdgcn"], "iris_pull_twoshot", r"\bglobal_atomic_add\b.*sc0 sc1"
+    )
+    # The exit release only reports returned peer reads, so it needs a barrier
+    # after them; its local output stores need not reach L2.
+    assert len(releases) == 2 + exit_barrier, releases
+    assert all(waited for _, waited, _ in releases[:2]), releases
+    assert all(barrier for _, _, barrier in releases), releases
+
+
+@pytest.mark.skipif(not current_platform().is_cdna4, reason="gfx950 codegen")
+def test_iris_allgather_rmsnorm_mxfp4_stores_reach_l2_before_release():
+    """Every subgroup's staged shard reaches L2 before the readiness release.
+
+    At TP4 the 1024-feature shard spans two of the eight subgroups, and the
+    release run by one thread waits only for its own subgroup's stores.
+    Compile without launching and check that, on every path, each subgroup
+    runs s_waitcnt vmcnt(0) before the barrier preceding the release. The
+    later completion release only reports returned peer reads, so it needs
+    just a barrier after them.
+    """
+    from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel.ops.communication._iris.all_gather import (
+        iris_fused_pull_allgather_rmsnorm_mxfp4 as fn,
+    )
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_arch_policy,
+    )
+    from utils import vmcnt_zero_before_barrier
+
+    pointers = ("local_input", "symmetric_input", "weight", "ready_flags")
+    signature = {name: "*bf16" for name in pointers[:3]}
+    signature.update(packed_output="*u8", scale_output="*u8", ready_flags="*i32")
+    signature.update(heaps=("i64",) * 4)
+    signature.update(scale_stride_linear="i32", scale_stride_mblock="i32")
+    constexprs = {
+        "rank": 1,
+        "local_width": 1024,
+        "total_width": 4096,
+        "eps": 1e-6,
+        "weight_offset": 1.0,
+        "block_k": 4096,
+        "input_published": False,
+        "num_warps": 8,
+        "WAIT_STORES": iris_arch_policy(ArchVersion(9, 5)).wait_stores,
+    }
+    signature.update({name: "constexpr" for name in constexprs})
+    signature = {name: signature[name] for name in fn.arg_names}
+    attrs = {
+        (index,): [["tt.divisibility", 16]]
+        for index, name in enumerate(fn.arg_names)
+        if name in pointers or name.endswith("output")
+    }
+    kernel = triton.compile(
+        gluon._runtime.GluonASTSource(
+            fn, signature, constexprs=constexprs, attrs=attrs
+        ),
+        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+        options={"num_warps": 8},
+    )
+    releases = vmcnt_zero_before_barrier(
+        kernel.asm["amdgcn"], fn.fn.__name__, r"\bglobal_atomic_add\b.*sc0 sc1"
+    )
+    assert len(releases) == 2, releases
+    assert releases[0][1], releases
+    assert releases[1][2], releases

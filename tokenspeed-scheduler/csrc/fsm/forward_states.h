@@ -24,13 +24,14 @@
 #include <concepts>
 #include <cstdint>
 #include <memory>
-#include <span>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
 #include <vector>
 
 #include "cache/core/cache_types.h"
+#include "cache/tier/storage_lease.h"
 #include "core/token_container.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "scheduler/request_spec.h"
@@ -40,6 +41,9 @@ namespace tokenspeed::fsm {
 
 enum class PrefillSource { kLocal, kRemote };
 
+// A scheduling attempt advances this in place and StagedCacheProgress
+// (scheduler/operations/progress.h) undoes the advance when the attempt
+// fails: a field an attempt changes must be restored there.
 struct CacheProgress {
     // One source of truth for both the next hash-chain seed and the cumulative
     // history needed to publish a resumable boundary across chunk edges.
@@ -50,76 +54,97 @@ struct CacheProgress {
     // there publishes its natural checkpoint where the KV is already cached,
     // so the next prompt resumes at the junction. Zero once passed or absent.
     std::int32_t junction_tokens{0};
+    // The tail checkpoint the request resumed from on the Device
+    // (CacheCoordinator::AdmissionResult::resumed_tail_hash). The finish that
+    // publishes the end state marks it superseded.
+    std::optional<std::string> resumed_tail_hash;
+    // The in-forward State checkpoint a scheduled forward writes
+    // (SchedulerConfig::state_checkpoint_in_forward): the page boundary it
+    // sits at and, per cache group, the block it is written to (null for
+    // non-State groups). The request's next publication point publishes it
+    // (AdvanceRequestProgress); zero tokens means none is pending.
+    std::int32_t state_checkpoint_tokens{0};
+    std::vector<CacheBlockRef> state_checkpoint_blocks;
+    // The blocks of the checkpoint the latest publication point published,
+    // held until the next one so the publication's spans stay valid; the
+    // index keeps them cached, unless another request published the
+    // checkpoint first and these are the request's private copies. A
+    // retraction drops them once its publication is applied (a Retracted
+    // request holds no Device block).
+    std::vector<CacheBlockRef> published_state_checkpoint_blocks;
+    // The boundary of the in-forward State checkpoint the request published
+    // -- from its block, or from the live slot of a chunk that ended there --
+    // zero without one. Kept after the blocks are let go: the finish reads it
+    // (SchedulerConfig::demote_superseded_state_checkpoints).
+    std::int32_t published_state_checkpoint_tokens{0};
+    // One aligned input checkpoint and its non-replayable sliding windows.
+    // Kept while the request runs: restricted State cannot publish a decode
+    // frontier to replace it. Admission may release this optional hold for
+    // capacity, and retraction drops it before imaging the request.
+    std::vector<CacheBlockRef> retained_input_checkpoint;
+    // The boundary the first admission resumed from (its prefix hit; zero for
+    // none). Never changes after the first admission. The pre-tail State
+    // checkpoint makes the prompt end dead
+    // (SchedulerConfig::state_checkpoint_in_forward) only for a request that
+    // resumed at or below it, which every admission of the prompt and its
+    // first decode read alike (Scheduler::promptEndCheckpoint). Superseded
+    // checkpoint demotion counts it at the first admission and reads it at
+    // the finish (Scheduler::demoteSupersededCheckpoint). Neither reads it on
+    // the D role, the only one whose first admission is a remote landing.
+    std::int32_t resume_tokens{0};
+    // Whether the first decode published the prompt end and rotated the
+    // State slots (PublicationPoint::kOwnerContinues). Until a forward past
+    // the prompt end lands, the state there sits in slot 0, and slot 1 is a
+    // block no forward wrote: a finish at the prompt end, whose first decode
+    // ran as a padding row, publishes slot 0 (CompletedPages::state_slot).
+    bool prompt_end_rotated{false};
 };
 
-inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
-                                                        TokenContainer::Window window) {
+inline std::span<const std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
+                                                            TokenContainer::Window window) {
     const std::int32_t shifted_start = window.begin + 1;
     const std::int32_t shifted_end = std::min(token_container->PrefillSize(), shifted_start + window.size);
     const std::int32_t shifted_size = std::max<std::int32_t>(0, shifted_end - shifted_start);
-
-    std::vector<std::int32_t> shifted;
-    shifted.reserve(static_cast<std::size_t>(window.size));
-    if (shifted_size > 0) {
-        auto slice = token_container->TokenSlice(TokenContainer::Window{shifted_start, shifted_size});
-        shifted.insert(shifted.end(), slice.begin(), slice.end());
-    }
-    shifted.resize(static_cast<std::size_t>(window.size), -1);
-    return shifted;
+    if (shifted_size == 0) return {};
+    return token_container->TokenSlice(TokenContainer::Window{shifted_start, shifted_size});
 }
 
-// Waiting for admission. A request whose L3 prefetch landed comes back here
-// holding the Host entries it fetched (prefetched_host_entries), pinned so
-// they are still there when its admission claims them as an ordinary Host hit;
-// the pins drop with the state at admission, after the admission acquired its
-// own references.
-struct Submitted {
-    Submitted(TokenContainer* token_container, std::int32_t prefix_granularity)
-        : token_container_{token_container}, prefix_granularity_{prefix_granularity} {}
-    Submitted(TokenContainer* token_container, std::int32_t prefix_granularity,
-              std::vector<CacheBlockRef> prefetched_host_entries)
-        : token_container_{token_container},
-          prefix_granularity_{prefix_granularity},
-          prefetched_host_entries_{std::move(prefetched_host_entries)} {}
-
-    TokenContainer* TokenContainerPtr() const { return token_container_; }
-    std::int32_t PrefixGranularity() const { return prefix_granularity_; }
-    // A further prefetch (the remainder beyond what landed) carries these on,
-    // so the first fetch's entries stay pinned until the admission that
-    // claims them all.
-    std::vector<CacheBlockRef> TakePrefetchedHostEntries() { return std::exchange(prefetched_host_entries_, {}); }
-
-private:
-    TokenContainer* token_container_{};
-    std::int32_t prefix_granularity_{};
-    std::vector<CacheBlockRef> prefetched_host_entries_;
+// Ready data stays charged to its storage ticket until normal admission has
+// acquired the Host sources -- admission consumes the state holding the
+// lease -- or this hold expires. It is not an I/O deadline.
+struct StorageReadyHold {
+    StorageLease lease;
+    std::int64_t deadline_us;
 };
 
-// Before admission, with an L3 prefetch in flight: the request pins the Host
-// blocks the fetch fills -- and the entries an earlier prefetch of its own
-// already landed (host_blocks holds both) -- with nothing on the Device and
-// no request-pool row; it is skipped by admission (later Submitted requests
-// may be admitted past it, it holds no head of line) and is never a victim.
-// The op's ACK (PrefetchDone) returns it to Submitted holding every entry
-// that landed; an abort drops its pins, and the op's own pins keep the
-// blocks still being filled until the ACK.
-struct Prefetching {
-    Prefetching(TokenContainer* token_container, std::int32_t prefix_granularity,
-                std::vector<CacheBlockRef> host_blocks, std::uint32_t prefetch_op)
-        : token_container{token_container},
-          prefix_granularity{prefix_granularity},
-          host_blocks{std::move(host_blocks)},
-          prefetch_op{prefetch_op} {}
+// Resources shared by pre-admission states. Moving a state carries the hold
+// with it, including when a PD bootstrap completes after the L3 read.
+struct AdmissionResources {
+    TokenContainer* token_container;
+    std::int32_t prefix_granularity;
+    bool storage_prepared{false};
+    std::optional<StorageReadyHold> storage_hold;
+    // Fixed prompt identities for admission retries, never residency. Leaving
+    // the pre-admission states releases them together with the storage hold.
+    PreparedPrefixKeys prefix_keys;
+};
 
-    TokenContainer* token_container{};
-    std::int32_t prefix_granularity{};
-    std::vector<CacheBlockRef> host_blocks;
-    std::uint32_t prefetch_op{};
+// Eligible for ordinary admission. A pending L3 dependency is Prefetching.
+struct Submitted {
+    Submitted(TokenContainer* token_container, std::int32_t prefix_granularity)
+        : admission{token_container, prefix_granularity} {}
+    explicit Submitted(AdmissionResources resources) : admission{std::move(resources)} {}
+    TokenContainer* TokenContainerPtr() const { return admission.token_container; }
+    std::int32_t PrefixGranularity() const { return admission.prefix_granularity; }
+
+    // Successful later first admissions while this is the oldest waiting prompt.
+    std::int32_t prefill_bypasses{0};
+    AdmissionResources admission;
 };
 
 // Everything a page-holding state owns on the request's behalf: the KV
-// pages, the request-pool slot, the prefix-cache progress and the count of
-// forwards still out against those pages. Move-only, and moved as ONE
+// pages, the request-pool slot, any decode permit, the prefix-cache progress
+// and the count of forwards still out against those pages. Move-only, and moved as ONE
 // bundle: a transition hands it whole to exactly one successor state, or
 // returns the pages to the coordinator and lets the empty bundle die. There
 // is no third path, and no field that a transition could forget to carry.
@@ -127,7 +152,16 @@ struct ForwardResources {
     TokenContainer* token_container{};
     std::int32_t prefix_granularity{};
     ReqPoolIndex req_pool_index;
+    DecodeSlotIndex decode_slot;
     std::vector<BlockTable> block_tables;
+    // Per cache group, the copy-in blocks the request holds for its prompt
+    // end, which its first decode publishes and keeps writing past: aligned
+    // to CacheCoordinator::CopyInSlots, each reserved by the admission that
+    // allocated the block of its slot, null until then. The first decode
+    // spends them (CacheCoordinator::Admit); they go with the tables, so a
+    // retraction releases them and a restore reserves them again. Empty
+    // when the request reserves none.
+    std::vector<std::vector<CacheBlockRef>> copy_in_blocks;
     CacheProgress cache_progress;
     // Forwards scheduled for this request whose results have not come back.
     // More than one is normal under the overlap schedule, which plans the
@@ -263,6 +297,10 @@ struct Retracted {
     std::int32_t prefix_granularity{};
     CacheProgress cache_progress;
     RetractionImage image;
+    // The tails (boundaries in tokens) the image's published slots sit at,
+    // from their KV-event descriptors (Scheduler::kvEventTailsOf): the
+    // restore registers them again before its ACK republishes the slots.
+    std::vector<std::int32_t> kv_event_tails;
     // The slot-state blob's slot in the runtime's arena. Shared with the
     // store that exports into it and, later, the restore that imports from
     // it: whichever of the state and the in-flight op lives longer keeps the
@@ -280,23 +318,19 @@ struct Retracted {
     // The store ops the image waits for: the L2 leg's write-back(s) -- its
     // own and any earlier in-flight store carrying one of its keys -- and
     // the tail leg's snapshot store. A restore is issued only once every one
-    // has been acknowledged.
-    std::vector<std::uint32_t> pending_store_ops;
+    // has landed: each wait expires when its op's ACK drops the op's record.
+    std::vector<StoreWait> image_stores;
 
     TokenContainer* TokenContainerPtr() const { return token_container; }
     std::int32_t PrefixGranularity() const { return prefix_granularity; }
     std::int64_t RetractionEpoch() const { return retraction_epoch; }
     bool ResumesGeneration() const { return resumes_generation; }
-    bool ImageLanded() const { return pending_store_ops.empty(); }
+    bool ImageLanded() const { return std::ranges::all_of(image_stores, &StoreWait::Landed); }
+    // Whether the op's publications concern the image: its L2 slots follow
+    // them (RetractionImage::FollowPublished), since an L3 prefetch of the
+    // same key may have published first, leaving the ticket's block unindexed.
     bool WaitsForStore(std::uint32_t op_id) const {
-        return std::find(pending_store_ops.begin(), pending_store_ops.end(), op_id) != pending_store_ops.end();
-    }
-    // The store landed; its publications say which Host block is canonical
-    // for each key, and the image's L2 slots follow (an L3 prefetch of the
-    // same key may have published first, leaving the ticket's block unindexed).
-    void NoteStoreLanded(std::uint32_t op_id, std::span<const HostPublication> published) {
-        std::erase(pending_store_ops, op_id);
-        image.FollowPublished(published);
+        return std::ranges::find(image_stores, op_id, &StoreWait::op_id) != image_stores.end();
     }
 };
 
@@ -307,10 +341,12 @@ struct Retracted {
 // the slot-state blob into is NOT in `resources` yet: the restore op owns it
 // until its ACK (an abort meanwhile must not re-grant a row still being
 // written), and RestoreDoneEvent installs it; `resources.req_pool_index` is
-// empty here.
+// empty here. A resumed decode's permit stays with that op too, so cancelling
+// the request cannot admit another decode before the restore retires.
 struct Restoring {
     ForwardResources resources;
     RetractionImage image;
+    std::vector<std::int32_t> kv_event_tails;  // Retracted::kv_event_tails
     std::shared_ptr<SnapshotSlotIndex> blob_slot;
     ResumeShape shape;
     std::uint32_t restore_op{0};
@@ -325,13 +361,17 @@ struct Restoring {
 // result still arrives and extends the tokens by what it reports (nothing
 // when the device stopped the request, which keeps the frontier before the
 // token the finish was decided on). Nothing is scheduled for it, and it is no
-// retraction victim.
+// retraction victim. Cancellation with queued forwards uses the same state
+// to retain their resources, but releases them without publishing a frontier.
 struct Finishing {
-    explicit Finishing(ForwardResources resources) : resources{std::move(resources)} {}
+    Finishing(ForwardResources resources, bool publish_completed_pages)
+        : resources{std::move(resources)}, publish_completed_pages{publish_completed_pages} {}
 
     void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { resources.ExtendTokens(result_tokens); }
 
     ForwardResources resources;
+    // A cancelled request waits for its forwards too, but publishes nothing.
+    bool publish_completed_pages;
 };
 
 struct Finished {};

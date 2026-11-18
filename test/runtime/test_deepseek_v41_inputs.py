@@ -28,21 +28,17 @@ cache. Run with CUDA_VISIBLE_DEVICES selecting an available GPU.
 
 import os
 import sys
-from concurrent.futures import Future
 from contextlib import contextmanager
-from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
 
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.engine.scheduler_utils import (
-    engram_context_len,
-    ngram_inputs_for_forward,
-)
+from tokenspeed.runtime.engine.scheduler_utils import engram_context_len
 from tokenspeed.runtime.execution import input_buffer, model_executor, weight_loader
 from tokenspeed.runtime.execution.device import DeviceHandle
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -70,7 +66,7 @@ from tokenspeed.runtime.multimodal.inputs import (
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
-register_cuda_ci(est_time=30, suite="runtime-1gpu")
+register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 VOCAB_SIZE = 128
 
@@ -90,6 +86,10 @@ def _op(states, rids, slots, lengths, prefixes, replays, overrides):
         ids.extend(
             (state.prompt_input_ids + state.output_ids)[prefix : prefix + length]
         )
+    input_ids = np.array(ids, dtype=np.int32)
+    shifted_ids = np.array(ids[1:] + [-1] if ids else [], dtype=np.int32)
+    input_ids.flags.writeable = False
+    shifted_ids.flags.writeable = False
     return SimpleNamespace(
         request_ids=rids,
         request_pool_indices=slots,
@@ -97,8 +97,8 @@ def _op(states, rids, slots, lengths, prefixes, replays, overrides):
         prefill_lengths=[
             len(states[r].prompt_input_ids) + len(states[r].output_ids) for r in rids
         ],
-        input_ids=ids,
-        shifted_input_ids=ids[1:] + [-1] if ids else [],
+        input_ids=input_ids,
+        shifted_input_ids=shifted_ids,
         extend_prefix_lens=prefixes,
         extend_replay_lens=replays,
         decode_input_ids=overrides,
@@ -152,7 +152,11 @@ def buffers(request, monkeypatch):
     )
     ib.init_ngram_buffers(3, _hash_params(ib.device), VOCAB_SIZE)
     runtime = RuntimeStates(
-        req_pool_size=5, vocab_size=VOCAB_SIZE, output_length=1, device=device
+        req_pool_size=5,
+        input_vocab_size=VOCAB_SIZE,
+        vocab_size=VOCAB_SIZE,
+        output_length=1,
+        device=device,
     )
     runtime.init_ngram_state(3)
     return ib, runtime
@@ -177,13 +181,66 @@ def _hash_params(device):
     )
 
 
+def _ngram_inputs(forward_op, rid_to_state, context_len: int) -> NGramInputs:
+    """The windows the control plane sends with a forward (``ts-control``'s
+    ``ngram_windows``): per row, the token at its position and its
+    ``context_len`` predecessors, newest first, -1 where the request has
+    none; an extend row's position is its prefix length, a decode row's its
+    newest committed token."""
+    tokens, positions = [], []
+    num_extends = forward_op.num_extends()
+    for i, rid in enumerate(forward_op.request_ids):
+        state = rid_to_state[rid]
+        prompt, output = state.prompt_input_ids, state.output_ids
+        total = len(prompt) + len(output)
+        start = forward_op.extend_prefix_lens[i] if i < num_extends else total - 1
+        tokens.append(
+            tuple(
+                (
+                    -1
+                    if p < 0 or p >= total
+                    else prompt[p] if p < len(prompt) else output[p - len(prompt)]
+                )
+                for p in range(start, start - context_len - 1, -1)
+            )
+        )
+        positions.append(start)
+    return NGramInputs(tokens=tuple(tokens), positions=tuple(positions))
+
+
 def _fill(ib, runtime, op, snapshot):
     n = op.num_extends()
     runtime.reset_states(
         torch.tensor(op.request_pool_indices[:n], dtype=torch.int64, device=ib.device),
         torch.tensor(op.extend_prefix_lens, dtype=torch.int32, device=ib.device),
     )
-    ib.fill_input_buffers(op, runtime, sum(op.input_lengths), ngram_inputs=snapshot)
+    total = sum(op.input_lengths)
+    ids = ib.fill_input_buffers(op, runtime, total)
+    ib.load_round_inputs(op, runtime, total, ids, ngram_inputs=snapshot)
+
+
+def test_decode_override_clears_only_consumed_flags_without_host_sync(buffers):
+    ib, runtime = buffers
+    runtime.valid_cache_lengths.fill_(2)
+    runtime.future_input_map.fill_(22)
+    runtime.spec_candidates_ready.fill_(True)
+    states = {"a": _state([10, 11, 12], []), "b": _state([20, 21, 22], [])}
+    op = _op(states, ["a", "b"], [2, 4], [1, 1], [], [], [12, -1])
+    snapshot = _ngram_inputs(op, states, 3)
+    on_cuda = torch.device(ib.device).type == "cuda"
+    previous = torch.cuda.get_sync_debug_mode() if on_cuda else None
+    try:
+        if on_cuda:
+            torch.cuda.set_sync_debug_mode("error")
+        ids = ib.fill_input_buffers(op, runtime, 2)
+        ib.load_round_inputs(op, runtime, 2, ids, ngram_inputs=snapshot)
+    finally:
+        if on_cuda:
+            torch.cuda.set_sync_debug_mode(previous)
+    assert ib.input_ids_buf[:2].tolist() == [12, 22]
+    assert runtime.spec_candidates_ready.tolist() == [
+        i not in (2, 4) for i in range(runtime.spec_candidates_ready.numel())
+    ]
 
 
 def _expected(tokens, positions):
@@ -241,7 +298,7 @@ def test_chunked_prefill_and_pending_overlap_samples(buffers, overlap):
     states = {"a": _state([10, 11, 12, 13, 14], [])}
     for prefix, length in [(0, 2), (2, 3)]:
         op = _op(states, ["a"], [2], [length], [prefix], [0], [])
-        _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+        _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
         _assert_rows(
             ib,
             _expected(states["a"].prompt_input_ids, range(prefix, prefix + length)),
@@ -254,7 +311,7 @@ def test_chunked_prefill_and_pending_overlap_samples(buffers, overlap):
         if not overlap:
             states["a"].output_ids.append(current)
         op = _op(states, ["a"], [2], [1], [], [], [-1])
-        snapshot = ngram_inputs_for_forward(op, states, 3)
+        snapshot = _ngram_inputs(op, states, 3)
         if overlap:
             # Commit can mutate request state after dispatch but before the
             # forward thread consumes its frozen snapshot. The current ID is
@@ -266,26 +323,6 @@ def test_chunked_prefill_and_pending_overlap_samples(buffers, overlap):
         _assert_rows(ib, _expected(full, [len(full) - 1]), [True])
         assert ib.ngram_previous_tokens_buf.data_ptr() == pointer
         _sample(ib, runtime, [current + 1], 0, [1], False)
-    assert set(vars(runtime)) == {
-        "device",
-        "vocab_size",
-        "valid_cache_lengths",
-        "future_input_map",
-        "spec_candidates_ready",
-        "draft_probs",
-        "draft_probs_sentinel",
-        "chain_parents",
-        "future_parent_map",
-        "ngram_accepted_tokens",
-        "ngram_needs_seed",
-        "ngram_request_ids",
-        "request_token_history_ids",
-        "draft_request_token_history_ids",
-        "stop_token_ids",
-        "token_limits",
-        "_stop_criteria_owners",
-        "stopped",
-    }
     assert not runtime.has_request_token_history
     assert runtime.ngram_accepted_tokens.shape == (6, 3)
     assert runtime.ngram_accepted_tokens[2].tolist() == [18, 17, 16]
@@ -301,7 +338,7 @@ def test_prefix_hit_mixed_reordered_requests_and_raw_barriers(buffers, barrier):
     runtime.valid_cache_lengths[3] = 4
     runtime.future_input_map[3, 0] = 24
     op = _op(states, ["prefill", "decode"], [1, 3], [4, 1], [3], [0], [-1])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     expected = _expected(states["prefill"].prompt_input_ids, range(3, 7)) + [
         [23, 22, 21]
     ]
@@ -312,7 +349,7 @@ def test_prefix_hit_mixed_reordered_requests_and_raw_barriers(buffers, barrier):
     states["prefill"].output_ids.append(8)
     states["decode"].output_ids.append(25)
     op = _op(states, ["decode", "prefill"], [3, 1], [1, 1], [], [], [-1, -1])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     _assert_rows(ib, [[24, 23, 22], [7, 6, 5]], [True, True])
 
 
@@ -324,7 +361,7 @@ def test_replayed_prefix_hit_feeds_rows_from_the_window_start(buffers):
     states = {"a": _state([10, 11, 12, 13, 14, 15, 16, 17], [])}
     # Hit at 6, window 4: rows [2, 8) with the first four replayed.
     op = _op(states, ["a"], [2], [6], [2], [4], [])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     assert ib.positions_buf[:6].tolist() == [2, 3, 4, 5, 6, 7]
     assert ib.input_ids_buf[:6].tolist() == [12, 13, 14, 15, 16, 17]
     _assert_rows(ib, _expected(states["a"].prompt_input_ids, range(2, 8)), [True] * 6)
@@ -343,12 +380,12 @@ def test_retraction_readmission_pd_bootstrap_and_slot_reuse(buffers):
     # Retraction turns accepted output back into a prefill suffix. Neither
     # prefix matching nor a pool-slot change changes physical token identity.
     op = _op(states, ["a"], [4], [3], [3], [0], [])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     _assert_rows(ib, [[12, 11, 10], [13, 12, 11], [14, 13, 12]], [True] * 3)
     del states["a"]
     states["b"] = _state([30], [])
     op = _op(states, ["b"], [4], [1], [0], [0], [])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     _assert_rows(ib, [[-1, -1, -1]], [True])
 
     # A PD destination need not have executed any local prefill. Its bootstrap
@@ -356,7 +393,7 @@ def test_retraction_readmission_pd_bootstrap_and_slot_reuse(buffers):
     states["pd"] = _state([40, 41, 42], [43])
     runtime.valid_cache_lengths[1] = 3
     op = _op(states, ["pd"], [1], [1], [], [], [43])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     _assert_rows(ib, [[42, 41, 40]], [True])
     assert ib.input_ids_buf[0].item() == 43
 
@@ -370,17 +407,17 @@ def test_snapshot_restore_reseeds_engram_before_commit(buffers, destination):
     runtime.valid_cache_lengths[source] = 5
     runtime.future_input_map[source, 0] = 15
     image = torch.empty(runtime.slot_state_bytes(), dtype=torch.uint8, device=ib.device)
-    runtime.export_slot_state(source, image, None, request_id="a")
+    runtime.export_slot_state(source, image, None, admission_id=1)
     runtime.ngram_request_ids[destination] = "a"
     runtime.ngram_accepted_tokens[destination].fill_(99)
     runtime.ngram_needs_seed[destination] = False
     runtime.valid_cache_lengths[destination] = 0
-    runtime.import_slot_state(destination, image, None, request_id="a")
+    runtime.import_slot_state(destination, image, None, admission_id=1)
 
     # The restored request receives an explicit decode token even when its
     # pool slot did not change. This must override any stale accepted tail.
     op = _op(states, ["a"], [destination], [1], [], [], [15])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     _assert_rows(ib, [[14, 13, 12]], [True])
     assert runtime.ngram_accepted_tokens[destination].tolist() == [99, 99, 99]
     assert runtime.valid_cache_lengths[destination].item() == 5
@@ -393,12 +430,12 @@ def test_empty_prefill_padding_and_idle_scrub(buffers):
     ib, runtime = buffers
     states = {"a": _state([1, 2, 3], [])}
     op = _op(states, ["a"], [1], [3], [0], [0], [])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     pointer = ib.ngram_previous_tokens_buf.data_ptr()
     ib.fill_dummy_decode_buffers(batch_size=4, total_tokens=4)
     _assert_rows(ib, [[-1] * 3] * 4, [False] * 4)
     op = _op(states, ["a"], [1], [0], [3], [0], [])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     assert ib.ngram_model_kwargs(0)["engram_hash_ids"].shape == (0, 2, 6)
     assert (ib.ngram_previous_tokens_buf == -1).all()
     assert not ib.ngram_token_mask_buf.any()
@@ -406,7 +443,7 @@ def test_empty_prefill_padding_and_idle_scrub(buffers):
     assert ib.ngram_prefix_buf[0].tolist() == [3, 2, 1]
     states["a"].output_ids.append(4)
     op = _op(states, ["a"], [1], [1], [], [], [4])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     _assert_rows(ib, [[3, 2, 1]], [True])
 
 
@@ -422,7 +459,7 @@ def test_large_prefill_to_small_decode_keeps_graph_padding_dead(buffers):
     prompt = [i % 80 + 1 for i in range(1024)]
     states = {"a": _state(prompt, [])}
     op = _op(states, ["a"], [1], [1024], [0], [0], [])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     _assert_rows(ib, _expected(prompt, range(1024)), [True] * 1024)
     _sample(ib, runtime, [81], 1, [1], False)
     states["a"].output_ids.append(81)
@@ -443,7 +480,7 @@ def test_large_prefill_to_small_decode_keeps_graph_padding_dead(buffers):
     pointers = (ib.ngram_seed_buf.data_ptr(), ib.ngram_hash_ids_buf.data_ptr())
     for next_token in [82, 83, 84]:
         op = _op(states, ["a"], [1], [1], [], [], [-1])
-        _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+        _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
         full = states["a"].prompt_input_ids + states["a"].output_ids
         expected = _expected(full, [len(full) - 1])
         _assert_rows(ib, expected, [True])
@@ -458,39 +495,15 @@ def test_large_prefill_to_small_decode_keeps_graph_padding_dead(buffers):
         states["a"].output_ids.append(next_token)
 
 
-def test_snapshot_validation_and_no_long_history_copy(buffers):
+def test_the_buffers_validate_the_windows_and_the_config_their_width(buffers):
     ib, runtime = buffers
-
-    class NoIteration(list):
-        def __iter__(self):
-            raise AssertionError("must not copy full request history")
-
-        def __add__(self, other):
-            raise AssertionError("must not concatenate full request history")
-
-    state = _state([], [])
-    state.prompt_input_ids = NoIteration(range(100_000))
     op = SimpleNamespace(request_ids=["a"], input_lengths=[1], num_extends=lambda: 0)
-    snapshot = ngram_inputs_for_forward(op, {"a": state}, 3)
-    assert snapshot.tokens == ((99999, 99998, 99997, 99996),)
-    assert snapshot.positions == (99999,)
-    with pytest.raises(FrozenInstanceError):
-        snapshot.positions = (0,)
     with pytest.raises(ValueError, match="one history snapshot"):
         ib.fill_ngram_inputs(None, 1, runtime, op)
     with pytest.raises(ValueError, match="history width"):
         ib.fill_ngram_inputs(
             NGramInputs(tokens=((1, 2),), positions=(0,)), 1, runtime, op
         )
-    op.input_lengths = [8]
-    assert ngram_inputs_for_forward(op, {"a": state}, 3) == snapshot
-    op.num_extends = lambda: 1
-    op.extend_prefix_lens = [99_000]
-    op.input_lengths = [1_000]
-    prefill_snapshot = ngram_inputs_for_forward(op, {"a": state}, 3)
-    assert prefill_snapshot.tokens == ((99000, 98999, 98998, 98997),)
-    assert prefill_snapshot.positions == (99000,)
-    assert ngram_inputs_for_forward(None, {}, 0) is None
     assert (
         engram_context_len(SimpleNamespace(ple_layer_ids=[1], ngram_context_len=2)) == 0
     )
@@ -504,7 +517,11 @@ def test_snapshot_validation_and_no_long_history_copy(buffers):
 
 def _spec_runtime(ib, width):
     runtime = RuntimeStates(
-        req_pool_size=5, vocab_size=VOCAB_SIZE, output_length=width, device=ib.device
+        req_pool_size=5,
+        input_vocab_size=VOCAB_SIZE,
+        vocab_size=VOCAB_SIZE,
+        output_length=width,
+        device=ib.device,
     )
     runtime.init_ngram_state(3)
     return runtime
@@ -520,7 +537,7 @@ def test_verify_branch_history_all_accept_lengths(buffers, width, accepted, over
     states = {"a": _state([10, 11, 12, 13], [])}
     prefix = states["a"].prompt_input_ids.copy()
     op = _op(states, ["a"], [2], [4], [0], [0], [])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     _sample(ib, runtime, [20], 1, [1], True)
     pending = [20]
     pointer = runtime.ngram_accepted_tokens.data_ptr()
@@ -530,7 +547,7 @@ def test_verify_branch_history_all_accept_lengths(buffers, width, accepted, over
         if not overlap:
             states["a"].output_ids.extend(pending)
         op = _op(states, ["a"], [2], [width], [], [], [-1])
-        snapshot = ngram_inputs_for_forward(op, states, 3)
+        snapshot = _ngram_inputs(op, states, 3)
         assert len(snapshot.tokens) == 1
         if overlap:
             # The snapshot predates a whole verify commit, not just one ID.
@@ -564,7 +581,7 @@ def test_verify_raw_barriers_survive_clamp_and_acceptance(
     branch[barrier_row] = barrier
     runtime.future_input_map[2] = torch.tensor(branch, device=ib.device)
     op = _op(states, ["a"], [2], [4], [], [], [-1])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     full = states["a"].prompt_input_ids + branch
     _assert_rows(ib, _expected(full, range(3, 7)), [t != barrier for t in branch])
     assert ib.input_ids_buf[barrier_row].item() == min(max(barrier, 0), VOCAB_SIZE - 1)
@@ -574,7 +591,7 @@ def test_verify_raw_barriers_survive_clamp_and_acceptance(
     assert runtime.ngram_accepted_tokens[2].tolist() == expected_tail
     next_branch = [99, 40, 41, 42]
     runtime.future_input_map[2] = torch.tensor(next_branch, device=ib.device)
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     _assert_rows(
         ib,
         _expected(prefix + next_branch, range(len(prefix), len(prefix) + 4)),
@@ -591,7 +608,7 @@ def test_decode_gathers_each_request_row_from_its_slot(buffers):
         runtime.valid_cache_lengths[slot] = 3
         runtime.future_input_map[slot] = torch.tensor(row, device=ib.device)
     op = _op(states, ["a", "b", "c"], list(rows), [4] * 3, [], [], [-1] * 3)
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     assert ib.input_ids_buf[:12].tolist() == rows[3] + rows[1] + rows[2]
 
 
@@ -614,7 +631,7 @@ def test_mixed_verify_empty_prefix_recovery_and_override(buffers):
         [0, 0],
         [-1],
     )
-    snapshot = ngram_inputs_for_forward(op, states, 3)
+    snapshot = _ngram_inputs(op, states, 3)
     _fill(ib, runtime, op, snapshot)
     _assert_rows(
         ib,
@@ -633,7 +650,7 @@ def test_mixed_verify_empty_prefix_recovery_and_override(buffers):
     # immutable snapshot still owns the original physical prefix after dispatch.
     states["decode"].output_ids = [33, 34, 99]
     op = _op(states, ["decode"], [0], [2], [3], [0], [])
-    snapshot = ngram_inputs_for_forward(op, states, 3)
+    snapshot = _ngram_inputs(op, states, 3)
     states["decode"].prompt_input_ids[2] = 77
     _fill(ib, runtime, op, snapshot)
     _assert_rows(ib, [[32, 31, 30], [33, 32, 31]], [True, True])
@@ -644,7 +661,7 @@ def test_mixed_verify_empty_prefix_recovery_and_override(buffers):
     states["decode"].output_ids = [43]
     runtime.valid_cache_lengths[0] = 3
     op = _op(states, ["decode"], [0], [4], [], [], [43])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     _assert_rows(
         ib, [[42, 41, 40], [43, 42, 41], [43, 43, 42], [43, 43, 43]], [True] * 4
     )
@@ -659,7 +676,7 @@ def test_mixed_verify_empty_prefix_recovery_and_override(buffers):
     )
     runtime.future_input_map[0] = torch.tensor([43, 44, 45, 46], device=ib.device)
     op = _op(states, ["decode"], [0], [4], [], [], None)
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     _assert_rows(
         ib, [[42, 41, 40], [43, 42, 41], [44, 43, 42], [45, 44, 43]], [True] * 4
     )
@@ -676,7 +693,7 @@ def test_uncovered_seed_fails_instead_of_reusing_another_request_tail(buffers):
     runtime.future_input_map[2] = torch.tensor([20, 21, 22, 23])
     op = _op(states, ["a"], [2], [4], [], [], [-1])
     with pytest.raises(RuntimeError, match="seed snapshot does not cover"):
-        _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+        _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
 
 
 @pytest.mark.parametrize("record_update", [False, True])
@@ -744,7 +761,7 @@ def test_runtime_update_replay_shrink_idle_and_slot_reuse(buffers, record_update
             for slot, branch in zip(slots, branches):
                 runtime.future_input_map[slot] = torch.tensor(branch, device=ib.device)
             op = _op(states, rids, slots, [4] * len(rids), [], [], [-1] * len(rids))
-            _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+            _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
         else:
             ib.fill_dummy_decode_buffers(4, 16)
         accepts.copy_(torch.tensor(counts + [99] * (4 - len(rids)), device=ib.device))
@@ -795,16 +812,19 @@ def test_executor_input_capacity_covers_decode_capture(
         device="cpu",
         max_num_seqs=4,
         data_parallel_size=1,
+        enable_memory_saver=False,
         spec_algo="DSPARK" if width > 1 else None,
         spec_num_tokens=width,
         chunked_prefill_size=chunk_size,
         max_req_pool_size=5,
         pp_size=pp_size,
         overlap_schedule_depth=depth,
+        input_vocab_size=VOCAB_SIZE,
         vocab_size=VOCAB_SIZE,
         output_length=width,
         enable_nan_detection=False,
         enable_speculative_sampling=False,
+        state_checkpoint_in_forward=False,
     )
     runner = SimpleNamespace(
         mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),
@@ -946,6 +966,9 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     runner.is_generation = True
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = ib.device
+    # autotune() runs its dummy forwards on the serving stream.
+    executor.device_module = torch.get_device_module(ib.device)
+    executor.execution_stream = executor.device_module.Stream()
     executor.config = SimpleNamespace(
         max_num_seqs=2,
         data_parallel_size=1,
@@ -968,6 +991,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     executor.runtime_states = runtime
     executor.model_runner = runner
     executor.drafter = None
+    executor._samples_from_vocab_shard = False
     pg = PrefillGraph.__new__(PrefillGraph)
     pg.config = executor.config
     pg.input_buffers = ib
@@ -998,7 +1022,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         lambda path, group, rank: events.append(("save", path, group, rank)),
     )
 
-    executor.autotune()
+    executor.autotune(keep_loaded_tactics=False)
 
     assert (ib.ngram_previous_tokens_buf == -1).all()
     assert not ib.ngram_token_mask_buf.any()
@@ -1122,7 +1146,7 @@ def test_history_views_replay_after_batch_shrink_and_idle(buffers):
         pytest.skip("CUDA graph buffer contract")
     states = {"a": _state([10, 11, 12], [])}
     op = _op(states, ["a"], [1], [3], [0], [0], [])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     graph = torch.cuda.CUDAGraph()
     torch.cuda.synchronize()
     with torch.cuda.graph(graph):
@@ -1131,7 +1155,7 @@ def test_history_views_replay_after_batch_shrink_and_idle(buffers):
         mask = ib.ngram_model_kwargs(4)["engram_token_mask"].clone()
     states["b"] = _state([20, 21], [])
     op = _op(states, ["b"], [1], [1], [1], [0], [])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     graph.replay()
     torch.testing.assert_close(
         hashes,
@@ -1150,25 +1174,18 @@ def test_history_views_replay_after_batch_shrink_and_idle(buffers):
     assert not mask.any()
 
 
-def test_dispatch_owns_snapshot_until_forward_thread_consumes_it():
+def test_the_forward_reads_a_snapshot_that_does_not_alias_request_state():
     states = {"a": _state([1, 2, 3], [])}
     op = _op(states, ["a"], [1], [1], [], [], [-1])
-    snapshot = ngram_inputs_for_forward(op, states, 3)
-    submitted, consumed = [], []
-
-    def submit(fn):
-        future = Future()
-        submitted.append((future, fn))
-        return future
+    snapshot = _ngram_inputs(op, states, 3)
+    consumed = []
 
     def execute(forward_op, sampling_params_list, **kwargs):
         consumed.append(kwargs["ngram_inputs"])
-        return SimpleNamespace(sync=lambda: None)
+        return SimpleNamespace()
 
     handle = DeviceHandle(
-        SimpleNamespace(
-            forward_thread=SimpleNamespace(submit=submit), execute_forward_op=execute
-        ),
+        SimpleNamespace(device="cpu", execute_forward_op=execute),
         host_cache_executor=None,
         kv_transfer=None,
     )
@@ -1183,14 +1200,12 @@ def test_dispatch_owns_snapshot_until_forward_thread_consumes_it():
         input_logprob_plan=None,
         sampled_top_k=0,
         stop_criteria=(),
+        admission_ids=(1,),
     )
-    pending = handle._submit_forward(planned, capture_next_input_ids=False)
+    handle._launch_forward(planned, capture_next_input_ids=False)
+    # Later edits to the request's state cannot reach what the forward read.
     states["a"].prompt_input_ids.clear()
     states.clear()
-    assert not consumed
-    future, fn = submitted.pop()
-    future.set_result(fn())
-    pending.result()
     assert consumed == [NGramInputs(tokens=((3, 2, 1, -1),), positions=(2,))]
 
 
@@ -1246,6 +1261,8 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
         tokenizer_mode="auto",
         trust_remote_code=False,
         revision="revision",
+        weight_memory_policy=None,
+        model_update_draft_weights=None,
     )
     config = SimpleNamespace(
         dtype=torch.bfloat16,
@@ -1259,6 +1276,7 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
         gpu_id=0,
         memory_saver_adapter=SimpleNamespace(region=region),
         checkpoint_load_group=None,
+        is_draft_worker=False,
     )
     assert result is model
     assert events == (
@@ -1274,16 +1292,22 @@ def test_forced_single_token_resets_draft_tree_parents(buffers):
     ib, _ = buffers
     runtime = _spec_runtime(ib, 4)
     runtime.init_draft_trees(4)
+    runtime.init_draft_tree_q(4, num_slots=3, num_candidates=8)
     tree = torch.tensor([-1, 0, 0, 1], dtype=torch.int32, device=ib.device)
     runtime.future_parent_map[:] = tree
+    # A sampled tree: its nodes name their parents' draft q.
+    runtime.future_draft_q.slot[:] = torch.tensor([-1, 0, 0, 1], dtype=torch.int32)
     states = {"decode": _state([40, 41, 42], [43])}
     runtime.valid_cache_lengths[0] = 3
     runtime.future_input_map[0] = torch.tensor([43, 44, 45, 46], device=ib.device)
     op = _op(states, ["decode"], [0], [4], [], [], [43])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     assert ib.force_single_token_verify_buf[0].item()
     assert runtime.future_parent_map[0].tolist() == [-1, 0, 1, 2]
     assert runtime.future_parent_map[1].tolist() == tree.tolist()
+    # The dummy chain is deterministic.
+    assert runtime.future_draft_q.slot[0].tolist() == [-1] * 4
+    assert runtime.future_draft_q.slot[1].tolist() == [-1, 0, 0, 1]
 
 
 @pytest.mark.parametrize(
@@ -1313,7 +1337,7 @@ def test_image_mask_survives_input_clamp(buffers, prefix, length, image_rows):
     # Even a hash-like generated ID must not mark a decode row as an image.
     runtime.future_input_map[3] = item.pad_value
     op = _op(states, list(states), [1, 2, 3], [2, length, 1], [0, prefix], [0, 0], [-1])
-    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     ids = ib.input_ids_buf  # Include padding rows in the mask check.
     assert ((ids >= 0) & (ids < VOCAB_SIZE)).all()
     context = MultimodalForwardContext(
@@ -1361,3 +1385,61 @@ def test_engram_token_map_must_cover_the_vocabulary():
     )
     with pytest.raises(ValueError, match="fewer than the vocabulary"):
         ib.init_ngram_buffers(3, _hash_params("cpu"), VOCAB_SIZE + 1)
+
+
+def test_input_only_tokens_survive_prefill_decode_and_ngram_preparation(buffers):
+    ib, _ = buffers
+    runtime = RuntimeStates(
+        req_pool_size=5,
+        input_vocab_size=VOCAB_SIZE,
+        vocab_size=64,
+        output_length=1,
+        device=ib.device,
+    )
+    runtime.init_ngram_state(3)
+    states = {"a": _state([10, 100, 127, 20], [])}
+    op = _op(states, ["a"], [2], [4], [0], [0], [])
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
+    assert ib.input_ids_buf[:4].tolist() == [10, 100, 127, 20]
+    assert ib.ngram_previous_tokens_buf[3, :3].tolist() == [127, 100, 10]
+    runtime.valid_cache_lengths[2] = 4
+    runtime.future_input_map[2] = 100
+    op = _op(states, ["a"], [2], [1], [], [], [-1])
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
+    assert ib.input_ids_buf[0].item() == 100
+    runtime.init_draft_probs(spec_num_tokens=2, reject_threshold=2.0)
+    assert runtime.draft_probs.shape == (6, 2, 64)
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("draft_ids", [[5, 63], [64, 127], [-1, 999]])
+def test_spec_candidates_use_output_bounds_without_narrowing_inputs(
+    buffers, mixed, draft_ids
+):
+    ib, _ = buffers
+    runtime = RuntimeStates(
+        req_pool_size=5,
+        input_vocab_size=VOCAB_SIZE,
+        vocab_size=64,
+        output_length=3,
+        device=ib.device,
+    )
+    runtime.init_ngram_state(3)
+    runtime.future_input_map[2] = torch.tensor([100, *draft_ids], device=ib.device)
+    runtime.valid_cache_lengths[2] = 4
+    states = {"p": _state([100, 127], []), "d": _state([1, 2, 3, 4], [])}
+    op = (
+        _op(states, ["p", "d"], [1, 2], [2, 3], [0], [0], [-1])
+        if mixed
+        else _op(states, ["d"], [2], [3], [], [], [-1])
+    )
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
+    start = 2 if mixed else 0
+    assert ib.input_ids_buf[start : start + 3].tolist() == [
+        100,
+        *[min(63, max(0, x)) for x in draft_ids],
+    ]
+    if mixed:
+        assert ib.input_ids_buf[:2].tolist() == [100, 127]
+    # The drafter-owned source is never rewritten by input preparation.
+    assert runtime.future_input_map[2].tolist() == [100, *draft_ids]

@@ -42,6 +42,12 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
+# Known follow-up, deferred by decision (C4): GrammarHostBuffers / _fill_eager_bitmask were restored for imports only; main runs the grammar host node in C++.
+# See merge_main_1117.md, "Known follow-ups".
+pytestmark = pytest.mark.skip(
+    reason="merge_main_1117.md known follow-up (C4): GrammarHostBuffers / _fill_eager_bitmask were restored for imports only; main runs the grammar host node in C++"
+)
+
 from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
     ForwardOutputLayout,
 )

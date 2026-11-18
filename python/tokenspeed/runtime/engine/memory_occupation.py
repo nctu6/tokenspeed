@@ -18,24 +18,22 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""GPU-memory data plane for sleep/wake (release/resume_memory_occupation).
+"""GPU memory a sleeping engine releases (``release_memory_occupation``)
+and restores on wake, one :class:`MemoryRegion` per tag.
 
-Pairs with the control-plane :class:`PauseController`. A *release* pauses and
-drains the scheduler (delegated to the pause controller) and only then frees GPU
-memory; a *resume* re-maps it. Each tag is one :class:`MemoryRegion` and is
-freed/restored independently, so the RL loop can resume weights (and NCCL),
-push fresh weights, then resume the KV cache:
+The Rust control plane drains the engine and orders the regions (the KV
+cache first, NCCL last; resume in reverse); the data plane frees and
+restores each one. Each tag is released and restored independently, so the
+RL loop can resume weights (and NCCL), push fresh weights, then resume the KV
+cache:
 
-- ``weights``: model parameters (restored from their CPU backup);
+- ``weights``: model parameters (CPU backup, or discard until a complete
+  replica-committed update; frozen draft allocations retain CPU backup);
 - ``kv_cache``: the cache arena (discarded; zeroed on resume);
 - ``cuda_graph``: the decode CUDA graph memory pool (discarded; every replay
   rewrites it before reading);
 - ``nccl``: NCCL communicator buffers (suspended and resumed in place); only
   on an engine whose NCCL can suspend a communicator.
-
-This module knows nothing about ZMQ beyond a ``send_func`` reply socket, and
-nothing about scheduling beyond delegating drain to the pause controller. What
-a region does to free or restore its memory is the caller's (``PauseHooks``).
 """
 
 from __future__ import annotations
@@ -53,18 +51,6 @@ from tokenspeed.runtime.engine.io_struct import (
     ResumeMemoryOccupationReqOutput,
 )
 
-if TYPE_CHECKING:
-    # The pause module builds this module's regions (PauseHooks), so a
-    # runtime import here would be circular.
-    from tokenspeed.runtime.engine.pause import PauseController
-
-# Release order: the KV cache first (a PD engine deregisters it from the
-# transfer engine before it is unmapped), NCCL last (nothing may issue a
-# collective after it is suspended). Resume runs the reverse order, so NCCL and
-# the graphs are back before the weights and the KV cache are used again.
-VALID_TAGS = ("kv_cache", "weights", "cuda_graph", "nccl")
-RESUME_ORDER = tuple(reversed(VALID_TAGS))
-
 
 @dataclass(frozen=True)
 class MemoryRegion:
@@ -79,6 +65,71 @@ class MemoryRegion:
 
     release: Callable[[], None]
     resume: Callable[[], None]
+
+
+def memory_regions(
+    device, adapter, *, nccl_suspendable: bool
+) -> dict[str, MemoryRegion]:
+    """The releasable GPU-memory regions of an engine, keyed by tag.
+
+    The memory-saver ``adapter`` unmaps and re-maps the allocator regions;
+    the device handle does the data-plane work that must surround them.
+    Which pools and peers that work touches is the handle's business; this
+    side only says when. ``nccl_suspendable`` says whether the process's
+    NCCL can suspend communicators; without it there is no ``nccl`` region.
+    """
+
+    def release_kv_cache() -> None:
+        # Wait for in-flight copies and deregister the arena from the PD
+        # transfer engine before its memory goes away.
+        device.prepare_kv_release()
+        adapter.pause(tag="kv_cache")
+
+    def resume_kv_cache() -> None:
+        device.before_kv_resume()
+        adapter.resume(tag="kv_cache")
+        # Re-mapped memory holds garbage: zero it, then register it with
+        # the PD transfer engine again.
+        device.finish_kv_resume()
+
+    def allocator_region(tag: str) -> MemoryRegion:
+        def release() -> None:
+            device.synchronize()
+            adapter.pause(tag=tag)
+
+        return MemoryRegion(release=release, resume=lambda: adapter.resume(tag=tag))
+
+    regions = {
+        "kv_cache": MemoryRegion(release=release_kv_cache, resume=resume_kv_cache),
+        "weights": MemoryRegion(
+            release=lambda: device.release_weights(adapter),
+            resume=lambda: device.resume_weights(adapter),
+        ),
+        "cuda_graph": allocator_region("cuda_graph"),
+    }
+    if nccl_suspendable:
+        regions["nccl"] = MemoryRegion(
+            release=device.suspend_nccl, resume=device.resume_nccl
+        )
+    return regions
+
+
+# --- definitions restored from the pre-merge branch (D3-3) ---
+
+if TYPE_CHECKING:
+    # The pause module builds this module's regions (PauseHooks), so a
+    # runtime import here would be circular.
+    from tokenspeed.runtime.engine.pause import PauseController
+
+
+# Release order: the KV cache first (a PD engine deregisters it from the
+# transfer engine before it is unmapped), NCCL last (nothing may issue a
+# collective after it is suspended). Resume runs the reverse order, so NCCL and
+# the graphs are back before the weights and the KV cache are used again.
+VALID_TAGS = ("kv_cache", "weights", "cuda_graph", "nccl")
+
+
+RESUME_ORDER = tuple(reversed(VALID_TAGS))
 
 
 def _normalize_tags(

@@ -19,6 +19,7 @@ from typing import Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.compile_monitor import is_serving
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -27,6 +28,7 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 
 @triton.jit
@@ -345,33 +347,65 @@ def fp8_quantize_per_token(
     return codes, scales
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["groups"])
 def _fp8_token_group_quantize_kernel(
     x_ptr,
     out_ptr,
     scale_ptr,
+    groups,
     group_size,
     eps,
     bit8_min,
     bit8_max,
     BLOCK: tl.constexpr,
+    GROUPS_PER_PROGRAM: tl.constexpr,
+    USE_RECIPROCAL: tl.constexpr,
 ):
-    group_id = tl.program_id(0)
+    # Each program quantizes GROUPS_PER_PROGRAM consecutive groups, one per
+    # tile row; every group's arithmetic is independent of the tiling.
+    group_ids = tl.program_id(0).to(tl.int64) * GROUPS_PER_PROGRAM + tl.arange(
+        0, GROUPS_PER_PROGRAM
+    )
     cols = tl.arange(0, BLOCK)
-    mask = cols < group_size
-    offsets = group_id.to(tl.int64) * group_size + cols
+    mask = (cols < group_size)[None, :]
+    # Only a multi-group tile can run past the last group.
+    group_mask = None
+    if GROUPS_PER_PROGRAM > 1:
+        group_mask = group_ids < groups
+        mask = mask & group_mask[:, None]
+    offsets = group_ids[:, None] * group_size + cols[None, :]
 
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    scale = tl.maximum(tl.max(tl.abs(x), axis=0), eps) / bit8_max
-    out = tl.clamp(x / scale, bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
+    scale = tl.maximum(tl.max(tl.abs(x), axis=1), eps) / bit8_max
+    if USE_RECIPROCAL:
+        inverse_scale = 1.0 / scale
+        normalized = x * inverse_scale[:, None]
+    else:
+        normalized = x / scale[:, None]
+    out = tl.clamp(normalized, bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
 
     tl.store(out_ptr + offsets, out, mask=mask)
-    tl.store(scale_ptr + group_id, scale)
+    tl.store(scale_ptr + group_ids, scale, mask=group_mask)
+
+
+def _fp8_token_group_groups_per_cta(
+    x: torch.Tensor, group_size: int, groups: int
+) -> int | None:
+    # The grouped launch was measured on gfx950 with 256 compute units. Its
+    # crossover keeps at least two workgroups per compute unit on that device.
+    if group_size != 128 or x.device.type != "cuda" or torch.version.hip is None:
+        return None
+    device_properties = torch.cuda.get_device_properties(x.device)
+    if (
+        not current_platform().is_cdna4
+        or device_properties.multi_processor_count != 256
+    ):
+        return None
+    return 16 if groups >= 32 * device_properties.multi_processor_count else 1
 
 
 def _fp8_token_group_quantize(
-    x: torch.Tensor,
-    group_size: int,
+    x: torch.Tensor, group_size: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.shape[-1] % group_size != 0:
         raise ValueError(
@@ -390,21 +424,63 @@ def _fp8_token_group_quantize(
     )
 
     groups = x.numel() // group_size
+    groups_per_cta = _fp8_token_group_groups_per_cta(x, group_size, groups)
     block = triton.next_power_of_2(group_size)
-    num_warps = min(max(block // 256, 1), 8)
+    # Tile by input size, measured on GB300: one group per program below
+    # 16 Ki padded elements, then tiles of consecutive groups, 1024 elements
+    # below 1.75 Mi (7 << 18) padded elements and 8192 from there. Groups of
+    # 1024 or more stay one per program. A program gets a warp per 256 tile
+    # elements, up to 8. The group count is a runtime argument; of the input
+    # size, only the tile is a compile-time choice.
+    padded_elements = groups * block
+    if padded_elements < 1 << 14 or block >= 1024:
+        groups_per_program = 1
+    elif padded_elements < 7 << 18:
+        groups_per_program = 1024 // block
+    else:
+        groups_per_program = 8192 // block
+    if groups_per_cta == 16:
+        groups_per_program = groups_per_cta
     fp8_finfo = torch.finfo(out_dtype)
-
-    _fp8_token_group_quantize_kernel[(groups,)](
-        x,
-        out,
-        scales,
-        group_size,
-        1e-10,
-        bit8_min=fp8_finfo.min,
-        bit8_max=fp8_finfo.max,
-        BLOCK=block,
-        num_warps=num_warps,
-        num_stages=1,
+    args = (x, out, scales, groups, group_size, 1e-10)
+    options = {
+        "bit8_min": fp8_finfo.min,
+        "bit8_max": fp8_finfo.max,
+        "BLOCK": block,
+        "num_stages": 1,
+    }
+    # Startup compiles every tile for this call's signature, so that a later
+    # input of another size and the same signature compiles nothing while
+    # serving.
+    if not is_serving() and block < 1024:
+        tiles = (
+            (1, 8, 16)
+            if groups_per_cta is not None
+            else (1, 1024 // block, 8192 // block)
+        )
+        for tile in tiles:
+            _fp8_token_group_quantize_kernel.warmup(
+                *args,
+                **options,
+                GROUPS_PER_PROGRAM=tile,
+                USE_RECIPROCAL=groups_per_cta is not None and tile == 16,
+                num_warps=(
+                    1
+                    if groups_per_cta is not None and tile == 16
+                    else min(max(tile * block // 256, 1), 8)
+                ),
+                grid=(1,),
+            )
+    _fp8_token_group_quantize_kernel[(triton.cdiv(groups, groups_per_program),)](
+        *args,
+        **options,
+        GROUPS_PER_PROGRAM=groups_per_program,
+        USE_RECIPROCAL=groups_per_cta == 16,
+        num_warps=(
+            1
+            if groups_per_cta == 16
+            else min(max(groups_per_program * block // 256, 1), 8)
+        ),
     )
     return out, scales
 
@@ -1347,6 +1423,8 @@ def _rmsnorm_nvfp4_quant_kernel(
     sentinel_word: tl.constexpr,
     sentinel_half: tl.constexpr,
     MAILBOX: tl.constexpr,
+    MAILBOX_BLOCK_WIDTH: tl.constexpr,
+    MAILBOX_BLOCK_STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
     SF_BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -1360,14 +1438,23 @@ def _rmsnorm_nvfp4_quant_kernel(
         # Dependents may launch now; their own wait still covers this grid's completion.
         tl.extra.cuda.gdc_launch_dependents()
     if MAILBOX:
-        # One row-wide poll load keeps the plain path's variance sum order bitwise.
-        half_ptr = x_ptr.to(tl.pointer_type(tl.int16)) + row * width + offsets
+        # One row-wide poll load over the blocks keeps the plain path's variance sum order bitwise.
+        element = (
+            (offsets // MAILBOX_BLOCK_WIDTH) * MAILBOX_BLOCK_STRIDE
+            + row * MAILBOX_BLOCK_WIDTH
+            + offsets % MAILBOX_BLOCK_WIDTH
+        )
+        half_ptr = x_ptr.to(tl.pointer_type(tl.int16)) + element
         halves = tl.load(half_ptr, mask=mask, other=0, volatile=True)
         while _mailbox_row_dirty(halves, sentinel_half):
             halves = tl.load(half_ptr, mask=mask, other=0, volatile=True)
         values = halves.to(tl.bfloat16, bitcast=True).to(tl.float32)
-        word_ptr = x_ptr.to(tl.pointer_type(tl.int32)) + row * (width // 2)
-        word_ptr += tl.arange(0, BLOCK // 2)
+        words = tl.arange(0, BLOCK // 2)
+        word_ptr = x_ptr.to(tl.pointer_type(tl.int32)) + (
+            (words // (MAILBOX_BLOCK_WIDTH // 2)) * (MAILBOX_BLOCK_STRIDE // 2)
+            + row * (MAILBOX_BLOCK_WIDTH // 2)
+            + words % (MAILBOX_BLOCK_WIDTH // 2)
+        )
         tl.store(word_ptr, tl.full([BLOCK // 2], sentinel_word, tl.int32))
     else:
         values = tl.load(x_ptr + row * width + offsets, mask=mask, other=0.0).to(
@@ -1388,7 +1475,8 @@ def _rmsnorm_nvfp4_quant_kernel(
     sf_e4m3 = sf_value.to(tl.float8e4nv)
     sf_f32 = sf_e4m3.to(tl.float32)
     out_scale = _rcp_approx(sf_f32 * _rcp_approx(global_scale))
-    out_scale = tl.where(amax != 0.0, out_scale, 0.0)
+    # A block whose E4M3 scale rounds to zero encodes zero values.
+    out_scale = tl.where(sf_f32 != 0.0, out_scale, 0.0)
     scaled = tl.reshape(blocks * out_scale[:, None], [BLOCK // 2, 2])
     low, high = tl.split(scaled)
     packed = tl.inline_asm_elementwise(
@@ -1431,9 +1519,19 @@ def triton_rmsnorm_nvfp4_quant(
     enable_pdl: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Triton kernel of :func:`tokenspeed_kernel.ops.quantization.rmsnorm_nvfp4_quant`."""
-    if x.ndim != 2 or x.dtype != torch.bfloat16 or not x.is_cuda:
-        raise ValueError("x must be a BF16 GPU tensor shaped [rows, width]")
-    rows, width = x.shape
+    if x.ndim != (2 if mailbox_sentinel is None else 3):
+        raise ValueError(
+            "x must be [rows, width] rows or a [blocks, rows, block_width] mailbox"
+        )
+    if x.dtype != torch.bfloat16 or not x.is_cuda:
+        raise ValueError("x must be a BF16 GPU tensor")
+    if mailbox_sentinel is None:
+        rows, width = x.shape
+        block_width = block_stride = width
+    else:
+        blocks, rows, block_width = x.shape
+        width = blocks * block_width
+        block_stride = x.stride(0)
     if width % NVFP4_BLOCK:
         raise ValueError(f"width must be a multiple of {NVFP4_BLOCK}, got {width}")
     if weight.shape != (width,) or weight.device != x.device:
@@ -1445,9 +1543,13 @@ def triton_rmsnorm_nvfp4_quant(
             mailbox_sentinel >> 16
         ):
             raise ValueError("the mailbox sentinel is one word whose halves agree")
-        if width & (width - 1) or not x.is_contiguous():
-            raise ValueError("a mailbox needs contiguous rows of a power-of-two width")
-    values = x.contiguous()
+        if width & (width - 1) or block_width & (block_width - 1):
+            raise ValueError("a mailbox needs power-of-two row and block widths")
+        if x.stride()[1:] != (block_width, 1) or block_stride < rows * block_width:
+            raise ValueError(
+                "a mailbox must be the first rows of whole contiguous blocks"
+            )
+    values = x if mailbox_sentinel is not None else x.contiguous()
     packed = torch.empty((rows, width // 2), dtype=torch.uint8, device=x.device)
     # flashinfer's consumers may touch the round_up(rows, 16) tail; keep that storage.
     padded_rows = (rows + 15) // 16 * 16
@@ -1475,6 +1577,8 @@ def triton_rmsnorm_nvfp4_quant(
         sentinel_word=sentinel - (1 << 32) if sentinel >= 1 << 31 else sentinel,
         sentinel_half=(sentinel & 0xFFFF) - (1 << 16 if sentinel & 0x8000 else 0),
         MAILBOX=mailbox_sentinel is not None,
+        MAILBOX_BLOCK_WIDTH=block_width,
+        MAILBOX_BLOCK_STRIDE=block_stride,
         BLOCK=block,
         SF_BLOCK=NVFP4_BLOCK,
         ENABLE_PDL=use_pdl,
@@ -1630,36 +1734,73 @@ def _gated_fp8_quantize_kernel(
     tl.store(scale_ptr + row * groups + group, scale, valid_group)
 
 
-@triton.jit(do_not_specialize=["X0"])
+@triton.jit(do_not_specialize=["M", "X0", "SA"])
 def _rmsnorm_fp8_group32_ue8m0(
     X,
     W,
     N,
     Q,
     S,
+    M,
     X0,
+    SA,
     K: tl.constexpr,
     EPS: tl.constexpr,
     BLOCK: tl.constexpr,
+    LAYOUT: tl.constexpr,
+    PADDED_GROUPS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    # Padding-only programs wait too: the scale buffer may reuse memory the
+    # upstream kernel still reads.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64)
     col = tl.arange(0, BLOCK)
-    x = tl.load(X + row * X0 + col, col < K, 0).to(tl.float32)
-    w = tl.load(W + col, col < K, 0).to(tl.float32)
-    inv = tl.rsqrt(tl.sum(x * x, 0) / K + EPS)
-    normalized = (x * inv * w).to(N.dtype.element_ty)
-    tl.store(N + row * K + col, normalized, col < K)
-    values = tl.reshape(normalized.to(tl.float32), (BLOCK // 32, 32))
-    raw = tl.maximum(tl.max(tl.abs(values), 1), 1e-4) * (1.0 / 448.0)
-    bits = raw.to(tl.int32, bitcast=True)
-    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
-    quantized = tl.reshape(
-        values * (1.0 / (exponent << 23).to(tl.float32, bitcast=True))[:, None],
-        (BLOCK,),
-    ).to(tl.float8e4nv)
-    tl.store(Q + row * K + col, quantized, col < K)
     groups = tl.arange(0, BLOCK // 32)
-    tl.store(S + row * (K // 32) + groups, exponent.to(tl.uint8), groups < K // 32)
+    k_tiles: tl.constexpr = (K + 127) // 128
+    if row < M:
+        x = tl.load(X + row * X0 + col, col < K, 0).to(tl.float32)
+        w = tl.load(W + col, col < K, 0).to(tl.float32)
+        inv = tl.rsqrt(tl.sum(x * x, 0) / K + EPS)
+        normalized = (x * inv * w).to(N.dtype.element_ty)
+        tl.store(N + row * K + col, normalized, col < K)
+        values = tl.reshape(normalized.to(tl.float32), (BLOCK // 32, 32))
+        raw = tl.maximum(tl.max(tl.abs(values), 1), 1e-4) * (1.0 / 448.0)
+        bits = raw.to(tl.int32, bitcast=True)
+        exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        quantized = tl.reshape(
+            values * (1.0 / (exponent << 23).to(tl.float32, bitcast=True))[:, None],
+            (BLOCK,),
+        ).to(tl.float8e4nv)
+        tl.store(Q + row * K + col, quantized, col < K)
+        if LAYOUT == "packed":
+            # Four group bytes form one little-endian int32 word, and the words
+            # are MN-major: word w of this row sits at w * SA + row. Groups past
+            # K/32 contribute zero so a trailing word carries no stale byte.
+            words: tl.constexpr = BLOCK // 128
+            packed = tl.sum(
+                tl.reshape(tl.where(groups < K // 32, exponent, 0), (words, 4))
+                << (tl.arange(0, 4) * 8)[None, :],
+                1,
+            )
+            # SA grows with the token count; widen before multiplying it.
+            word = tl.arange(0, words).to(tl.int64)
+            tl.store(S + word * SA + row, packed, word < K // 128)
+        else:
+            if LAYOUT == "swizzled":
+                offsets = _fp8_swizzled_scale_offset(row, groups, k_tiles)
+            else:
+                offsets = row * (K // 32) + groups
+            tl.store(S + offsets, exponent.to(tl.uint8), groups < K // 32)
+    if LAYOUT == "swizzled":
+        # The grid covers every row of the last 128-row tile. Padding rows and
+        # the scale columns past K/32 read as zero; each program owns its row.
+        padded = tl.arange(0, PADDED_GROUPS)
+        padding = (padded < k_tiles * 4) & ((padded >= K // 32) | (row >= M))
+        offsets = _fp8_swizzled_scale_offset(row, padded, k_tiles)
+        tl.store(S + offsets, tl.zeros((PADDED_GROUPS,), tl.uint8), padding)
 
 
 @register_kernel(
@@ -1749,8 +1890,17 @@ def triton_rmsnorm_fp8_group32_ue8m0(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
+    *,
+    scale_layout: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return BF16 normalized rows, E4M3 codes and canonical group-32 scales."""
+    """Return BF16 normalized rows, E4M3 codes and group-32 UE8M0 scales.
+
+    The scales follow ``scale_layout``: ``"canonical"`` uint8 ``[M, K/32]``,
+    ``"swizzled"`` the 1-D F8_128x4 bytes ``mm(prepacked_scales=True)`` reads,
+    or ``"packed"`` int32 ``[M, K/128]`` words that ``fp8_projection`` reads.
+    """
+    if scale_layout not in ("canonical", "swizzled", "packed"):
+        raise ValueError(f"unsupported group-32 scale layout: {scale_layout!r}")
     if (
         x.ndim != 2
         or not x.is_cuda
@@ -1765,23 +1915,48 @@ def triton_rmsnorm_fp8_group32_ue8m0(
         or eps <= 0
     ):
         raise ValueError("Expected BF16 [M,K] input and [K] weight, K divisible by 32")
+    if scale_layout == "packed" and x.shape[1] % 128:
+        raise ValueError("Packed group-32 scales need K divisible by 128")
     m, k = x.shape
     normalized = torch.empty_like(x, memory_format=torch.contiguous_format)
     quantized = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
-    scales = torch.empty((m, k // 32), dtype=torch.uint8, device=x.device)
+    # Only the swizzled layout pads its row count; the kernel's padding-only
+    # programs zero the bytes the GEMM reads past M and past K/32.
+    rows = triton.cdiv(m, 128) * 128 if scale_layout == "swizzled" else m
+    scale_stride = 0
+    if scale_layout == "swizzled":
+        scales = torch.empty(
+            (rows * triton.cdiv(k, 128) * 4,), dtype=torch.uint8, device=x.device
+        )
+    elif scale_layout == "packed":
+        # MN-major words with the token count padded to four, so each column
+        # starts 16-byte aligned for TMA; the row stride stays one.
+        scale_stride = (m + 3) // 4 * 4
+        scales = torch.empty(
+            k // 128 * scale_stride, dtype=torch.int32, device=x.device
+        ).as_strided((m, k // 128), (1, scale_stride))
+    else:
+        scales = torch.empty((m, k // 32), dtype=torch.uint8, device=x.device)
     if m:
-        _rmsnorm_fp8_group32_ue8m0[(m,)](
+        enable_pdl = pdl_enabled()
+        _rmsnorm_fp8_group32_ue8m0[(rows,)](
             x,
             weight,
             normalized,
             quantized,
             scales,
+            m,
             x.stride(0),
+            scale_stride,
             k,
             eps,
             triton.next_power_of_2(k),
+            scale_layout,
+            triton.next_power_of_2(triton.cdiv(k, 128) * 4),
+            enable_pdl,
             num_warps=4,
             enable_fp_fusion=False,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return normalized, quantized, scales
 
@@ -1875,7 +2050,6 @@ def _fp8_swizzled_scale_offset(row, column, K_TILES: tl.constexpr):
 
 @triton.jit(
     do_not_specialize=["M", "X0"],
-    do_not_specialize_on_alignment=["M", "X0"],
 )
 def _fp8_group32_ue8m0_quantize_swizzled(
     X,
@@ -1886,7 +2060,11 @@ def _fp8_group32_ue8m0_quantize_swizzled(
     K: tl.constexpr,
     GROUPS: tl.constexpr,
     ZERO_BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     pid = tl.program_id(0).to(tl.int64)
     k_tiles = tl.cdiv(K, 128)
     if pid * GROUPS < M * (K // 32):
@@ -1946,7 +2124,8 @@ def _quantize_fp8_group32_swizzled(
         programs = max(
             triton.cdiv(m * (k // 32), groups), triton.cdiv(scale_count, zero_block)
         )
-        _fp8_group32_ue8m0_quantize_swizzled[(programs,)](
+        enable_pdl = pdl_enabled()
+        kernel_launcher(_fp8_group32_ue8m0_quantize_swizzled, (programs,))(
             x,
             quantized,
             scales,
@@ -1955,8 +2134,10 @@ def _quantize_fp8_group32_swizzled(
             k,
             groups,
             zero_block,
+            enable_pdl,
             num_warps=4,
             num_stages=1,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return quantized, scales
 
@@ -2054,3 +2235,9 @@ def quantize_fp8_group32_mn_major_scales(
             num_stages=1,
         )
     return quantized, scales.T[:m]
+
+
+register_triton_warmup(
+    _fp8_group32_ue8m0_quantize_swizzled,
+    variants=({"GROUPS": (4, 16, 32, 64)},),
+)

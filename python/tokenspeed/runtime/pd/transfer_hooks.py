@@ -30,7 +30,7 @@ scheduler with — feedback into the scheduler stays an explicit
 
 from __future__ import annotations
 
-from tokenspeed_scheduler import PD
+from tokenspeed_engine.scheduler import PD
 
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
