@@ -665,9 +665,16 @@ def _records_worker(rank, degree, rendezvous, use_pynccl):
             scaling=192**-0.5,
             logit_cap=0.0,
         )
+        # SM120's Triton dsa_prefill is the tensor-core leaf, whose bits the
+        # records core does not reproduce, so the records core never runs
+        # there (triton_dsa_prefill_dcp_records_supported).
+        platform = current_platform()
+        records_core_runs = not (
+            platform.is_nvidia and platform.arch_version.major == 12
+        )
         with context:
             # 1037 rows use the records core; 5 split keys and use packed partials.
-            for tokens, records_arm in ((1037, True), (5, False)):
+            for tokens, records_arm in ((1037, records_core_runs), (5, False)):
                 slots, lengths = _records_selection(degree, tokens, device)
                 generator = torch.Generator().manual_seed(900 + rank)
                 q = torch.randn((tokens, _RECORDS_HEADS, 576), generator=generator)
