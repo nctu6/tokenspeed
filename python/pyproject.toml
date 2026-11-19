@@ -72,9 +72,12 @@ dependencies = [
     "tokenspeed-kernel>=0.1.5.dev0",
     "tokenspeed-mooncake>=0.3.13.post20261026",
     "tokenspeed-engine>=0.1.1.dev0",
-    "tokenspeed-smg==1.16.0.post20261115",
-    "tokenspeed-smg-grpc-proto==0.4.28.post20261109",
-    "tokenspeed-smg-grpc-servicer==0.15.0.post20261110",
+    # The nctu6 fork builds smg/ (submodule) at these versions; scripts/install.sh
+    # replaces these published wheels with the source build. Do not move to the
+    # PyPI 1.16 wheels, which would override the fork.
+    "tokenspeed-smg==1.13.0.post20261019",
+    "tokenspeed-smg-grpc-proto==0.4.27.post20261019",
+    "tokenspeed-smg-grpc-servicer==0.14.0.post20261019",
     "tqdm",
     "transformers==5.12.0",
     "uv",
