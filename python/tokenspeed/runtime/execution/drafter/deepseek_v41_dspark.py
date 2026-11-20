@@ -182,38 +182,6 @@ class DeepseekV41DSpark(BaseDrafter):
         self.coupled_pools: SpeculativeSamplingPools | None = None
         self.block_verify_state: DSparkBlockVerifyState | None = None
 
-    def bind_sampling_backend(self, sampling_backend) -> None:
-        super().bind_sampling_backend(sampling_backend)
-        if COUPLED_DRAFT or BLOCK_VERIFY:
-            self.coupled_pools = sampling_backend.coupled_draft_pools()
-        if BLOCK_VERIFY:
-            if COUPLED_TEMPERATURE_SCALE != 1.0:
-                raise ValueError(
-                    "TOKENSPEED_DSPARK_BLOCK_VERIFY needs the draft sampled at the "
-                    "request temperature (COUPLED_TEMP_SCALE=1)"
-                )
-            projection = self.model.markov_projection
-            self.block_verify_state = DSparkBlockVerifyState(
-                pool=torch.zeros(
-                    (
-                        int(self.coupled_pools.seed.shape[0]),
-                        self.spec_num_tokens - 1,
-                        int(projection.num_embeddings_per_partition),
-                    ),
-                    dtype=torch.float32,
-                    device=self.device,
-                ),
-                embedding=self.model.markov_head.embedding.weight,
-                projection=projection.weight,
-                num_valid=int(projection.shard_indices.num_org_elements),
-                vocab_start=int(projection.shard_indices.org_vocab_start_index),
-                tp_size=int(self.draft_model.mapping.attn.tp_size),
-                # wire_target may run before or after this binding; whichever
-                # runs second copies the target's TP group into the state.
-                tp_group=self.tp_group,
-            )
-            sampling_backend.bind_block_verify(self.block_verify_state)
-
         self.adaptive_min_batch_size = global_server_args_dict[
             "dsv41_dspark_min_batch_size"
         ]
@@ -275,6 +243,38 @@ class DeepseekV41DSpark(BaseDrafter):
                 dtype=self.model.embed_tokens.weight.dtype,
                 device=self.device,
             )
+
+    def bind_sampling_backend(self, sampling_backend) -> None:
+        super().bind_sampling_backend(sampling_backend)
+        if COUPLED_DRAFT or BLOCK_VERIFY:
+            self.coupled_pools = sampling_backend.coupled_draft_pools()
+        if BLOCK_VERIFY:
+            if COUPLED_TEMPERATURE_SCALE != 1.0:
+                raise ValueError(
+                    "TOKENSPEED_DSPARK_BLOCK_VERIFY needs the draft sampled at the "
+                    "request temperature (COUPLED_TEMP_SCALE=1)"
+                )
+            projection = self.model.markov_projection
+            self.block_verify_state = DSparkBlockVerifyState(
+                pool=torch.zeros(
+                    (
+                        int(self.coupled_pools.seed.shape[0]),
+                        self.spec_num_tokens - 1,
+                        int(projection.num_embeddings_per_partition),
+                    ),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                embedding=self.model.markov_head.embedding.weight,
+                projection=projection.weight,
+                num_valid=int(projection.shard_indices.num_org_elements),
+                vocab_start=int(projection.shard_indices.org_vocab_start_index),
+                tp_size=int(self.draft_model.mapping.attn.tp_size),
+                # wire_target may run before or after this binding; whichever
+                # runs second copies the target's TP group into the state.
+                tp_group=self.tp_group,
+            )
+            sampling_backend.bind_block_verify(self.block_verify_state)
 
     def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
         return [] if self.confidence_scores is None else [self.confidence_scores[slot]]

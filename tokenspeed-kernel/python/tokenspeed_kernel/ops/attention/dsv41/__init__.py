@@ -614,60 +614,6 @@ def selected_attention_rope(
     )
 
 
-def prefill_indices(
-    swa_indices: torch.Tensor,
-    logical_rows: torch.Tensor,
-    global_slots: torch.Tensor,
-    history_base: torch.Tensor,
-    rows: torch.Tensor | None,
-    out: torch.Tensor | None,
-) -> torch.Tensor:
-    """Join SWA and selected global rows into compact prefill workspace indices.
-
-    The prefill workspace holds every query's SWA rows and a dequantized copy
-    of each request's global history; this builds the ``prefill_indices`` that
-    ``selected_attention`` reads it with, in one launch for a whole batch.
-
-    Args:
-        swa_indices: Int32 [T, W] workspace rows of each query's SWA keys, -1
-            for absent keys; W is a power of two (128 for V4.1).
-        logical_rows: Integer [T, K] request-local global row ids per query.
-        global_slots: Integer [T, K] physical slots of those rows; a negative
-            slot (non-causal, unselected or unmapped) drops the entry.
-        history_base: Integer [T] workspace row holding global row 0 of the
-            query's request, or -1 to drop all of the query's global entries.
-        rows: Optional contiguous integer [N] query rows to emit, in order;
-            None emits all T rows.
-        out: Contiguous-column int32 [N, W + K] destination, or None to allocate.
-
-    Returns:
-        Int32 [N, W + K]: the SWA indices, then ``history_base + logical_rows``
-        where the row id and slot are valid and -1 elsewhere.
-    """
-    if not swa_indices.is_cuda:
-        if rows is not None:
-            swa_indices, logical_rows, global_slots, history_base = (
-                t[rows] for t in (swa_indices, logical_rows, global_slots, history_base)
-            )
-        valid = (logical_rows >= 0) & (global_slots >= 0) & (history_base[:, None] >= 0)
-        joined = torch.cat(
-            (
-                swa_indices.to(torch.int32),
-                torch.where(valid, logical_rows + history_base[:, None], -1).to(
-                    torch.int32
-                ),
-            ),
-            dim=1,
-        )
-        if out is None:
-            return joined
-        out.copy_(joined)
-        return out
-    return _kernel("prefill_indices", swa_indices)(
-        swa_indices, logical_rows, global_slots, history_base, rows, out
-    )
-
-
 def index_score(
     index_q: torch.Tensor,
     weights: torch.Tensor,
