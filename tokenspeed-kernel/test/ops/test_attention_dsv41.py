@@ -1074,9 +1074,7 @@ def test_compressor_pool_token_count_and_capacity_do_not_recompile(device, rows)
         content, scores = projection[:, :512], projection[:, 512:]
         previous = torch.arange(count, device=device) - 1
         # The last row of the last page, so the in-page row offset is exercised.
-        slots = torch.full(
-            (count,), pages * rows - 1, device=device, dtype=torch.int32
-        )
+        slots = torch.full((count,), pages * rows - 1, device=device, dtype=torch.int32)
         active = torch.arange(count, device=device) % 2 == 1
         active[0] = True
         pooled = dsv41.compressor_pool(

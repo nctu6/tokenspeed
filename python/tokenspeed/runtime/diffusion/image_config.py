@@ -89,5 +89,7 @@ def parse_image_size(size: str, multiple: int) -> tuple[int, int]:
     if width <= 0 or height <= 0:
         raise ValueError(f"size={size!r} must be positive")
     if width % multiple or height % multiple:
-        raise ValueError(f"size={size!r}: width and height must be multiples of {multiple}")
+        raise ValueError(
+            f"size={size!r}: width and height must be multiples of {multiple}"
+        )
     return width, height

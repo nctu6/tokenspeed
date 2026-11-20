@@ -114,7 +114,9 @@ class H3ImagePipeline:
             self.config.dtype.lower(), self.config.dtype.lower()
         )
         if name not in table:
-            raise ValueError(f"dtype={self.config.dtype!r} must be one of {sorted(table)}")
+            raise ValueError(
+                f"dtype={self.config.dtype!r} must be one of {sorted(table)}"
+            )
         return table[name]
 
     def _load(self) -> None:
