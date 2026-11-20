@@ -264,8 +264,7 @@ def test_draft_loads_all_its_experts_under_a_target_expert_subset(monkeypatch):
     # serves the target with its first N experts; the draft's router keeps
     # every one of its own dspark_n_routed_experts rows.
     config = _draft_config()
-    config.n_routed_experts = config.dspark_n_routed_experts // 2
-    config.num_checkpoint_experts = config.dspark_n_routed_experts * 3
+    config.num_checkpoint_experts = config.n_routed_experts * 3
     _loader_model(monkeypatch, config, 0, "cpu")
     model = DeepseekV41ForCausalLMDSpark(
         SimpleNamespace(text_config=config), _mapping(0, 4, 4), _quant()
