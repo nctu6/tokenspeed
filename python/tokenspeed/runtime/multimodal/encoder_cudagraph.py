@@ -76,41 +76,6 @@ def pad_cu_seqlens(
     target = metadata_sequence_budget + 1 + ceil(budget_rows / PADDING_SEQUENCE_ROWS)
     return torch.cat([cu, cu[-1:].expand(target - cu.shape[0])])
 
-# Longest sequence the padding rows of a budget graph run as, which bounds their attention cost.
-PADDING_SEQUENCE_ROWS = 256
-
-
-def pad_cu_seqlens(
-    cu_seqlens: torch.Tensor,
-    real_rows: int,
-    budget_rows: int,
-    metadata_sequence_budget: int,
-    modality_name: str,
-) -> torch.Tensor:
-    """Extend a batch's offsets over the rows it leaves in its budget graph.
-
-    The result always holds ``metadata_sequence_budget + 1 +
-    ceil(budget_rows / PADDING_SEQUENCE_ROWS)`` offsets, the graph's fixed shape.
-    """
-    if cu_seqlens.shape[0] > metadata_sequence_budget + 1:
-        raise RuntimeError(
-            f"{modality_name} encoder cudagraph needs {cu_seqlens.shape[0] - 1} "
-            f"metadata sequences, but the configured limit is "
-            f"{metadata_sequence_budget}"
-        )
-    # Attention never writes rows outside every sequence yet reads them past a sequence's end, so padding rows run as sequences too.
-    padding = list(range(real_rows, budget_rows, PADDING_SEQUENCE_ROWS))[1:]
-    if real_rows < budget_rows:
-        padding.append(budget_rows)
-    cu = torch.cat(
-        [
-            cu_seqlens,
-            torch.tensor(padding, dtype=cu_seqlens.dtype, device=cu_seqlens.device),
-        ]
-    )
-    target = metadata_sequence_budget + 1 + ceil(budget_rows / PADDING_SEQUENCE_ROWS)
-    return torch.cat([cu, cu[-1:].expand(target - cu.shape[0])])
-
 
 @dataclass
 class BudgetGraphMetadata:

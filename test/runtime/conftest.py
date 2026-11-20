@@ -1,7 +1,10 @@
-"""Shared helpers for Kimi-K3 cache-group runtime tests."""
+"""Shared runtime-test hooks and helpers for Kimi-K3 cache-group tests."""
 
 from __future__ import annotations
 
+import os
+import signal
+import threading
 from types import SimpleNamespace
 
 import numpy as np

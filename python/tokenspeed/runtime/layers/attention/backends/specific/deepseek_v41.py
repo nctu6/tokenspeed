@@ -333,19 +333,6 @@ class V41IndexGeometry:
     kernel_metadata: object | None
 
 
-@dataclass
-class V41IndexGeometry:
-    # positions, request_indices and source_table are never read back: they
-    # pin the tensors whose id()s key the per-invocation geometry cache, so a
-    # freed tensor's id cannot be reused for a false hit while the entry lives.
-    positions: torch.Tensor
-    request_indices: torch.Tensor
-    source_table: torch.Tensor
-    table: torch.Tensor
-    lengths: torch.Tensor
-    kernel_metadata: object | None
-
-
 class DeepseekV41AttentionBackend(AttentionBackend):
     # Decode uses fixed-capacity rows and refresh-time history validation. The
     # CED decoder runs on a per-request tail of the prefill rows, so the model
