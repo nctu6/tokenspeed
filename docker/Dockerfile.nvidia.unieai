@@ -134,7 +134,7 @@ RUN python3 -m pip install cmake ninja && \
         --no-build-isolation --no-deps --force-reinstall && \
     python3 -m pip install tokenspeed-scheduler/ --no-deps --force-reinstall && \
     python3 -m pip install "torchao>=0.10.0" && \
-    python3 -m pip install "diffusers>=0.40.0" av imageio-ffmpeg soundfile
+    python3 -m pip install "diffusers>=0.43.0" av imageio-ffmpeg soundfile
 
 # DeepGEMM from the DeepGEMM/ submodule, after the engine/kernel installs that
 # re-pull the pinned tokenspeed-deepgemm wheel. That wheel owns the same

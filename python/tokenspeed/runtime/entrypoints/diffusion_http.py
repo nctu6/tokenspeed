@@ -20,7 +20,8 @@
 Sibling of :mod:`asr_http` and :mod:`music3_http`. The smg gateway speaks a
 text-in/text-out proto, so a DiT video model cannot be reached through it.
 ``serve()`` also dispatches MiniMax-Music3 to :mod:`music3_http`
-(``/v1/audio/speech``) when the checkpoint family is ``music3``.
+(``/v1/audio/speech``) when the checkpoint family is ``music3``, and
+MiniMax-H3-Image to :mod:`image_http` (``/v1/images/*``) for ``h3image``.
 
 Flags intentionally mirror familiar vLLM / vLLM-Omni names where the meaning
 matches (``--tensor-parallel-size``, ``--served-model-name``, ``--host``,
@@ -439,6 +440,11 @@ def serve(argv: list[str], *, host: str | None = None, port: int | None = None) 
             from tokenspeed.runtime.entrypoints.music3_http import serve as music3_serve
 
             music3_serve(argv, host=host, port=port)
+            return
+        if family == "h3image":
+            from tokenspeed.runtime.entrypoints.image_http import serve as image_serve
+
+            image_serve(argv, host=host, port=port)
             return
 
     args = parse_diffusion_argv(argv)

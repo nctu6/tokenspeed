@@ -35,7 +35,7 @@ __all__ = [
     "resolve_modular_root",
 ]
 
-DIFFUSION_FAMILIES = ("h3", "music3")
+DIFFUSION_FAMILIES = ("h3", "h3image", "music3")
 
 _INDEX_NAMES = ("modular_model_index.json", "model_index.json")
 
@@ -78,7 +78,7 @@ def is_modular_checkpoint(model_path: str) -> bool:
 
 
 def detect_diffusion_family(model_path: str) -> str:
-    """Return ``h3`` or ``music3`` for a modular checkpoint.
+    """Return ``h3``, ``h3image`` or ``music3`` for a diffusion checkpoint.
 
     Fail closed on unknown ModularPipeline families so we do not mis-route a
     future video/audio model onto the H3 ``/v1/videos`` surface.
@@ -92,6 +92,10 @@ def detect_diffusion_family(model_path: str) -> str:
         lower = blob.lower()
         if "music3" in lower or "minimaxmusic3" in lower.replace(" ", ""):
             return "music3"
+        # MiniMax-H3-Image (``MiniMaxH3ImagePipeline``) shares the "h3" prefix with
+        # the video model but serves /v1/images, so test it first.
+        if "h3image" in lower.replace(" ", "").replace("_", ""):
+            return "h3image"
         if "h3" in lower or "minimaxh3" in lower.replace(" ", ""):
             return "h3"
 
@@ -108,8 +112,8 @@ def detect_diffusion_family(model_path: str) -> str:
         return "h3"
 
     raise ValueError(
-        f"unsupported diffusion checkpoint at {path}: expected MiniMax-H3 or "
-        "MiniMax-Music3 (modular_model_index.json / model_index.json)"
+        f"unsupported diffusion checkpoint at {path}: expected MiniMax-H3, "
+        "MiniMax-H3-Image or MiniMax-Music3 (modular_model_index.json / model_index.json)"
     )
 
 

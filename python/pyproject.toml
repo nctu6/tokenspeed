@@ -101,7 +101,7 @@ instanttensor = ["instanttensor>=0.1.9,<0.2"]
 # extra for lean pip-only installs; ./scripts/install.sh installs these by
 # DEFAULT (same as other implemented-model deps; additive, no kernel upgrade).
 diffusion = [
-    "diffusers>=0.40.0",
+    "diffusers>=0.43.0",
     "av",
     "imageio-ffmpeg",
     "soundfile",

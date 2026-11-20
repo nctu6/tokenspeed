@@ -132,7 +132,7 @@ REINSTALL_DEEPGEMM="${REINSTALL_DEEPGEMM:-0}"
 REINSTALL_FA2="${REINSTALL_FA2:-0}"
 BUILD_FA2="${BUILD_FA2:-0}"
 # REINSTALL_DIFFUSION force-reinstalls MiniMax-H3 / Music3 diffusion deps
-# (diffusers>=0.40, PyAV, imageio-ffmpeg, soundfile). They install by DEFAULT
+# (diffusers>=0.43, PyAV, imageio-ffmpeg, soundfile). They install by DEFAULT
 # so install.sh covers every implemented model path (additive; no kernel/CUDA).
 REINSTALL_DIFFUSION="${REINSTALL_DIFFUSION:-0}"
 for arg in "$@"; do
@@ -973,7 +973,7 @@ if [[ "$FRESH" == "1" ]]; then
     # for an implemented model path. Pure Python / wheels; no kernel rebuild.
     # Also pulled via python[diffusion] above; reaffirm here for clarity.
     log "Installing diffusion deps (H3/Music3: diffusers, av, imageio-ffmpeg, soundfile)"
-    "$PY" -m pip install "diffusers>=0.40.0" av imageio-ffmpeg soundfile
+    "$PY" -m pip install "diffusers>=0.43.0" av imageio-ffmpeg soundfile
     # NOTE: vllm_flash_attn (FA2) is intentionally NOT built here. It is an
     # optional prefill speedup and its package can shadow the kernel's FA4
     # namespace, so it is opt-in via --with-fa2 (handled by the FA2 block below).
@@ -1026,11 +1026,11 @@ fi
 # plain ./scripts/install.sh covers every implemented model (incl. /v1/videos).
 # Idempotent: skip when already importable unless --force-diffusion.
 if [[ "$REINSTALL_DIFFUSION" == "1" ]] || ! have_module diffusers || ! have_module av || ! have_module soundfile; then
-    log "Installing diffusion deps for MiniMax-H3/Music3 (diffusers>=0.40, av, imageio-ffmpeg, soundfile)"
+    log "Installing diffusion deps for MiniMax-H3/Music3 (diffusers>=0.43, av, imageio-ffmpeg, soundfile)"
     if [[ "$REINSTALL_DIFFUSION" == "1" ]]; then
-        "$PY" -m pip install --upgrade --force-reinstall "diffusers>=0.40.0" av imageio-ffmpeg soundfile
+        "$PY" -m pip install --upgrade --force-reinstall "diffusers>=0.43.0" av imageio-ffmpeg soundfile
     else
-        "$PY" -m pip install "diffusers>=0.40.0" av imageio-ffmpeg soundfile
+        "$PY" -m pip install "diffusers>=0.43.0" av imageio-ffmpeg soundfile
     fi
     if ! "$PY" -c "import diffusers; import av; import soundfile" >/dev/null 2>&1; then
         err "diffusion deps installed but import failed; H3/Music3 serve will refuse to start"
