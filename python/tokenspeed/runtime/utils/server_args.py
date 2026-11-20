@@ -517,6 +517,45 @@ class ServerArgs:
     # requests are decoding, so requests arriving close together prefill in one
     # step. 0 is off. Consumed by runtime/engine/request_handler.py.
     prefill_coalesce_ms: float = 0.0
+    # Decode rounds owed to the running decodes after each prefill round; 0 is
+    # off (docs/design/scheduler.md §3.3).
+    prefill_decode_interval: int = 0
+    # The same, owed even while an overdue prompt suspends the interval.
+    prefill_decode_min_interval: int = 0
+    enable_short_prefill_first: bool = False
+    # The fused engine's prefill-delay gate (docs/design/prefill-delay.md):
+    # prefill work is held for a window of decode rounds and then batched, so
+    # a scattered prompt does not interrupt every rank's decode. Unset keeps
+    # the engine planning prefill every round.
+    # Rounds between ALL attempt points: every rank that would decode also
+    # has prefill work, so the group's prefills land in the same rounds.
+    prefill_attempt_interval: int | None = None
+    # Rounds between ANY attempt points: one rank's backlog opens the gate,
+    # bounding how long a prefill waits. Must be >= prefill_attempt_interval.
+    prefill_any_attempt_interval: int | None = None
+    # One prefill round per window: the round after a prefill round is not
+    # an ALL point while any rank decodes, so a backlog does not drain in
+    # consecutive prefill rounds. Requires prefill_attempt_interval.
+    prefill_single_round: bool = False
+    # Opt-in: the prefill forward that spans a long prompt's last prefix-page
+    # boundary before its replay tail (normally the final token) also writes
+    # the recurrent state there, where hybrid models publish a checkpoint;
+    # no chunk is cut for it. The prompt end that checkpoint covers and a
+    # fused finish past the prompt end then publish no state and no KV tail:
+    # a next turn that re-renders the end of the prompt and its reply cannot
+    # resume there. A finish also demotes the in-forward checkpoint its
+    # conversation published two turns back, which both cache tiers then evict
+    # early. On a prefill server a prompt too short for the in-forward
+    # checkpoint whose end lies inside a page publishes no state and no KV tail
+    # there either (docs/design/scheduler.md section 1.2).
+    enable_state_checkpoint_in_forward: bool = False
+    # Hybrid models: a State checkpoint a later request's checkpoint extends
+    # ranks, under cache pressure, as if last used this many new requests ago. None
+    # is the scheduler's default, 16 times the per-rank batch size.
+    checkpoint_retention_requests: int | None = None
+    # Checkpoints within this many later requests of the newest on their
+    # branch rank as it does. None is the scheduler's default, 0.
+    checkpoint_retention_leaf_distance: int | None = None
     # JSON on the CLI, normalized once to generic runtime options.
     kv_offload_config: str | dict | None = None
     # special kv cache
