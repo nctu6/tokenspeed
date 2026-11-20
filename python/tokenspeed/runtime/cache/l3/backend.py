@@ -108,7 +108,10 @@ def storage_object_key(
     TokenSpeed's Host pool is one compact byte buffer (flat KV). One Mooncake
     object stores the packed bytes of a single CacheBlock, keyed by the
     scheduler content hash plus the group/offset/rank that uniquely identify
-    the shard. Attention TP ranks each own a different physical KV slice.
+    the shard. Attention TP ranks each own a different physical KV slice,
+    unless the cache layout declares the bytes identical on every rank
+    (``CacheRecipe.kv_identical_across_attn_tp``): then every rank passes
+    rank 0 and the group shares one object per page.
     The trailing ``|c0`` is the retired context-parallel shard id, kept
     literal so objects written before its removal stay addressable; drop it
     with the next deliberate key-format bump.

@@ -1104,11 +1104,7 @@ def test_executor_prepares_eager_prefill_metadata_before_any_layer(
     executor._active_multimodal_context = None
     executor.runtime_states = SimpleNamespace(has_request_token_history=False)
     executor.input_buffers = SimpleNamespace(
-        input_ids_buf=torch.arange(7),
-        # Encoder-decoder models (Whisper) address cross-KV by pool slot, so
-        # every forward receives the request pool indices.
-        req_pool_indices_buf=torch.arange(2),
-        ngram_model_kwargs=lambda _: {},
+        input_ids_buf=torch.arange(7), ngram_model_kwargs=lambda _: {}
     )
 
     def prepare(capacity, bs, forward_mode, *, capture):

@@ -199,6 +199,14 @@ class Glm53FlashTextConfig(PretrainedConfig):
         if gate_lower_bound is not None:
             linear_lower_bound = gate_lower_bound
 
+        if layer_types is not None:
+            # Newer GLM-5-Next configs (transformers 5.23 ``glm5_next``) name
+            # the DSA layers ``indexed_attention``; that label is outside
+            # transformers' allowed layer types and fails config validation.
+            layer_types = [
+                "deepseek_sparse_attention" if t == "indexed_attention" else t
+                for t in layer_types
+            ]
         if layer_types is None and linear_attn_config is not None:
             kda_layers = set(linear_attn_config.get("kda_layers", ()))
             full_attn_layers = set(linear_attn_config.get("full_attn_layers", ()))

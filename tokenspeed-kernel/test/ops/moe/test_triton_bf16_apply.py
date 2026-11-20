@@ -88,7 +88,7 @@ def test_bf16_route_combine_rounds_before_accumulate_and_scale(graph_replay):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-@pytest.mark.parametrize("activation", ["silu", "situ"])
+@pytest.mark.parametrize("activation", ["silu", "situ", "gelu_tanh"])
 @pytest.mark.parametrize("num_tokens", [4, 48, 80])
 @pytest.mark.parametrize("intermediate", [32, 128])
 @pytest.mark.parametrize("precision_policy", ["default", "bf16_route_accum_fp32"])
@@ -99,7 +99,7 @@ def test_triton_bf16_moe_matches_torch(
     expert's 24 routes over two 16-row tiles and 80 (40 per expert) take 64-row
     tiles, while a 32-wide intermediate keeps the shallow token-count rule.
     On SM90 the three counts take the 16-, 32- and 64-row tiles."""
-    if activation == "situ" and precision_policy != "default":
+    if activation != "silu" and precision_policy != "default":
         pytest.skip("The opt-in precision policy supports SiLU only")
     generator = torch.Generator(device="cuda").manual_seed(0)
     x = torch.randn(
@@ -183,6 +183,10 @@ def test_triton_bf16_moe_matches_torch(
             gate = 4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)
             up = 25.0 * torch.tanh(up / 25.0)
             intermediate = (gate * up).to(torch.bfloat16)
+        elif activation == "gelu_tanh":
+            gate = gate.to(torch.bfloat16).float()
+            up = up.to(torch.bfloat16).float()
+            intermediate = (F.gelu(gate, approximate="tanh") * up).to(torch.bfloat16)
         else:
             intermediate = (F.silu(gate) * up).to(torch.bfloat16)
         expert_output = F.linear(intermediate.float(), w2[expert_id].float()).to(

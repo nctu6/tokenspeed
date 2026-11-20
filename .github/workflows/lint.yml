@@ -2,8 +2,6 @@ name: Lint
 
 on:
   pull_request:
-  push:
-    branches: [main]
 
 permissions:
   contents: read
@@ -17,35 +15,23 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Detect scheduler C++ changes
         id: scheduler_cpp_changes
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PUSH_BEFORE: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           changed_files="$RUNNER_TEMP/tokenspeed-lint-changed-files.txt"
           scheduler_cpp_files='^tokenspeed-scheduler/.*\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$'
           scheduler_cpp_config='^tokenspeed-scheduler/(\.clang-(format|tidy)|(.*/)?CMakeLists\.txt|.*\.cmake)$'
 
-          list_changed_files() {
-            if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-              git fetch --no-tags --depth=1 origin "$PUSH_BEFORE" &&
-                git diff --name-only --no-renames "$PUSH_BEFORE" "$GITHUB_SHA"
-            else
-              gh api \
-                "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-                --paginate \
-                -q '.[] | .filename, (.previous_filename // empty)'
-            fi
-          }
-
-          if ! list_changed_files > "$changed_files" || [[ ! -s "$changed_files" ]]; then
-            echo "::warning::Unable to classify changed files; running scheduler C++ lint"
-            changed=true
-          elif grep -Eq \
+          git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" > "$changed_files"
+          if grep -Eq \
             -e "$scheduler_cpp_files" \
             -e "$scheduler_cpp_config" \
             "$changed_files"; then
@@ -54,7 +40,7 @@ jobs:
             changed=false
           fi
 
-          # CI validates merged code; branch protection is a local commit guard.
+          # PR lint checks only files changed by this pull request.
           if [[ "$changed" == "true" ]]; then
             pre_commit_skip=no-commit-to-branch
           else
@@ -78,13 +64,26 @@ jobs:
       - name: Linting
         env:
           SKIP: ${{ steps.scheduler_cpp_changes.outputs.pre_commit_skip }}
-        run: pre-commit run --all-files
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: pre-commit run --from-ref "$BASE_SHA" --to-ref "$HEAD_SHA"
 
-      - name: Lint runtime Python with ruff
+      - name: Lint changed runtime Python with ruff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
+          mapfile -t runtime_files < <(
+            git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" -- python/tokenspeed/runtime \
+              | grep -E '\.py$' || true
+          )
+          if ((${#runtime_files[@]} == 0)); then
+            echo "No changed runtime Python files."
+            exit 0
+          fi
           python -m ruff check \
             --select F401,F841,F821,F823,F811,F541,TID251,UP035,UP006,UP007,UP045 \
-            python/tokenspeed/runtime
+            "${runtime_files[@]}"
 
       - name: Check release orchestration
         run: |
@@ -109,25 +108,33 @@ jobs:
             -DTOKENSPEED_SCHEDULER_BUILD_PYTHON=ON \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
-      - name: Lint scheduler Python and file starts
+      - name: Lint changed scheduler Python and file starts
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          python -m ruff check tokenspeed-scheduler
-          python - <<'PY'
-          import subprocess
+          mapfile -t scheduler_py_files < <(
+            git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" -- tokenspeed-scheduler \
+              | grep -E '\.py$' || true
+          )
+          if ((${#scheduler_py_files[@]} == 0)); then
+            echo "No changed scheduler Python files."
+            exit 0
+          fi
+          python -m ruff check "${scheduler_py_files[@]}"
+          python - "${scheduler_py_files[@]}" <<'PY'
+          import sys
           from pathlib import Path
 
-          suffixes = {".py", ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
-          files = subprocess.check_output(["git", "ls-files", "tokenspeed-scheduler"], text=True).splitlines()
           blank_starts = []
           relative_imports = []
-          for name in files:
+          for name in sys.argv[1:]:
               path = Path(name)
-              if path.suffix in suffixes and path.read_bytes().startswith((b"\n", b"\r\n")):
+              if path.read_bytes().startswith((b"\n", b"\r\n")):
                   blank_starts.append(name)
-              if path.suffix == ".py":
-                  for line_no, line in enumerate(path.read_text().splitlines(), 1):
-                      if line.startswith(("from .", "import .")):
-                          relative_imports.append(f"{name}:{line_no}: {line}")
+              for line_no, line in enumerate(path.read_text().splitlines(), 1):
+                  if line.startswith(("from .", "import .")):
+                      relative_imports.append(f"{name}:{line_no}: {line}")
 
           errors = []
           if blank_starts:
@@ -138,23 +145,37 @@ jobs:
               raise SystemExit("\n\n".join(errors))
           PY
 
-      - name: Lint scheduler C++
+      - name: Lint changed scheduler C++
         if: steps.scheduler_cpp_changes.outputs.changed == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          cpp_files="$(git ls-files tokenspeed-scheduler | grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$')"
+          mapfile -t cpp_files < <(
+            git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" -- tokenspeed-scheduler \
+              | grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$' || true
+          )
+          if ((${#cpp_files[@]} == 0)); then
+            echo "No changed scheduler C++ files."
+            exit 0
+          fi
           jobs="$(nproc)"
-          tidy_files="$(printf '%s\n' "$cpp_files" | grep -E '\.(c|cc|cpp|cxx)$' || true)"
-          format_count="$(printf '%s\n' "$cpp_files" | sed '/^$/d' | wc -l)"
-          tidy_count="$(printf '%s\n' "$tidy_files" | sed '/^$/d' | wc -l)"
+          format_count="${#cpp_files[@]}"
+          tidy_count=0
+          for file in "${cpp_files[@]}"; do
+            if [[ "$file" =~ \.(c|cc|cpp|cxx)$ ]]; then
+              tidy_count=$((tidy_count + 1))
+            fi
+          done
 
           echo "Running clang-format on ${format_count} files with ${jobs} workers"
-          printf '%s\n' "$cpp_files" | xargs -r -n 16 -P "$jobs" sh -c '
+          printf '%s\n' "${cpp_files[@]}" | xargs -r -n 16 -P "$jobs" sh -c '
             echo "clang-format: $*"
             clang-format --dry-run --Werror "$@"
           ' sh
 
           echo "Running clang-tidy on ${tidy_count} translation units with ${jobs} workers"
-          printf '%s\n' "$tidy_files" | xargs -r -n 1 -P "$jobs" sh -c '
+          printf '%s\n' "${cpp_files[@]}" | grep -E '\.(c|cc|cpp|cxx)$' | xargs -r -n 1 -P "$jobs" sh -c '
             echo "clang-tidy: $1"
             clang-tidy -p tokenspeed-scheduler/build "$1"
           ' sh

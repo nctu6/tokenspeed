@@ -159,3 +159,31 @@ os._exit(0)
                 print(f"Child {entrypoint} {stream}:\n{output}", file=sys.stderr)
         raise
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_dsv41_selection_memo_follows_registry_and_overrides():
+    import dataclasses
+
+    import torch
+    from tokenspeed_kernel.ops.attention import dsv41
+    from tokenspeed_kernel.registry import KernelRegistry
+    from tokenspeed_kernel.selection import kernel_override
+
+    cache = torch.empty(1, 584, dtype=torch.uint8)
+    first = dsv41._kernel("cache_gather", cache)
+    assert dsv41._kernel("cache_gather", cache) is first
+    registry = KernelRegistry.get()
+    spec = registry.get_by_name(first.name)
+    plugin = dataclasses.replace(
+        spec, name="test_plugin_dsv41_cache_gather", priority=spec.priority + 1
+    )
+    # A later registration (a plugin loading) must win over the memo.
+    registry.register(plugin, lambda *args: None)
+    try:
+        assert dsv41._kernel("cache_gather", cache).name == plugin.name
+        with kernel_override("attention", "dsv41_cache_gather", first.name):
+            assert dsv41._kernel("cache_gather", cache).name == first.name
+        assert dsv41._kernel("cache_gather", cache).name == plugin.name
+    finally:
+        registry._unregister(plugin.name)
+    assert dsv41._kernel("cache_gather", cache).name == first.name

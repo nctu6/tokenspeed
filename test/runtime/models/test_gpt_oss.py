@@ -237,10 +237,6 @@ class TestGptOss:
         self._run_quality_checks(MESH_CASES["combine_dense_moe"])
 
     def test_eagle3(self):
-        draft = MESH_CASES["eagle3"].extra_args[3]
-        reason = launch_skip_reason(draft, min_gpus=WORLD_SIZE)
-        if reason is not None:
-            self.skipTest(reason)
         self._run_quality_checks(MESH_CASES["eagle3"])
 
 

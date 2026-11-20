@@ -889,6 +889,15 @@ else:
 
 
 if platform.is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.block32 import (
+        launch_triton_mm_mxfp8_block32_gfx950 as _mm_mxfp8_block32_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.block32 import (
+        supports_triton_mm_mxfp8_block32_gfx950 as _supports_mxfp8_block32_problem,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.block32 import (
+        triton_mm_mxfp8_block32_num_counters_gfx950 as _mm_mxfp8_block32_counters,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (
         gluon_mm_mxfp8_decode_num_counters_gfx950 as _mm_mxfp8_decode_counters,
     )
@@ -1084,6 +1093,61 @@ if platform.is_amd:
             out=out,
         )
 
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="triton_mm_mxfp8_block32_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=_MXFP8_SIGNATURES,
+        # Above both kernels it replaces, only for the tuned (N, K, M) ranges
+        # where it measured faster (see block32.BLOCK32_CONFIGS).
+        priority=Priority.SPECIALIZED + 2,
+        traits={
+            "mnk_problem_filter": frozenset({_supports_mxfp8_block32_problem}),
+            "a_inner_stride_one": frozenset({True}),
+            "a_scales_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({True}),
+            "b_scales_inner_stride_one": frozenset({True}),
+            "block_scale_layout": frozenset({"canonical"}),
+            "out_dtype": frozenset({torch.bfloat16, torch.float16}),
+            "out_inner_stride_one": frozenset({True}),
+        },
+    )
+    def triton_mm_mxfp8_block32_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None,
+        block_size: list[int] | None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Dispatch tuned decode/medium-M MXFP8 GEMMs to the scaled-MFMA kernel."""
+        if A_scales is None or B_scales is None:
+            raise ValueError("gfx950 MXFP8 block32 GEMM requires both scale tensors")
+        if block_size is None:
+            raise ValueError("gfx950 MXFP8 block32 GEMM requires block_size")
+        counters = zeroed_state(
+            _mm_mxfp8_block32_counters(A.shape[0], B.shape[0], A.shape[1]),
+            dtype=torch.int32,
+            device=A.device,
+        )
+        return _mm_mxfp8_block32_impl(
+            A,
+            B,
+            A_scales,
+            B_scales,
+            out_dtype,
+            alpha=alpha,
+            block_size=block_size,
+            counters=counters,
+            out=out,
+            config=None,
+        )
+
 else:
 
     def gluon_mm_mxfp8_gfx950(**kwargs):
@@ -1096,6 +1160,11 @@ else:
 
     def gluon_mm_mxfp8_decode_gfx950(**kwargs):
         raise ImportError("gluon_mm_mxfp8_decode_gfx950 requires tokenspeed-kernel-amd")
+
+    def triton_mm_mxfp8_block32_gfx950(**kwargs):
+        raise ImportError(
+            "triton_mm_mxfp8_block32_gfx950 requires tokenspeed-kernel-amd"
+        )
 
 
 # ===-----------------------------------------------------------------------===#
@@ -1846,6 +1915,7 @@ __all__ = [
     "gluon_mm_mxfp8_gfx950",
     "gluon_mm_fp8_blockscale_gfx950",
     "gluon_mm_mxfp8_decode_gfx950",
+    "triton_mm_mxfp8_block32_gfx950",
     "gluon_mm_fp8_blockscale_gfx1250",
     "gluon_mm_fp8_blockscale_largem_gfx1250",
     "gluon_mm_mxfp8_ue8m0_gfx1250",

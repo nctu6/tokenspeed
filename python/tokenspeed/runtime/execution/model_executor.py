@@ -73,6 +73,13 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
+from tokenspeed.runtime.execution.gpu_step_timer import ENABLED as GPU_STEP_TIMING
+from tokenspeed.runtime.execution.gpu_step_timer import (
+    WINDOW_S as GPU_STEP_TIMING_WINDOW_S,
+)
+from tokenspeed.runtime.execution.gpu_step_timer import (
+    GpuStepTimer,
+)
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.model_runner import ModelRunner
@@ -868,6 +875,10 @@ class ModelExecutor:
         # themselves.
         self.default_stream = self.device_module.default_stream(self.device)
         self.execution_stream = self.device_module.Stream()
+        # Profiler-free GPU forward timing (TOKENSPEED_GPU_STEP_TIMING=1).
+        self.gpu_step_timer: GpuStepTimer | None = (
+            GpuStepTimer(GPU_STEP_TIMING_WINDOW_S) if GPU_STEP_TIMING else None
+        )
         # Throttles the mm_timing line inside execute_forward_op; the
         # per-round batch lines have their own counter on the control plane.
         self.log_step = 0
@@ -1281,7 +1292,10 @@ class ModelExecutor:
                     if warm_on_serving_stream
                     else contextlib.nullcontext()
                 ),
-                torch.no_grad(),
+                # Same grad mode as the serving forward: communication staging
+                # buffers created here are inference tensors, which only accept
+                # in-place writes inside inference mode.
+                maybe_inference_mode(),
                 kernel_warmup(enabled=True),
                 autotune(tune_mode=tune_mode, tuning_buckets=None, round_up=None),
             ):
@@ -2637,6 +2651,12 @@ class ModelExecutor:
             # cross-stream wait -- their writers ran on execution_stream too.
             self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
+            step_timer_start = (
+                self.gpu_step_timer.start() if self.gpu_step_timer else None
+            )
+            step_timer_launch = None
+            step_timer_host_start = 0.0
+            step_timer_host_ms = 0.0
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
@@ -2901,6 +2921,9 @@ class ModelExecutor:
                             else bs
                         )
                         forward_step_start = time.perf_counter()
+                    if self.gpu_step_timer is not None:
+                        step_timer_launch = self.gpu_step_timer.start()
+                        step_timer_host_start = time.perf_counter()
                     step_result = self.forward_step(
                         bs=bs,
                         ctx=ctx,
@@ -2934,6 +2957,10 @@ class ModelExecutor:
                     if timing_enabled:
                         forward_step_ms = (
                             time.perf_counter() - forward_step_start
+                        ) * 1000.0
+                    if self.gpu_step_timer is not None:
+                        step_timer_host_ms = (
+                            time.perf_counter() - step_timer_host_start
                         ) * 1000.0
 
                 # Embedding (pooling) serving: the forward produced one vector
@@ -3034,6 +3061,13 @@ class ModelExecutor:
 
                 copy_event = self.device_module.Event()
                 copy_event.record()
+                if step_timer_launch is not None:
+                    self.gpu_step_timer.finish(
+                        "decode" if num_extends == 0 else "extend",
+                        step_timer_start,
+                        step_timer_launch,
+                        step_timer_host_ms,
+                    )
                 if timing_enabled:
                     output_d2h_ms = (time.perf_counter() - output_d2h_start) * 1000.0
 

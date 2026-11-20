@@ -34,6 +34,7 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel_amd._device import num_cus
 from tokenspeed_kernel_amd._extern import extern_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
@@ -1708,7 +1709,7 @@ def _extend(
             # fit, so it counts twice toward filling the machine.
             base_ctas=grid_num_q_blocks * n_kv_heads * (2 if warp_pipeline else 1),
             num_pages=num_pages,
-            sm_count=_GFX950_SM_COUNT,
+            sm_count=num_cus(),
         )
 
     # Bound on q-blocks with query rows: the dense count plus one partial

@@ -64,7 +64,17 @@ class HostCacheStorage:
         layout: CacheTransferLayout,
         *,
         num_host_lcm_blocks: int,
+        host_buffer=None,
     ):
+        """
+        Args:
+            layout: The executor's transfer layout.
+            num_host_lcm_blocks: LCM blocks the buffer holds, null excluded.
+            host_buffer: A registered uint8 CPU tensor of exactly the
+                buffer's size to index instead of allocating one (the
+                attention-TP group's shared segment, ``l2/shared.py``);
+                None pins a private buffer.
+        """
         if num_host_lcm_blocks <= 0:
             raise ValueError("num_host_lcm_blocks must be > 0")
         self.layout = layout
@@ -75,6 +85,14 @@ class HostCacheStorage:
         ) = _compute_host_layout(layout)
         self.num_host_lcm_blocks = int(num_host_lcm_blocks)
         self.host_buffer_bytes = self.num_host_lcm_blocks * self.host_lcm_block_bytes
+        if host_buffer is not None:
+            if host_buffer.numel() != self.host_buffer_bytes:
+                raise ValueError(
+                    f"shared Host buffer holds {host_buffer.numel()} bytes, the "
+                    f"layout needs {self.host_buffer_bytes}"
+                )
+            self.host_buffer = host_buffer
+            return
         import torch
 
         self.host_buffer = torch.empty(

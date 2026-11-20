@@ -1,0 +1,57 @@
+name: Benchmark plan
+description: Define the goal, implementation breakdown, benchmark, and server settings
+labels: ['Performance']
+
+body:
+- type: textarea
+  id: goal
+  attributes:
+    label: Goal
+    description: Describe the objective, expected outcome, and scope of this work.
+  validations:
+    required: true
+- type: textarea
+  id: pr-breakdown
+  attributes:
+    label: PR Breakdown
+    description: List the planned PRs, their responsibilities, dependencies, and acceptance criteria.
+    placeholder: |
+      - PR 1:
+      - PR 2:
+      - Dependencies:
+      - Acceptance criteria:
+  validations:
+    required: true
+- type: textarea
+  id: benchmark
+  attributes:
+    label: Benchmark
+    description: Describe the workload, baseline, metrics, and benchmark commands or results.
+    placeholder: |
+      Model:
+      Dataset:
+      Input / output lengths:
+      Concurrency:
+      Baseline:
+      Metrics:
+      Command:
+  validations:
+    required: true
+- type: textarea
+  id: server-settings
+  attributes:
+    label: Server Settings
+    description: Provide the server launch command and relevant hardware, runtime, and serving configuration.
+    placeholder: |
+      Server command:
+      ```bash
+
+      ```
+
+      GPUs:
+      CUDA / ROCm:
+      Driver:
+      Container or commit:
+      Serving options:
+  validations:
+    required: true

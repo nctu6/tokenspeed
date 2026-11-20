@@ -84,6 +84,7 @@ __all__ = [
     "selected_attention_fp8",
     "prepare_fused_decode_weights",
     "selected_attention_rope",
+    "prefill_indices",
     "new_attention_schedule",
     "index_score",
     "index_topk",
@@ -308,7 +309,7 @@ def compressor_pool(
 
     content/scores are FP32 current projections; previous[T] names each pair's
     predecessor input row, or -1 to read tail[tail_slots[T]]. tail is the LCM
-    FP32 [pages,2,2,512] field. active[T] masks incomplete/padded pairs to zero.
+    FP32 [pages,rows,2,512] field. active[T] masks incomplete/padded pairs to zero.
     All arguments share a device; out is contiguous FP32 [T,512], or None to
     allocate. With norm_weight[512], preserve the BF16 pooled boundary and
     return BF16 RMS-normalized rows using norm_eps; None returns raw FP32.
@@ -329,7 +330,7 @@ def compressor_tail_scatter(
     """Store FP32 projected compressor inputs without compacting live rows.
 
     ``content`` and ``scores`` are FP32 [T, 512]; ``tail`` is a strided FP32
-    [pages, 2, 2, 512] field (page, token, content/score, channel). ``slots[T]``
+    [pages, rows, 2, 512] field (page, token, content/score, channel). ``slots[T]``
     are int32/int64 field-relative token slots. Negative/out-of-capacity slots
     skip writes; valid slots must be unique. Page zero is not special to this
     op: the caller maps null pages to -1. All input strides are honored.
@@ -1183,7 +1184,7 @@ def rope_pad_query(
     cos_sin_cache: torch.Tensor,
     solution: str | None,
 ) -> torch.Tensor:
-    """Rotate compact queries while fully writing the FlashMLA 64/128-head input.
+    """Rotate compact queries while fully writing the padded decode-attention input.
 
     Args:
         values: BF16/FP16 [tokens,real_heads,512], 1..128 heads, strided rows/heads.
@@ -1192,7 +1193,9 @@ def rope_pad_query(
         solution: Optional registered implementation restriction.
 
     Returns:
-        Fresh contiguous [tokens,64 or128,512] queries. Every padded head is zero;
+        Fresh contiguous [tokens,padded_heads,512] queries: 64 or 128 heads for
+        FlashMLA on NVIDIA, the next multiple of 16 on ROCm (the gfx950
+        selected-attention head block). Every padded head is zero;
         input storage is unchanged. This is forward/graph-owned scratch, never
         persistent KV or a request-indexed state buffer.
     """
@@ -1727,13 +1730,15 @@ def compressor_metadata(
     previous,
     read_slots,
     write_slots,
+    rows,
 ):
     """Fill ratio-2 pair coordinates and LCM tail addresses in O(N).
 
     positions/requests are integer [N] in request-major order, with consecutive
     positions within each request. Whole request spans may be reordered; arbitrary
     token permutations are unsupported. The metadata producer owns this layout.
-    table is the LCM tail page table; pages bounds physical residency.
+    table is the LCM tail page table of ``rows``-row pages; pages bounds
+    physical residency.
 
     Destinations are contiguous [N]: bool active and integer pair_positions,
     pair_requests, previous, read_slots, write_slots. previous indexes the input
@@ -1757,10 +1762,10 @@ def compressor_metadata(
             torch.arange(max(positions.numel() - 1, 0)).masked_fill(~in_batch, -1)
         )
         read_slots.copy_(
-            bounded_group_slots(pair_positions, pair_requests, table, 2, 1, 1, pages)
+            bounded_group_slots(pair_positions, pair_requests, table, rows, 1, 1, pages)
         )
         write_slots.copy_(
-            bounded_group_slots(positions, requests, table, 2, 1, 1, pages)
+            bounded_group_slots(positions, requests, table, rows, 1, 1, pages)
         )
         return
     _kernel("compressor_metadata", positions)(
@@ -1774,6 +1779,7 @@ def compressor_metadata(
         previous,
         read_slots,
         write_slots,
+        rows,
     )
 
 

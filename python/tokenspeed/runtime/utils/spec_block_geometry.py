@@ -186,6 +186,17 @@ def resolve_block_widths(algorithm: str, block_size: int) -> tuple[int, int]:
         ValueError: The block size leaves no room for a drafted token.
     """
     num_steps = int(block_size) - _STEP_OFFSET[algorithm]
+    # DSpark drafts its whole trained block in one pass, so verifying only the
+    # first k drafts changes nothing upstream of the verify: per-position
+    # acceptance falls off fast (~0.7, 0.4, 0.22, 0.12, 0.07), and the trailing
+    # verify rows cost all-reduce, attention and MoE work at large batches.
+    verify = os.environ.get("TOKENSPEED_DSPARK_VERIFY_DRAFTS")
+    if algorithm == "DSPARK" and verify:
+        if not 1 <= int(verify) <= num_steps:
+            raise ValueError(
+                f"TOKENSPEED_DSPARK_VERIFY_DRAFTS must be in 1..{num_steps}"
+            )
+        num_steps = int(verify)
     if num_steps < 1:
         raise ValueError(
             f"{algorithm} checkpoint block_size={int(block_size)} implies "

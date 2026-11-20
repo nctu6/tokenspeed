@@ -552,6 +552,14 @@ class AutoBackend(CommBackend):
             return None
         return self._iris.all_reduce_mhc_post(tensor, residual, post, comb, group)
 
+    def overlap_all_reduce_lanes(
+        self, group: Group, dtype: torch.dtype, count: int, max_programs: int
+    ) -> tuple | None:
+        """Iris lanes on node-local AMD groups (see CommBackend)."""
+        if not current_platform().is_amd or self._group_spans_nodes(group):
+            return None
+        return self._iris.overlap_all_reduce_lanes(group, dtype, count, max_programs)
+
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         return self._trtllm_ar.ensure_group_lane(group, hidden_dim)
 

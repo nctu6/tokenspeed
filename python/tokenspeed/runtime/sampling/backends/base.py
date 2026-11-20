@@ -515,6 +515,23 @@ class SamplingBackend(ABC):
             "flashinfer_full or sonic sampling backend (triton for DFLASH)"
         )
 
+    def coupled_draft_pools(self) -> SpeculativeSamplingPools:
+        """The per-request seed and temperature a block drafter shares noise with.
+
+        A backend whose verify samples the target with the pool-indexed
+        Gumbel-max streams (keyed by seed and absolute position) can have the
+        drafter draw its proposals from the same noise, so a proposal equals
+        the target's own sample wherever the two distributions agree and the
+        output stays the target's exact sample.
+
+        Raises:
+            NotImplementedError: This backend does not sample with those streams.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} has no pool-indexed Gumbel stream; coupled "
+            "drafting needs --sampling-backend triton or triton_full"
+        )
+
     def maybe_broadcast(self, *tensors: torch.Tensor) -> None:
         """Broadcast each tensor from tp_group[0] so all attention-TP ranks
         agree. No-op when sync is off or tp_size <= 1. Graph-safe."""

@@ -584,6 +584,13 @@ class TritonSamplingBackend(SamplingBackend):
             return _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P
         return _SAMPLE_ROUTE_GUMBEL_GENERIC
 
+    def coupled_draft_pools(self) -> SpeculativeSamplingPools:
+        return SpeculativeSamplingPools(
+            temperature=self._temperature_pool,
+            top_k=self._top_k_pool,
+            seed=self._seed_pool,
+        )
+
     def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:
         self._temperature_pool[pool_idx].fill_(float(sp.temperature))
         self._top_k_pool[pool_idx].fill_(int(sp.top_k))

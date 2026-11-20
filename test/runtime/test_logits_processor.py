@@ -491,10 +491,6 @@ def test_tp_logits_custom_collectives_serve_host_spread_group_with_fabric(monkey
         return "ag-state"
 
     monkeypatch.setattr(logits_processor_module, "create_state", _create_state)
-    # The multicast probe reads the host's fabric; this test is about sizing.
-    monkeypatch.setattr(
-        type(processor), "_tp_group_multicast_reachable", lambda self: True
-    )
     monkeypatch.setattr(
         logits_processor_module.pg_manager,
         "get_process_group",

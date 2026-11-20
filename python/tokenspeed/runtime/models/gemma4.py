@@ -85,8 +85,13 @@ from tokenspeed.runtime.layers.layernorm import RMSNorm, RMSNormNoWeight
 from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
+from tokenspeed.runtime.layers.moe import MoELayer, build_moe_checkpoint_loader
+from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
+from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
+from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.paged_attention import (
     PagedAttention,
     hf_sliding_window_to_window_left,
@@ -168,30 +173,19 @@ def _reject_unsupported_features(text_config) -> None:
         ValueError: If MoE / the double-wide MLP / per-layer input embeddings /
             KV-sharing is enabled on the config.
     """
-    # MoE / second MLP block. The reference enables the block when EITHER flag
-    # is truthy; ``num_experts`` / ``top_k_experts`` carry the expert count.
-    # Any of them being set means the checkpoint expects a routed expert
-    # contribution this dense port never computes.
-    enable_moe_block = getattr(text_config, "enable_moe_block", False)
-    use_second_mlp_block = getattr(text_config, "use_second_mlp_block", False)
-    num_experts = getattr(text_config, "num_experts", None) or 0
-    top_k_experts = getattr(text_config, "top_k_experts", None) or 0
-    if (
-        enable_moe_block
-        or use_second_mlp_block
-        or int(num_experts) > 0
-        or int(top_k_experts) > 0
-    ):
-        raise ValueError(
-            "Gemma 4 text port does not support MoE (enable_moe_block / "
-            "use_second_mlp_block / num_experts / top_k_experts); this build "
-            "serves the dense gemma-4-31B-it checkpoint only."
-        )
+    # MoE: ``enable_moe_block`` adds a routed-expert branch next to the dense
+    # MLP (gemma-4-26B-A4B), served by :class:`Gemma4MoE`. The legacy
+    # ``use_second_mlp_block`` flag has no implementation here.
+    if getattr(text_config, "use_second_mlp_block", False):
+        raise ValueError("Gemma 4 text port does not support use_second_mlp_block.")
 
     # Double-wide MLP: in the reference this only widens the KV-shared layers'
-    # intermediate size, but KV-sharing is itself unsupported here, so guard
-    # the flag whenever it is set rather than silently build a narrow MLP.
-    if getattr(text_config, "use_double_wide_mlp", False):
+    # intermediate size, so it is a no-op without KV-shared layers. KV-sharing
+    # is itself unsupported here; reject the flag only when it would widen one.
+    if (
+        getattr(text_config, "use_double_wide_mlp", False)
+        and (getattr(text_config, "num_kv_shared_layers", 0) or 0) > 0
+    ):
         raise ValueError(
             "Gemma 4 text port does not support the double-wide MLP "
             "(use_double_wide_mlp); this build serves the dense "
@@ -813,6 +807,99 @@ class Gemma4MLP(nn.Module):
         return x
 
 
+class Gemma4Router(nn.Module):
+    """Gemma 4 expert router (HF ``Gemma4TextRouter``).
+
+    ``proj(rmsnorm_noscale(x) * scale * hidden**-0.5)`` -> softmax -> top-k,
+    the top-k probabilities renormalized to sum to one and then multiplied
+    by ``per_expert_scale`` of the chosen experts. Replicated on every rank;
+    it runs in fp32 on the (small) ``[tokens, num_experts]`` logits.
+    """
+
+    def __init__(self, hidden_size: int, num_experts: int, top_k: int, eps: float):
+        super().__init__()
+        self.top_k = top_k
+        self.eps = eps
+        self.scalar_root_size = hidden_size**-0.5
+        self.proj = ReplicatedLinear(hidden_size, num_experts, bias=False)
+        self.scale = nn.Parameter(torch.ones(hidden_size), requires_grad=False)
+        self.per_expert_scale = nn.Parameter(
+            torch.ones(num_experts), requires_grad=False
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h = x.float()
+        h = h * torch.pow(h.pow(2).mean(-1, keepdim=True) + self.eps, -0.5)
+        h = (h * self.scale.float() * self.scalar_root_size).to(x.dtype)
+        logits, _ = self.proj(h)
+        probs = torch.softmax(logits.float(), dim=-1)
+        topk_weights, topk_ids = torch.topk(probs, k=self.top_k, dim=-1)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights * self.per_expert_scale.float()[topk_ids]
+        return topk_weights, topk_ids.to(torch.int32)
+
+
+class Gemma4MoE(nn.Module):
+    """Routed-expert branch of a Gemma 4 MoE layer (gemma-4-26B-A4B).
+
+    ``post_ffw_norm_2(experts(pre_ffw_norm_2(x)))`` with the router reading
+    the same pre-norm input ``x`` (the FFN residual). Experts are GeGLU
+    (``gelu_pytorch_tanh``), stored in the checkpoint as fused 3D
+    ``experts.gate_up_proj`` ``[E, 2I, H]`` / ``experts.down_proj``
+    ``[E, H, I]`` tensors.
+    """
+
+    def __init__(
+        self, text_config, mapping: Mapping, layer_id: int, quant_config, prefix: str
+    ):
+        super().__init__()
+        if mapping.attn.dp_size != 1:
+            raise ValueError("Gemma 4 MoE does not support attention DP")
+        self.mapping = mapping
+        hidden = int(text_config.hidden_size)
+        eps = float(text_config.rms_norm_eps)
+        num_experts = int(text_config.num_experts)
+        top_k = int(text_config.top_k_experts)
+        self.router = Gemma4Router(hidden, num_experts, top_k, eps)
+        self.experts = MoELayer(
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden,
+            intermediate_size=int(text_config.moe_intermediate_size),
+            quant_config=quant_config,
+            layer_index=layer_id,
+            prefix=prefix,
+            tp_rank=mapping.moe.tp_rank,
+            tp_size=mapping.moe.tp_size,
+            ep_rank=mapping.moe.ep_rank,
+            ep_size=mapping.moe.ep_size,
+            activation="gelu_tanh",
+            routing_config={
+                "routing_method_type": RoutingMethodType.RenormalizeNaive,
+                "normalize_topk_weights": True,
+            },
+        )
+        self.pre_feedforward_layernorm_2 = RMSNorm(hidden, eps=eps)
+        self.post_feedforward_layernorm_2 = RMSNorm(hidden, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[0] == 0:
+            return x
+        topk_weights, topk_ids = self.router(x)
+        out = self.experts(
+            hidden_states=self.pre_feedforward_layernorm_2(x),
+            topk_output=StandardTopKOutput(topk_weights, topk_ids, None),
+            num_global_tokens=x.shape[0],
+            max_num_tokens_per_gpu=x.shape[0],
+        )
+        # Each rank holds a partial sum (its intermediate shard or its experts).
+        if self.mapping.moe.tp_size > 1:
+            out = all_reduce(out, self.mapping.moe.tp_group)
+        if self.mapping.moe.ep_size > 1:
+            out = all_reduce(out, self.mapping.moe.ep_group)
+        return self.post_feedforward_layernorm_2(out)
+
+
 class Gemma4DecoderLayer(nn.Module):
     """Gemma 4 decoder layer: sandwich norms with EXPLICIT residual adds.
 
@@ -889,6 +976,19 @@ class Gemma4DecoderLayer(nn.Module):
         # (filled by the weight-load task) and applied to the layer output.
         # Initialised to ones so an unloaded layer is the identity scaling.
         self.register_buffer("layer_scalar", torch.ones(1))
+        # gemma-4-26B-A4B: routed experts next to the dense MLP. Their
+        # checkpoint names sit directly under the layer (``layers.{i}.router``,
+        # ``layers.{i}.experts``, ``..._layernorm_2``); load_weights maps them
+        # onto ``moe.*``.
+        self.moe: Gemma4MoE | None = None
+        self.post_feedforward_layernorm_1: RMSNorm | None = None
+        if getattr(text_config, "enable_moe_block", False):
+            self.moe = Gemma4MoE(
+                text_config, mapping, layer_id, quant_config, add_prefix("moe", prefix)
+            )
+            self.post_feedforward_layernorm_1 = RMSNorm(
+                int(text_config.hidden_size), eps=eps
+            )
 
     def forward(
         self,
@@ -972,6 +1072,12 @@ class Gemma4DecoderLayer(nn.Module):
         # down_proj is built reduce_results=False, so the shard sums are partial.
         if self.mapping.dense.tp_size > 1:
             hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
+        if self.moe is not None:
+            # HF: post_ffw_norm_1(mlp) + post_ffw_norm_2(experts), the router
+            # and experts reading the FFN residual (pre-norm input).
+            hidden_states = self.post_feedforward_layernorm_1(hidden_states) + self.moe(
+                residual
+            )
         if fused:
             output, normed = rmsnorm_residual_rmsnorm(
                 hidden_states,
@@ -1509,6 +1615,28 @@ class Gemma4ForConditionalGeneration(BaseCausalLM):
         layer_index_re = re.compile(r"\blayers\.(\d+)\.")
         loaded: set[str] = set()
         skipped: list[str] = []
+        # gemma-4-26B-A4B routed experts: fused 3D gate_up_proj / down_proj.
+        text_config = _text_config(self.config)
+        moe_loader = (
+            build_moe_checkpoint_loader(
+                params_dict=params_dict,
+                fused_schema=ExpertCheckpointSchema(
+                    gate_up_fused_name="gate_up_proj",
+                    down_proj_name="down_proj",
+                ),
+                num_experts=int(text_config.num_experts),
+                ep_rank=self.mapping.moe.ep_rank,
+                ep_size=self.mapping.moe.ep_size,
+            )
+            if getattr(text_config, "enable_moe_block", False)
+            else None
+        )
+        moe_renames = (
+            (".router.", ".moe.router."),
+            (".experts.", ".moe.experts."),
+            (".pre_feedforward_layernorm_2.", ".moe.pre_feedforward_layernorm_2."),
+            (".post_feedforward_layernorm_2.", ".moe.post_feedforward_layernorm_2."),
+        )
         for name, loaded_weight in weights:
             # Skip rotary buffers; optionally skip vision when text-only.
             # Audio remains skipped (not implemented). multi_modal_projector
@@ -1556,6 +1684,14 @@ class Gemma4ForConditionalGeneration(BaseCausalLM):
             # Tied lm_head is not stored separately (tie_word_embeddings=true).
             if "lm_head" in name:
                 continue
+            if moe_loader is not None and name.startswith("model.layers."):
+                for old_part, new_part in moe_renames:
+                    if old_part in name:
+                        name = name.replace(old_part, new_part)
+                        break
+                if moe_loader.matches(name):
+                    loaded.add(moe_loader.load(name, loaded_weight))
+                    continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -1645,9 +1781,14 @@ class Gemma4ForConditionalGeneration(BaseCausalLM):
         #   lists it once under ``model.embed_tokens.weight`` -- there is NO
         #   separate ``lm_head.weight`` entry in ``params_dict`` (verified on
         #   the real geometry), so the tie needs no special exclusion.
-        expected = set(params_dict) | {
-            name for name in buffers_dict if name.endswith("layer_scalar")
-        }
+        expected = {
+            name
+            for name in params_dict
+            # MoELayer keeps derived / backend-private params next to the
+            # checkpoint-loaded w13 / w2 expert weights.
+            if ".moe.experts." not in name
+            or name.endswith((".w13_weight", ".w2_weight"))
+        } | {name for name in buffers_dict if name.endswith("layer_scalar")}
         # HF vision towers may register non-checkpoint buffers; do not require
         # them. When multimodal is inactive, vision params are absent from
         # params_dict already. Soften skipped: allow leftover vision/audio

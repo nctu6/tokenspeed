@@ -139,6 +139,16 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
                 hidden.mean(dim=1) if capture_input else None,
             )
 
+        # An extend runs the candidate source split around its row selection.
+        def narrowing_head(self, hidden, pre_mix, ctx):
+            events.append(("layer", self.layer_id))
+            rows = v41._row_plan(self.layer_id, 20, ctx)
+            assert rows.keep_rows is None and rows.source is rows.query
+            return [pre_mix]
+
+        def narrowed_forward(self, hidden, head, positions, image_mask, ctx):
+            return embeddings[:, None, :] + streams + 10 * self.layer_id, head[0]
+
     target = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
     nn.Module.__init__(target)
     target.model = DeepseekV41Model.__new__(DeepseekV41Model)
@@ -154,6 +164,7 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
     target.model.mapping = _mapping(0, 1, 1)
     target.model.ced_decoder_start = 20
     target.model.decoder_uses_engram = True
+    target.model.mapping = SimpleNamespace(attn=SimpleNamespace(has_dp=False))
     target.model.layers = nn.ModuleList(Layer(i) for i in range(40))
     target.model.norm = SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-6)
     target.set_dspark_layers_to_capture([37, 38, 39])
@@ -246,6 +257,22 @@ def _draft_checkpoint(model):
         (1, h + config.dspark_markov_rank), dtype=torch.bfloat16
     )
     return weights
+
+
+def test_draft_loads_all_its_experts_under_a_target_expert_subset(monkeypatch):
+    # --hf-overrides '{"n_routed_experts": N, "num_checkpoint_experts": M}'
+    # serves the target with its first N experts; the draft's router keeps
+    # every one of its own dspark_n_routed_experts rows.
+    config = _draft_config()
+    config.num_checkpoint_experts = config.n_routed_experts * 3
+    _loader_model(monkeypatch, config, 0, "cpu")
+    model = DeepseekV41ForCausalLMDSpark(
+        SimpleNamespace(text_config=config), _mapping(0, 4, 4), _quant()
+    )
+    assert model.model.config.num_checkpoint_experts is None
+    assert model.model.config.n_routed_experts == config.dspark_n_routed_experts
+    model.load_weights(_draft_checkpoint(model.model).items())
+    assert model.checkpoint_load_report["loaded"] > 0
 
 
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])

@@ -694,3 +694,23 @@ def test_batch_invariant_all_reduce_refuses_order_dependent_non_sum(
             GROUP,
             op=torch.distributed.ReduceOp.PRODUCT,
         )
+
+
+@pytest.mark.parametrize(
+    ("fabric", "producer_direct_bytes", "staged_bytes"),
+    [
+        ("xgmi", 1024 * 1024, 512 * 1024),
+        # PCIe-only hosts route whole chunked-prefill reductions through Iris.
+        ("pcie", 256 * 1024 * 1024, 256 * 1024 * 1024),
+    ],
+)
+def test_iris_caps_follow_the_gpu_fabric(
+    monkeypatch, fabric, producer_direct_bytes, staged_bytes
+):
+    monkeypatch.setattr(
+        iris_module, "current_platform", lambda: SimpleNamespace(is_amd=True)
+    )
+    monkeypatch.setenv("TOKENSPEED_AMD_GPU_FABRIC", fabric)
+    backend = IrisBackend(Mock())
+    assert backend.producer_direct_max_bytes == producer_direct_bytes
+    assert backend._max_numel == staged_bytes // torch.bfloat16.itemsize

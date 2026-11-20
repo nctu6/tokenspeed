@@ -21,12 +21,14 @@
 """Iris collectives with persistent, per-group symmetric states."""
 
 import math
+import os
 from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.distributed.amd_fabric import local_gpus_pcie_only
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -45,6 +47,51 @@ if TYPE_CHECKING:
 
 _DEFAULT_PRODUCER_DIRECT_MAX_BYTES = 1024 * 1024
 _DEFAULT_ALL_REDUCE_MAX_BYTES = 512 * 1024
+# On PCIe-only hosts Iris also beats RCCL on prefill activations (see
+# amd_fabric), so both paths cover a whole chunked-prefill all-reduce:
+# 16384 tokens x 7168 hidden in BF16 is 235 MB.
+_PCIE_ALL_REDUCE_MAX_BYTES = 256 * 1024 * 1024
+# Overlap lanes reserved when TOKENSPEED_PREFILL_TBO=1: one per micro-batch.
+_OVERLAP_LANE_COUNT = 2
+
+
+def _overlap_lane_numel(producer_direct_max_numel: int) -> int:
+    """A lane carries one micro-batch: half the group's producer capacity."""
+    return producer_direct_max_numel // 2
+
+
+class IrisOverlapLane:
+    """One micro-batch's producer-direct all-reduce, for comm/compute overlap.
+
+    The producer writes its partial into ``acquire``'s view; ``reduce`` then
+    sums it over the group into ``out`` on the current stream. The pull kernel
+    is capped at ``max_programs`` workgroups: on PCIe-only MI350P, 16-32
+    programs move as many bytes as 84 while leaving the CUs to the compute
+    stream. Reusing a lane's buffer is safe once its previous ``reduce`` has
+    completed locally: the two-shot reduction finishes only after every peer
+    has read this rank's partition.
+    """
+
+    def __init__(self, state: "IrisAllReduce", max_programs: int):
+        self.state = state
+        self.max_programs = max_programs
+
+    def acquire(self, shape: tuple[int, ...]) -> torch.Tensor:
+        return self.state.acquire_outputs((shape,))[0]
+
+    def can_reduce(self, shape: tuple[int, ...]) -> bool:
+        return self.state.producer_pull.can_run((shape,))
+
+    def reduce(self, out: torch.Tensor) -> None:
+        import tokenspeed_kernel.ops.communication._iris.all_reduce as pull_impl
+
+        # The pull kernels read their program cap at launch.
+        saved = pull_impl._PULL_MAX_PROGRAMS
+        pull_impl._PULL_MAX_PROGRAMS = min(saved, self.max_programs)
+        try:
+            self.state.producer_pull.run(out)
+        finally:
+            pull_impl._PULL_MAX_PROGRAMS = saved
 
 
 class IrisBackend(CommBackend):
@@ -53,8 +100,23 @@ class IrisBackend(CommBackend):
     def __init__(
         self,
         fallback: CommBackend,
-        producer_direct_max_bytes: int = _DEFAULT_PRODUCER_DIRECT_MAX_BYTES,
+        producer_direct_max_bytes: int | None = None,
     ):
+        """Args:
+        fallback: Backend for collectives Iris does not serve.
+        producer_direct_max_bytes: Producer-direct all-reduce capacity, or
+            None for the host default (larger on PCIe-only AMD hosts).
+        """
+        pcie_only = current_platform().is_amd and local_gpus_pcie_only()
+        all_reduce_max_bytes = (
+            _PCIE_ALL_REDUCE_MAX_BYTES if pcie_only else _DEFAULT_ALL_REDUCE_MAX_BYTES
+        )
+        if producer_direct_max_bytes is None:
+            producer_direct_max_bytes = (
+                _PCIE_ALL_REDUCE_MAX_BYTES
+                if pcie_only
+                else _DEFAULT_PRODUCER_DIRECT_MAX_BYTES
+            )
         self._fallback = fallback
         self._instances: dict[tuple[Group, torch.dtype], IrisAllReduce] = {}
         self._gathers: dict[tuple[Group, torch.dtype], IrisAllGather] = {}
@@ -63,9 +125,19 @@ class IrisBackend(CommBackend):
         self._pull_exchanges: dict[Group, IrisPullExchange] = {}
         self._producer_direct_max_bytes = producer_direct_max_bytes
         self._max_numel = (
-            min(producer_direct_max_bytes, _DEFAULT_ALL_REDUCE_MAX_BYTES)
+            min(producer_direct_max_bytes, all_reduce_max_bytes)
             // torch.bfloat16.itemsize
         )
+        # Overlap lanes (prefill two-micro-batch overlap) share the Iris heap,
+        # which is sized when the first state is created: reserve them then.
+        self._overlap_lane_reserve = (
+            _OVERLAP_LANE_COUNT
+            if os.environ.get("TOKENSPEED_PREFILL_TBO", "0") == "1"
+            else 0
+        )
+        self._overlap_lanes: dict[
+            tuple[Group, torch.dtype], tuple[IrisOverlapLane, ...] | None
+        ] = {}
 
     @property
     def producer_direct_max_bytes(self) -> int:
@@ -179,19 +251,77 @@ class IrisBackend(CommBackend):
         staged_max_numel: int,
         producer_direct_max_numel: int,
     ) -> "IrisAllReduce":
-        from tokenspeed_kernel.ops.communication.iris import create_iris_state
+        from tokenspeed_kernel.ops.communication._iris import (
+            HEAP_HEADROOM_BYTES,
+            MIN_HEAP_BYTES,
+        )
+        from tokenspeed_kernel.ops.communication.iris import (
+            IrisAllReduce,
+            create_iris_state,
+        )
 
+        heap_size = None
+        if self._overlap_lane_reserve:
+            lane_bytes = IrisAllReduce.heap_bytes(
+                0, _overlap_lane_numel(producer_direct_max_numel), len(group), dtype
+            )
+            heap_size = max(
+                MIN_HEAP_BYTES,
+                IrisAllReduce.heap_bytes(
+                    staged_max_numel, producer_direct_max_numel, len(group), dtype
+                )
+                + self._overlap_lane_reserve * lane_bytes
+                + HEAP_HEADROOM_BYTES,
+            )
         state = create_iris_state(
             group=pg_manager.get_process_group("nccl", group),
             rank_in_group=group.index(dist.get_rank()),
             staged_max_numel=staged_max_numel,
             producer_direct_max_numel=producer_direct_max_numel,
             dtype=dtype,
-            heap_size=None,
+            heap_size=heap_size,
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
         )
         self.install(group, state)
         return state
+
+    def overlap_all_reduce_lanes(
+        self, group: Group, dtype: torch.dtype, count: int, max_programs: int
+    ) -> "tuple[IrisOverlapLane, ...] | None":
+        """Lanes reserved in the shared heap (see CommBackend); None if absent."""
+        key = (group, dtype)
+        if key in self._overlap_lanes:
+            lanes = self._overlap_lanes[key]
+            return None if lanes is None or len(lanes) < count else lanes[:count]
+        if (
+            len(group) <= 1
+            or not current_platform().is_cdna4
+            or dtype != torch.bfloat16
+            or count > self._overlap_lane_reserve
+        ):
+            return None
+        from tokenspeed_kernel.ops.communication.iris import create_iris_state
+
+        main = self._get_or_create(group, dtype)
+        lanes = tuple(
+            IrisOverlapLane(
+                create_iris_state(
+                    group=pg_manager.get_process_group("nccl", group),
+                    rank_in_group=group.index(dist.get_rank()),
+                    staged_max_numel=0,
+                    producer_direct_max_numel=_overlap_lane_numel(
+                        main.producer_direct_max_numel
+                    ),
+                    dtype=dtype,
+                    heap_size=None,
+                    device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+                ),
+                max_programs,
+            )
+            for _ in range(self._overlap_lane_reserve)
+        )
+        self._overlap_lanes[key] = lanes
+        return lanes[:count]
 
     def _get_or_create(self, group: Group, dtype: torch.dtype) -> "IrisAllReduce":
         state = self.state(group, dtype)

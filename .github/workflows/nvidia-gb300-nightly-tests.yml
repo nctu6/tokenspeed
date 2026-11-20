@@ -56,12 +56,9 @@ jobs:
         if: steps.gate.outputs.allowed == 'true' && steps.gate.outputs.enabled == 'true'
         id: matrix
         run: |
-          matrix=$(python3 test/ci_system/pipeline.py scan \
-            --root test/ci \
-            --trigger nightly \
-            --runner-group nvidia-arm \
-            --workflow-stage model-test \
-            --multi-node only)
+          # Model validation is temporarily disabled. Re-enable only after
+          # Qwen3.8-27B and Qwen3.6-35B-A3B CI tasks are available.
+          matrix='{"include":[]}'
           matrix=$(printf '%s' "$matrix" | python3 -c \
             "import json, sys; data=json.load(sys.stdin); data['include']=[item for item in data.get('include', []) if item['runner'].startswith('slurm-gb300-')]; print(json.dumps(data, separators=(',', ':')))")
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"

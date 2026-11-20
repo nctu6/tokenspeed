@@ -31,7 +31,10 @@ row's selected tiles, so each selected row is loaded and dequantized once per
 are exactly zero, so their output is the V row sum scaled per head by the
 sink, computed once for all such groups. Small batches split the selected
 tiles over workgroups and merge the partial softmax states in a reduce kernel.
-See the "DeepSeek V4.1 selected attention" section of ``ops/README.md``.
+Batches with at least one workgroup per CU (speculative decode) take
+``gluon_dsv41_selected_attention_rows_gfx950`` instead, whose waves split the
+head dims. See the "DeepSeek V4.1 selected attention" section of
+``ops/README.md``.
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel_amd._device import num_cus, num_xcds
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
 __all__ = ["launch_gluon_dsv41_selected_attention_gfx950"]
@@ -51,13 +55,17 @@ _BLOCK_H = 16
 _TILE_K = 64
 # The main kernel keeps one workgroup per CU (VGPR-bound occupancy), so rows
 # are split over workgroups only while the grid still fits the 256 CUs once.
-_TARGET_CTAS = 256
+_TARGET_CTAS = num_cus()
 _MAX_SPLITS = 16
 # The reduce splits head dims over workgroups too: one workgroup per token and
 # 16-head group alone is too few to stream a small batch's partials.
 _REDUCE_DIM_BLOCK = 64
 # One workgroup covers at most 64 query heads (four 16-head groups).
 _HEAD_GROUPS_PER_CTA = 4
+# The unsplit kernel is sized for two workgroups per CU.
+# The unsplit decode kernel: 32-row tiles keep two workgroups per CU.
+_ROWS_TILE_K = 32
+_ROWS_WAVES_PER_EU = 2
 
 
 @gluon.jit
@@ -740,6 +748,652 @@ def gluon_dsv41_selected_attention_gfx950(
 
 
 @gluon.jit
+def _dequant_global_pairs(values, scales):
+    """E2M1 times E4M3 into FP16 dim pairs, int32 [TILE_K, 256].
+
+    E2M1 values and E4M3 scales are exact in FP16 and their product has at
+    most six significant bits inside FP16's normal range, so every value is
+    exact (and equal to the BF16 dequantization). One asm block per word
+    converts its four bytes and scales them, so no FP32 temporaries exist.
+    """
+    scale = (
+        scales.to(tl.float8e4nv, bitcast=True)
+        .to(gl.float16)
+        .to(gl.int16, bitcast=True)
+        .to(gl.int32)
+    )
+    values, scale = gl.broadcast(values, scale[:, :, :, None])
+    pair0, pair1, pair2, pair3 = gl.inline_asm_elementwise(
+        "v_cvt_scalef32_pk_f16_fp4 $0, $4, 1.0\n"
+        "v_cvt_scalef32_pk_f16_fp4 $1, $4, 1.0 op_sel:[1,0,0]\n"
+        "v_cvt_scalef32_pk_f16_fp4 $2, $4, 1.0 op_sel:[0,1,0]\n"
+        "v_cvt_scalef32_pk_f16_fp4 $3, $4, 1.0 op_sel:[1,1,0]\n"
+        "v_pk_mul_f16 $0, $0, $5 op_sel_hi:[1,0]\n"
+        "v_pk_mul_f16 $1, $1, $5 op_sel_hi:[1,0]\n"
+        "v_pk_mul_f16 $2, $2, $5 op_sel_hi:[1,0]\n"
+        "v_pk_mul_f16 $3, $3, $5 op_sel_hi:[1,0]",
+        "=&v,=&v,=&v,=&v,v,v",
+        [values, scale],
+        dtype=(gl.int32, gl.int32, gl.int32, gl.int32),
+        is_pure=True,
+        pack=1,
+    )
+    pairs = gl.join(gl.join(pair0, pair2), gl.join(pair1, pair3))
+    return pairs.reshape([pairs.shape[0], 256])
+
+
+@gluon.constexpr_function
+def _p_operand_layout(block_h, tile_k):
+    """The batched PV A operand ([wave, head, row]) as a linear layout:
+    lane = head + 16 * (row // 8 % 4), register = row % 8 + 8 * (row // 32),
+    one copy per wave. The summed scores live in (a slice of) it, so the
+    probabilities need no layout conversion."""
+    rows = [[0, 0, 1], [0, 0, 2], [0, 0, 4]]
+    bit = 32
+    while bit < tile_k:
+        rows.append([0, 0, bit])
+        bit *= 2
+    return gl.DistributedLinearLayout(
+        reg_bases=rows,
+        lane_bases=[[0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [0, 0, 8], [0, 0, 16]],
+        warp_bases=[[1, 0, 0], [2, 0, 0]],
+        block_bases=[],
+        shape=[4, block_h, tile_k],
+    )
+
+
+@gluon.jit
+def _attend_split_tile(
+    kv_view,
+    partial_shared,
+    valid_rows,
+    q_dot,
+    score_scale,
+    max_value,
+    denominator,
+    accumulator,
+    row_sum,
+    row_count,
+    active,
+    with_row_sum,
+    BLOCK_H: gl.constexpr,
+    TILE_K: gl.constexpr,
+    MFMA_LAYOUT: gl.constexpr,
+    P_LAYOUT: gl.constexpr,
+):
+    """Fold one LDS tile [TILE_K, 512] (BF16 or FP16 ``kv_view``) into the
+    softmax, with wave w owning head dims [128w, 128w + 128).
+
+    QK and PV are batched [4 waves, ...] MFMAs: each wave multiplies its query
+    slice with its K slice and stores the partial scores; every wave sums the
+    four partials directly in the PV operand layout (the only cross-wave
+    exchange), runs the softmax on the full tile and accumulates PV for its
+    own V slice.
+    """
+    dtype: gl.constexpr = kv_view.dtype
+    a_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=MFMA_LAYOUT, k_width=8
+    )
+    b_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=MFMA_LAYOUT, k_width=8
+    )
+    p_layout: gl.constexpr = gl.SliceLayout(0, P_LAYOUT)
+    acc_head_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, MFMA_LAYOUT))
+    slices = kv_view.reshape([TILE_K, 4, 128])
+    ones = gl.full([4, BLOCK_H, TILE_K], 1.0, dtype=dtype, layout=a_layout)
+    p_dot = ones
+    previous_scale = gl.full([BLOCK_H], 1.0, dtype=gl.float32, layout=acc_head_layout)
+    if active:
+        k_dot = slices.permute([1, 2, 0]).load(b_layout)
+        partial = gl.amd.cdna4.mfma(
+            q_dot,
+            k_dot,
+            gl.zeros([4, BLOCK_H, TILE_K], dtype=gl.float32, layout=MFMA_LAYOUT),
+        )
+        partial_shared.store(partial.reshape([4 * BLOCK_H, TILE_K]))
+        scores = partial_shared.slice(0, BLOCK_H, dim=0).load(p_layout)
+        for w in gl.static_range(1, 4):
+            scores += partial_shared.slice(w * BLOCK_H, BLOCK_H, dim=0).load(p_layout)
+        scores = gl.where(valid_rows[None, :], scores * score_scale, -float("inf"))
+        next_max = gl.maximum(max_value, gl.max(scores, axis=1))
+        safe_next_max = gl.where(next_max > -float("inf"), next_max, 0.0)
+        alpha = gl.exp(max_value - safe_next_max)
+        probabilities = gl.exp(scores - safe_next_max[:, None])
+        denominator = alpha * denominator + gl.sum(probabilities, axis=1)
+        max_value = next_max
+        # Every wave holds the whole tile in its own copy of the operand.
+        p_wide, _ = gl.broadcast(
+            probabilities.to(dtype)[None, :, :],
+            gl.zeros([4, BLOCK_H, TILE_K], dtype=dtype, layout=P_LAYOUT),
+        )
+        p_dot = gl.convert_layout(p_wide, a_layout, assert_trivial=True)
+        previous_scale = gl.convert_layout(alpha, acc_head_layout)
+    v_dot = slices.permute([1, 0, 2]).load(b_layout)
+    if active:
+        accumulator = gl.amd.cdna4.mfma(
+            p_dot, v_dot, accumulator * previous_scale[None, :, None]
+        )
+    if with_row_sum:
+        row_sum = gl.amd.cdna4.mfma(ones, v_dot, row_sum)
+        row_count += gl.sum(valid_rows.to(gl.int32), axis=0)
+    return max_value, denominator, accumulator, row_sum, row_count
+
+
+@gluon.jit
+def _split_rope_table(rope_row, ROPE_DIM: gl.constexpr, LAYOUT: gl.constexpr):
+    """Inverse RoPE (cos, sin) per dim pair of a [4 waves, 16, 128] output in
+    LAYOUT (cos 1, sin 0 outside the tail), loaded once per program."""
+    pairs_shape: gl.constexpr = gl.zeros([4, 16, 128], dtype=gl.float32, layout=LAYOUT)
+    even, _ = gl.split(pairs_shape.reshape([4, 16, 64, 2]))
+    pair_layout: gl.constexpr = gl.SliceLayout(1, even.type.layout)
+    start: gl.constexpr = (512 - ROPE_DIM) // 2
+    pairs = (
+        gl.arange(0, 4, layout=gl.SliceLayout(1, pair_layout))[:, None] * 64
+        + gl.arange(0, 64, layout=gl.SliceLayout(0, pair_layout))[None, :]
+    )
+    rope = (pairs >= start) & (ROPE_DIM > 0)
+    index = gl.where(rope, pairs - start, 0)
+    cosine = gl.load(rope_row + index, mask=rope, other=1.0)
+    sine = gl.load(rope_row + ROPE_DIM // 2 + index, mask=rope, other=0.0)
+    return cosine, sine
+
+
+@gluon.jit
+def _store_split_rows(
+    values,
+    out_row,
+    head_base,
+    num_heads,
+    stride_o_h,
+    cosine,
+    sine,
+    ROPE_DIM: gl.constexpr,
+    LAYOUT: gl.constexpr,
+):
+    """Store FP32 [4 waves, 16 heads, 128 dims] output as BF16 (dim 128w + d).
+
+    With ROPE_DIM the BF16 values' interleaved tail is rotated in registers
+    (each lane holds whole dim pairs) and rounded again, as ``rope_inplace``
+    on the stored output would do.
+    """
+    waves = gl.arange(0, 4, layout=gl.SliceLayout(1, gl.SliceLayout(2, LAYOUT)))
+    heads = head_base + gl.arange(
+        0, 16, layout=gl.SliceLayout(0, gl.SliceLayout(2, LAYOUT))
+    )
+    dims = gl.arange(0, 128, layout=gl.SliceLayout(0, gl.SliceLayout(1, LAYOUT)))
+    if ROPE_DIM > 0:
+        # Round to BF16 first, exactly like rope_inplace on the stored output.
+        values = values.to(gl.bfloat16).to(gl.float32)
+        even, odd = gl.split(values.reshape([4, 16, 64, 2]))
+        c = cosine[:, None, :]
+        s = sine[:, None, :]
+        values = gl.convert_layout(
+            gl.join(even * c - odd * s, odd * c + even * s).reshape([4, 16, 128]),
+            values.type.layout,
+            assert_trivial=True,
+        )
+    gl.store(
+        out_row
+        + heads[None, :, None].to(tl.int64) * stride_o_h
+        + waves[:, None, None] * 128
+        + dims[None, None, :],
+        values.to(gl.bfloat16),
+        mask=(heads < num_heads)[None, :, None],
+    )
+
+
+def _selected_attention_rows_metadata(grid, kernel, args):
+    tokens = args["q"].shape[0]
+    heads = args["num_heads"]
+    swa_width = args["swa_width"]
+    global_width = args["global_width"] if args["HAS_GLOBAL"] else 0
+    return {
+        "name": kernel.name,
+        "flops16": 4 * tokens * heads * (swa_width + global_width) * _HEAD_DIM,
+        "bytes": tokens
+        * (
+            swa_width * (_SWA_ROW_BYTES + 4)
+            + global_width * (_GLOBAL_ROW_BYTES + 4)
+            + heads * _HEAD_DIM * 4
+        ),
+    }
+
+
+@gluon.jit(launch_metadata=_selected_attention_rows_metadata)
+def gluon_dsv41_selected_attention_rows_gfx950(
+    q,
+    swa_cache,
+    swa_slots,
+    swa_lens,
+    global_cache,
+    global_slots,
+    global_lens,
+    attn_sink,
+    out,
+    stride_q_t: tl.int64,
+    stride_q_h: tl.int64,
+    swa_page_stride: tl.int64,
+    swa_slot_stride: tl.int64,
+    swa_width,
+    global_page_stride: tl.int64,
+    global_slot_stride: tl.int64,
+    global_width,
+    stride_o_t: tl.int64,
+    stride_o_h: tl.int64,
+    softmax_scale: tl.float32,
+    swa_capacity,
+    global_capacity,
+    num_heads,
+    head_blocks,
+    rope_positions,
+    rope_cos_sin,
+    stride_rope: tl.int64,
+    HAS_GLOBAL: gl.constexpr,
+    HEAD_GROUPS: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    TILE_K: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    ROPE_DIM: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+):
+    """Unsplit decode: program w owns query row w // head_blocks and head block
+    w % head_blocks over all of the row's selected tiles, and writes the final
+    (optionally RoPE-rotated) output.
+
+    The four waves split the head dims (not the tile rows), so the softmax
+    needs one cross-wave exchange per tile. Global tiles dequantize to exact
+    FP16 (E2M1 x E4M3 fits FP16 exactly) and run FP16 MFMAs against an
+    exactly power-of-two scaled FP16 query; SWA tiles stay BF16. Consecutive
+    rows (one request's speculative rows, whose selections overlap) are mapped
+    to the same XCD and its L2.
+    """
+    gl.static_assert(BLOCK_H == 16)
+    gl.static_assert(HEAD_DIM == 512)
+    mfma: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1, 1],
+    )
+    a_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma, k_width=8
+    )
+    q_block_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 8], [1, 1, 64], [1, 4, 1], [2, 1, 0]
+    )  # [group, head, dim]; only [head, dim] slices are loaded
+    # Wave w loads and dequantizes dims [128w, 128w + 128) of every row.
+    swa_raw_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 16], [8, 8, 1], [1, 4, 1], [2, 1, 0]
+    )
+    global_raw_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 2, 2], [16, 4, 1, 1], [1, 4, 1, 1], [3, 2, 1, 0]
+    )
+    swa_row_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, swa_raw_layout))
+    global_row_layout: gl.constexpr = gl.SliceLayout(
+        1, gl.SliceLayout(2, gl.SliceLayout(3, global_raw_layout))
+    )
+    # The PV A operand ([wave, head, row]) as a linear layout, so the summed
+    # scores can live in (a slice of) it: lane = head + 16 * (row // 8 % 4),
+    # register = row % 8 + 8 * (row // 32), one copy per wave.
+    p_operand_layout: gl.constexpr = _p_operand_layout(BLOCK_H, TILE_K)
+    score_row_layout: gl.constexpr = gl.SliceLayout(
+        0, gl.SliceLayout(0, p_operand_layout)
+    )
+    head_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(0, p_operand_layout))
+    out_head_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, mfma))
+    # 16-byte XOR swizzle across rows; the int32 view (FP16 dim pairs) has
+    # the same byte layout.
+    kv_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 8, [1, 0])
+    pair_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(4, 1, 8, [1, 0])
+
+    # Programs are dispatched round-robin over the XCDs; give each XCD a
+    # contiguous range of rows instead.
+    program = gl.program_id(axis=0)
+    programs = gl.num_programs(axis=0)
+    per_xcd = (programs + NUM_XCDS - 1) // NUM_XCDS
+    tall_xcds = programs % NUM_XCDS
+    if tall_xcds == 0:
+        tall_xcds = NUM_XCDS
+    xcd = program % NUM_XCDS
+    work = xcd * per_xcd + program // NUM_XCDS
+    if xcd >= tall_xcds:
+        work -= xcd - tall_xcds
+    token_idx = work // head_blocks
+    head_base = (work % head_blocks) * (HEAD_GROUPS * BLOCK_H)
+
+    swa_len = gl.minimum(gl.maximum(gl.load(swa_lens + token_idx), 0), swa_width)
+    swa_tiles = gl.cdiv(swa_len, TILE_K)
+    swa_row = token_idx.to(tl.int64) * swa_slot_stride
+    if HAS_GLOBAL:
+        global_len = gl.minimum(
+            gl.maximum(gl.load(global_lens + token_idx), 0), global_width
+        )
+        global_row = token_idx.to(tl.int64) * global_slot_stride
+    else:
+        global_len = 0
+        global_row = token_idx.to(tl.int64) * 0
+    global_tiles = gl.cdiv(global_len, TILE_K)
+
+    # Bit g of active_groups marks a head group with a nonzero query, which
+    # needs its own pass over the selected rows; q_max is its largest |q|.
+    # One 16-head group at a time keeps the check's registers small.
+    group_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, q_block_layout))
+    block_groups = gl.arange(0, HEAD_GROUPS, layout=group_layout)
+    group_heads = gl.arange(
+        0, BLOCK_H, layout=gl.SliceLayout(1, gl.SliceLayout(0, q_block_layout))
+    )
+    block_dims = gl.arange(
+        0, HEAD_DIM, layout=gl.SliceLayout(0, gl.SliceLayout(0, q_block_layout))
+    )
+    q_max = gl.zeros([HEAD_GROUPS], dtype=gl.float32, layout=group_layout)
+    for group in range(HEAD_GROUPS):
+        heads = head_base + group * BLOCK_H + group_heads
+        q_group = gl.load(
+            q
+            + token_idx.to(tl.int64) * stride_q_t
+            + heads[:, None].to(tl.int64) * stride_q_h
+            + block_dims[None, :],
+            mask=(heads < num_heads)[:, None],
+            other=0.0,
+        )
+        group_max = gl.max(gl.max(gl.abs(q_group.to(gl.float32)), axis=1), axis=0)
+        q_max = gl.where(block_groups == group, group_max, q_max)
+    active_groups = gl.sum(gl.where(q_max > 0.0, 1 << block_groups, 0), axis=0)
+    need_row_sum = active_groups != (1 << HEAD_GROUPS) - 1
+    kv_shared = gl.allocate_shared_memory(
+        gl.bfloat16, [TILE_K, HEAD_DIM], layout=kv_shared_layout
+    )
+    kv_half = kv_shared.reinterpret(gl.float16, [TILE_K, HEAD_DIM], kv_shared_layout)
+    kv_pairs = kv_shared.reinterpret(
+        gl.int32, [TILE_K, HEAD_DIM // 2], pair_shared_layout
+    )
+    partial_shared = gl.allocate_shared_memory(
+        gl.float32,
+        [4 * BLOCK_H, TILE_K],
+        layout=gl.PaddedSharedLayout.with_identity_for(
+            [[TILE_K, 4]], [4 * BLOCK_H, TILE_K], [1, 0]
+        ),
+    )
+
+    out_row = out + token_idx.to(tl.int64) * stride_o_t
+    rope_row = rope_cos_sin
+    if ROPE_DIM > 0:
+        rope_row += (
+            gl.maximum(gl.load(rope_positions + token_idx), 0).to(tl.int64)
+            * stride_rope
+        )
+    zero_acc = gl.zeros([4, BLOCK_H, 128], dtype=gl.float32, layout=mfma)
+    row_sum = zero_acc
+    row_count = 0
+    q_waves = gl.arange(0, 4, layout=gl.SliceLayout(1, gl.SliceLayout(2, a_layout)))
+    q_dims = gl.arange(0, 128, layout=gl.SliceLayout(0, gl.SliceLayout(1, a_layout)))
+
+    for group in range(HEAD_GROUPS):
+        active = ((active_groups >> group) & 1) != 0
+        with_row_sum = need_row_sum and group == 0
+        if active or with_row_sum:
+            group_base = head_base + group * BLOCK_H
+            dot_heads = group_base + gl.arange(
+                0, BLOCK_H, layout=gl.SliceLayout(0, gl.SliceLayout(2, a_layout))
+            )
+            q_dot = gl.load(
+                q
+                + token_idx.to(tl.int64) * stride_q_t
+                + dot_heads[None, :, None].to(tl.int64) * stride_q_h
+                + q_waves[:, None, None] * 128
+                + q_dims[None, None, :],
+                mask=(dot_heads < num_heads)[None, :, None],
+                other=0.0,
+            )
+            score_heads = group_base + gl.arange(0, BLOCK_H, layout=head_layout)
+            # The sink is the initial state (logit sink, weight 1).
+            max_value = gl.load(
+                attn_sink + score_heads, mask=score_heads < num_heads, other=0.0
+            )
+            denominator = gl.full([BLOCK_H], 1.0, dtype=gl.float32, layout=head_layout)
+            accumulator = zero_acc
+
+            # Slots are fetched two tiles ahead and rows one tile ahead.
+            s_slot, s_valid = _tile_slots(
+                swa_slots,
+                swa_row,
+                0,
+                swa_len,
+                swa_width,
+                swa_capacity,
+                TILE_K,
+                swa_row_layout,
+            )
+            _, s_score = _tile_slots(
+                swa_slots,
+                swa_row,
+                0,
+                swa_len,
+                swa_width,
+                swa_capacity,
+                TILE_K,
+                score_row_layout,
+            )
+            s_values, s_scales = _load_swa_rows(
+                swa_cache, s_slot, s_valid, swa_page_stride, swa_raw_layout
+            )
+            n_slot, n_valid = _tile_slots(
+                swa_slots,
+                swa_row,
+                1,
+                swa_len,
+                swa_width,
+                swa_capacity,
+                TILE_K,
+                swa_row_layout,
+            )
+            _, n_score = _tile_slots(
+                swa_slots,
+                swa_row,
+                1,
+                swa_len,
+                swa_width,
+                swa_capacity,
+                TILE_K,
+                score_row_layout,
+            )
+            for tile in range(0, swa_tiles):
+                nn_slot, nn_valid = _tile_slots(
+                    swa_slots,
+                    swa_row,
+                    tile + 2,
+                    swa_len,
+                    swa_width,
+                    swa_capacity,
+                    TILE_K,
+                    swa_row_layout,
+                )
+                _, nn_score = _tile_slots(
+                    swa_slots,
+                    swa_row,
+                    tile + 2,
+                    swa_len,
+                    swa_width,
+                    swa_capacity,
+                    TILE_K,
+                    score_row_layout,
+                )
+                n_values, n_scales = _load_swa_rows(
+                    swa_cache, n_slot, n_valid, swa_page_stride, swa_raw_layout
+                )
+                kv_shared.store(_dequant_swa_rows(s_values, s_scales))
+                max_value, denominator, accumulator, row_sum, row_count = (
+                    _attend_split_tile(
+                        kv_shared,
+                        partial_shared,
+                        s_score,
+                        q_dot,
+                        softmax_scale,
+                        max_value,
+                        denominator,
+                        accumulator,
+                        row_sum,
+                        row_count,
+                        active,
+                        with_row_sum,
+                        BLOCK_H,
+                        TILE_K,
+                        mfma,
+                        p_operand_layout,
+                    )
+                )
+                s_values, s_scales, s_score = n_values, n_scales, n_score
+                n_slot, n_valid, n_score = nn_slot, nn_valid, nn_score
+            if HAS_GLOBAL:
+                # FP16 query scaled by 2^shift (exact) so its largest element
+                # lies in [2^13, 2^15): far from FP16 overflow and subnormals.
+                group_max = gl.max(gl.where(block_groups == group, q_max, 0.0), axis=0)
+                shift = 13.0 - gl.floor(gl.log2(gl.maximum(group_max, 1e-30)))
+                q_half = (q_dot.to(gl.float32) * gl.exp2(shift)).to(gl.float16)
+                half_scale = softmax_scale * gl.exp2(-shift)
+                g_slot, g_valid = _tile_slots(
+                    global_slots,
+                    global_row,
+                    0,
+                    global_len,
+                    global_width,
+                    global_capacity,
+                    TILE_K,
+                    global_row_layout,
+                )
+                _, g_score = _tile_slots(
+                    global_slots,
+                    global_row,
+                    0,
+                    global_len,
+                    global_width,
+                    global_capacity,
+                    TILE_K,
+                    score_row_layout,
+                )
+                g_values, g_scales = _load_global_rows(
+                    global_cache, g_slot, g_valid, global_page_stride, global_raw_layout
+                )
+                n_slot, n_valid = _tile_slots(
+                    global_slots,
+                    global_row,
+                    1,
+                    global_len,
+                    global_width,
+                    global_capacity,
+                    TILE_K,
+                    global_row_layout,
+                )
+                _, n_score = _tile_slots(
+                    global_slots,
+                    global_row,
+                    1,
+                    global_len,
+                    global_width,
+                    global_capacity,
+                    TILE_K,
+                    score_row_layout,
+                )
+                for tile in range(0, global_tiles):
+                    nn_slot, nn_valid = _tile_slots(
+                        global_slots,
+                        global_row,
+                        tile + 2,
+                        global_len,
+                        global_width,
+                        global_capacity,
+                        TILE_K,
+                        global_row_layout,
+                    )
+                    _, nn_score = _tile_slots(
+                        global_slots,
+                        global_row,
+                        tile + 2,
+                        global_len,
+                        global_width,
+                        global_capacity,
+                        TILE_K,
+                        score_row_layout,
+                    )
+                    n_values, n_scales = _load_global_rows(
+                        global_cache,
+                        n_slot,
+                        n_valid,
+                        global_page_stride,
+                        global_raw_layout,
+                    )
+                    kv_pairs.store(_dequant_global_pairs(g_values, g_scales))
+                    max_value, denominator, accumulator, row_sum, row_count = (
+                        _attend_split_tile(
+                            kv_half,
+                            partial_shared,
+                            g_score,
+                            q_half,
+                            half_scale,
+                            max_value,
+                            denominator,
+                            accumulator,
+                            row_sum,
+                            row_count,
+                            active,
+                            with_row_sum,
+                            BLOCK_H,
+                            TILE_K,
+                            mfma,
+                            p_operand_layout,
+                        )
+                    )
+                    g_values, g_scales, g_score = n_values, n_scales, n_score
+                    n_slot, n_valid, n_score = nn_slot, nn_valid, nn_score
+
+            if active:
+                cosine, sine = _split_rope_table(rope_row, ROPE_DIM, mfma)
+                scale = gl.convert_layout(
+                    gl.where(denominator > 0.0, 1.0 / denominator, 0.0),
+                    out_head_layout,
+                )
+                _store_split_rows(
+                    accumulator * scale[None, :, None],
+                    out_row,
+                    group_base,
+                    num_heads,
+                    stride_o_h,
+                    cosine,
+                    sine,
+                    ROPE_DIM,
+                    mfma,
+                )
+
+    if need_row_sum:
+        # A zero query scores exactly zero on every valid row, so its output
+        # is row_sum * e^-m / (count * e^-m + e^(sink - m)), m = max(sink, 0).
+        count = row_count.to(gl.float32)
+        cosine, sine = _split_rope_table(rope_row, ROPE_DIM, mfma)
+        for group in range(HEAD_GROUPS):
+            if ((active_groups >> group) & 1) == 0:
+                group_base = head_base + group * BLOCK_H
+                sink_heads = group_base + gl.arange(0, BLOCK_H, layout=out_head_layout)
+                sink = gl.load(
+                    attn_sink + sink_heads, mask=sink_heads < num_heads, other=0.0
+                )
+                frame = gl.maximum(sink, 0.0)
+                weight = gl.exp(-frame)
+                total = count * weight + gl.exp(sink - frame)
+                coefficient = gl.where(total > 0.0, weight / total, 0.0)
+                _store_split_rows(
+                    row_sum * coefficient[None, :, None],
+                    out_row,
+                    group_base,
+                    num_heads,
+                    stride_o_h,
+                    cosine,
+                    sine,
+                    ROPE_DIM,
+                    mfma,
+                )
+
+
+@gluon.jit
 def _split_state(part_stats, part_count, rows, heads, num_heads, mask, active):
     """Per-split (max, sum) [splits, heads]; zero-query heads use frame 0, count."""
     if active:
@@ -954,6 +1608,33 @@ def launch_gluon_dsv41_selected_attention_gfx950(
         from tokenspeed_kernel.ops.attention.dsv4 import dsv4_prefill
 
         out = _output(out, q.shape, q.dtype, q.device)
+        width = prefill_indices.shape[-1]
+        if q.shape[1] in (64, 128) and width > 64 and width % 64:
+            # Widths off the 64-row grid (DSpark draft: SWA window + block,
+            # e.g. 134) have no tuned dsv4_prefill kernel and fell back to the
+            # portable Triton one (~4.5x slower). Pad with ignored -1 entries
+            # and run the sparse kernel, which then masks non-compact indices.
+            from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.sparse_prefill import (
+                gluon_dsv4_sparse_prefill_gfx950,
+            )
+
+            padded = max(128, -(-width // 64) * 64)
+            indices = torch.nn.functional.pad(
+                prefill_indices, (0, padded - width), value=-1
+            ).contiguous()
+            lengths = torch.full(
+                (q.shape[0],), padded, dtype=torch.int32, device=q.device
+            )
+            return gluon_dsv4_sparse_prefill_gfx950(
+                q=q.contiguous(),
+                kv=prefill_kv,
+                indices=indices,
+                lens=lengths,
+                attn_sink=attn_sink.contiguous(),
+                softmax_scale=float(softmax_scale),
+                out=out,
+                assume_compact_indices=False,
+            )
         lengths = torch.full(
             (q.shape[0],),
             prefill_indices.shape[-1],
@@ -1032,7 +1713,9 @@ def launch_gluon_dsv41_selected_attention_gfx950(
     if not math.isfinite(scale):
         raise ValueError("softmax_scale must be finite")
 
-    q = q.contiguous()
+    # Both kernels take row and head strides; only head dims must be dense.
+    if q.stride(2) != 1:
+        q = q.contiguous()
     sink = attn_sink.contiguous()
     swa_slots_i = swa_slots.to(torch.int32).contiguous()
     swa_lens_i = swa_lens.to(torch.int32).contiguous()
@@ -1069,6 +1752,49 @@ def launch_gluon_dsv41_selected_attention_gfx950(
             _TARGET_CTAS // (tokens * head_blocks),
         ),
     )
+    # Up to one workgroup per CU the one-wave unsplit main kernel is faster;
+    # past that the rows kernel's two workgroups per CU win.
+    if tokens * head_blocks > _TARGET_CTAS:
+        gluon_dsv41_selected_attention_rows_gfx950[(tokens * head_blocks,)](
+            q,
+            swa_cache,
+            swa_slots_i,
+            swa_lens_i,
+            global_cache_u8,
+            global_slots_i,
+            global_lens_i,
+            sink,
+            out,
+            q.stride(0),
+            q.stride(1),
+            swa_cache.stride(0),
+            swa_slots_i.stride(0),
+            swa_slots_i.shape[1],
+            global_page_stride,
+            global_slot_stride,
+            global_width,
+            out.stride(0),
+            out.stride(1),
+            scale,
+            swa_cache.shape[0] * _PAGE_ROWS,
+            global_capacity,
+            q.shape[1],
+            head_blocks,
+            rope_positions if rope else swa_lens_i,
+            rope_cos_sin if rope else sink,
+            rope_cos_sin.stride(0) if rope else 0,
+            HAS_GLOBAL=has_global,
+            HEAD_GROUPS=head_groups,
+            BLOCK_H=_BLOCK_H,
+            TILE_K=_ROWS_TILE_K,
+            HEAD_DIM=_HEAD_DIM,
+            ROPE_DIM=rope_cos_sin.shape[1] if rope else 0,
+            NUM_XCDS=num_xcds(),
+            num_warps=4,
+            num_stages=1,
+            waves_per_eu=_ROWS_WAVES_PER_EU,
+        )
+        return out
     if splits > 1:
         heads = q.shape[1]
         part_stats = torch.empty(

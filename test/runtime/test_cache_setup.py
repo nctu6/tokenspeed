@@ -1114,6 +1114,8 @@ def test_ordinary_mha_reserves_null_parent_within_cache_budget(
     )
 
     assert setup.spec.family == "mha"
+    # KV heads split across attention TP: each rank caches different bytes.
+    assert setup.kv_identical_across_attn_tp is False
     assert setup.spec.memory_plan.prefix_granularity == 64
     assert setup.spec.memory_plan.num_lcm_blocks == usable_pages
     assert setup.spec.memory_plan.arena_bytes <= 16_384

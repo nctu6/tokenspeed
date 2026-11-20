@@ -372,7 +372,7 @@ def test_zero_decoder_attention_still_runs_the_global_producer():
     )
     forward = load_symbol(
         RUNTIME + "models/deepseek_v41.py",
-        "forward",
+        "_layer_forward",
         owner="DeepseekV41Attention",
         _row_plan=lambda *args: plan,
         current_forward_ctx=lambda: None,
@@ -394,6 +394,46 @@ def test_zero_decoder_attention_still_runs_the_global_producer():
     assert output.shape == (0, 8)
     torch.testing.assert_close(writes[0], hidden)
     assert len(writes) == 1
+
+
+@pytest.mark.parametrize(
+    "capturing, extend, layer_id, index_group, kvp, expected",
+    [
+        (True, True, 19, (0,), 1, "split"),
+        (True, True, 21, (0,), 1, "split"),
+        (True, True, 20, (0,), 1, "layer"),
+        (True, False, 19, (0,), 1, "layer"),
+        (False, True, 19, (0,), 1, "layer"),
+        (True, True, 19, (0, 1, 2, 3), 1, "layer"),
+        (True, True, 19, (0,), 2, "layer"),
+    ],
+)
+def test_captured_extend_splits_attention_where_rows_stay_token_local(
+    capturing, extend, layer_id, index_group, kvp, expected
+):
+    """The split runs only where every pre/post-attention op is token-local.
+
+    The narrowing layer changes the row count, and indexer QCP and KVP
+    partition rows by request, so each keeps the whole-layer break.
+    """
+    forward = load_symbol(
+        RUNTIME + "models/deepseek_v41.py",
+        "forward",
+        owner="DeepseekV41Attention",
+        is_breakable_capture_active=lambda: capturing,
+    )
+    attention = SimpleNamespace(
+        layer_id=layer_id,
+        ced_decoder_start=20,
+        _captured_extend_forward=lambda *args: "split",
+        _layer_forward=lambda *args: "layer",
+    )
+    backend = SimpleNamespace(
+        spec=SimpleNamespace(indexer_query_group=index_group), kvp_size=kvp
+    )
+    mode = SimpleNamespace(is_extend=lambda: extend)
+    ctx = SimpleNamespace(attn_backend=backend, forward_mode=mode)
+    assert forward(attention, None, None, ctx, True) == expected
 
 
 def test_zero_decoder_skips_layers_and_normalization():

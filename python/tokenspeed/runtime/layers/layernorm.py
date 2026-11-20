@@ -198,6 +198,11 @@ class RMSNorm(torch.nn.Module):
                 )
                 if fused_result[0] is not None:
                     return fused_result
+                if not (residual_reduce_scattered or has_partial_norm_out):
+                    # The fused kernel declined (e.g. its Iris staging buffer
+                    # does not fit the heap): callers hand us unreduced
+                    # partial sums, so reduce before the plain add + norm.
+                    x = all_reduce(x, group)
 
         result = self.forward(x, residual)
         if isinstance(result, tuple):
@@ -462,6 +467,11 @@ class GemmaRMSNorm(torch.nn.Module):
                 )
                 if fused_result[0] is not None:
                     return fused_result
+                if not (residual_reduce_scattered or has_partial_norm_out):
+                    # The fused kernel declined (e.g. its Iris staging buffer
+                    # does not fit the heap): callers hand us unreduced
+                    # partial sums, so reduce before the plain add + norm.
+                    x = all_reduce(x, group)
 
         result = self.forward(x, residual)
         if isinstance(result, tuple):

@@ -414,7 +414,9 @@ def _pre_reduce_apply_fuses_norm(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens"], do_not_specialize_on_alignment=["num_tokens"]
+)
 def _mhc_prenorm_gemm_triton_kernel(
     x,
     fn,
@@ -534,7 +536,9 @@ def _load_reduced_mix(
     return value
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens"], do_not_specialize_on_alignment=["num_tokens"]
+)
 def _mhc_pre_mix_triton_kernel(
     gemm_out_mul,
     gemm_out_sqrsum,
@@ -1229,7 +1233,9 @@ def triton_mhc_post(
 # ===-----------------------------------------------------------------------===#
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens"], do_not_specialize_on_alignment=["num_tokens"]
+)
 def _mhc_prefill_project_hc4_kernel(
     residual,
     fn,
@@ -1369,7 +1375,8 @@ def mhc_prefill_project_hc4(
 
 
 @triton.jit(
-    do_not_specialize=["num_tokens"], do_not_specialize_on_alignment=["n_splits"]
+    do_not_specialize=["n_splits", "num_tokens"],
+    do_not_specialize_on_alignment=["n_splits", "num_tokens"],
 )
 def _mhc_pre_mix_hc4_kernel(
     gemm_out_mul,
@@ -1505,7 +1512,9 @@ def mhc_pre_mix_hc4(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens"], do_not_specialize_on_alignment=["num_tokens"]
+)
 def _mhc_pre_only_hc4_kernel(
     gemm_out_mul,
     gemm_out_sqrsum,
@@ -1585,7 +1594,9 @@ def mhc_pre_only_hc4(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens"], do_not_specialize_on_alignment=["num_tokens"]
+)
 def _mhc_post_comb_hc4_kernel(
     gemm_out_mul,
     gemm_out_sqrsum,

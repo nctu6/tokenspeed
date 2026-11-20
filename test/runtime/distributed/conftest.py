@@ -47,3 +47,14 @@ def _host_independent_nvls_probe(monkeypatch):
     from tokenspeed.runtime.distributed import nvls_multicast
 
     monkeypatch.setattr(nvls_multicast, "nvls_multicast_mapping_usable", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _host_independent_amd_fabric(monkeypatch):
+    """Keep routing tests independent of the host's AMD GPU fabric.
+
+    On PCIe-only AMD hosts the auto backend skips every symmetric-memory
+    route; these tests exercise the XGMI defaults. The environment variable
+    (unlike a monkeypatched function) also reaches ``mp.spawn`` workers.
+    """
+    monkeypatch.setenv("TOKENSPEED_AMD_GPU_FABRIC", "xgmi")

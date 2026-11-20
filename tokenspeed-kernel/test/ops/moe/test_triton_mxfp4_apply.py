@@ -20,6 +20,8 @@ def _dequantize(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("activation", ["silu", "situ"])
 # 192 is a multiple of 64 but not 128, like a 640-wide expert sharded by TP2.
+
+
 @pytest.mark.parametrize("intermediate_size", [128, 192])
 def test_triton_mxfp4_moe_matches_torch(
     activation: str, intermediate_size: int
@@ -129,6 +131,99 @@ def test_triton_mxfp4_moe_matches_torch(
         expected.index_add_(0, token_ids, weighted)
 
     torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.02)
+
+
+def test_triton_weight_only_mxfp4_moe_situ_matches_torch() -> None:
+    """Weight-only (BF16 activation) MXFP4 experts with Kimi-K3 SiTU."""
+    if not current_platform().is_amd:
+        pytest.skip("Triton MXFP4 MoE is registered for AMD GPUs")
+
+    inter, hidden, experts = 128, 128, 4
+    generator = torch.Generator(device="cuda").manual_seed(1)
+    x = torch.randn(5, hidden, device="cuda", dtype=torch.bfloat16, generator=generator)
+    w13 = torch.randint(
+        0,
+        256,
+        (experts, 2 * inter, hidden // 2),
+        device="cuda",
+        dtype=torch.uint8,
+        generator=generator,
+    )
+    w13_scale = torch.full(
+        (experts, 2 * inter, hidden // 32), 122, device="cuda", dtype=torch.uint8
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (experts, hidden, inter // 2),
+        device="cuda",
+        dtype=torch.uint8,
+        generator=generator,
+    )
+    w2_scale = torch.full(
+        (experts, hidden, inter // 32), 122, device="cuda", dtype=torch.uint8
+    )
+    topk_ids = torch.tensor(
+        [[0, 1], [1, 2], [2, 3], [3, 0], [0, 2]], device="cuda", dtype=torch.int32
+    )
+    topk_weights = torch.rand(5, 2, device="cuda", generator=generator)
+
+    weights = torch.nn.Module()
+    weights.w13_weight = w13
+    weights.w13_weight_scale = w13_scale
+    weights.w2_weight = w2
+    weights.w2_weight_scale = w2_scale
+    weights.top_k = 2
+    weights.w13_input_layout = "concatenated"
+    weights.activation = "situ"
+    weights.activation_situ_beta = 4.0
+    weights.activation_situ_linear_beta = 25.0
+    plan = kernel_moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="situ",
+        routing_mode="precomputed_topk",
+        ispp=inter,
+        internal_activation_dtype="input",
+        solution="triton",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
+        ep_token_layout=None,
+        features=frozenset(),
+    )
+    plan["precision_policy"] = "default"
+    plan["output_scale"] = 1.0
+    kernel_moe_process_weights(plan, weights)
+    actual = kernel_moe_apply(
+        plan,
+        x,
+        weights,
+        torch.empty((5, experts), device="cuda"),
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+    w13_dequant = _dequantize(w13, w13_scale).float()
+    w2_dequant = _dequantize(w2, w2_scale).float()
+    expected = torch.zeros((5, hidden), device="cuda", dtype=torch.float32)
+    for expert_id in range(experts):
+        token_ids, slots = torch.where(topk_ids == expert_id)
+        gate, up = F.linear(x[token_ids].float(), w13_dequant[expert_id]).chunk(
+            2, dim=-1
+        )
+        gate = 4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)
+        up = 25.0 * torch.tanh(up / 25.0)
+        intermediate = (gate * up).to(torch.bfloat16).float()
+        expert_output = F.linear(intermediate, w2_dequant[expert_id])
+        expected.index_add_(
+            0, token_ids, expert_output * topk_weights[token_ids, slots, None]
+        )
+
+    torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.05)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")

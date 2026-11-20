@@ -61,6 +61,10 @@ class DeepseekV41Config(SoftmaxAttnConfig):
     attention_query_group: tuple[int, ...]
     indexer_query_rank: int
     indexer_query_group: tuple[int, ...]
+    # Attention-TP ranks that may shard decode indexer rows
+    # (TOKENSPEED_DSV41_DECODE_INDEXER_TP); independent of prefill QCP.
+    indexer_decode_rank: int = 0
+    indexer_decode_group: tuple[int, ...] = ()
 
     @classmethod
     def generate(cls, server_args, model_config, is_draft: bool) -> AttnConfig:
@@ -188,6 +192,8 @@ class DeepseekV41Config(SoftmaxAttnConfig):
             attention_query_group=attention_group,
             indexer_query_rank=query_rank,
             indexer_query_group=query_group,
+            indexer_decode_rank=attn.tp_rank,
+            indexer_decode_group=tuple(attn.tp_group),
             cache_layer_types=("sliding_attention",) * len(ratios),
             sliding_window_tokens=int(hf.sliding_window),
             compress_ratios=ratios,

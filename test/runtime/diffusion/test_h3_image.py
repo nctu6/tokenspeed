@@ -165,12 +165,13 @@ def test_generations_and_edits_endpoints():
     response = client.post(
         "/v1/images/edits",
         data={"prompt": "swap <Picture 1> and <Picture 2>", "size": "64x64"},
-        files=[("image", ("a.png", refs[0], "image/png")), ("image", ("b.png", refs[1], "image/png"))],
+        files=[
+            ("image", ("a.png", refs[0], "image/png")),
+            ("image", ("b.png", refs[1], "image/png")),
+        ],
     )
     assert response.status_code == 200
     assert pipeline.requests[-1].reference_images == refs
 
-    response = client.post(
-        "/v1/images/edits", data={"prompt": "x", "size": "64x64"}
-    )
+    response = client.post("/v1/images/edits", data={"prompt": "x", "size": "64x64"})
     assert response.status_code == 400

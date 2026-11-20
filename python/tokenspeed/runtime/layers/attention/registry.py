@@ -127,6 +127,9 @@ class AttentionBuild:
     cache_fields_by_stage: tuple[tuple[str, ...], ...]
     producer_fields_by_step: tuple[tuple[str, ...], ...]
     logical_plan: CacheMemoryPlan | None
+    # Every attention-TP rank caches the same bytes for a page, so L3 may
+    # keep one copy per page (CacheRecipe.kv_identical_across_attn_tp).
+    kv_identical_across_attn_tp: bool
 
 
 def _ordinary_cache_family(config: AttnConfig | None) -> CacheModelFamily | None:
@@ -1652,4 +1655,5 @@ def create_attn_components(
         cache_fields_by_stage=cache_fields_by_stage,
         producer_fields_by_step=stage_schedules[server_args.mapping.pp_rank],
         logical_plan=logical_plan,
+        kv_identical_across_attn_tp=cache_setup.kv_identical_across_attn_tp,
     )

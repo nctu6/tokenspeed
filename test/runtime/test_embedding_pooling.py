@@ -1,11 +1,11 @@
 """Tests for the embedding (pooling) serving path.
 
-CPU-only: no engine, no GPU. They cover the two places where a pooling bug
-produces a *well-formed but wrong* answer, which is the failure mode nothing
-downstream can catch:
+No engine and no model. They cover the places where a pooling bug produces a
+*well-formed but wrong* answer, which nothing downstream can catch:
 
-  1. the reduction itself (LAST/CLS/MEAN over a packed batch), and
-  2. the decision of whether this server pools at all, and how.
+  1. the reduction itself (LAST/CLS/MEAN over a packed batch),
+  2. the decision of whether this server pools at all, and how, and
+  3. how a pooling request is admitted and which request types a server takes.
 
 The checkpoint-detection tests use fixture directories rather than a real
 model, so they run anywhere.
@@ -13,22 +13,39 @@ model, so they run anywhere.
 
 import json
 import os
+import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import torch
 
-from tokenspeed.runtime.configs.model_config import (
+# CI Registration (parsed via AST, runtime no-op)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+from tokenspeed.runtime.configs.pooling_config import (
     PoolingConfig,
     read_sentence_transformers_pooling,
     resolve_pooling_config,
 )
+from tokenspeed.runtime.engine.generation_output_processor import RequestState
+from tokenspeed.runtime.engine.input_processor import InputProcessor
+from tokenspeed.runtime.engine.io_struct import (
+    EmbeddingReqInput,
+    GenerateReqInput,
+    TokenizedEmbeddingReqInput,
+)
+from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.layers.pooler import (
     Pooler,
     PoolingType,
     pool_hidden_states,
     seq_lens_from_gather_ids,
 )
+from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 def _packed_batch(lengths, hidden=6, seed=0):
@@ -90,13 +107,6 @@ class PoolReductionTest(unittest.TestCase):
         self.assertTrue(torch.equal(out.embeddings, states.index_select(0, gather_ids)))
 
 
-class _ServerArgsStub:
-    def __init__(self, is_embedding=None, pooling_type=None, pooling_normalize=None):
-        self.is_embedding = is_embedding
-        self.pooling_type = pooling_type
-        self.pooling_normalize = pooling_normalize
-
-
 def _checkpoint(pooling: dict | None, normalize_module: bool = False) -> str:
     path = tempfile.mkdtemp()
     if pooling is not None:
@@ -115,7 +125,7 @@ class PoolingConfigDetectionTest(unittest.TestCase):
     def test_generative_checkpoint_is_not_a_pooling_server(self):
         path = _checkpoint(None)
         self.assertIsNone(read_sentence_transformers_pooling(path))
-        self.assertIsNone(resolve_pooling_config(path, _ServerArgsStub()))
+        self.assertIsNone(resolve_pooling_config(path))
 
     def test_lasttoken_plus_normalize_module_is_read_off_the_checkpoint(self):
         path = _checkpoint({"pooling_mode_lasttoken": True}, normalize_module=True)
@@ -144,20 +154,17 @@ class PoolingConfigDetectionTest(unittest.TestCase):
 
     def test_explicit_off_beats_a_pooling_checkpoint(self):
         path = _checkpoint({"pooling_mode_lasttoken": True})
-        self.assertIsNone(
-            resolve_pooling_config(path, _ServerArgsStub(is_embedding=False))
-        )
+        self.assertIsNone(resolve_pooling_config(path, is_embedding=False))
 
     def test_forcing_embedding_without_a_pooling_config_is_refused(self):
         path = _checkpoint(None)
         with self.assertRaises(ValueError):
-            resolve_pooling_config(path, _ServerArgsStub(is_embedding=True))
+            resolve_pooling_config(path, is_embedding=True)
 
     def test_overrides_win_over_the_checkpoint(self):
         path = _checkpoint({"pooling_mode_lasttoken": True}, normalize_module=True)
         config = resolve_pooling_config(
-            path,
-            _ServerArgsStub(pooling_type="mean", pooling_normalize=False),
+            path, pooling_type="mean", pooling_normalize=False
         )
         self.assertEqual(
             config, PoolingConfig(pooling_type=PoolingType.MEAN, normalize=False)
@@ -165,12 +172,52 @@ class PoolingConfigDetectionTest(unittest.TestCase):
 
     def test_override_supplies_the_mode_a_bare_checkpoint_lacks(self):
         path = _checkpoint(None)
-        config = resolve_pooling_config(
-            path, _ServerArgsStub(is_embedding=True, pooling_type="cls")
-        )
+        config = resolve_pooling_config(path, is_embedding=True, pooling_type="cls")
         self.assertEqual(
             config, PoolingConfig(pooling_type=PoolingType.CLS, normalize=False)
         )
+
+
+class EmbeddingRequestPathTest(unittest.TestCase):
+    def test_pooling_request_is_admitted_with_no_generation_budget(self):
+        handler = SimpleNamespace(tokenizer=None, hf_eos_token_id=[0])
+        recv_req = TokenizedEmbeddingReqInput(
+            rid="r0",
+            input_ids=[11, 12, 13],
+            sampling_params=SamplingParams(max_new_tokens=128),
+        )
+        req_spec, req_state, _ = RequestHandler.handle_embedding_request(
+            handler, recv_req
+        )
+        # The scheduler sizes the admission reserve from this budget; any
+        # non-zero value reserves decode room a pooling request never uses.
+        self.assertEqual(req_spec.max_new_tokens, 0)
+        self.assertEqual(req_state.sampling_params.max_new_tokens, 0)
+        self.assertEqual(req_state.input_length, 3)
+        self.assertFalse(req_state.stream)
+        self.assertFalse(req_state.wants_input_logprobs)
+        self.assertIsNone(req_state.embedding)
+
+    def test_server_mode_refuses_the_other_request_type(self):
+        def processor(is_generation):
+            return InputProcessor(SimpleNamespace(is_generation=is_generation))
+
+        with self.assertRaisesRegex(ValueError, "generative model"):
+            processor(True).validate_request(EmbeddingReqInput(text="a"))
+        with self.assertRaisesRegex(ValueError, "embedding model"):
+            processor(False).validate_request(GenerateReqInput(text="a"))
+
+    def test_embedding_state_reads_no_generation_fields(self):
+        # TokenizedEmbeddingReqInput carries no stream or logprob options, so
+        # the generate constructor cannot build its state.
+        recv_req = TokenizedEmbeddingReqInput(
+            rid="r1", input_ids=[1, 2], sampling_params=SamplingParams()
+        )
+        state = RequestState.from_embedding_req(
+            recv_req, tokenizer=None, eos_token_ids=[0]
+        )
+        self.assertEqual(state.prompt_input_ids, [1, 2])
+        self.assertIsNone(state.output_token_logprobs_val)
 
 
 if __name__ == "__main__":

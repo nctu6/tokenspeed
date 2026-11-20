@@ -1,0 +1,82 @@
+name: GB10 CI Gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  checks: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  prepare:
+    name: Prepare GB10 gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create pending GB10 check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pull = context.payload.pull_request;
+            const headSha = pull.head.sha;
+            const checkName = "GB10 CI Gate";
+            const summary =
+              "A maintainer must comment `/ci-run` to run the GB10 unit/model CI.";
+
+            const { data } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: headSha,
+              per_page: 100,
+            });
+            const existing = data.check_runs
+              .filter((run) => run.name === checkName)
+              .sort(
+                (left, right) =>
+                  Date.parse(right.started_at || right.created_at) -
+                  Date.parse(left.started_at || left.created_at),
+              )[0];
+
+            const check = {
+              name: checkName,
+              head_sha: headSha,
+              status: "queued",
+              output: {
+                title: "Maintainer trigger required",
+                summary,
+              },
+            };
+            if (existing) {
+              await github.rest.checks.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                check_run_id: existing.id,
+                ...check,
+              });
+            } else {
+              await github.rest.checks.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ...check,
+              });
+            }
+
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pull.number,
+                per_page: 100,
+              },
+            );
+            const marker = "<!-- gb10-ci-gate -->";
+            if (!comments.some((comment) => comment.body?.includes(marker))) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pull.number,
+                body: `${marker}\n**GB10 CI is required before merge.** A maintainer must comment \`/ci-run\` to start it.`,
+              });
+            }

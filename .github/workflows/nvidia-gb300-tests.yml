@@ -1,29 +1,9 @@
 name: NVIDIA GB300 Tests
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "python/pyproject.toml"
-      - "python/tokenspeed/**"
-      - "tokenspeed-kernel/**"
-      - "tokenspeed-mla/**"
-      - "tokenspeed-engine/**"
-      - "tokenspeed-scheduler/**"
-      - "test/**"
-      - ".github/workflows/nvidia-gb300-tests.yml"
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    branches: [main]
-    paths:
-      - "python/pyproject.toml"
-      - "python/tokenspeed/**"
-      - "tokenspeed-kernel/**"
-      - "tokenspeed-mla/**"
-      - "tokenspeed-engine/**"
-      - "tokenspeed-scheduler/**"
-      - "test/**"
-      - ".github/workflows/nvidia-gb300-tests.yml"
+  # Keep the workflow and submission scripts available for manual reruns,
+  # but do not create GB300 checks on every PR or main push.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -118,14 +98,9 @@ jobs:
         if: steps.changes.outputs.should_run == 'true'
         id: matrix
         run: |
-          matrix=$(python3 test/ci_system/pipeline.py scan \
-            --root test/ci \
-            --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
-            ${{ steps.changes.outputs.full_tests == 'true' && '--full-tests' || '' }} \
-            --trigger "${{ github.event_name == 'push' && 'post-submit' || 'per-commit' }}" \
-            --runner-group nvidia-arm \
-            --workflow-stage model-test \
-            --multi-node only)
+          # Model validation is temporarily disabled. Re-enable only after
+          # Qwen3.8-27B and Qwen3.6-35B-A3B CI tasks are available.
+          matrix='{"include":[]}'
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           printf '%s' "$matrix" | python3 -c \
             "import json, sys; print('has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" \

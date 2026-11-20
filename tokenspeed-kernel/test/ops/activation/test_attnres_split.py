@@ -19,7 +19,7 @@ from tokenspeed_kernel.platform import current_platform, pdl_enabled
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-H = 7168  # K3 hidden size; the kernels static-assert two 4096 sweeps.
+H = 7168  # K3 hidden size; the kernels sweep each row in two tiles.
 
 
 @pytest.fixture(autouse=True)
@@ -43,29 +43,33 @@ def _reference(prefix, blocks, wp, eps, out_w):
     ).float()
 
 
-def _scratch(T):
+def _scratch(T, hidden=H):
     return (
         torch.empty(T, dtype=torch.float32, device="cuda"),
         torch.empty(T, dtype=torch.float32, device="cuda"),
-        torch.empty(T, H, dtype=torch.float32, device="cuda"),
+        torch.empty(T, hidden, dtype=torch.float32, device="cuda"),
     )
 
 
 @pytest.mark.parametrize(
     "T,KB,use_norm", [(1, 8, True), (1, 8, False), (1, 3, True), (4, 8, True)]
 )
-def test_partial_combine_parity(T, KB, use_norm):
+# 512 / 1000: small (tiny-checkpoint) and non-power-of-two hidden sizes.
+@pytest.mark.parametrize("hidden", [H, 512, 1000])
+def test_partial_combine_parity(T, KB, use_norm, hidden):
     torch.manual_seed(T * 10 + KB)
-    prefix = torch.randn(T, H, dtype=torch.bfloat16, device="cuda")
-    blocks = torch.randn(KB, T, H, dtype=torch.bfloat16, device="cuda")
-    wp = torch.randn(H, dtype=torch.bfloat16, device="cuda")
+    prefix = torch.randn(T, hidden, dtype=torch.bfloat16, device="cuda")
+    blocks = torch.randn(KB, T, hidden, dtype=torch.bfloat16, device="cuda")
+    wp = torch.randn(hidden, dtype=torch.bfloat16, device="cuda")
     out_w = (
-        (torch.rand(H, dtype=torch.bfloat16, device="cuda") + 0.5) if use_norm else None
+        (torch.rand(hidden, dtype=torch.bfloat16, device="cuda") + 0.5)
+        if use_norm
+        else None
     )
     eps = 1e-5
 
-    scratch = _scratch(T)
-    out = torch.empty(T, H, dtype=torch.bfloat16, device="cuda")
+    scratch = _scratch(T, hidden)
+    out = torch.empty(T, hidden, dtype=torch.bfloat16, device="cuda")
     attnres_partial(blocks, wp, eps, scratch)
     attnres_combine(prefix, wp, out_w, eps, scratch, out)
 

@@ -267,7 +267,7 @@ class TestKimiK25:
     def _require_draft(self, draft: str):
         reason = launch_skip_reason(draft, min_gpus=WORLD_SIZE)
         if reason is not None:
-            self.skipTest(reason)
+            pytest.skip(reason)
 
     def _run_quality_checks(self, case: MeshCase):
         port = _next_server_port()
@@ -296,17 +296,14 @@ class TestKimiK25:
 
     def test_tsckpt_eagle3(self):
         """Kimi K2.5 with EAGLE3 draft."""
-        self._require_draft(DRAFT_MODEL)
         self._run_quality_checks(MESH_CASES["tsckpt_eagle3"])
 
     def test_nvckpt_eagle3(self):
         """Kimi K2.5 with MLA EAGLE3 draft (trtllm_mla drafter + FP8 KV cache)."""
-        self._require_draft(MLA_DRAFT_MODEL)
         self._run_quality_checks(MESH_CASES["nvckpt_eagle3"])
 
     def test_dflash(self):
         """Kimi K2.5 with native DFLASH block-diffusion draft (fa4 drafter)."""
-        self._require_draft(DFLASH_DRAFT_MODEL)
         self._run_quality_checks(MESH_CASES["dflash"])
 
 

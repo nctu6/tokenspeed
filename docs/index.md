@@ -31,6 +31,7 @@ features:
 
 - [Getting started](./guides/getting-started.md)
 - [Launching a server](./guides/launching.md)
+- [Supported models](./models/supported.md)
 - [Model recipes](./recipes/models.md)
 - [Server parameters](./configuration/server.md)
 - [Compatible parameters](./configuration/compatible-parameters.md)

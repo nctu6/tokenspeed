@@ -61,6 +61,24 @@ graph replay. BF16 atomic summation is order-dependent and rounds after each
 route, unlike FP32 reduction. EP uses atomic accumulation because each rank
 owns only a sparse subset of the routed experts.
 
+Three package-prefill paths are on by default (set the variable to `0` to fall
+back to the previous kernels); both are read at import and are bit-identical
+to the fallback:
+
+* `TOKENSPEED_MOE_PREFILL_S1_V2` — stage 1 with `BLOCK_M == 64`
+  (interleaved GDOT128 W13, E2M1) runs a three-slot A ring: tile `k`
+  computes while the A copy of `k + 2` and the B / scale loads of `k + 1` are
+  in flight, and E8M0 scales arrive as whole 4-byte CDNA4 cells that are
+  unpacked only at the MFMA. Byte scale loads are packed right after issue,
+  which makes every tile wait on its own prefetch. The flag also selects
+  64-row tiles from 24 to 320 routes per expert (`fused/tuning.py`).
+* `TOKENSPEED_MOE_PREFILL_S2_V2` — the stage-2 1x2 kernel (`BLOCK_M >= 32`)
+  loads scales as dwords; one cell serves a BK128 tile pair.
+* `TOKENSPEED_MOE_PREFILL_S2_REDUCE_V2` — FP32-reduction combine: the stage-2
+  GEMM runs all N tiles of one route block back to back (M-major, as the
+  atomic path already does) so the expert's W2 rows are reused from L2, and
+  the reduce kernel reads the BF16 partials with `.cg` loads.
+
 ## Staged package files
 
 | File | Role |

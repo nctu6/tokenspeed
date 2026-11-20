@@ -591,7 +591,6 @@ elif (
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "head_dim": _FA3_HOPPER_HEAD_DIMS,
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
             "sinks": _FA3_SINKS,
@@ -649,7 +648,6 @@ elif (
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "head_dim": _FA3_HOPPER_HEAD_DIMS,
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
@@ -713,7 +711,6 @@ elif (
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "head_dim": _FA3_HOPPER_HEAD_DIMS,
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
             "sinks": _FA3_SINKS,

@@ -670,6 +670,46 @@ class PoolRowViewWidthTest(unittest.TestCase):
         self.assertTrue(torch.equal(k_cache[loc].reshape(n, 2, 512), k))
         self.assertTrue(torch.equal(v_cache[loc].reshape(n, 2, 512), v))
 
+    def test_a_write_waits_for_its_layers_host_load_first(self):
+        """``set_kv_buffer`` waits for the layer's Host load before it writes.
+
+        A Host tail hit loads a whole page, so a draft context write into
+        that page must land after the load, or the late copy overwrites it.
+        """
+        if not torch.cuda.is_available():
+            self.skipTest("set_kv_buffer runs a CUDA triton scatter")
+        from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+        pool = self._build_pool("cuda")
+        layer = PagedAttention(
+            num_heads=16,
+            head_dim=512,
+            scaling=1.0,
+            num_kv_heads=2,
+            layer_id=1,
+            logit_cap=0.0,
+            sliding_window_size=-1,
+            rotary_emb=None,
+            qk_norm=None,
+        )
+        n = self._PREFIX
+        loc = torch.arange(n, device="cuda", dtype=torch.int64)
+        k = torch.ones(n, 2, 512, device="cuda", dtype=torch.bfloat16)
+        pool.k_buffer[1].zero_()
+        seen = []
+
+        class _Load:
+            """Records, at each wait, whether the write already landed."""
+
+            def wait_for_layer(self, layer_index):
+                torch.cuda.synchronize()
+                seen.append((layer_index, bool(pool.k_buffer[1].any())))
+
+        pool.layerwise_load_tracker = _Load()
+        pool.set_kv_buffer(layer, loc, k, k)
+        torch.cuda.synchronize()
+        self.assertEqual(seen[0], (1, False))
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

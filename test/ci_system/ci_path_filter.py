@@ -11,6 +11,7 @@ from pipeline import is_amd_runner, is_npu_runner, is_nvidia_arm_runner, normali
 RUNNER_GROUPS = (
     "amd-mi350",
     "amd-mi450",
+    "gb10",
     "nvidia-arm",
     "nvidia-gb200-slurm",
     "nvidia-gb300-slurm",
@@ -22,6 +23,7 @@ RUNNER_GROUPS = (
 RUNNER_GROUP_VENDORS = {
     "amd-mi350": "amd",
     "amd-mi450": "amd",
+    "gb10": "nvidia",
     "nvidia-arm": "nvidia",
     "nvidia-gb200-slurm": "nvidia",
     "nvidia-gb300-slurm": "nvidia",
@@ -274,6 +276,8 @@ def runner_label_in_group(label: str, runner_group: str) -> bool:
         return is_amd_runner(label) and not label.startswith(
             ("amd-mi450-", "amd-mi45x-")
         )
+    if runner_group == "gb10":
+        return label == "gb10-altos"
     if is_amd_runner(label):
         return False
     if runner_group == "nvidia-x86":

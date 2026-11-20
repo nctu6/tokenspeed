@@ -25,6 +25,7 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel_amd._device import num_cus, num_xcds
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.sparse_prefill import (
     gluon_dsv4_sparse_prefill_gfx950,
@@ -42,7 +43,7 @@ _LOG2E = 1.4426950408889634
 _BLOCK_H = 16
 _TILE_K = 32
 _NUM_WARPS = 4
-_NUM_XCDS = 8
+_NUM_XCDS = num_xcds()
 # A row whose byte offset (2^21 rows x 1 KiB = 2^31) lies past every buffer
 # range: buffer loads from it return zeros.
 _OOB_ROW = gl.constexpr(1 << 21)

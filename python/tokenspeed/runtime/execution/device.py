@@ -1722,6 +1722,47 @@ def probe_arena_floor(
     )
 
 
+def _shared_l2_group(
+    server_args, *, kv_identical_across_attn_tp: bool, attn_tp_rank: int, pg_manager
+):
+    """The attention-TP group that shares one Host L2 buffer, or None.
+
+    ``--kvstore-share-host-across-attn-tp`` applies only where it is correct
+    and possible: an L2 tier, a layout whose bytes are identical on every
+    attention-TP rank, no KVP sharding of Host blocks, and a group on one
+    node (the buffer is a shared-memory segment). The node check is a
+    collective over the group, entered by every rank alike.
+    """
+    from tokenspeed.runtime.cache.l2.shared import SharedL2Group, same_host
+
+    attn = server_args.mapping.attn
+    tp_size = int(attn.tp_size)
+    if not server_args.kvstore_share_host_across_attn_tp:
+        return None
+    reason = None
+    if not server_args.enable_kvstore:
+        reason = "no Host L2 tier"
+    elif tp_size <= 1:
+        reason = "attention TP size 1"
+    elif not kv_identical_across_attn_tp:
+        reason = "the cache layout's bytes differ across attention-TP ranks"
+    elif int(attn.kvp_size) > 1:
+        reason = "--kv-parallel-size > 1 shards Host blocks per rank"
+    cpu_group = None
+    if reason is None:
+        cpu_group = pg_manager.get_process_group("gloo", attn.tp_group)
+        if not same_host(cpu_group, tp_size):
+            reason = "the attention-TP group spans nodes"
+    if reason is not None:
+        if attn_tp_rank == 0:
+            logger.info(
+                f"--kvstore-share-host-across-attn-tp ignored: {reason}; each "
+                "rank keeps its own Host L2 buffer"
+            )
+        return None
+    return SharedL2Group(rank=attn_tp_rank, size=tp_size, cpu_group=cpu_group)
+
+
 def _retraction_pool_request(
     server_args,
     contract,
@@ -2070,6 +2111,12 @@ def build_device_side(
             process_group_manager as pg_manager,
         )
 
+        shared_l2 = _shared_l2_group(
+            server_args,
+            kv_identical_across_attn_tp=attention.kv_identical_across_attn_tp,
+            attn_tp_rank=attn_tp_rank,
+            pg_manager=pg_manager,
+        )
         host_cache_executor = HostCacheExecutor(
             views.token_to_kv_pool,
             draft_pool=views.draft_token_to_kv_pool,
@@ -2087,6 +2134,7 @@ def build_device_side(
                 if server_args.mapping.world_size > 1
                 else None
             ),
+            shared_l2=shared_l2,
         )
     elif attn_tp_rank == 0:
         # With an executor the line comes from its resolved sizing.

@@ -102,7 +102,7 @@ def _validate(
             raise ValueError("MoE output_scale must be finite and positive")
     elif plan.get("output_scale", 1.0) != 1.0:
         raise ValueError("MoE output_scale requires an explicit precision policy")
-    if activation not in {"silu", "situ", "swiglu"}:
+    if activation not in {"silu", "situ", "swiglu", "gelu_tanh"}:
         raise ValueError(f"Triton MoE does not support activation {activation!r}")
     swiglu_arg = getattr(w, "swiglu_arg", None)
     if swiglu_arg is not None and (
@@ -205,6 +205,13 @@ def _stage1_kernel(
                 gate = situ_beta * libdevice.tanh(gate / situ_beta) * tl.sigmoid(gate)
                 if HAS_LINEAR_BETA:
                     up = situ_linear_beta * libdevice.tanh(up / situ_linear_beta)
+                activated = (gate * up).to(inter_ptr.dtype.element_ty)
+            elif ACTIVATION == "gelu_tanh":
+                # GeGLU with the tanh GELU approximation (gelu_pytorch_tanh).
+                gate = gate_acc.to(inter_ptr.dtype.element_ty).to(tl.float32)
+                up = up_acc.to(inter_ptr.dtype.element_ty).to(tl.float32)
+                inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
+                gate = 0.5 * gate * (1.0 + libdevice.tanh(inner))
                 activated = (gate * up).to(inter_ptr.dtype.element_ty)
             else:
                 if ROUND_GEMM_OUTPUTS:

@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING
 from tokenspeed.runtime.cache.transfer.layout import CacheTransferLayout
 
 if TYPE_CHECKING:
+    import torch
+
     from tokenspeed.runtime.cache.transfer.layout import CacheGroupLayout
     from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -206,6 +208,7 @@ class HostCacheStorage:
         *,
         group_specs: Sequence[CacheGroupSpec],
         num_host_lcm_blocks: int,
+        host_buffer: torch.Tensor | None = None,
     ):
         """
         Args:
@@ -213,6 +216,10 @@ class HostCacheStorage:
             group_specs: The scheduler's group specs, which size the shared
                 parent (``compute_host_lcm_block_bytes``).
             num_host_lcm_blocks: Parents to allocate, the null block excluded.
+            host_buffer: A registered uint8 CPU tensor of exactly the buffer's
+                size to index instead of allocating one (the attention-TP
+                group's shared segment, ``l2/shared.py``); None pins a
+                private buffer.
         """
         if num_host_lcm_blocks <= 0:
             raise ValueError("num_host_lcm_blocks must be > 0")
@@ -225,6 +232,14 @@ class HostCacheStorage:
         ) = _compute_host_layout(layout, group_specs=group_specs)
         self.num_host_lcm_blocks = int(num_host_lcm_blocks)
         self.host_buffer_bytes = self.num_host_lcm_blocks * self.host_lcm_block_bytes
+        if host_buffer is not None:
+            if host_buffer.numel() != self.host_buffer_bytes:
+                raise ValueError(
+                    f"shared Host buffer holds {host_buffer.numel()} bytes, the "
+                    f"layout needs {self.host_buffer_bytes}"
+                )
+            self.host_buffer = host_buffer
+            return
         import torch
 
         self.host_buffer = torch.empty(

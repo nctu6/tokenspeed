@@ -72,8 +72,10 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_GLOBAL_R2_GROUP_ID,
     V41_GROUP_GEOMETRY,
     V41_HEAD_DIM,
+    V41_INDEX_SCORE_CHUNK,
     V41_PREFILL_QUERY_TILE,
     V41_SWA_GROUP_ID,
+    V41_TAIL_ROWS,
     V41_WINDOW_SIZE,
     v41_prefill_kv_workspace_rows,
     v41_table_widths,
@@ -654,6 +656,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             metadata.block_tables[gid],
             self.cache_pool.arena.cache_group_page_counts[gid],
             *metadata.compressor,
+            rows=V41_TAIL_ROWS,
         )
 
     def window_slots(
@@ -1239,7 +1242,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         slots = self.cache_slots(
             V41_COMPRESSOR_TAIL_GROUP_ID, positions, request_indices, forward_mode
         )
-        return self.cache_pool.compressor_tail(owner)[slots // 2, slots % 2]
+        return self.cache_pool.compressor_tail(owner)[
+            slots // V41_TAIL_ROWS, slots % V41_TAIL_ROWS
+        ]
 
     def write_compressor_tail(
         self, owner, content, scores, positions, request_indices, forward_mode
@@ -1262,8 +1267,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             dsv41.compressor_tail_scatter(content, scores, tail, slots)
         else:
             live = slots >= 0
-            tail[slots[live] // 2, slots[live] % 2, 0] = content[live].float()
-            tail[slots[live] // 2, slots[live] % 2, 1] = scores[live].float()
+            tail[slots[live] // V41_TAIL_ROWS, slots[live] % V41_TAIL_ROWS, 0] = (
+                content[live].float()
+            )
+            tail[slots[live] // V41_TAIL_ROWS, slots[live] % V41_TAIL_ROWS, 1] = scores[
+                live
+            ].float()
 
     def compress(
         self,
@@ -1322,7 +1331,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             for start in range(0, positions.numel(), 8):
                 stop = min(start + 8, positions.numel())
                 slot = slots[start:stop].clamp_min(0)
-                history = tail[slot // 2, slot % 2]
+                history = tail[slot // V41_TAIL_ROWS, slot % V41_TAIL_ROWS]
                 prior = previous[start:stop].clamp_min(0)
                 prior_content = torch.where(
                     missing[start:stop, None], history[:, 0], content[prior]
@@ -1346,8 +1355,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             dsv41.compressor_tail_scatter(content, scores, tail, write_slots)
         else:
             live = write_slots >= 0
-            tail[write_slots[live] // 2, write_slots[live] % 2, 0] = content[live]
-            tail[write_slots[live] // 2, write_slots[live] % 2, 1] = scores[live]
+            tail[
+                write_slots[live] // V41_TAIL_ROWS, write_slots[live] % V41_TAIL_ROWS, 0
+            ] = content[live]
+            tail[
+                write_slots[live] // V41_TAIL_ROWS, write_slots[live] % V41_TAIL_ROWS, 1
+            ] = scores[live]
         return pooled, pair_positions, pair_requests
 
     def write_global(
@@ -1902,7 +1915,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 candidate_capacity if produce_candidates else 0,
                 self.spec.candidate_block_size,
                 max(1, stop - start),
-                256,
+                V41_INDEX_SCORE_CHUNK,
                 index_process_group,
                 outputs,
                 None,

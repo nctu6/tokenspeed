@@ -135,7 +135,7 @@ class TestQwen35VlmE2E:
 
         reason = launch_skip_reason(MODEL)
         if reason is not None:
-            raise unittest.SkipTest(reason)
+            pytest.skip(reason)
 
     def test_image_chat_completion(self):
         import requests

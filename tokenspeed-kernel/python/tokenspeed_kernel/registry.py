@@ -283,6 +283,9 @@ class KernelRegistry:
         self._by_name: dict[str, KernelSpec] = {}
         self._impls: dict[str, Callable] = {}  # name -> callable
         self._selection_cache: dict[tuple, SelectedKernel] = {}
+        # Bumped whenever a cached selection may go stale, so a caller that
+        # memoizes a selection outside this cache knows to select again.
+        self.generation = 0
 
     @classmethod
     def get(cls) -> KernelRegistry:
@@ -427,9 +430,11 @@ class KernelRegistry:
         self._selection_cache = {
             k: v for k, v in self._selection_cache.items() if k[:2] != key
         }
+        self.generation += 1
 
     def clear_cache(self) -> None:
         self._selection_cache.clear()
+        self.generation += 1
 
 
 def register_kernel(

@@ -530,12 +530,13 @@ def _compressor_tail_scatter_kernel(
     # Rows the destination holds; it follows the buffer's size, which can
     # track the batch, so it stays a runtime bound.
     CAPACITY,
+    ROWS: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     slot = tl.load(Slots + row * LS).to(tl.int64)
     if slot >= 0 and slot < CAPACITY:
         d = tl.arange(0, 512)
-        base = Tail + slot // 2 * TP + slot % 2 * TR + d * TD
+        base = Tail + slot // ROWS * TP + slot % ROWS * TR + d * TD
         tl.store(base, tl.load(Content + row * CS0 + d * CS1))
         tl.store(base + TK, tl.load(Scores + row * SS0 + d * SS1))
 
@@ -557,11 +558,11 @@ def compressor_tail_scatter(content, scores, tail, slots):
         or content.dtype != torch.float32
         or scores.dtype != torch.float32
         or tail.ndim != 4
-        or tail.shape[1:] != (2, 2, 512)
+        or tail.shape[2:] != (2, 512)
         or tail.dtype != torch.float32
     ):
         raise ValueError(
-            "require FP32 content/scores [T, 512] and tail [pages, 2, 2, 512]"
+            "require FP32 content/scores [T, 512] and tail [pages, rows, 2, 512]"
         )
     _same_device(content, (scores, tail, slots))
     _integers(slots, (content.shape[0],), "slots")
@@ -575,7 +576,8 @@ def compressor_tail_scatter(content, scores, tail, slots):
             *scores.stride(),
             *tail.stride(),
             slots.stride(0),
-            CAPACITY=tail.shape[0] * 2,
+            CAPACITY=tail.shape[0] * tail.shape[1],
+            ROWS=tail.shape[1],
             num_warps=4,
         )
 
@@ -1543,6 +1545,7 @@ def _compressor_pool(
     O0: tl.constexpr,
     O1: tl.constexpr,
     PAGES,
+    ROWS: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     channels = tl.arange(0, 512)
@@ -1553,10 +1556,12 @@ def _compressor_pool(
     in_current = live & (previous >= 0) & (previous < N)
     # Pool capacity changes when startup replaces the probe arena. Widen
     # before multiplying so a runtime int32 page count cannot wrap the bound.
-    in_tail = live & (previous < 0) & (slot >= 2) & (slot < PAGES.to(tl.int64) * 2)
+    in_tail = (
+        live & (previous < 0) & (slot >= ROWS) & (slot < PAGES.to(tl.int64) * ROWS)
+    )
     old_content = tl.load(CONTENT + previous * C0 + channels * C1, in_current, 0.0)
     old_scores = tl.load(SCORES + previous * G0 + channels * G1, in_current, 0.0)
-    tail_offset = slot // 2 * T0 + slot % 2 * T1 + channels * T3
+    tail_offset = slot // ROWS * T0 + slot % ROWS * T1 + channels * T3
     tail_content = tl.load(TAIL + tail_offset, in_tail, 0.0)
     tail_scores = tl.load(TAIL + tail_offset + T2, in_tail, 0.0)
     old_content = tl.where(in_current, old_content, tail_content)
@@ -1600,11 +1605,11 @@ def compressor_pool(
         or content.dtype != torch.float32
         or scores.dtype != torch.float32
         or tail.ndim != 4
-        or tail.shape[1:] != (2, 2, 512)
+        or tail.shape[2:] != (2, 512)
         or tail.dtype != torch.float32
     ):
         raise ValueError(
-            "Compressor pooling requires FP32 [N,512] and [pages,2,2,512] tail"
+            "Compressor pooling requires FP32 [N,512] and [pages,rows,2,512] tail"
         )
     count = content.shape[0]
     for value in (previous, tail_slots):
@@ -1657,6 +1662,7 @@ def compressor_pool(
             *tail.stride(),
             *out.stride(),
             tail.shape[0],
+            tail.shape[1],
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -2001,7 +2007,10 @@ def _rope_pad_query(
 @_register_rope("dsv41_rope_pad_query")
 def rope_pad_query(values, positions, cache):
     n, h, _ = values.shape
-    hp = 64 if h <= 64 else 128
+    # FlashMLA (NVIDIA) consumes 64/128-head queries; the gfx950 selected
+    # attention takes any multiple of its 16-head MFMA block, so padding to
+    # 64 would only add zero heads it must still multiply and write.
+    hp = -(-h // 16) * 16 if torch.version.hip else (64 if h <= 64 else 128)
     output = torch.empty((n, hp, 512), dtype=values.dtype, device=values.device)
     return _launch_query(values, positions, cache, output, hp)
 
@@ -4359,6 +4368,7 @@ def _compressor_metadata(
     TS1,
     PAGES,
     BLOCK: tl.constexpr,
+    ROWS: tl.constexpr,
 ):
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     position = tl.load(Positions + row * P0, row < N, -1).to(tl.int64)
@@ -4378,10 +4388,10 @@ def _compressor_metadata(
         -1,
     )
     read_slot = resolve_group_slot(
-        Table, pair, pair_request, TR, TC, TS0, TS1, 2, 1, 1, PAGES
+        Table, pair, pair_request, TR, TC, TS0, TS1, ROWS, 1, 1, PAGES
     )
     write_slot = resolve_group_slot(
-        Table, position, request, TR, TC, TS0, TS1, 2, 1, 1, PAGES
+        Table, position, request, TR, TC, TS0, TS1, ROWS, 1, 1, PAGES
     )
     tl.store(Active + row, active, row < N)
     tl.store(PairPositions + row, pair, row < N)
@@ -4411,6 +4421,7 @@ def compressor_metadata(
     previous,
     read_slots,
     write_slots,
+    rows=2,
 ):
     """Fill a ratio-2 plan for consecutive rows within each request in O(N)."""
     n = positions.numel()
@@ -4444,6 +4455,7 @@ def compressor_metadata(
             *table.stride(),
             pages,
             BLOCK=256,
+            ROWS=rows,
             num_warps=4,
         )
 
@@ -4948,21 +4960,20 @@ def _clean_logits_output(
 
 
 @triton.jit
-def _block_select_keys(row, start, n, latest, BLOCK: tl.constexpr):
+def _block_select_keys(row, start, n, latest, BLOCK: tl.constexpr, seen):
     # Order-preserving uint32 keys of 8-row block maxima. The newest visible
-    # block with a finite score is forced in.
+    # block with a finite score is forced in. Columns past the visible length
+    # ``seen`` are masked, so they need not hold -inf.
     idx = start + tl.arange(0, BLOCK)
-    in_range = idx < n
+    cols = idx[:, None] * 8 + tl.arange(0, 8)[None, :]
     x = tl.max(
         tl.load(
-            row + idx[:, None] * 8 + tl.arange(0, 8)[None, :],
-            mask=in_range[:, None],
-            other=-float("inf"),
+            row + cols, mask=(idx < n)[:, None] & (cols < seen), other=-float("inf")
         ),
         axis=1,
     )
     x = tl.where((idx == latest) & (x > -float("inf")), float("inf"), x)
-    valid = in_range & (x > -float("inf"))
+    valid = (idx < n) & (x > -float("inf"))
     bits = x.to(tl.uint32, bitcast=True)
     key = tl.where((bits >> 31) != 0, ~bits, bits | 0x80000000)
     return idx, key, valid
@@ -5003,7 +5014,7 @@ def _index_block_select_kernel(
     for p in tl.static_range(4):
         hist = tl.zeros([256], dtype=tl.int32)
         for start in range(0, n, BLOCK):
-            _, key, valid = _block_select_keys(row, start, n, latest, BLOCK)
+            _, key, valid = _block_select_keys(row, start, n, latest, BLOCK, seen)
             match = valid & ((key & high) == prefix)
             bucket = ((key >> (24 - 8 * p)) & 255).to(tl.int32)
             hist += tl.histogram(bucket, 256, mask=match)
@@ -5022,7 +5033,7 @@ def _index_block_select_kernel(
     selected = 0
     ties = 0
     for start in range(0, n, BLOCK):
-        idx, key, valid = _block_select_keys(row, start, n, latest, BLOCK)
+        idx, key, valid = _block_select_keys(row, start, n, latest, BLOCK, seen)
         equal = (valid & (key == prefix)).to(tl.int32)
         tie_rank = ties + tl.cumsum(equal, 0) - equal
         take = valid & ((key > prefix) | ((equal != 0) & (tie_rank < remaining)))
@@ -5089,7 +5100,7 @@ def _block_keys_pass(
         return
     latest = tl.where(seen > 0, (seen - 1) // 8, -1)
     row = logits + query.to(tl.int64) * stride_logits
-    idx, key, valid = _block_select_keys(row, start, n, latest, BLOCK)
+    idx, key, valid = _block_select_keys(row, start, n, latest, BLOCK, seen)
     key = tl.where(valid, key, 0)
     tl.store(
         keys + query.to(tl.int64) * n_blocks + idx,

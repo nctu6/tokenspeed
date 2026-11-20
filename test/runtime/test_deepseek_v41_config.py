@@ -45,6 +45,7 @@ from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import (
     DeepseekV41Config as DeepseekV41AttnConfig,
 )
+from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import V41_TAIL_ROWS
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v41 import (
     DeepseekV41CachePool,
 )
@@ -435,7 +436,12 @@ def test_config_selects_flash_recipe_and_checks_geometry(runtime_config, overlap
     assert layout.lcm_block_bytes == rows.lcm_block_bytes
     assert layout.plane_bytes == (("flatkv", rows.lcm_block_bytes),)
     assert dict(layout.group_packing) == dict(rows.group_packing)
-    assert [group.block_granularity for group, _ in groups] == [64, 128, 64, 2]
+    assert [group.block_granularity for group, _ in groups] == [
+        64,
+        128,
+        64,
+        V41_TAIL_ROWS,
+    ]
     assert [len(fields) for _, fields in groups] == [40, 6, 2, 3]
     assert [group.sliding_window_tokens for group, _ in groups] == [
         128,
@@ -504,7 +510,7 @@ def test_real_server_args_prepare_cache_pool_and_backend(runtime_config, overlap
         (pool.swa(39), (64, rows.swa_row_bytes)),
         (pool.global_kv(2), (64, rows.global_row_bytes)),
         (pool.index_k(20), (64, rows.index_row_bytes)),
-        (pool.compressor_tail(14), (2, 2, 512)),
+        (pool.compressor_tail(14), (V41_TAIL_ROWS, 2, 512)),
     ):
         assert tuple(view.shape[1:]) == shape
         assert (

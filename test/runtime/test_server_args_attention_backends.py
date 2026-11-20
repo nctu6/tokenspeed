@@ -943,7 +943,7 @@ class TestDisaggregationGraphFlags:
 
 
 class TestL3StorageBackend:
-    def test_cli_accepts_mooncake_and_memory(self):
+    def test_cli_accepts_mooncake_file_and_memory(self):
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
         action = None
@@ -952,7 +952,7 @@ class TestL3StorageBackend:
                 action = candidate
                 break
         assert (action) is not None
-        assert (set(action.choices)) == ({"mooncake", "memory"})
+        assert (set(action.choices)) == ({"mooncake", "file", "memory"})
 
     def test_memory_backend_keeps_host_io(self):
         args = object.__new__(ServerArgs)

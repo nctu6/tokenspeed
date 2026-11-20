@@ -1779,6 +1779,13 @@ def _attnres_combine_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+def _attnres_block(hidden: int) -> int:
+    """Tile width for the AttnRes kernels: they sweep each row in exactly two
+    tiles, so pick the power of two covering half the hidden size (4096 for
+    Kimi-K3's 7168)."""
+    return max(16, triton.next_power_of_2(triton.cdiv(hidden, 2)))
+
+
 def attnres_partial(blocks, wp, eps, scratch):
     """Blocks-side online-softmax partial. scratch = (m [T], s [T], acc [T,H] fp32)."""
     KB, T, H = blocks.shape
@@ -1814,7 +1821,7 @@ def attnres_partial(blocks, wp, eps, scratch):
         stride_bt=blocks.stride(1),
         eps=eps,
         NORMALIZE_VALUES=False,
-        BLOCK=4096,
+        BLOCK=_attnres_block(H),
         ENABLE_PDL=enable_pdl,
         num_warps=8,
         **pdl_kwargs,
@@ -1870,7 +1877,7 @@ def attnres_partial_dual(blocks, wp_a, wp_b, eps, scratch_a, scratch_b):
         stride_bk=blocks.stride(0),
         stride_bt=blocks.stride(1),
         eps=eps,
-        BLOCK=4096,
+        BLOCK=_attnres_block(H),
         ENABLE_PDL=enable_pdl,
         num_warps=8,
         **pdl_kwargs,
@@ -1914,7 +1921,7 @@ def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out):
         NORMALIZE_VALUES=False,
         ROUND_MIX=True,
         HAS_OUTNORM=out_norm_w is not None,
-        BLOCK=4096,
+        BLOCK=_attnres_block(H),
         num_warps=8,
         ENABLE_PDL=enable_pdl,
         TRIGGER_FIRST=False,

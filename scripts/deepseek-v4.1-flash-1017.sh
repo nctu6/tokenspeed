@@ -11,7 +11,9 @@
 # four-group KV cache; the serve knobs below follow the recipe in
 # docs/recipes/models.md ("DeepSeek V4.1-Flash"). Same-checkpoint DSpark
 # speculative decoding is on by default (the CI/eval default for this
-# checkpoint); it requires --disable-kvstore and prefix caching on.
+# checkpoint). It needs prefix caching on; V4.1 keeps the draft windows in
+# its SWA cache group, so the Host KVStore (and L3 under it) works with
+# DSpark too. The KVStore stays off unless ENABLE_KVSTORE=1.
 #
 # MoE backend is arch-aware:
 #   Datacenter Blackwell (sm100/sm103, B200/GB200): mega_moe + expert parallel
@@ -34,6 +36,8 @@
 #   ENABLE_EXPERT_PARALLEL  default: 1 when MOE_BACKEND=mega_moe, else 0.
 #                        Non-empty/1 = --enable-expert-parallel (ep_size=world).
 #   ENABLE_DSPARK        default: 1 (--speculative-algorithm DSPARK). 0 to disable.
+#   ENABLE_KVSTORE       default: 0 (--disable-kvstore). 1 keeps the Host KVStore
+#                        (L2) on; add --kvstore-* / L3 flags via EXTRA_SERVE_ARGS.
 #   DTYPE                default: bfloat16
 #   MAX_MODEL_LEN        default: 32768
 #   MAX_TOTAL_TOKENS     default: 262144  (KV budget; caps admission)
@@ -57,8 +61,17 @@
 #                        Set 1 for text-only (adds --language-model-only, drops
 #                        the vision tower; slightly less memory). Multimodal TP=4
 #                        is verified on sm120 (~85 GB/GPU; vision uses triton_attn).
+#   ROUTED_EXPERTS       default: 128 at TP=2 on <128 GiB cards, else empty (all
+#                        checkpoint experts). N = load only the first N routed
+#                        experts per layer via --hf-overrides
+#                        '{"n_routed_experts": N, "num_checkpoint_experts": <ckpt>}'
+#                        (docs/recipes/models.md). The router keeps those N rows,
+#                        so this is a different model than the checkpoint: use it
+#                        for bring-up/numerics on 2 GPUs, not for quality.
+#                        Set empty to load all experts.
 #   ALLOW_TP2_OOM        default: empty. 1 = bypass the TP=2 weight-fit guard and
-#                        attempt TP=2 anyway (expected CUDA OOM on <128 GiB cards).
+#                        attempt TP=2 with all experts anyway (expected CUDA OOM
+#                        on <128 GiB cards).
 #   VENV_DIR             default: ./.venv
 #   TOKENSPEED_CUDA_ARCH override detected arch (e.g. sm100 / sm90 / 10.0 / 9.0)
 #   VLLM_BATCH_INVARIANT default: empty. Truthy (1/true/yes/on) = deterministic
@@ -72,7 +85,7 @@
 # Recommended invoke:
 #   # TP=4 on GPUs 0-3
 #   TENSOR_PARALLEL_SIZE=4 CUDA_DEVICES=0,1,2,3 ./scripts/deepseek-v4.1-flash-1017.sh
-#   # TP=2 on GPUs 0-1
+#   # TP=2 on GPUs 0-1 (96 GiB cards: partial MoE, first 128 of 384 experts)
 #   TENSOR_PARALLEL_SIZE=2 CUDA_DEVICES=0,1 ./scripts/deepseek-v4.1-flash-1017.sh
 #
 # Usage:
@@ -195,6 +208,7 @@ else
 fi
 
 ENABLE_DSPARK="${ENABLE_DSPARK:-1}"
+ENABLE_KVSTORE="${ENABLE_KVSTORE:-0}"
 DTYPE="${DTYPE:-bfloat16}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-262144}"
@@ -248,26 +262,52 @@ if [[ "${_NDEV}" -ne "${TENSOR_PARALLEL_SIZE}" ]]; then
 fi
 
 # TP=2 weight-fit guard. The non-offloadable on-GPU weight (~307 GB, mostly MXFP4
-# experts) needs ~154 GB/GPU at TP=2. Cards below ~128 GiB cannot hold it, and no
-# weight/expert CPU-offload or sub-4-bit path exists to close the gap (quantization
-# does NOT help: experts are already MXFP4). Refuse early with a clear message.
-# Override with ALLOW_TP2_OOM=1 to attempt anyway (expected CUDA OOM at weight load).
-if [[ "${TENSOR_PARALLEL_SIZE}" == "2" && "${ALLOW_TP2_OOM:-}" != "1" ]]; then
+# experts) needs ~154 GB/GPU at TP=2 with every expert loaded. Cards below
+# ~128 GiB cannot hold it, and quantization does not help (experts are already
+# MXFP4). There the default is a partial MoE: only the first ROUTED_EXPERTS
+# (128 of 384) routed experts per layer, ~1/3 of the expert bytes (~50 GB/GPU).
+_tp2_small_gpu=0
+if [[ "${TENSOR_PARALLEL_SIZE}" == "2" ]]; then
     _mem="${_GPU_MEM_MIB:-0}"
     if [[ "${_mem}" =~ ^[0-9]+$ && "${_mem}" -lt 131072 ]]; then
-        echo "ERROR: TP=2 needs ~154 GB/GPU of non-offloadable weight (MXFP4 experts);" >&2
-        echo "  this GPU has ~$(( _mem / 1024 )) GiB. It will OOM at weight load." >&2
-        echo "  Engram host-table + language-model-only + quantization CANNOT close the gap" >&2
-        echo "  (experts are already ~4-bit MXFP4). Use TP>=4, more GPUs, or a smaller" >&2
-        echo "  checkpoint. See deepseek-v4.1-flash-1017-research.md. Set ALLOW_TP2_OOM=1" >&2
-        echo "  to attempt anyway." >&2
-        exit 1
+        _tp2_small_gpu=1
     fi
 fi
-
-# DSpark replay requires KVStore off and prefix caching on (scheduler_utils).
+if [[ "${_tp2_small_gpu}" == "1" && "${ALLOW_TP2_OOM:-}" != "1" ]]; then
+    ROUTED_EXPERTS="${ROUTED_EXPERTS-128}"
+else
+    ROUTED_EXPERTS="${ROUTED_EXPERTS-}"
+fi
+# Routed experts the checkpoint holds (text_config.n_routed_experts); 384 for
+# V4.1-Flash when the config cannot be read (e.g. MODEL_PATH is a hub id).
+CHECKPOINT_EXPERTS="${CHECKPOINT_EXPERTS:-}"
+if [[ -n "$ROUTED_EXPERTS" && -z "$CHECKPOINT_EXPERTS" ]]; then
+    CHECKPOINT_EXPERTS="$(python3 - "$MODEL_PATH/config.json" <<'PY' 2>/dev/null || true
+import json, sys
+config = json.load(open(sys.argv[1]))
+print(config.get("text_config", config)["n_routed_experts"])
+PY
+)"
+    CHECKPOINT_EXPERTS="${CHECKPOINT_EXPERTS:-384}"
+fi
+if [[ -n "$ROUTED_EXPERTS" ]]; then
+    if ! [[ "$ROUTED_EXPERTS" =~ ^[0-9]+$ && "$ROUTED_EXPERTS" -ge 1 \
+            && "$ROUTED_EXPERTS" -le "$CHECKPOINT_EXPERTS" ]]; then
+        echo "ERROR: ROUTED_EXPERTS='$ROUTED_EXPERTS' must be 1..${CHECKPOINT_EXPERTS}." >&2
+        exit 1
+    fi
+elif [[ "${_tp2_small_gpu}" == "1" && "${ALLOW_TP2_OOM:-}" != "1" ]]; then
+    echo "ERROR: TP=2 with all experts needs ~154 GB/GPU of non-offloadable weight;" >&2
+    echo "  this GPU has ~$(( _mem / 1024 )) GiB. Keep the default ROUTED_EXPERTS=128" >&2
+    echo "  (partial MoE), use TP=4, or set ALLOW_TP2_OOM=1 to attempt anyway." >&2
+    exit 1
+fi
 if [[ "${ENABLE_DSPARK}" != "0" && "${ENABLE_DSPARK}" != "1" ]]; then
     echo "ERROR: ENABLE_DSPARK must be 0 or 1." >&2
+    exit 1
+fi
+if [[ "${ENABLE_KVSTORE}" != "0" && "${ENABLE_KVSTORE}" != "1" ]]; then
+    echo "ERROR: ENABLE_KVSTORE must be 0 or 1." >&2
     exit 1
 fi
 
@@ -291,7 +331,7 @@ else
     exit 1
 fi
 
-echo "[deepseek-v4.1-flash-1017] arch=${_CUDA_ARCH:-unknown} gpu_mem=${_GPU_MEM_MIB:-unknown}MiB moe_policy=${_MOE_POLICY} CUDA_DEVICES=${CUDA_DEVICES} TP=${TENSOR_PARALLEL_SIZE} moe_backend=${MOE_BACKEND} expert_parallel=${ENABLE_EXPERT_PARALLEL} dspark=${ENABLE_DSPARK} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS} MAX_NUM_SEQS=${MAX_NUM_SEQS} gpu_mem_util=${GPU_MEMORY_UTILIZATION:-engine_default} reasoning=${REASONING_PARSER:-none} tool_parser=${TOOL_CALL_PARSER:-none} auto_tool_choice=${ENABLE_AUTO_TOOL_CHOICE:-off} engram_host_table=${ENGRAM_HOST_TABLE:-off} lm_only=${LANGUAGE_MODEL_ONLY:-off} model=${MODEL_PATH}" >&2
+echo "[deepseek-v4.1-flash-1017] arch=${_CUDA_ARCH:-unknown} gpu_mem=${_GPU_MEM_MIB:-unknown}MiB moe_policy=${_MOE_POLICY} CUDA_DEVICES=${CUDA_DEVICES} TP=${TENSOR_PARALLEL_SIZE} moe_backend=${MOE_BACKEND} expert_parallel=${ENABLE_EXPERT_PARALLEL} dspark=${ENABLE_DSPARK} kvstore=${ENABLE_KVSTORE} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS} MAX_NUM_SEQS=${MAX_NUM_SEQS} gpu_mem_util=${GPU_MEMORY_UTILIZATION:-engine_default} reasoning=${REASONING_PARSER:-none} tool_parser=${TOOL_CALL_PARSER:-none} auto_tool_choice=${ENABLE_AUTO_TOOL_CHOICE:-off} routed_experts=${ROUTED_EXPERTS:-all}${ROUTED_EXPERTS:+/${CHECKPOINT_EXPERTS}} engram_host_table=${ENGRAM_HOST_TABLE:-off} lm_only=${LANGUAGE_MODEL_ONLY:-off} model=${MODEL_PATH}" >&2
 
 # --served-model-name is nargs="+": SPACE-separated names, each its own argv
 # item (NOT comma-separated -- a comma becomes part of a single literal name).
@@ -313,8 +353,13 @@ cmd=(
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
     --max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE"
     --enable-prefix-caching
-    --disable-kvstore
 )
+if [[ "$ENABLE_KVSTORE" == "0" ]]; then
+    cmd+=(--disable-kvstore)
+fi
+if [[ -n "$ROUTED_EXPERTS" ]]; then
+    cmd+=(--hf-overrides "{\"n_routed_experts\": ${ROUTED_EXPERTS}, \"num_checkpoint_experts\": ${CHECKPOINT_EXPERTS}}")
+fi
 if [[ -n "$ENGRAM_HOST_TABLE" && "$ENGRAM_HOST_TABLE" != "0" ]]; then
     cmd+=(--engram-host-table --engram-host-table-layout "$ENGRAM_HOST_TABLE_LAYOUT")
 fi

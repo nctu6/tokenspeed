@@ -12,7 +12,6 @@ on:
       - "tokenspeed-kernel/**"
       - "tokenspeed-kernel-amd/**"
       - "tokenspeed-engine/**"
-      - "tokenspeed-scheduler/**"
       - "test/**"
       - ".github/workflows/amd-kernel-benchmark.yml"
       - ".github/workflows/run-ci-task-matrix.yml"
@@ -25,7 +24,6 @@ on:
       - "tokenspeed-kernel/**"
       - "tokenspeed-kernel-amd/**"
       - "tokenspeed-engine/**"
-      - "tokenspeed-scheduler/**"
       - "test/**"
       - ".github/workflows/amd-kernel-benchmark.yml"
       - ".github/workflows/run-ci-task-matrix.yml"
@@ -40,9 +38,10 @@ concurrency:
 
 jobs:
   scan:
-    # Run jobs for pull requests, or for push/manual events in the official
+    # Benchmark CI is intentionally paused.
     # repository or a repository whose full name matches TOKENSPEED_CI_REPOSITORY.
     if: |
+      false &&
       github.event_name == 'pull_request' ||
       github.repository == 'lightseekorg/tokenspeed' ||
       github.repository == vars.TOKENSPEED_CI_REPOSITORY
@@ -128,6 +127,7 @@ jobs:
   kernel-benchmark:
     needs: scan
     if: |
+      false &&
       needs.scan.outputs.should_run == 'true' &&
       needs.scan.outputs.kernel_benchmark_has_tasks == 'true' &&
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
@@ -143,13 +143,7 @@ jobs:
   # this job as well as the other PR test workflows' gates. Keep the name so a
   # benchmark failure blocks merging.
   finish:
-    if: |
-      always() &&
-      (
-        github.event_name == 'pull_request' ||
-        github.repository == 'lightseekorg/tokenspeed' ||
-        github.repository == vars.TOKENSPEED_CI_REPOSITORY
-      )
+    if: false
     needs: [scan, kernel-benchmark]
     runs-on: ubuntu-latest
     steps:

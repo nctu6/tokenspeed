@@ -406,9 +406,7 @@ def test_prefetch_convergence_precedes_the_rounds_cache_poll(
     scheduler at the head advance; the forward is never touched and the
     remote prefill always goes out."""
     trace = []
-    first_forward = SimpleNamespace(
-        request_ids=["running"], input_lengths=[1], num_extends=lambda: 0
-    )
+    first_forward = SimpleNamespace(request_ids=["running"], input_lengths=[1])
     first_plan = SimpleNamespace(
         forward=[first_forward], remote_prefill=None, aborts=[]
     )

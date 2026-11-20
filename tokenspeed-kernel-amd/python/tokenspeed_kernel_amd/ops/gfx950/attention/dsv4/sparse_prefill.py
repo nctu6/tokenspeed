@@ -31,6 +31,7 @@ validated DeepSeek-V4 prefill shapes: B=1, D=512, H in {64, 128}, topk>=128.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._device import num_xcds as _num_xcds
 from tokenspeed_kernel_amd._triton import cdna4_async_copy as cdna4_async
 from tokenspeed_kernel_amd._triton import (
     gl,
@@ -851,7 +852,7 @@ def gluon_dsv4_sparse_prefill_gfx950(
     assert block_k in (32, 64)
     assert topk3.size(2) % block_k == 0
 
-    num_xcds = 8
+    num_xcds = _num_xcds()
     grid = (num_xcds, triton.cdiv(h, 64), triton.cdiv(s, num_xcds))
     kernel = (
         gluon_dsv4_prefill_sparse_k64_gfx950

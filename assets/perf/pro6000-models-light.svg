@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="320" viewBox="0 0 760 320" role="img" aria-label="NVIDIA RTX PRO 6000 Blackwell · client concurrency">
+<rect width="760" height="320" rx="8" fill="#fcfcfb"/>
+<text x="84" y="26" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="15" font-weight="600" fill="#0b0b0b">NVIDIA RTX PRO 6000 Blackwell · client concurrency</text>
+<text x="84" y="45" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#52514e">requests per unit time vs vLLM 0.32 (vLLM-Omni for MiniMax)</text>
+<line x1="84" x2="740" y1="276.0" y2="276.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="76" y="280.0" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#898781" text-anchor="end">0×</text>
+<line x1="84" x2="740" y1="233.6" y2="233.6" stroke="#e1e0d9" stroke-width="1"/>
+<text x="76" y="237.6" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#898781" text-anchor="end">0.5×</text>
+<line x1="84" x2="740" y1="191.2" y2="191.2" stroke="#e1e0d9" stroke-width="1"/>
+<text x="76" y="195.2" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#52514e" text-anchor="end">vLLM 1×</text>
+<line x1="84" x2="740" y1="148.8" y2="148.8" stroke="#e1e0d9" stroke-width="1"/>
+<text x="76" y="152.8" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#898781" text-anchor="end">1.5×</text>
+<line x1="84" x2="740" y1="106.4" y2="106.4" stroke="#e1e0d9" stroke-width="1"/>
+<text x="76" y="110.4" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#898781" text-anchor="end">2×</text>
+<line x1="84" x2="740" y1="64.0" y2="64.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="76" y="68.0" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#898781" text-anchor="end">2.5×</text>
+<line x1="84" x2="740" y1="191.2" y2="191.2" stroke="#52514e" stroke-width="1" stroke-dasharray="4 3"/>
+<path d="M155.3,276.0 L155.3,170.6 Q155.3,166.6 159.3,166.6 L175.3,166.6 Q179.3,166.6 179.3,170.6 L179.3,276.0 Z" fill="#2a78d6"><title>whisper-large-v3 (1 GPU) C=1: 1.29×</title></path>
+<text x="167.3" y="161.6" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="10" fill="#0b0b0b" text-anchor="middle">1.29</text>
+<path d="M181.3,276.0 L181.3,180.8 Q181.3,176.8 185.3,176.8 L201.3,176.8 Q205.3,176.8 205.3,180.8 L205.3,276.0 Z" fill="#eb6834"><title>whisper-large-v3 (1 GPU) C=8: 1.17×</title></path>
+<text x="193.3" y="171.8" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="10" fill="#0b0b0b" text-anchor="middle">1.17</text>
+<path d="M207.3,276.0 L207.3,187.6 Q207.3,183.6 211.3,183.6 L227.3,183.6 Q231.3,183.6 231.3,187.6 L231.3,276.0 Z" fill="#1baf7a"><title>whisper-large-v3 (1 GPU) C=16: 1.09×</title></path>
+<text x="219.3" y="178.6" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="10" fill="#0b0b0b" text-anchor="middle">1.09</text>
+<text x="193.3" y="294.0" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#52514e" text-anchor="middle">whisper-large-v3 (1 GPU)</text>
+<path d="M374.0,276.0 L374.0,179.1 Q374.0,175.1 378.0,175.1 L394.0,175.1 Q398.0,175.1 398.0,179.1 L398.0,276.0 Z" fill="#2a78d6"><title>MiniMax-Music3 (2 GPU) C=1: 1.19×</title></path>
+<text x="386.0" y="170.1" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="10" fill="#0b0b0b" text-anchor="middle">1.19</text>
+<path d="M400.0,276.0 L400.0,140.1 Q400.0,136.1 404.0,136.1 L420.0,136.1 Q424.0,136.1 424.0,140.1 L424.0,276.0 Z" fill="#eb6834"><title>MiniMax-Music3 (2 GPU) C=8: 1.65×</title></path>
+<text x="412.0" y="131.1" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="10" fill="#0b0b0b" text-anchor="middle">1.65</text>
+<path d="M426.0,276.0 L426.0,129.1 Q426.0,125.1 430.0,125.1 L446.0,125.1 Q450.0,125.1 450.0,129.1 L450.0,276.0 Z" fill="#1baf7a"><title>MiniMax-Music3 (2 GPU) C=16: 1.78×</title></path>
+<text x="438.0" y="120.1" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="10" fill="#0b0b0b" text-anchor="middle">1.78</text>
+<text x="412.0" y="294.0" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#52514e" text-anchor="middle">MiniMax-Music3 (2 GPU)</text>
+<path d="M592.7,276.0 L592.7,151.1 Q592.7,147.1 596.7,147.1 L612.7,147.1 Q616.7,147.1 616.7,151.1 L616.7,276.0 Z" fill="#2a78d6"><title>MiniMax-H3 672×384 (2 GPU) C=1: 1.52×</title></path>
+<text x="604.7" y="142.1" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="10" fill="#0b0b0b" text-anchor="middle">1.52</text>
+<path d="M618.7,276.0 L618.7,107.0 Q618.7,103.0 622.7,103.0 L638.7,103.0 Q642.7,103.0 642.7,107.0 L642.7,276.0 Z" fill="#eb6834"><title>MiniMax-H3 672×384 (2 GPU) C=8: 2.04×</title></path>
+<text x="630.7" y="98.0" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="10" fill="#0b0b0b" text-anchor="middle">2.04</text>
+<path d="M644.7,276.0 L644.7,107.0 Q644.7,103.0 648.7,103.0 L664.7,103.0 Q668.7,103.0 668.7,107.0 L668.7,276.0 Z" fill="#1baf7a"><title>MiniMax-H3 672×384 (2 GPU) C=16: 2.04×</title></path>
+<text x="656.7" y="98.0" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="10" fill="#0b0b0b" text-anchor="middle">2.04</text>
+<text x="630.7" y="294.0" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#52514e" text-anchor="middle">MiniMax-H3 672×384 (2 GPU)</text>
+<rect x="678.0" y="17" width="10" height="10" rx="2" fill="#1baf7a"/>
+<text x="693.0" y="26" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#52514e">C=16</text>
+<rect x="623.0" y="17" width="10" height="10" rx="2" fill="#eb6834"/>
+<text x="638.0" y="26" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#52514e">C=8</text>
+<rect x="568.0" y="17" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text x="583.0" y="26" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#52514e">C=1</text>
+</svg>

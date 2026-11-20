@@ -458,6 +458,37 @@ arrival counter, and a reduction in split order by the last arrival, so
 results are deterministic and the launch is HIP-graph safe. An XCD remap
 keeps the M tiles that share a weight tile on one XCD's L2.
 
+### gfx950 MXFP8 block32 projection
+
+`triton_mm_mxfp8_block32_gfx950` (`gfx950/gemm/mxfp8/block32.py`, adapted from
+vLLM's `rocm_block32_gemm.py` and ROCm/aiter#5750) serves the DeepSeek V4.1
+TP4 dense MXFP8 projections at the `(N, K, M)` ranges listed in its tuned
+table, where it measured faster than both kernels above on MI350P. Automatic
+selection ranks it above them and its problem filter admits only those
+ranges, so every other shape and row count keeps the decode or prefill kernel.
+
+#### Contract
+
+- Same operands as the decode projection: E4M3 `[M, K]` / `[N, K]` with unit
+  inner strides, canonical uint8 UE8M0 scales `[M, K/32]` / `[N, K/32]`, an
+  explicit `[1, 32]` scale block, BF16 or FP16 output with unit inner stride.
+- `M` and `N` are runtime arguments (`M` is not specialized); `K` and the tile
+  configuration are compile-time. Ragged `N` clamps weight rows, a `K` tail is
+  masked.
+- Products use the native scaled E4M3 MFMA (`tl.dot_scaled`) with FP32
+  accumulation, like the prefill kernel, not the decode kernel's exact BF16
+  path.
+
+#### Algorithm
+
+A tiled Triton kernel computes one `BLOCK_M x BLOCK_N` tile per program. For
+small `M` a packed variant fills the MFMA rows with `K_PACK` K panels per token
+and keeps only the block-diagonal products. Either may split K: the splits of a
+tile get program ids congruent mod 8, so they land on one XCD; each writes an
+FP32 partial, and the last arrival (CTA-scope counter in that XCD's L2) sums
+them in split order and re-arms the counter, so results are deterministic and
+HIP-graph safe.
+
 ### gfx950 dense MXFP4 linear (dynamic MXFP4 activations)
 
 `gluon_mxfp4_linear_gfx950` and `gluon_mxfp4_swiglu_linear_gfx950` run the
@@ -1228,8 +1259,26 @@ group whose query is all zero scores exactly zero, so its output is
 such groups skip the score and PV passes, and one all-ones MFMA per tile
 accumulates the V row sum for all of them.
 
-The main kernel runs one workgroup per CU (VGPR-bound). While
-`tokens * head_blocks` is below 256, rows are split over up to 16
+Once `tokens * head_blocks` exceeds the CU count (speculative decode: 64
+users x 6 rows = 384 rows), `gluon_dsv41_selected_attention_rows_gfx950`
+takes over: one workgroup per (row, head block) over all of the row's tiles,
+no partials. Its four waves split the head dims instead of the tile rows
+(batched `[4 waves, ...]` MFMAs over reshaped LDS views of a 32-row tile):
+each wave stores its partial QK scores, every wave sums the four partials
+directly in the PV A-operand layout (a linear layout, so the probabilities
+need no conversion), runs the softmax on the whole tile and accumulates PV
+for its own 128 dims. A wave holds only its 128-dim query slice, which with
+the 32-row tiles fits two workgroups per CU. Global tiles dequantize to FP16
+(`v_cvt_scalef32_pk_f16_fp4`, then `v_pk_mul_f16` by the E4M3 scale: E2M1 x
+E4M3 has at most six significant bits, so every value is exact and equals
+the BF16 dequantization) and run FP16 MFMAs against the query scaled by an
+exact power of two (largest element in `[2^13, 2^15)`); SWA tiles stay BF16.
+Program ids are remapped so consecutive rows (one request's speculative rows,
+whose selections overlap) share an XCD's L2. The RoPE epilogue loads its
+cos/sin once per pass and rotates the BF16 output in registers.
+
+Below that, the main kernel runs one workgroup per CU (VGPR-bound). While
+`tokens * head_blocks` is below the CU count, rows are split over up to 16
 workgroups that store FP32 `(max, sum, P @ V)` partials (zero-query groups store
 the row sum and count). `gluon_dsv41_selected_attention_reduce_gfx950` merges
 them in a fixed order and adds the sink once; each of its workgroups owns one

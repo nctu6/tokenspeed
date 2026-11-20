@@ -1,0 +1,10 @@
+{
+ "id": 245,
+ "date": "2026-11-15",
+ "area": "Kernels: MoE decode",
+ "experiment": "branch moe-dec2 (.wt-moe2, a1b2c3d4)，TOKENSPEED_MOE_DECODE_V2=1：<一句話說改了什麼>。microbench rows 48/96/192/384：舊 334/482/584/612 µs → 新 …。A/B：scripts/ab_moe2.sh，AgentX STRESS 600 s，c32/c64/c16 各 A B B A，gmu 0.86；A = c4c64-wave 49c86553 + 最佳 env。",
+ "result": "A/B 平均 RPM：c32 A 124.2 [125.4, 123.0] / B … [… , …]（Δ …%）；c64 …；c16 …。ITL …；錯誤率 0；無 OUT_OF_RESOURCES。",
+ "interpretation": "<為什麼：例如 kernel −20% 但 MoE 只佔 c32 暴露時間 17%，預期 +3.4%，在雜訊內>",
+ "decision": "<採用 / 否決 / 保留 opt-in / 下一步>",
+ "commit": "a1b2c3d4 (moe-dec2)"
+}

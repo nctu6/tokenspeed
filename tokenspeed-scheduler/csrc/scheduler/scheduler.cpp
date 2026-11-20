@@ -166,6 +166,8 @@ Scheduler::Scheduler(SchedulerConfig config)
         // 1K C32 P99 ITL 155 ms); an eighth halves that step while long prompts
         // beside few decodes (128K C4) never reach the cap.
         mixed_prefill_floor_ = std::max(0, env_int("TOKENSPEED_MIXED_PREFILL_FLOOR", mixed_ref_chunk_ / 8));
+        // TOKENSPEED_DECODE_EVERY_PREFILL_ROUNDS (default 0 = off, non-mixed mode only).
+        decode_every_prefill_rounds_ = std::max(0, env_int("TOKENSPEED_DECODE_EVERY_PREFILL_ROUNDS", 0));
     }
     // Validate requires in-forward checkpoints, and with them prefix caching,
     // outside the D role, which computes no prompt; without a State group

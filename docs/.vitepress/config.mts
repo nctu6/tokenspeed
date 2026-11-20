@@ -4,7 +4,7 @@ export default defineConfig({
   lang: "en-US",
   title: "TokenSpeed",
   description: "TokenSpeed is a speed-of-light LLM inference engine.",
-  base: "/tokenspeed/",
+  base: "/UnieInfra/",
   srcDir: ".",
   cleanUrls: true,
   lastUpdated: true,
@@ -24,9 +24,10 @@ export default defineConfig({
       { text: "Docs Home", link: "/" },
       { text: "Getting Started", link: "/guides/getting-started" },
       { text: "Launching", link: "/guides/launching" },
+      { text: "Models", link: "/models/supported" },
       { text: "Recipes", link: "/recipes/models" },
       { text: "Configuration", link: "/configuration/server" },
-      { text: "GitHub", link: "https://github.com/lightseekorg/tokenspeed" }
+      { text: "GitHub", link: "https://github.com/UnieAI/UnieInfra" }
     ],
     sidebar: [
       {
@@ -53,8 +54,11 @@ export default defineConfig({
         ]
       },
       {
-        text: "Recipes",
-        items: [{ text: "Model Recipes", link: "/recipes/models" }]
+        text: "Models",
+        items: [
+          { text: "Supported Models", link: "/models/supported" },
+          { text: "Model Recipes", link: "/recipes/models" }
+        ]
       },
       {
         text: "Serving",
@@ -70,7 +74,7 @@ export default defineConfig({
     },
     editLink: {
       pattern:
-        "https://github.com/lightseekorg/tokenspeed/edit/main/docs/:path",
+        "https://github.com/UnieAI/UnieInfra/edit/main/docs/:path",
       text: "Edit this page on GitHub"
     },
     footer: {
@@ -78,7 +82,7 @@ export default defineConfig({
       copyright: "Copyright © lightseekorg"
     },
     socialLinks: [
-      { icon: "github", link: "https://github.com/lightseekorg/tokenspeed" }
+      { icon: "github", link: "https://github.com/UnieAI/UnieInfra" }
     ],
     outline: "deep",
     outlineTitle: "On this page",

@@ -79,6 +79,9 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 RATIOS = (0, 0) + (2,) * 18 + (1,) * 20
+# Compressor-tail rows per page: 2, or 32 on ROCm. Derive tail addresses from
+# it instead of pinning the 2-row checkpoint geometry.
+TAIL_ROWS = V41_GROUP_GEOMETRY[TAIL][0]
 OWNERS = (2, 8, 14, 20)
 SOURCES = (2, 8, 14, 20, 24, 28, 32, 36)
 
@@ -1127,13 +1130,18 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool, verify_
         gid: torch.zeros(5, t.shape[1], device="cuda", dtype=torch.int32)
         for gid, t in tables.items()
     }
+    # Tails start at parent 11, like _tables: page 541 with 2-row tails.
+    tail_packing = backend.cache_pool.arena.plan.group(TAIL).cache_blocks_per_lcm_block
+    tail_first = 10 * tail_packing + 1
     for r in range(5):
         wide_tables[SWA][r, 0] = r + 1
         wide_tables[R1][r, 0] = 541 + r
         wide_tables[R2][r, 0] = 161 + r
-        tail_pages = (verify_width + 1) // 2
+        tail_pages = -(-verify_width // TAIL_ROWS)
         wide_tables[TAIL][r, :tail_pages] = torch.arange(
-            541 + r * tail_pages, 541 + (r + 1) * tail_pages, device="cuda"
+            tail_first + r * tail_pages,
+            tail_first + (r + 1) * tail_pages,
+            device="cuda",
         )
     for bs in (5, 0):
         backend.refresh_decode_metadata(
@@ -1460,7 +1468,12 @@ def test_dspark_windows_join_the_swa_group():
     # all groups meet the index alignment and stay inside the padding budget.
     layout = _layout(recipe)
     assert layout.lcm_block_bytes == 3_225_600
-    assert dict(layout.group_packing) == {SWA: 2, R2: 45, R1: 140, TAIL: 126}
+    assert dict(layout.group_packing) == {
+        SWA: 2,
+        R2: 45,
+        R1: 140,
+        TAIL: V41_CACHE_FORMATS["v41"].dspark_group_packing[TAIL],
+    }
     recipe.check_layout(layout)
     setup = recipe.setup()
     assert setup.spec.token_capacity == 1024
@@ -1535,6 +1548,8 @@ def test_pd_contract_describes_every_group_and_field(dspark):
 @pytest.mark.parametrize("dspark", [False, True])
 def test_every_cache_format_packs_to_the_plane_it_declares(cache_format, dspark):
     """Each format's frozen packing must be what the planner derives from it."""
+    if cache_format == "v4" and TAIL_ROWS != 2:
+        pytest.skip("v4 (Hopper) packings only fit 2-row compressor-tail pages")
     rows = V41_CACHE_FORMATS[cache_format]
     recipe = _recipe("cpu")
     spec = recipe.attn_config.component(DeepseekV41Config)
@@ -1574,7 +1589,12 @@ def test_recipe_exact_geometry_capacity_and_dispatch():
     assert layout.plane_bytes == (("flatkv", 1_382_400),)
     assert dict(layout.group_packing) == dict(V41_CACHE_FORMATS["v41"].group_packing)
     specs = {s.group_id: s for s, _ in recipe.groups()}
-    assert [specs[g].block_granularity for g in V41_GROUP_GEOMETRY] == [64, 128, 64, 2]
+    assert [specs[g].block_granularity for g in V41_GROUP_GEOMETRY] == [
+        64,
+        128,
+        64,
+        TAIL_ROWS,
+    ]
     assert all(s.attn_kind != "state" for s in specs.values())
     assert specs[SWA].sliding_window_tokens == 128
     assert specs[TAIL].sliding_window_tokens == 2
@@ -1583,7 +1603,9 @@ def test_recipe_exact_geometry_capacity_and_dispatch():
         for (spec, fields) in recipe.groups()
         for gid in (spec.group_id,)
     }
-    assert payload == {SWA: 1_351_680, R2: 68_352, R1: 22_784, TAIL: 24_576}
+    # Three ratio-2 owners, each a [TAIL_ROWS, 2, 512] FP32 tail page.
+    tail_payload = 3 * TAIL_ROWS * 2 * 512 * 4
+    assert payload == {SWA: 1_351_680, R2: 68_352, R1: 22_784, TAIL: tail_payload}
     assert len(layout.fields) == 51
     assert all(f.page_stride_bytes % 256 == 0 for f in layout.fields)
     setup = recipe.setup()
@@ -1681,7 +1703,12 @@ def test_pool_strides_owner_fences_and_no_redundant_fields():
         (pool.swa(7), (64, 528), 1_382_400, 7),
         (pool.global_kv(8), (64, 288), 69_120, 8),
         (pool.index_k(20), (64, 68), 23_040, 20),
-        (pool.compressor_tail(14), (2, 2, 512), 25_600, 14),
+        (
+            pool.compressor_tail(14),
+            (TAIL_ROWS, 2, 512),
+            1_382_400 // V41_CACHE_FORMATS["v41"].group_packing[TAIL],
+            14,
+        ),
     ):
         assert tuple(view.shape[1:]) == shape
         assert view.stride(0) * view.element_size() == stride
@@ -2766,13 +2793,14 @@ def test_compressor_plan_shared_owners_and_reused_tail_page(device, monkeypatch)
     backend = _backend(device, 2)
     tables = _tables(device)
     # The first completed pair needs token2 before token4 reuses its tail slot.
-    tables[TAIL][0, 2] = tables[TAIL][0, 1]
+    # (With wide ROCm tail pages both tokens already share one page.)
+    tables[TAIL][0, 4 // TAIL_ROWS] = tables[TAIL][0, 2 // TAIL_ROWS]
     calls = []
     prepare = dsv41.compressor_metadata
 
-    def counted(*args):
+    def counted(*args, **kwargs):
         calls.append(args)
-        return prepare(*args)
+        return prepare(*args, **kwargs)
 
     monkeypatch.setattr(dsv41, "compressor_metadata", counted)
     meta = _extend(backend, tables, [4, 3], [3, 0], [0, 0], _final([4, 3], [3, 0]))
@@ -2798,8 +2826,8 @@ def test_compressor_plan_shared_owners_and_reused_tail_page(device, monkeypatch)
                 prior = coords.index((position - 1, request))
                 c, s = content[prior], scores[prior]
             else:
-                page = tables[TAIL][request, (position - 1) // 2]
-                c, s = old_tail[page, (position - 1) % 2]
+                page = tables[TAIL][request, (position - 1) // TAIL_ROWS]
+                c, s = old_tail[page, (position - 1) % TAIL_ROWS]
             weights = torch.stack((s, scores[i])).softmax(0)
             expected[i] = weights[0] * c + weights[1] * content[i]
         got, positions, requests = backend.compress(
@@ -2815,7 +2843,7 @@ def test_compressor_plan_shared_owners_and_reused_tail_page(device, monkeypatch)
     with pytest.raises(ValueError, match="content/scores"):
         backend.compress(2, content[:2], scores[:2], ForwardMode.EXTEND, None, 0.0)
     # Preparing a new forward must resolve the changed LCM assignment again.
-    tables[TAIL][0, 1] = 0
+    tables[TAIL][0, 2 // TAIL_ROWS] = 0
     _extend(backend, tables, [4, 3], [3, 0], [0, 0], _final([4, 3], [3, 0]))
     assert len(calls) == 2
 
@@ -2892,13 +2920,13 @@ def test_compressor_plan_ragged_windows_rebase_only_predecessors(device):
     requests = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2, 2], device=device)
     table = torch.ones((3, 8), dtype=torch.int32, device=device)
     full = V41CompressorPlan.allocate(positions.numel(), torch.device(device))
-    dsv41.compressor_metadata(positions, requests, table, 2, *full)
+    dsv41.compressor_metadata(positions, requests, table, 2, *full, rows=2)
     before = tuple(tensor.clone() for tensor in full)
     for start, stop in ((0, 3), (3, 10), (6, 10), (4, 8), (6, 6), (0, 0)):
         window = full.window(start, stop)
         expected = V41CompressorPlan.allocate(stop - start, torch.device(device))
         dsv41.compressor_metadata(
-            positions[start:stop], requests[start:stop], table, 2, *expected
+            positions[start:stop], requests[start:stop], table, 2, *expected, rows=2
         )
         for name, parent, got, want in zip(
             full._fields, full, window, expected, strict=True
@@ -3130,7 +3158,9 @@ def _tables_with_packing(device, packing):
     # group numbers its own pages with page 0 reserved, so parent n begins at
     # packing * (n - 1) + 1. Derive the IDs from the pool's packing so DSpark
     # can put multiple SWA pages in one parent.
-    used = {SWA: 4, R2: widths[R2], R1: widths[R1], TAIL: 100}
+    # Tails cover the first 200 raw tokens: 100 two-row pages, or fewer wide
+    # (ROCm) pages, so every tail fits parents 10..15 of the 16-parent pool.
+    used = {SWA: 4, R2: widths[R2], R1: widths[R1], TAIL: -(-200 // TAIL_ROWS)}
     for gid, parent in ((R2, 8), (R1, 9), (TAIL, 10)):
         first = packing[gid] * parent + 1
         assert (
@@ -4953,3 +4983,9 @@ def test_prefill_indexer_native_architecture(monkeypatch, major, minor, expected
         assert not dsv41.prefill_indexer_batching_supported(132)
     finally:
         deep_gemm.is_native_indexer_available.cache_clear()
+
+
+def test_flash_cache_is_one_copy_for_every_attention_tp_rank():
+    # Latent FlatKV, compressor/indexer and DSpark rows carry no head axis,
+    # so L3 may keep one copy per page for the whole attention-TP group.
+    assert _recipe("cpu").setup().kv_identical_across_attn_tp is True

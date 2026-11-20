@@ -752,6 +752,11 @@ private:
     // (never below long_prefill_floor_), so a burst of new prompts cannot
     // stretch every decode's step. 0 disables.
     std::int32_t mixed_decode_ref_{0};
+    // Outside mixed mode: after this many prefill rounds in a row, a round
+    // with decodes waiting decodes instead (TOKENSPEED_DECODE_EVERY_PREFILL_ROUNDS,
+    // 0 disables). prefill_rounds_since_decode_ counts the current streak.
+    std::int32_t decode_every_prefill_rounds_{0};
+    std::int32_t prefill_rounds_since_decode_{0};
     void capPrefillBesideDecodes(PlanBuild& build) const;
     std::int32_t prefillBudgetFor(const Request& request, const PlanBuild& build) const;
 

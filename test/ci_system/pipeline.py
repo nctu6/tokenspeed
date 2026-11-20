@@ -74,6 +74,7 @@ SUPPORTED_RUNNER_GROUPS = (
     "amd",
     "amd-mi350",
     "amd-mi450",
+    "gb10",
     "nvidia",
     "nvidia-arm",
     "nvidia-x86",
@@ -159,6 +160,8 @@ def runner_matches_group(runner: str, runner_group: str) -> bool:
         return False
     if runner_group == "amd":
         return is_amd_runner(runner)
+    if runner_group == "gb10":
+        return runner == "gb10-altos"
     if runner_group == "amd-mi450":
         return runner.startswith(AMD_MI450_RUNNER_PREFIXES)
     if runner_group == "amd-mi350":

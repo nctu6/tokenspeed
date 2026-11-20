@@ -70,9 +70,6 @@ _OTHER_KEY_OWNERS = {
     "models/dots3_note.py:Dots3NoteIndexer.forward",
     "models/glm5.py:GlmDsaIndexer.forward",
     "models/glm53_flash.py:Glm53FlashIndexer.forward",
-    # Gemma 4 normalizes and rotates q/k itself (learnable-scale q/k norms,
-    # per-layer-type RoPE) and hands PagedAttention rotary_emb=None.
-    "models/gemma4.py:Gemma4Attention.forward",
 }
 # The norm, RoPE, quantize and KV-write steps the prologue owns: modules and kernel entries.
 _PROLOGUE_STEPS = {

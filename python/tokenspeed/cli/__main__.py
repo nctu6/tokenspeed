@@ -52,6 +52,26 @@ def _serve_asr(raw_argv: list[str]) -> None:
     serve(engine_args, host=host, port=port)
 
 
+def _serve_embed(raw_argv: list[str]) -> None:
+    """``ts serve`` for pooling checkpoints: text in, one vector out.
+
+    SMG's direct ZMQ lane has no embedding request ("ZMQ backend does not
+    support embeddings yet"), so, like ASR, this path owns the
+    OpenAI-compatible /v1/embeddings HTTP surface in-process.
+    """
+    from tokenspeed.cli._argsplit import split_argv
+    from tokenspeed.runtime.entrypoints.embedding_server import serve
+    from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+    engine_args, host, port = _split_host_port(raw_argv)
+    gateway = list(split_argv(raw_argv).gateway)
+    api_key = None
+    if "--api-key" in gateway:
+        api_key = gateway[gateway.index("--api-key") + 1]
+    print(f"[ts serve] embedding server on http://{host}:{port}")
+    serve(prepare_server_args(engine_args), host=host, port=port, api_key=api_key)
+
+
 def _serve_diffusion(raw_argv: list[str]) -> None:
     """``ts serve`` for diffusers pipelines (MiniMax-H3, MiniMax-Music3, ...).
 
@@ -85,6 +105,9 @@ def _serve(args: argparse.Namespace, raw_argv: list[str]) -> None:
         print(f"[ts serve] runtime: {runtime} -- {describe_runtime(runtime)}")
         if runtime == "asr":
             _serve_asr(raw_argv)
+            return
+        if runtime == "embed":
+            _serve_embed(raw_argv)
             return
         if runtime == "diffusion":
             _serve_diffusion(raw_argv)

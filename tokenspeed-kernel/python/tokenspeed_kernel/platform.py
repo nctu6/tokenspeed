@@ -499,35 +499,19 @@ def _detect_npu_platform() -> PlatformInfo:
     )
 
 
-# Device-property names torch exposes for the per-block shared-memory ceiling,
-# most useful first. `max_shared_memory_per_block` is NOT one of them (reading
-# it always yielded 0). The opt-in ceiling is what a kernel can raise itself to
-# via cudaFuncAttributeMaxDynamicSharedMemorySize (101,376 B on sm_120, 232,448 B
-# on sm_90) and is the limit Triton checks a launch against; the plain
-# per-block value is the 48 KB default, used only if opt-in is missing.
-_CUDA_SHARED_MEMORY_PROPS = ("shared_memory_per_block_optin", "shared_memory_per_block")
-
-
 def _cuda_shared_memory_budget(props) -> int:
-    """Per-block shared-memory budget (bytes) for CUDA kernel tile selection.
+    """Return the per-block shared-memory limit used by Triton tile selection."""
+    optin = getattr(props, "shared_memory_per_block_optin", None)
+    if optin is not None:
+        return int(optin)
 
-    Args:
-        props: ``torch.cuda.get_device_properties(...)`` (or any object with the
-            same attributes).
+    default = getattr(props, "shared_memory_per_block", None)
+    if default is not None:
+        return int(default)
 
-    Returns:
-        The first positive value among ``_CUDA_SHARED_MEMORY_PROPS``, or ``0``
-        when none is available. ``0`` means "unknown" to consumers such as the
-        Triton MHA prefill tile choice, which then keeps its datacenter tiles.
-    """
-    for name in _CUDA_SHARED_MEMORY_PROPS:
-        value = getattr(props, name, None)
-        if value:
-            return int(value)
     logger.warning(
-        "CUDA device properties expose no shared-memory limit (%s); "
-        "max_shared_memory_per_sm=0 (unknown)",
-        ", ".join(_CUDA_SHARED_MEMORY_PROPS),
+        "CUDA shared-memory limit is unavailable; using 0 and retaining the "
+        "large-memory tile fallback"
     )
     return 0
 

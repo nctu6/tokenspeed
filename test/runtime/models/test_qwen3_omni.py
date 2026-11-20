@@ -378,9 +378,8 @@ class TestQwen3OmniModelHelpers:
 
         config = Qwen3OmniMoeVisionEncoderConfig(
             depth=1,
-            # head_dim 16: the smallest the Triton attention tile can dot.
-            hidden_size=32,
-            intermediate_size=64,
+            hidden_size=16,
+            intermediate_size=32,
             num_heads=2,
             patch_size=2,
             temporal_patch_size=2,

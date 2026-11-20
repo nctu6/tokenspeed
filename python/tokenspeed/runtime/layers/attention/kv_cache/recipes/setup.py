@@ -154,6 +154,9 @@ class CacheSetup:
     # The linear backend verifies from paged state and owns the planned
     # ``fixed_workspace_bytes`` of verify staging.
     uses_paged_state_verify: bool
+    # Every attention-TP rank caches the same bytes for a page
+    # (CacheRecipe.kv_identical_across_attn_tp).
+    kv_identical_across_attn_tp: bool
 
     @property
     def num_target_layers(self) -> int:

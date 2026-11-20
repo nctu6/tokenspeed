@@ -48,6 +48,7 @@ sums the FP32 partials in split order and runs the epilogue.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._device import num_xcds
 from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import _remap_xcd
@@ -589,7 +590,7 @@ def _get_partial_scratch(device: torch.device, numel: int) -> torch.Tensor:
 # A call uses the config of the smallest M bucket covering its M (None covers
 # the rest), so M stays a runtime argument within a bucket.
 _Config = tuple[int, int, int, int, int, int]
-_NUM_XCDS = 8
+_NUM_XCDS = num_xcds()
 
 # Cold-cache sweeps on gfx950 at the Qwen3.8-Flash-Next TP2 shared expert,
 # keyed by (SwiGLU, N, K): gate_up [640, 2560] and down [2560, 320].

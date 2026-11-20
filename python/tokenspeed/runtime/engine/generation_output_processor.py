@@ -45,6 +45,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     make_finish_event,
     make_update_reserve_tokens_event,
 )
+from tokenspeed.runtime.engine.shadow_ngram import SHADOW_NGRAM, shadow_ngram_summary
 from tokenspeed.runtime.execution.types import StopCriteria
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
@@ -615,6 +616,12 @@ class OutputProcesser:
             )
 
     def log_accept_length(self, rid, request_state: RequestState):
+        if SHADOW_NGRAM and self.attn_tp_rank == 0:
+            summary = shadow_ngram_summary(
+                request_state.prompt_input_ids, request_state.output_ids
+            )
+            if summary is not None:
+                logger.info(f"Req: {rid!s} {summary}")
         # When --enable-log-request-stats is on, the richer RequestStats line (which
         # already carries acc_len) replaces this one — see _log_request_stats.
         if self.attn_tp_rank == 0 and not self.enable_log_request_stats:

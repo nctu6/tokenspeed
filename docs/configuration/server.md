@@ -20,6 +20,28 @@ For a compact compatibility table, see
 | `--revision` | Model branch, tag, or commit. |
 | `--download-dir` | Hugging Face download/cache directory. |
 | `--hf-overrides` | JSON overrides for model configuration values. |
+| `--is-embedding` / `--no-is-embedding` | Serve the checkpoint as an embedding (pooling) model: one vector per request, no token generation. Unset, it is inferred from the checkpoint's sentence-transformers `1_Pooling/config.json`. |
+| `--pooling-type` | Override the pooling reduction: `last`, `cls`, or `mean`. Required with `--is-embedding` on a checkpoint that ships no pooling config. |
+| `--pooling-normalize` / `--no-pooling-normalize` | Override whether pooled vectors are L2-normalized; by default this follows the checkpoint's `modules.json`. |
+
+### Embedding models
+
+An embedding server runs one prefill per request and returns the pooled
+vector through `Engine.encode()`; generate requests are refused, and an
+embedding request on a generative server is refused too. At startup it turns
+off prefix caching, opens the prefill chunk budget to `--max-prefill-tokens`
+so a prompt is never split (a pooled vector reduces over the whole prompt, so
+`--max-prefill-tokens` must be at least the context length), and disables the
+overlap schedule. Speculative decoding is rejected. No decode CUDA graph is
+captured, as for the prefill role of a disaggregated deployment.
+
+`ts serve` on an embedding checkpoint does not start the smg gateway (its
+engine protocol has no embedding RPC). It serves OpenAI-compatible
+`/v1/embeddings`, `/v1/models` and `/health` from the engine process on
+`--host`/`--port`. `--api-key` requires `Authorization: Bearer <key>` on
+`/v1/*`; without it the endpoints are unauthenticated. `encoding_format`
+accepts `float` and `base64`; `dimensions` is rejected. Other gateway flags
+and multi-node launches are refused.
 
 Models can request shared writable checkpoint mappings for selected host
 weights. Use `--load-format auto` or `--load-format safetensors` with writable
@@ -1627,18 +1649,18 @@ abort would not conclude the PD transfer it has registered. A prefill
 request past its first admission is not counted as stalled at all, as its
 pages stay pinned for the transfer.
 
-### Host L2 and Mooncake Store L3
+### Host L2 and L3 storage (Mooncake Store or local disk)
 
 Host KVStore (`--kvstore-ratio` / `--kvstore-size`) is a compact pinned
 buffer under GPU cache (flat KV). `--kvstore-storage-backend mooncake`
-adds Mooncake Store as L3 under that buffer:
+adds Mooncake Store as L3 under that buffer; `file` uses a local disk instead:
 
 ```
 GPU Device KV (L1)
   ↕ D2H / H2D
 Host pinned buffer (L2 / flat KV)
   ↕ batch_put_from / batch_get_into
-Mooncake Store (L3)
+Mooncake Store or local disk (L3)
 ```
 
 Host L2 and the retraction snapshot pool pack each group's payload independently
@@ -1765,6 +1787,23 @@ they usually do on pipeline stages, which store different layers, so with
 `--pipeline-parallel-size > 1` size Host L2 with `--kvstore-ratio` rather
 than `--kvstore-size`.
 
+**One Host L2 buffer per attention-TP group.** When the cache layout stores
+the same bytes on every attention-TP rank (DeepSeek V4.1-Flash, see "One copy
+per attention-TP group" below), `--kvstore-share-host-across-attn-tp`
+replaces the ranks' identical private buffers with one shared-memory segment
+(`/dev/shm`, mapped and registered with the device runtime by every rank,
+unlinked once mapped) of the group size times one rank's L2 size. The node
+pins the same Host memory, and the mirrored schedulers address that many
+times the pages: under TP4 a 4 GB per-rank L2 becomes one 16 GB L2.
+Attention-TP rank 0 performs every Device-to-Host copy and every L3 backup,
+probe and prefetch of the buffer; every rank loads its Device pages from it.
+The other ranks acknowledge their writes from an empty copy, and the
+completion intersection across the group holds each op until rank 0 has
+copied, so no rank loads a page before it is written and no page is reused
+before every rank has loaded it. The retraction snapshot pool stays per rank.
+The flag is ignored, with a log, for a layout whose bytes differ per rank,
+under `--kv-parallel-size > 1`, or for a group that spans nodes.
+
 **Requirements and deployment.** L3 requires Host L2 (omit
 `--disable-kvstore`) and currently supports PP=1. Cyclic KV-page sharding
 (`--kv-parallel-size`) is supported when the payload is replicated within
@@ -1815,6 +1854,83 @@ explicitly. Without JSON connection settings, the client reads
 `MOONCAKE_MASTER` / `MOONCAKE_CLIENT` and the other Mooncake environment
 settings. `global_segment_size` defaults to 4 GiB, so explicitly set `0` for
 clients that must not mount storage. The default tenant is `default`.
+
+**Local disk (`--kvstore-storage-backend file`).** Keeps L3 objects on a
+local NVMe directory, one file per packed Host CacheBlock, under
+`<path>/rank<N>` so each rank sizes and evicts only its own objects. Every
+field of the extra config is required:
+
+```json
+{
+  "path": "/nvme/l3",
+  "capacity_gb": 200,
+  "io_threads": 8,
+  "o_direct": true,
+  "verify_crc": true,
+  "fsync": false
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `path` | Directory on a local file system; created if missing. |
+| `capacity_gb` | Disk bytes per rank (headers and 4 KiB padding included). A put that does not fit evicts least-recently-used segments; an existence probe or a read refreshes the segment holding the object. |
+| `io_threads` | Parallel reads/writes inside one `batch_get_into` / `batch_put_from`. |
+| `o_direct` | Bypass the page cache. Start-up fails when the file system refuses O_DIRECT (for example tmpfs). |
+| `verify_crc` | Store a CRC32 per object and treat a mismatch as a miss. |
+| `fsync` | `fdatasync` each object before it becomes visible. Puts are atomic either way (temporary file, then rename); without it a crash can lose recent objects, which then read as misses. |
+
+Objects written by one `batch_put_from` call (for example the KV groups of
+one prefix page) go into one *segment* file: a header (magic, per object its
+key, offset, size and CRC32, and a CRC32 over that table) padded to 4 KiB,
+then the payloads back to back, padded to 4 KiB at the end. A large put is
+split across the I/O threads, never into segments under 1 MiB nor over
+8 MiB of payload. A read opens each segment once and copies every requested
+object out of it, so small KV objects do not pay a file open per object.
+When every object of a segment is requested and the Host slices are 4 KiB
+aligned in address and size, the payloads are read and written directly
+between the file and the pinned Host buffer; otherwise they go through an
+aligned per-thread bounce buffer. A read whose key, size or CRC does not
+match the segment header is a miss. Capacity and LRU eviction work per
+segment, and `remove_by_prefix` deletes every segment holding a matching
+key (other keys written in the same put go with it, as misses). The index
+is rebuilt from the headers at start-up (temporary files and segments with
+a bad header or length are deleted), so cached prefixes survive a restart;
+the key namespace already carries the model, weight version, cache layout
+and quantization, so a different deployment never reads them.
+
+On one Micron 7450 NVMe with 3.2 MiB objects, `o_direct: true` and CRC
+verification, reads reach about 5.3 GB/s with 4 threads (2.5 GB/s with 1)
+and writes about 1.3 GB/s, close to the drive's limits. Small objects are
+bound by per-file CPU cost, which segments amortize: DeepSeek V4.1-Flash
+under TP4 writes six objects of about 38 KB per prefix page, and a 93-page
+prefetch (558 objects) takes about 17 ms per rank with four ranks on one
+drive and `io_threads: 16`, against about 30 ms with one file per object.
+Restoring a 24k-token prompt from L3 after a restart then has a TTFT of
+about 0.08 s, against 0.77 s to recompute it.
+
+**One copy per attention-TP group.** When the model's cache layout stores
+the same bytes on every attention-TP rank (DeepSeek V4.1-Flash: latent
+FlatKV, compressor/indexer and DSpark rows, no head axis), the L3 keys name
+rank 0, so Mooncake keeps one object per page. The file store then shares
+the directory of attention-TP rank 0 (`rank<N>` of its global rank): only
+that rank writes and deletes files, and the other ranks index the same
+segment names and offsets from their identical puts. Every rank records the
+CRC32 of its own bytes and checks reads against it, whatever `verify_crc`
+says, so a rank whose bytes differ reads a miss instead of another rank's
+data. The group reads through the page cache (writes keep `o_direct`): its
+ranks prefetch the same files at about the same time, so the drive serves
+each file once. Under TP4 disk use and write traffic drop 4x; a 93-page
+prefetch takes about 14 ms per rank (17 ms with a copy per rank) and a
+24k-token prompt restored after a restart has a TTFT of about 0.08 s.
+
+**What reaches L3.** L3 receives exactly what is written to Host L2, so the
+Host write policy decides what persists. `TOKENSPEED_KVSTORE_WRITE_POLICY`
+is `reuse` by default (a Device prefix is copied out after its first reuse
+hit), `reuse_pressure` (also when the Device pool runs low), or `eager`
+(every published prefix, as each prefill chunk completes). Under `reuse` a
+prompt that is sent once is never written, so it does not survive a
+restart; use `eager` when L3 should keep every prompt.
 
 **Asynchronous preparation before admission.** Queries and GETs hold no
 Device pages or request-pool slots. Once a GET has retired on every owner,

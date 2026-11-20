@@ -32,7 +32,7 @@ jobs:
         with:
           script: |
             const workflows = [
-              "nvidia-b200-tests.yml",
+              "nvidia-gb10-tests.yml",
               "amd-mi350-tests.yml",
               "amd-mi450-tests.yml",
               "amd-kernel-benchmark.yml",

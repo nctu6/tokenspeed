@@ -838,6 +838,7 @@ class EventLoop:
             self.output_processor.mark_abort(request_id)
 
     def _process_new_requests(self):
+        self.request_handler.engine_busy = self._num_running() > 0
         recv_reqs = self.request_handler.recv_reqs()
         # Pause-state snapshot for withhold_admissions below: it must be
         # taken before process_requests, which may flip the state mid-batch.

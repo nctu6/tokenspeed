@@ -1,0 +1,194 @@
+name: Maintainer CI Run
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: write
+  checks: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  ci-run:
+    name: ci-run / GB10
+    if: github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    steps:
+      - name: Validate command and react
+        id: trigger
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const command = context.payload.comment.body.trim();
+            if (command !== "/ci-run") {
+              core.setOutput("triggered", "false");
+              return;
+            }
+            try {
+              await github.rest.reactions.createForIssueComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: context.payload.comment.id,
+                content: "rocket",
+              });
+            } catch (error) {
+              core.warning(`Could not add reaction: ${error.message}`);
+            }
+            core.setOutput("triggered", "true");
+            core.notice("Accepted /ci-run; GB10 CI dispatch started.");
+
+      - name: Dispatch and wait for GB10 CI
+        if: steps.trigger.outputs.triggered == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const actor = context.payload.comment.user.login;
+            const { owner, repo } = context.repo;
+
+            const { data: pull } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: issue.number,
+            });
+
+            const { data: permission } =
+              await github.rest.repos.getCollaboratorPermissionLevel({
+                owner,
+                repo,
+                username: actor,
+              });
+            const allowed = new Set(["admin", "maintain", "push"]);
+            if (!allowed.has(permission.permission)) {
+              core.setFailed(
+                `/${actor} is not a maintainer; repository permission is ${permission.permission}`,
+              );
+              return;
+            }
+
+            if (pull.state !== "open") {
+              core.setFailed(`PR #${issue.number} is not open`);
+              return;
+            }
+            if (pull.draft) {
+              core.setFailed(`PR #${issue.number} is still a draft`);
+              return;
+            }
+
+            const headSha = pull.head.sha;
+            async function completeGate(conclusion, title, summary) {
+              const { data } = await github.rest.checks.listForRef({
+                owner,
+                repo,
+                ref: headSha,
+                per_page: 100,
+              });
+              const gate = data.check_runs
+                .filter((run) => run.name === "GB10 CI Gate")
+                .sort(
+                  (left, right) =>
+                    Date.parse(right.started_at || right.created_at) -
+                    Date.parse(left.started_at || left.created_at),
+                )[0];
+              if (!gate) {
+                core.warning("GB10 CI Gate check was not found");
+                return;
+              }
+              await github.rest.checks.update({
+                owner,
+                repo,
+                check_run_id: gate.id,
+                status: "completed",
+                conclusion,
+                completed_at: new Date().toISOString(),
+                output: { title, summary },
+              });
+            }
+            const defaultBranch = context.payload.repository.default_branch;
+            const requestedAt = Date.now();
+            core.notice(
+              `Dispatching NVIDIA GB10 Tests for PR #${issue.number} at ${headSha}`,
+            );
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner,
+              repo,
+              workflow_id: "nvidia-gb10-tests.yml",
+              ref: defaultBranch,
+              inputs: {
+                commit: headSha,
+                pr_number: String(issue.number),
+                trigger: "manual",
+              },
+            });
+
+            const deadline = Date.now() + 120 * 60 * 1000;
+            let run;
+            while (Date.now() < deadline) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner,
+                repo,
+                workflow_id: "nvidia-gb10-tests.yml",
+                event: "workflow_dispatch",
+                branch: defaultBranch,
+                per_page: 20,
+              });
+              const candidates = data.workflow_runs
+                .filter((item) => Date.parse(item.created_at) >= requestedAt - 10000)
+                .sort(
+                  (left, right) =>
+                    Date.parse(right.created_at) - Date.parse(left.created_at),
+                );
+              const matching = candidates.filter((item) =>
+                String(item.display_title || '').includes(headSha) ||
+                String(item.display_title || '').includes(`#${issue.number}`),
+              );
+              run = matching[0] || candidates[0];
+              if (run) {
+                core.notice(`GB10 CI run: ${run.html_url}`);
+                if (run.status === "completed") {
+                  break;
+                }
+              }
+              await new Promise((resolve) => setTimeout(resolve, 15000));
+            }
+
+            if (!run) {
+              await completeGate(
+                "failure",
+                "GB10 CI dispatch failed",
+                "The GB10 workflow did not create a run.",
+              );
+              core.setFailed("GB10 workflow dispatch did not create a run");
+              return;
+            }
+            if (run.status !== "completed") {
+              await completeGate(
+                "failure",
+                "GB10 CI timed out",
+                `GB10 CI did not complete: ${run.html_url}`,
+              );
+              core.setFailed(`GB10 CI timed out: ${run.html_url}`);
+              return;
+            }
+            if (run.conclusion !== "success") {
+              await completeGate(
+                "failure",
+                "GB10 CI failed",
+                `GB10 CI concluded ${run.conclusion}: ${run.html_url}`,
+              );
+              core.setFailed(
+                `GB10 CI concluded ${run.conclusion}: ${run.html_url}`,
+              );
+              return;
+            }
+            await completeGate(
+              "success",
+              "GB10 CI passed",
+              `GB10 CI passed: ${run.html_url}`,
+            );
+            core.notice(`GB10 CI passed: ${run.html_url}`);

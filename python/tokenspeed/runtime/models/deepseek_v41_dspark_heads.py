@@ -83,8 +83,14 @@ def sample_dspark_block_greedy(
     candidates: torch.Tensor,
     partials: torch.Tensor | None,
     output: torch.Tensor,
+    sampling: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Apply the trained Markov correction and greedily sample a fixed block.
+    """Apply the trained Markov correction and sample a fixed block.
+
+    Greedy by default. With ``sampling`` each step instead draws a Gumbel-max
+    sample of ``logit / temperature`` with the noise stream the verifier's
+    pool-indexed samplers use, so a draft step and the target row that checks
+    it share their noise (see ``dspark_block_greedy_step``).
 
     Args:
         local_base_logits: ``[rows, block, local_vocab]`` FP32 logits of this
@@ -101,6 +107,8 @@ def sample_dspark_block_greedy(
             row strides may include a preceding anchor column. The sampler
             writes only this view, so the drafter can produce proposals directly
             into its final token table without touching the anchor.
+        sampling: None for greedy, else per-row ``(seeds, temperatures,
+            positions)``; ``positions`` is the Philox offset of block step 0.
 
     Returns:
         ``output``, filled in place.
@@ -146,6 +154,7 @@ def sample_dspark_block_greedy(
             shard.num_org_elements,
             scored,
             output,
+            sampling,
         )
         if partials is not None:
             all_gather_single(current.view(-1), scored.view(-1), tp_group)

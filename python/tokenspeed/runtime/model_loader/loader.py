@@ -657,7 +657,14 @@ class DefaultModelLoader(BaseModelLoader):
 
             with startup_phase("weights.postprocess"):
                 # post_load_transformed_modules must recognise every hook run here.
-                for _, module in model.named_modules():
+                trace_mem = os.environ.get("TOKENSPEED_TRACE_POSTPROCESS_MEM") == "1"
+                for module_name, module in model.named_modules():
+                    if trace_mem and torch.cuda.is_available():
+                        logger.info(
+                            "postprocess %s: allocated %.2f GiB",
+                            module_name,
+                            torch.cuda.memory_allocated() / 2**30,
+                        )
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
                         # When quant methods need to process weights after loading

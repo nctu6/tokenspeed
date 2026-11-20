@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="320" viewBox="0 0 760 320" role="img" aria-label="AMD Instinct MI350P (PCIe) · DeepSeek-V4.1-Flash TP4">
+<rect width="760" height="320" rx="8" fill="#1a1a19"/>
+<text x="84" y="26" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="15" font-weight="600" fill="#f0efec">AMD Instinct MI350P (PCIe) · DeepSeek-V4.1-Flash TP4</text>
+<text x="84" y="45" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#c3c2b7">AgentX stress, 600 s per cell, T=1.0, requests/min vs vLLM (best cap each)</text>
+<line x1="84" x2="740" y1="276.0" y2="276.0" stroke="#383835" stroke-width="1"/>
+<text x="76" y="280.0" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#898781" text-anchor="end">0×</text>
+<line x1="84" x2="740" y1="243.4" y2="243.4" stroke="#2c2c2a" stroke-width="1"/>
+<text x="76" y="247.4" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#c3c2b7" text-anchor="end">vLLM 1×</text>
+<line x1="84" x2="740" y1="210.8" y2="210.8" stroke="#2c2c2a" stroke-width="1"/>
+<text x="76" y="214.8" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#898781" text-anchor="end">2×</text>
+<line x1="84" x2="740" y1="178.2" y2="178.2" stroke="#2c2c2a" stroke-width="1"/>
+<text x="76" y="182.2" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#898781" text-anchor="end">3×</text>
+<line x1="84" x2="740" y1="145.5" y2="145.5" stroke="#2c2c2a" stroke-width="1"/>
+<text x="76" y="149.5" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#898781" text-anchor="end">4×</text>
+<line x1="84" x2="740" y1="112.9" y2="112.9" stroke="#2c2c2a" stroke-width="1"/>
+<text x="76" y="116.9" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#898781" text-anchor="end">5×</text>
+<line x1="84" x2="740" y1="80.3" y2="80.3" stroke="#2c2c2a" stroke-width="1"/>
+<text x="76" y="84.3" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#898781" text-anchor="end">6×</text>
+<line x1="84" x2="740" y1="243.4" y2="243.4" stroke="#c3c2b7" stroke-width="1" stroke-dasharray="4 3"/>
+<path d="M126.7,276.0 L126.7,225.5 Q126.7,221.5 130.7,221.5 L146.7,221.5 Q150.7,221.5 150.7,225.5 L150.7,276.0 Z" fill="#3987e5"><title>c1 UnieInfra: 1.67×</title></path>
+<text x="138.7" y="216.5" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#f0efec" text-anchor="middle">1.67×</text>
+<text x="138.7" y="294.0" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#c3c2b7" text-anchor="middle">c1</text>
+<path d="M236.0,276.0 L236.0,241.2 Q236.0,237.2 240.0,237.2 L256.0,237.2 Q260.0,237.2 260.0,241.2 L260.0,276.0 Z" fill="#3987e5"><title>c4 UnieInfra: 1.19×</title></path>
+<text x="248.0" y="232.2" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#f0efec" text-anchor="middle">1.19×</text>
+<text x="248.0" y="294.0" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#c3c2b7" text-anchor="middle">c4</text>
+<path d="M345.3,276.0 L345.3,238.3 Q345.3,234.3 349.3,234.3 L365.3,234.3 Q369.3,234.3 369.3,238.3 L369.3,276.0 Z" fill="#3987e5"><title>c16 UnieInfra: 1.28×</title></path>
+<text x="357.3" y="229.3" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#f0efec" text-anchor="middle">1.28×</text>
+<text x="357.3" y="294.0" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#c3c2b7" text-anchor="middle">c16</text>
+<path d="M454.7,276.0 L454.7,243.8 Q454.7,239.8 458.7,239.8 L474.7,239.8 Q478.7,239.8 478.7,243.8 L478.7,276.0 Z" fill="#3987e5"><title>c32 UnieInfra: 1.11×</title></path>
+<text x="466.7" y="234.8" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#f0efec" text-anchor="middle">1.11×</text>
+<text x="466.7" y="294.0" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#c3c2b7" text-anchor="middle">c32</text>
+<path d="M564.0,276.0 L564.0,240.2 Q564.0,236.2 568.0,236.2 L584.0,236.2 Q588.0,236.2 588.0,240.2 L588.0,276.0 Z" fill="#3987e5"><title>c64 UnieInfra: 1.22×</title></path>
+<text x="576.0" y="231.2" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#f0efec" text-anchor="middle">1.22×</text>
+<text x="576.0" y="294.0" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#c3c2b7" text-anchor="middle">c64</text>
+<path d="M673.3,276.0 L673.3,88.2 Q673.3,84.2 677.3,84.2 L693.3,84.2 Q697.3,84.2 697.3,88.2 L697.3,276.0 Z" fill="#3987e5"><title>c128 UnieInfra: 5.88×</title></path>
+<text x="685.3" y="79.2" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#f0efec" text-anchor="middle">5.88×</text>
+<text x="685.3" y="294.0" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#c3c2b7" text-anchor="middle">c128</text>
+</svg>

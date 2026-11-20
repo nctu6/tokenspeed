@@ -334,6 +334,9 @@ class Envs:
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
+    # AMD GPU peer fabric (sizes Iris collectives): "auto" reads the amdkfd
+    # topology; "xgmi" / "pcie" force it (distributed/amd_fabric.py).
+    TOKENSPEED_AMD_GPU_FABRIC = EnvStr("auto")
 
     # Shared-expert parallelism.
     TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE = EnvInt(1)

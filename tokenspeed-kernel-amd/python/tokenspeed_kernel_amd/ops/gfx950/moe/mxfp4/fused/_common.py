@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 
 import torch
+from tokenspeed_kernel_amd._device import num_cus, num_xcds
 from tokenspeed_kernel_amd.ops.gfx950.moe._common import (
     RaggedTensorMetadata,
 )
@@ -87,7 +88,7 @@ def composition(cls):
     return cls
 
 
-_CDNA4_NUM_CUS = 256
+_CDNA4_NUM_CUS = num_cus()
 
 
 _PERSISTENT_OVERSUBSCRIBE = 2
@@ -111,7 +112,7 @@ _GLUON_DOT_SUB_TILE_K = _GLUON_DOT_K_QUAD * _GLUON_DOT_K_WIDTH  # = 64
 _TCP_INFLIGHT_CAP_BYTES = 32 * 1024  # gfx9 L1/TCP per-CU in-flight cap
 
 
-_CDNA4_NUM_XCDS = 8  # MI355X has 8 XCDs (chiplets) per device.
+_CDNA4_NUM_XCDS = num_xcds()  # MI355X has 8 XCDs (chiplets), MI350P 4.
 
 
 _SCALE_LOAD_MODES = ("bypass", "transpose", "swizzle")

@@ -52,6 +52,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel_amd._device import num_xcds
 from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import gluon_moe_sorting
@@ -67,7 +68,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
 
 _MXFP4_BLOCK = gl.constexpr(32)
 # gfx950 (MI350/MI355) dispatches workgroups round-robin over 8 XCDs.
-_NUM_XCDS = 8
+_NUM_XCDS = num_xcds()
 # Route sets up to this size are sorted inside the quantization launch.
 _FUSED_SORT_MAX_ROUTES = 1024
 

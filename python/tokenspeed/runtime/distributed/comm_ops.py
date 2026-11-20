@@ -401,6 +401,22 @@ def all_reduce_mhc_post(
     return backend.all_reduce_mhc_post(tensor, residual, post, comb, group)
 
 
+def overlap_all_reduce_lanes(
+    group: Group,
+    dtype: torch.dtype,
+    count: int,
+    max_programs: int,
+    backend: CommBackend | None = None,
+) -> tuple | None:
+    """``count`` independent all-reduce lanes for comm/compute overlap, or None.
+
+    See ``CommBackend.overlap_all_reduce_lanes``. COLLECTIVE on first use.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.overlap_all_reduce_lanes(group, dtype, count, max_programs)
+
+
 def prepare_all_reduce_lane(
     group: Group,
     hidden_dim: int,

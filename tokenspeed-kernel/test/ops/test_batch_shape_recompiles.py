@@ -463,6 +463,92 @@ def test_dsv41_index_topk_table_width():
                 torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
+def test_dsv41_finish_topk_width_and_strides():
+    """Every short-history row width shares one binary, at any stride.
+
+    Serving recompiled this kernel per power-of-two output width and per
+    divisibility class of its strides -- 14 compiles and ~22 s of stalls in one
+    256-request agent cell -- so a width or stride must not select a binary.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
+
+    generator = torch.Generator(device=DEVICE).manual_seed(5)
+
+    def run(rows, width, pad, candidates=False):
+        # Views into wider buffers give batch-dependent strides and offsets.
+        scores = torch.randn(rows, width + pad, device=DEVICE, generator=generator)
+        scores = scores[:, pad:]
+        scores[:, ::7] = -torch.inf
+        ids = torch.randperm(4 * width, device=DEVICE, generator=generator)[:width]
+        ids = ids.repeat(rows, 1).to(torch.int32)
+        out = torch.empty(rows, width + pad, dtype=torch.int32, device=DEVICE)
+        out = out[:, :width]
+        lens = torch.empty(rows + 1, dtype=torch.int32, device=DEVICE)[1:]
+        cands = None
+        if candidates:
+            cands = torch.arange(rows * width, dtype=torch.int32, device=DEVICE)
+            cands = cands.view(rows, width)
+        implementation._finish_topk(scores, ids, out, lens, cands)
+        live = scores > -torch.inf
+        for r in range(rows):
+            want = ids[r][live[r]].long()
+            if candidates:
+                want = cands[r, want // 8].long() * 8 + want % 8
+            want = want.sort().values
+            n = int(live[r].sum())
+            assert int(lens[r]) == n
+            torch.testing.assert_close(out[r, :n].long(), want, rtol=0, atol=0)
+            assert bool((out[r, n:] == -1).all())
+
+    run(3, 512, 0)
+    run(3, 512, 0, candidates=True)
+    with assert_no_triton_compile(implementation._finish_topk_kernel):
+        for rows, width, pad in ((1, 8, 1), (5, 37, 3), (16, 128, 0), (7, 300, 9)):
+            run(rows, width, pad)
+            run(rows, width, pad, candidates=True)
+
+
+def test_mhc_hc4_pre_mix_token_count():
+    from tokenspeed_kernel.ops.residual import triton as residual
+
+    hidden = 5120
+    generator = torch.Generator(device=DEVICE).manual_seed(13)
+    scale = torch.tensor([0.7, 1.1, 0.5], device=DEVICE)
+    base = torch.randn(24, device=DEVICE, generator=generator)
+    mul = torch.randn(64, 24, device=DEVICE, generator=generator)
+    sqrsum = torch.rand(64, device=DEVICE, generator=generator) * 4 * hidden
+
+    def run(tokens, n_splits):
+        gemm_mul = torch.zeros(n_splits, tokens, 24, device=DEVICE)
+        gemm_sqrsum = torch.zeros(n_splits, tokens, device=DEVICE)
+        gemm_mul[0], gemm_sqrsum[0] = mul[:tokens], sqrsum[:tokens]
+        pre = torch.empty(tokens, 4, device=DEVICE)
+        post = torch.empty(tokens, 4, device=DEVICE)
+        comb = torch.empty(tokens, 16, device=DEVICE)
+        residual.mhc_pre_mix_hc4(
+            gemm_mul,
+            gemm_sqrsum,
+            scale,
+            base,
+            pre,
+            post,
+            comb,
+            hidden_size=hidden,
+            rms_eps=1e-6,
+            hc_eps=1e-5,
+            sinkhorn_iters=3,
+            n_splits=n_splits,
+            num_tokens=tokens,
+        )
+        return pre, post, comb
+
+    expected = run(64, 1)
+    with assert_no_triton_compile(residual._mhc_pre_mix_hc4_kernel):
+        for tokens, n_splits in ((1, 1), (16, 2), (37, 16), (64, 3)):
+            for got, want in zip(run(tokens, n_splits), expected, strict=True):
+                torch.testing.assert_close(got, want[:tokens], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("with_candidates", [False, True])
 @pytest.mark.parametrize("sort_positions", [False, True])
 def test_dsv41_finish_selection_width(with_candidates, sort_positions):
@@ -592,7 +678,9 @@ def test_dsv41_page_table_geometry():
                 torch.int64,
             )
         )
-        dsv41.compressor_metadata(positions, requests, table, pages, *compressor)
+        dsv41.compressor_metadata(
+            positions, requests, table, pages, *compressor, rows=2
+        )
         selection, lengths = dsv41.selection_table(positions, requests, table, 4)
         assert (selection[:, 4:] == -1).all()
         return (

@@ -1,29 +1,8 @@
 name: NVIDIA GB200 Tests
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "python/pyproject.toml"
-      - "python/tokenspeed/**"
-      - "tokenspeed-kernel/**"
-      - "tokenspeed-mla/**"
-      - "tokenspeed-engine/**"
-      - "tokenspeed-scheduler/**"
-      - "test/**"
-      - ".github/workflows/nvidia-gb200-tests.yml"
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    branches: [main]
-    paths:
-      - "python/pyproject.toml"
-      - "python/tokenspeed/**"
-      - "tokenspeed-kernel/**"
-      - "tokenspeed-mla/**"
-      - "tokenspeed-engine/**"
-      - "tokenspeed-scheduler/**"
-      - "test/**"
-      - ".github/workflows/nvidia-gb200-tests.yml"
+  # Keep the workflow and submission scripts available for manual reruns,
+  # but do not create GB200 checks on every PR or main push.
   workflow_dispatch:
 
 permissions:
@@ -127,6 +106,7 @@ jobs:
             ${{ steps.changes.outputs.full_tests == 'true' && '--full-tests' || '' }} \
             --trigger "$TRIGGER" \
             --runner-group nvidia-arm \
+            --workflow-stage unit-test \
             --multi-node exclude)
           matrix=$(printf '%s' "$matrix" | python3 -c \
             "import json, sys; data=json.load(sys.stdin); data['include']=[item for item in data.get('include', []) if item['runner'].startswith('slurm-gb200-')]; print(json.dumps(data, separators=(',', ':')))")

@@ -130,6 +130,44 @@ def _mxfp8_quantize_tile(out):
 
 
 @gluon.jit
+def load_cdna4_scale_u8(scale_ptr, byte_offsets):
+    """Load E8M0 scale bytes from the CDNA4 swizzled scale layout as dwords.
+
+    In that layout every 4-byte cell holds the scales of rows ``r`` and
+    ``r + 16`` for K groups ``k`` and ``k + 4``; the two half bits are the
+    low two address bits, and every other offset term is a multiple of 4.
+    Loading the containing dword and shifting out the byte returns exactly
+    ``scale_ptr[byte_offsets]``, but lets the compiler merge the up to four
+    byte gathers a lane makes per cell into one dword load and select the
+    byte instead of packing separately loaded bytes. ``scale_ptr`` must be
+    4-byte aligned.
+    """
+    words = gl.amd.cdna4.buffer_load(
+        ptr=scale_ptr.to(gl.pointer_type(gl.int32)),
+        offsets=byte_offsets >> 2,
+    )
+    return ((words >> ((byte_offsets & 3) * 8)) & 0xFF).to(gl.uint8)
+
+
+@gluon.jit
+def load_cdna4_scale_pair_u8(scale_ptr, byte_offsets):
+    """Return ``(scale_ptr[byte_offsets], scale_ptr[byte_offsets + 2])``.
+
+    ``byte_offsets`` must address K groups ``0..3`` of an 8-group panel
+    (K-half bit clear). Groups ``4..7`` share the same 4-byte cells, so a
+    single dword load serves both BK128 halves of the panel.
+    """
+    words = gl.amd.cdna4.buffer_load(
+        ptr=scale_ptr.to(gl.pointer_type(gl.int32)),
+        offsets=byte_offsets >> 2,
+    )
+    shift = (byte_offsets & 3) * 8
+    lo = ((words >> shift) & 0xFF).to(gl.uint8)
+    hi = ((words >> (shift + 16)) & 0xFF).to(gl.uint8)
+    return lo, hi
+
+
+@gluon.jit
 def _mxfp4_store_cdna4_scale(
     scale_ptr,
     scale_byte,

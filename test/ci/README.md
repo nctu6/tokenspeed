@@ -48,7 +48,7 @@ Every task declares one `workflow_stage`:
 Only AMD workflows run the `import-check` stage, so its tasks must use AMD
 runner labels. Validation rejects other runner labels for that stage.
 
-The NVIDIA B200 Tests and AMD Tests workflows run unit tests before model
+The NVIDIA Tests and AMD Tests workflows run unit tests before model
 tests. AMD kernel benchmarks run in the separate AMD Kernel Benchmark workflow,
 concurrently with unit tests. Matrix entries within
 each stage run in parallel. The workflow treats a stage with no matching tasks

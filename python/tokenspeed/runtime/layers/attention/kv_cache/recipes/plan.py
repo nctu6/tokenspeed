@@ -731,12 +731,7 @@ def pack(
             byte ratios plus the exact-page-stride constraints their fields
             impose.
         alignment: Byte alignment for plane sizes.
-        max_padding_fraction: Padding budget per group, measured over the
-            planes a group actually occupies (not the whole parent, which may
-            hold other groups' disjoint planes). For every group that shares
-            one aliased set of byte-equal planes -- the uniform and hybrid
-            slab models -- a group's planes are the whole parent, so this is
-            the whole-parent fraction unchanged.
+        max_padding_fraction: Padding budget per group.
 
     Returns:
         The packed :class:`CacheLayout`.

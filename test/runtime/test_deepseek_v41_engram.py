@@ -571,10 +571,7 @@ def test_cuda_lookup_hash_and_graph_replay():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
-    reason="MXFP8 W8A8 projection needs SM100+; older parts keep BF16 weights",
-)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_quantized_projection_forward():
     torch.manual_seed(41)
     quant = Mxfp8Config.from_config(

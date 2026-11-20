@@ -563,6 +563,8 @@ def get_config(
         "Gemma3Config",
         "Gemma4ForConditionalGeneration",
         "Gemma4Config",
+        "Mistral3ForConditionalGeneration",
+        "Mistral3Config",
         "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Omni_Reasoning_V3",
         "NemotronH_Omni_Reasoning_V3NextN",

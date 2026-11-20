@@ -831,7 +831,7 @@ def test_gumbel_min_p_samples_allowed_set(
         assert probs[token_id] >= threshold
 
 
-def _dspark_block_on_shards(base, anchors, embedding, projection, tp):
+def _dspark_block_on_shards(base, anchors, embedding, projection, tp, sampling=None):
     """Run every shard's step kernel on one device and hand-gather the candidates."""
     rows, block, vocab = base.shape
     local = vocab // tp
@@ -853,6 +853,7 @@ def _dspark_block_on_shards(base, anchors, embedding, projection, tp):
                 local,
                 partials[rank],
                 out,
+                sampling,
             )
         candidates.copy_(partials)
     dspark_block_greedy_resolve(candidates, out, block - 1)
@@ -876,6 +877,104 @@ def test_dspark_block_greedy_matches_the_full_vocabulary_argmax(
 
     expected = torch_dspark_block_greedy(base, anchors, embedding, projection)
     assert torch.equal(out.long(), expected)
+
+
+@pytest.mark.parametrize(
+    ("rows", "block", "vocab", "tp"),
+    ((9, 5, 4 * 2048, 4), (3, 4, 1000, 1), (17, 3, 4096, 2)),
+)
+def test_dspark_block_sampling_draws_the_verifiers_noise(
+    rows: int, block: int, vocab: int, tp: int, device: str
+) -> None:
+    """With a zero Markov bias each step equals the target's pool Gumbel sample.
+
+    The verifier samples row ``s`` with the stream keyed by (seed, offset + s)
+    and the global token id; the draft must draw that same noise, whatever the
+    tensor-parallel split, so it proposes the target's own sample wherever the
+    draft and target logits agree.
+    """
+    torch.manual_seed(7 + rows)
+    rank = 32
+    embedding = torch.zeros(vocab, rank, device=device, dtype=torch.bfloat16)
+    projection = torch.randn(vocab, rank, device=device).to(torch.bfloat16)
+    base = torch.randn(rows, block, vocab, device=device) * 3
+    anchors = torch.randint(0, vocab, (rows,), device=device, dtype=torch.int32)
+    seeds = torch.randint(1, 1 << 40, (rows,), device=device, dtype=torch.int64)
+    temperatures = torch.linspace(0.7, 1.3, rows, device=device, dtype=torch.float32)
+    positions = torch.randint(5, 100000, (rows,), device=device, dtype=torch.int64)
+
+    out = _dspark_block_on_shards(
+        base, anchors, embedding, projection, tp, (seeds, temperatures, positions)
+    )
+
+    pool_indices = torch.arange(rows, dtype=torch.int32, device=device)
+    for step in range(block):
+        local_ids, local_scores, scratch = _gumbel_scratch(rows, vocab, device)
+        expected = gumbel_sample_from_pools(
+            base[:, step].contiguous(),
+            pool_indices,
+            temperatures,
+            seeds,
+            positions + step,
+            local_ids,
+            local_scores,
+            scratch,
+        )
+        assert torch.equal(out[:, step].cpu(), expected.cpu()), step
+    single = _dspark_block_on_shards(
+        base, anchors, embedding, projection, 1, (seeds, temperatures, positions)
+    )
+    assert torch.equal(out, single)
+
+
+def test_dspark_block_sampling_follows_the_markov_bias(device: str) -> None:
+    """A large bias toward one token wins at any temperature, as in greedy."""
+    rows, block, vocab, rank = 4, 3, 2048, 16
+    embedding = torch.zeros(vocab, rank, device=device, dtype=torch.bfloat16)
+    embedding[:, 0] = 1.0
+    projection = torch.zeros(vocab, rank, device=device, dtype=torch.bfloat16)
+    projection[1234, 0] = 1.0e4
+    base = torch.randn(rows, block, vocab, device=device)
+    anchors = torch.randint(0, vocab, (rows,), device=device, dtype=torch.int32)
+    seeds = torch.arange(1, rows + 1, device=device, dtype=torch.int64)
+    temperatures = torch.ones(rows, device=device, dtype=torch.float32)
+    positions = torch.full((rows,), 42, device=device, dtype=torch.int64)
+
+    out = _dspark_block_on_shards(
+        base, anchors, embedding, projection, 1, (seeds, temperatures, positions)
+    )
+
+    assert (out == 1234).all()
+
+
+def test_dspark_block_sampling_rejects_mismatched_row_tensors(device: str) -> None:
+    rows, block, vocab, rank = 2, 2, 1024, 16
+    embedding = torch.zeros(vocab, rank, device=device, dtype=torch.bfloat16)
+    projection = torch.zeros(vocab, rank, device=device, dtype=torch.bfloat16)
+    base = torch.zeros(rows, block, vocab, device=device)
+    anchors = torch.zeros(rows, device=device, dtype=torch.int32)
+    candidates = torch.empty(
+        1, rows, dspark_block_candidate_tiles(vocab), dtype=torch.int64, device=device
+    )
+    partials = torch.empty_like(candidates[0])
+    out = torch.empty(rows, block, dtype=torch.int32, device=device)
+    seeds = torch.zeros(rows, device=device, dtype=torch.int64)
+    positions = torch.zeros(rows, device=device, dtype=torch.int64)
+
+    with pytest.raises(ValueError, match="sampling needs"):
+        dspark_block_greedy_step(
+            base,
+            0,
+            anchors,
+            candidates,
+            embedding,
+            projection,
+            0,
+            vocab,
+            partials,
+            out,
+            (seeds, torch.ones(rows, device=device, dtype=torch.float64), positions),
+        )
 
 
 def test_dspark_block_greedy_reads_strided_anchors(device: str) -> None:

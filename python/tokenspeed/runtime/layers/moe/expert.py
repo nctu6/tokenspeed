@@ -271,6 +271,11 @@ class MoELayer(torch.nn.Module):
                 ),
                 "the flashinfer_trtllm unquant kernel accepts it",
             )
+            # The Triton BF16 kernels (the AMD default) declare
+            # ispp_alignment={32}. A partition such as gemma-4-26B-A4B's
+            # 704 / TP4 = 176 would otherwise select no kernel at all.
+            if get_moe_backend().value in ("auto", "triton"):
+                self._pad_ispp(32, "the Triton MoE kernels accept it")
         if self._quant_kind == "nvfp4":
             self._apply_trtllm_ispp_padding(
                 (
@@ -669,6 +674,16 @@ class MoELayer(torch.nn.Module):
         trtllm_only = backend == "auto" and not self._spec.gated
         if not every_backend and backend != "flashinfer_trtllm" and not trtllm_only:
             return
+        self._pad_ispp(alignment, reason)
+
+    def _pad_ispp(self, alignment: int, reason: str) -> None:
+        """Round the intermediate size per partition up to ``alignment``.
+
+        The loaders shard the checkpoint by the padded partition size, so
+        the zero tail sits at the end of the last ranks' slices. The zero
+        rows of w13 and the matching zero columns of w2 add nothing to the
+        output.
+        """
         ispp = self.intermediate_size // self.tp_size
         if ispp % alignment == 0:
             return

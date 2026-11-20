@@ -690,6 +690,10 @@ class LatentMoELayer(nn.Module):
             # with Iris's spin-wait all-reduce kernels. Keep the captured path
             # serial; eager serving can safely use the compute-stream overlap.
             and not get_is_cuda_graph_phase()
+            # The graph-phase flag covers decode capture only; breakable
+            # prefill graphs capture without it, and replaying the overlapped
+            # capture corrupts the layer output on gfx950.
+            and not torch.cuda.is_current_stream_capturing()
         )
         shared_reduction_applied = False
 
@@ -793,6 +797,16 @@ class LatentMoELayer(nn.Module):
             shared_reduction_applied = True
 
         if reduction_outputs is not None:
+            # A producer may return its own tensor instead of filling its
+            # destination (not every MoE kernel honors _situ_output_buffer;
+            # gfx950 EP4 selects one that does not). Land such partials in
+            # the reduction outputs, or the joint reduction sums stale rows.
+            for partial, target in (
+                (shared_output, shared_target),
+                (routed_latent, routed_target),
+            ):
+                if partial.data_ptr() != target.data_ptr():
+                    target.copy_(partial)
             shared_output, routed_latent = all_reduce(
                 reduction_outputs,
                 self.expert_parallel_group,

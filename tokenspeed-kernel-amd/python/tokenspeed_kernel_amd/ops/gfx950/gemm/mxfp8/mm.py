@@ -40,6 +40,7 @@ from __future__ import annotations
 from typing import Callable, NamedTuple
 
 import torch
+from tokenspeed_kernel_amd._device import num_cus, num_xcds
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (
     gluon_mm_mxfp8_decode_num_counters_gfx950,
@@ -58,7 +59,7 @@ MXFP8_NUM_WARPS = 8
 MXFP8_WAVES_PER_EU = 2
 MXFP8_WARPS_M = 2
 MXFP8_WARPS_N = 4
-MXFP8_NUM_XCDS = 8
+MXFP8_NUM_XCDS = num_xcds()
 MXFP8_GROUP_SIZE_M = 4
 MXFP8_N_ALIGN = 16
 # Scale staging: direct register loads, dword async copies alongside the
@@ -67,7 +68,7 @@ MXFP8_SCALES_DIRECT = gl.constexpr(0)
 MXFP8_SCALES_ASYNC = gl.constexpr(1)
 MXFP8_SCALES_PRELOAD = gl.constexpr(2)
 MXFP8_PRELOAD_TILES = 8
-MXFP8_NUM_CUS = 256
+MXFP8_NUM_CUS = num_cus()
 MXFP8_MIN_SPLIT_PAIRS = 2
 MXFP8_MAX_SPLITS = 8
 # Split-K cost model (microseconds), measured on MI355X: one 256x256x128 tile

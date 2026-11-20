@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -63,6 +64,12 @@ from tokenspeed.runtime.sampling.backends.triton import (
     _TOP_P_PARALLEL_VERIFY_ATTEMPTS,
     TritonSamplingBackend,
 )
+from tokenspeed.runtime.sampling.block_verify import block_verify_chain_chunked
+
+_BLOCK_VERIFY_MAX_BS = int(
+    os.environ.get("TOKENSPEED_DSPARK_BLOCK_VERIFY_MAX_BS", "128")
+)
+_BLOCK_VERIFY_CHUNK = int(os.environ.get("TOKENSPEED_DSPARK_BLOCK_VERIFY_CHUNK", "16"))
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -497,6 +504,10 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
 
         return sampled, self._ones_buf[: logits.shape[0]]
 
+    def bind_block_verify(self, state) -> None:
+        """Verify DSpark chains jointly (block verification); see block_verify.py."""
+        self._block_verify_state = state
+
     @nvtx_range("sampling:verify", color="yellow")
     def verify(
         self,
@@ -543,6 +554,45 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             req_pool_indices,
             num_tokens_per_req=num_tokens_per_req,
         )
+
+        block_state = getattr(self, "_block_verify_state", None)
+        # Block verification gathers full-vocab draft logits across TP ranks
+        # (bs x steps x vocab fp32) every step; past a few dozen requests that
+        # all-gather and the full-vocab softmaxes cost more than the extra
+        # accepted tokens, so large batches keep the exact-match verify.
+        if (
+            block_state is not None
+            and num_tokens_per_req > 1
+            and bs <= _BLOCK_VERIFY_MAX_BS
+        ):
+            slots = req_pool_indices.long()
+            block_verify_chain_chunked(
+                block_state,
+                slots,
+                logits,
+                candidates.to(torch.int32),
+                self._temperature_pool.index_select(0, slots),
+                predict,
+                accept_index,
+                accept_length,
+                _BLOCK_VERIFY_CHUNK,
+            )
+            accept_length += 1
+            self.broadcast_verify_outputs()
+            valid = accept_index >= 0
+            safe_positions = accept_index.clamp(min=0).long()
+            accepted_tokens = predict.long().gather(0, safe_positions.view(-1))
+            pool_idx_expanded = (
+                req_pool_indices.unsqueeze(-1)
+                .expand(-1, num_tokens_per_req)
+                .reshape(-1)
+            )
+            self._accumulate_counts(
+                pool_idx_expanded,
+                accepted_tokens,
+                valid.reshape(-1).to(torch.int32),
+            )
+            return predict, accept_length
 
         offsets_pool = self._prepare_sampling_offsets(sampling_info)
         target_sampled = self._gumbel_sample_full_logits(

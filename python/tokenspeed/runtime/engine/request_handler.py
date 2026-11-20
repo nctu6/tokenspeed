@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections import deque
 from collections.abc import Mapping
 from http import HTTPStatus
@@ -237,6 +238,15 @@ class RequestHandler:
         # passes the handle in; None elsewhere (e.g. unit tests).
         self._device = device
 
+        # Prefill coalescing (--prefill-coalesce-ms): the input rank holds new
+        # generate requests while others decode and releases them together.
+        # It decides before the broadcast, so every rank sees one stream.
+        self.prefill_coalesce_s = max(0.0, server_args.prefill_coalesce_ms) / 1000
+        self._held_reqs: list = []
+        self._held_since = 0.0
+        # Whether any request is decoding; the event loop sets it each round.
+        self.engine_busy = False
+
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
         self.attn_tp_rank = mapping.attn.tp_rank
@@ -365,10 +375,33 @@ class RequestHandler:
                 except zmq.ZMQError:
                     break
                 recv_reqs.append(recv_req)
+            if self.prefill_coalesce_s > 0:
+                recv_reqs = self._coalesce(recv_reqs)
         else:
             recv_reqs = None
 
         return recv_reqs
+
+    def _coalesce(self, recv_reqs: list) -> list:
+        """Hold new generate requests while others decode; release them together.
+
+        Held requests are released, in arrival order, once the oldest has
+        waited ``prefill_coalesce_s``, when nothing is decoding, or when any
+        other message arrives (an abort or a flush must not overtake them).
+        """
+        if not self._held_reqs and not recv_reqs:
+            return recv_reqs
+        if not self._held_reqs:
+            self._held_since = time.monotonic()
+        self._held_reqs.extend(recv_reqs)
+        if (
+            self.engine_busy
+            and all(isinstance(r, TokenizedGenerateReqInput) for r in recv_reqs)
+            and time.monotonic() - self._held_since < self.prefill_coalesce_s
+        ):
+            return []
+        released, self._held_reqs = self._held_reqs, []
+        return released
 
     def recv_reqs(self) -> list:
         if self.attn_tp_size == 1:

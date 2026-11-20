@@ -23,7 +23,7 @@ jobs:
             group: pr-test-amd-mi450
           - name: AMD Kernel Benchmark
             group: pr-test-amd-kernel-benchmark
-          - name: NVIDIA B200 Tests
+          - name: NVIDIA Tests
             group: pr-test-nvidia
           - name: NVIDIA ARM Tests
             group: pr-test-nvidia-arm

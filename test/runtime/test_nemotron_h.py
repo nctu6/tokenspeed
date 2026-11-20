@@ -1171,10 +1171,7 @@ def test_mamba2_replay_commit_matches_the_staged_verify_states(state_dtype, tree
         assert torch.equal(replayed[committed], staged[committed]), component
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
-    reason="static per-tensor FP8 GEMM kernels are registered for SM100+ only",
-)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shared_scale", [True, False])
 def test_static_per_tensor_checkpoint_runs_a_merged_projection(
     shared_scale: bool,

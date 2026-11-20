@@ -310,6 +310,20 @@ class CommBackend(ABC):
         """
         return None
 
+    def overlap_all_reduce_lanes(
+        self, group: Group, dtype: torch.dtype, count: int, max_programs: int
+    ) -> tuple | None:
+        """Independent producer-direct all-reduce lanes for comm/compute overlap.
+
+        Each lane owns its own symmetric producer buffer, so one lane's
+        producer can write while another lane's reduction reads, and its
+        reductions use at most ``max_programs`` workgroups so compute running
+        beside them keeps most of the GPU. COLLECTIVE on first use. Returns
+        None when the backend has no such lanes (the caller then must not
+        overlap).
+        """
+        return None
+
     def acquire_all_reduce_outputs(
         self,
         shapes: tuple[tuple[int, ...], ...],

@@ -1,0 +1,21 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-gb10-runtime-and-kernel
+type: ut
+workflow_stage: unit-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - gb10-altos
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    - python3 test/runtime/run_ci_suite.py --device cuda --suite runtime-1gpu --timeout-per-file ${CI_TIMEOUT_PER_FILE:-1800}
+    - python3 -m pytest tokenspeed-kernel/test/test_numerics.py -v
+    - python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_cuda.py -v
+report:
+  github_step_summary: true

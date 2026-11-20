@@ -1683,6 +1683,7 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             // bound guards against). A victim that is still the blocker had
             // nobody else to serve (docs/design/scheduler.md §2).
             scheduleDecodeBatch(feedback, build, candidates);
+
             if (build.pushed_decode || blocker == victim) {
                 return;
             }
@@ -2362,7 +2363,9 @@ void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& buil
         // token) would only get a step nobody reads: it occupies the GPU for a
         // whole step after the request is done, and the next prompt queues
         // behind it. At C1 that step is ~18 ms; the follow-up request sees about
-        // half of it as extra queueing. An undeclared budget never qualifies.
+        // half of it as extra queueing. An undeclared budget never qualifies,
+        // and neither does a request with nothing in flight (see
+        // DeclaredBudgetCoveredByInFlight): it still needs its final step.
         if (request->Is<fsm::Decoding>() && request->DeclaredBudgetCoveredByInFlight()) {
             continue;
         }

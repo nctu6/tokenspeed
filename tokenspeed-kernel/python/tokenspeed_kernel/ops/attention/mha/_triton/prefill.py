@@ -19,37 +19,10 @@
 # SOFTWARE.
 
 import math
-import os
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
-
-
-def _env_flag(name: str, default: bool) -> bool:
-    """Parse a boolean env flag (``1/true/yes/on`` vs ``0/false/no/off``).
-
-    Unset or empty falls back to ``default``; an unrecognized value raises so a
-    typo never silently picks a kernel variant.
-    """
-    raw = os.environ.get(name, "").strip().lower()
-    if raw == "":
-        return default
-    if raw in ("1", "true", "yes", "on"):
-        return True
-    if raw in ("0", "false", "no", "off"):
-        return False
-    raise ValueError(f"{name}={raw!r}: expected one of 1/0/true/false/yes/no/on/off")
-
-
-# Read once at import; forwarded to ``_fwd_kernel`` as constexprs, so each
-# setting compiles its own specialization and the "off" kernel is the legacy one.
-#
-# SKIP_OOR: query blocks whose first row is past this sequence's extend length
-# return immediately instead of streaming the whole KV range just to store
-# nothing (ragged batches, e.g. one long chunk next to short prefix-cached
-# turns). Output is bitwise identical; ``0`` is a kill switch.
-_TRITON_PREFILL_SKIP_OOR = _env_flag("TOKENSPEED_TRITON_PREFILL_SKIP_OOR", True)
 
 
 @triton.jit
@@ -108,7 +81,6 @@ def _fwd_kernel(
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
     HAS_LSE: tl.constexpr,
-    SKIP_OOR_BLOCKS: tl.constexpr = False,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -117,11 +89,6 @@ def _fwd_kernel(
 
     cur_seq_extend_start_idx = tl.load(cu_seqlens_q + cur_seq)
     cur_seq_len_extend = tl.load(cu_seqlens_q + cur_seq + 1) - cur_seq_extend_start_idx
-    if SKIP_OOR_BLOCKS:
-        # Every row of this block is past the sequence's extend length: the
-        # epilogue stores are fully masked, so the KV loop is pure waste.
-        if cur_block_m * BLOCK_M >= cur_seq_len_extend:
-            return
     if HAS_KV_CACHE:
         cur_seq_len = tl.load(cache_seqlens + cur_seq)
     else:
@@ -217,14 +184,9 @@ def _fwd_kernel(
                 cache_token_indices = start_n + offs_n
                 page_indices = cache_token_indices // PAGE_SIZE
                 page_offsets = cache_token_indices - page_indices * PAGE_SIZE
-                # Bound page-table gathers: masked lanes of the last tile can
-                # compute page_indices past stride even when mask_n is false;
-                # on sm120 a predicated load with a wildly OOB address has
-                # still faulted under memory pressure.
-                page_in_range = mask_n & (page_indices < page_table_stride_b)
                 physical_pages = tl.load(
                     page_table + cur_seq * page_table_stride_b + page_indices,
-                    mask=page_in_range,
+                    mask=mask_n,
                     other=0,
                 )
                 # int64 to avoid address overflow for large (>int32 range) KV caches
@@ -236,7 +198,7 @@ def _fwd_kernel(
                 )
                 k = tl.load(
                     K_Buffer + offs_k,
-                    mask=(page_in_range[None, :]) & (mask_d[:, None]),
+                    mask=(mask_n[None, :]) & (mask_d[:, None]),
                     other=0.0,
                 )
             else:
@@ -261,7 +223,7 @@ def _fwd_kernel(
                     )
                     kpe = tl.load(
                         K_Buffer + offs_kpe,
-                        mask=page_in_range[None, :],
+                        mask=mask_n[None, :],
                         other=0.0,
                     )
                 else:
@@ -300,7 +262,7 @@ def _fwd_kernel(
                 )
                 v = tl.load(
                     V_Buffer + offs_v,
-                    mask=page_in_range[:, None] & mask_dv[None, :],
+                    mask=mask_n[:, None] & mask_dv[None, :],
                     other=0.0,
                 )
             else:
@@ -352,61 +314,15 @@ def _fwd_kernel(
         tl.store(LSE_Extend + offs_lse, lse, mask=mask_m)
 
 
-# sm_120 (RTX PRO 6000 / workstation Blackwell) sorts ABOVE sm_90 by version
-# but carries only ~100 KB opt-in shared memory per block -- the same budget as
-# sm_86/sm_89, not sm_90's 227 KB. The datacenter prefill tiles below ask for
-# ~114 KB and the Triton launch aborts with OutOfResources on sm_120, so the
-# device must be classified by its measured shared-memory budget, not by the
-# arch-version ordering.
+# Use the device budget instead of architecture version: SM120 has a smaller
+# shared-memory limit than datacenter Blackwell.
 _LARGE_SHARED_MEMORY_BYTES = 128 * 1024
 
 
 def _has_large_shared_memory(platform) -> bool:
-    """Whether the device has a datacenter-sized per-block shared-memory budget.
-
-    Args:
-        platform: the current ``PlatformInfo``; its ``max_shared_memory_per_sm``
-            is the opt-in per-block ceiling a kernel tile must fit under.
-
-    Returns:
-        ``True`` when the device can opt into at least
-        ``_LARGE_SHARED_MEMORY_BYTES``. A budget of ``0`` means the platform
-        layer could not determine one; that also returns ``True`` so a detection
-        gap never silently narrows tiles already validated on datacenter parts.
-    """
+    """Return whether the device can use the large-memory tile."""
     budget = platform.max_shared_memory_per_sm
     return budget == 0 or budget >= _LARGE_SHARED_MEMORY_BYTES
-
-
-def _select_prefill_tiles(platform, Lq: int) -> tuple[int, int]:
-    """``(BLOCK_M, BLOCK_N)`` for the NVIDIA prefill/extend kernel.
-
-    Classifies the device by its measured shared-memory budget rather than by
-    arch-version ordering alone: sm_120 is ``is_hopper_plus`` by version but has
-    the ~100 KB budget of sm_86/sm_89, so it takes the small-memory Ampere tiles.
-    sm_86/sm_89 are additionally matched by compute-capability minor so they
-    keep small tiles even when the budget is unknown (``0`` is treated as large
-    by ``_has_large_shared_memory``).
-
-    Args:
-        platform: ``PlatformInfo`` of a non-AMD device.
-        Lq: query/key head dim (``q_extend.shape[-1]``).
-    """
-    small_smem = not _has_large_shared_memory(platform)
-
-    if platform.is_hopper_plus and not small_smem:
-        return (128, 64) if Lq <= 256 else (32, 64)
-
-    if platform.is_ampere_plus:
-        if small_smem or platform.arch_version.minor in (6, 9):
-            if Lq <= 128:
-                return (64, 128)
-            return (64, 64) if Lq <= 256 else (32, 32)
-        if Lq <= 128:
-            return (128, 128)
-        return (64, 64) if Lq <= 256 else (32, 64)
-
-    return (64, 64) if Lq <= 128 else (32, 32)
 
 
 def prefill_attention_fwd(
@@ -464,7 +380,31 @@ def prefill_attention_fwd(
         num_warps = 4
 
     else:
-        BLOCK_M, BLOCK_N = _select_prefill_tiles(platform, Lq)
+        small_smem = not _has_large_shared_memory(platform)
+        if platform.is_hopper_plus and not small_smem:
+            if Lq <= 256:
+                BLOCK_M, BLOCK_N = (128, 64)
+            else:
+                BLOCK_M, BLOCK_N = (32, 64)
+        elif platform.is_ampere_plus:
+            # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
+            if small_smem:
+                if Lq <= 128:
+                    BLOCK_M, BLOCK_N = (64, 128)
+                elif Lq <= 256:
+                    BLOCK_M, BLOCK_N = (64, 64)
+                else:
+                    BLOCK_M, BLOCK_N = (32, 32)
+            else:
+                if Lq <= 128:
+                    BLOCK_M, BLOCK_N = (128, 128)
+                elif Lq <= 256:
+                    BLOCK_M, BLOCK_N = (64, 64)
+                else:
+                    BLOCK_M, BLOCK_N = (32, 64)
+        else:
+            BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
+
         num_warps = 4 if Lk <= 64 else 8
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
@@ -534,7 +474,6 @@ def prefill_attention_fwd(
         HAS_SINK=HAS_SINK,
         HAS_LSE=HAS_LSE,
         STORE_TRANSPOSE=platform.is_amd,
-        SKIP_OOR_BLOCKS=_TRITON_PREFILL_SKIP_OOR,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,

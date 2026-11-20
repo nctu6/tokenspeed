@@ -32,18 +32,33 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
 )
 
 _PAGE_SIZE = 64
-# Match the native paged scorer's transient score budget. Heads are gathered
-# once per API chunk; only score/selection work is split at wider histories.
-_LOGITS_BUDGET_BYTES = 32 << 20
+# Transient FP32 score budget per query tile, the same 512 MiB default as
+# --deepseek-v4-indexer-prefill-max-logits-mb. Heads are gathered once per API
+# chunk; only score/selection work is split at wider histories. A smaller
+# budget makes the tile count per chunk grow with history length (32 MiB gave
+# ~7x more launches at a 400K-token history), which slows long-context prefill
+# and deepens the host launch queue enough to hit a ROCm runtime race.
+_LOGITS_BUDGET_BYTES = 512 << 20
 _FP32_BYTES = 4
+
+
+# Query chunks and tiles start at multiples of this many rows (when they hold
+# at least that many), so a request's speculative rows (next_n dividing 120,
+# e.g. 1-6, 8, 10, 12) never straddle two launches: the gfx950 scorer shares
+# key loads across a request's rows only within one launch's row block.
+_QUERY_ROW_ALIGN = 120
+_MAX_QUERY_CHUNK = 2 * _QUERY_ROW_ALIGN
 
 
 def _score_query_tile(queries: int, width: int) -> int:
     """Fit as many queries as possible in one bounded FP32 logits tile."""
-    return min(
+    tile = min(
         queries,
         max(1, _LOGITS_BUDGET_BYTES // (width * _FP32_BYTES)),
     )
+    if _QUERY_ROW_ALIGN <= tile < queries:
+        tile -= tile % _QUERY_ROW_ALIGN
+    return tile
 
 
 @triton.jit(
@@ -236,7 +251,11 @@ def run_dsv41_csa2_index_topk(
         # loads 16-byte row chunks, so normalize only those layouts. Runtime
         # arenas align index pages to 256 bytes and never take this copy.
         cache_2d = cache_2d.contiguous()
-    query_chunk_size = min(int(query_chunk_size), 256)
+    query_chunk_size = int(query_chunk_size)
+    if query_chunk_size > _QUERY_ROW_ALIGN:
+        query_chunk_size = min(
+            query_chunk_size - query_chunk_size % _QUERY_ROW_ALIGN, _MAX_QUERY_CHUNK
+        )
     make_blocks = bool(candidate_topk)
     # Pack every query once; the pack also zeroes unused block lengths.
     q, w, _shards = _index_gather_heads(index_q, weights, process_group)

@@ -455,8 +455,11 @@ class ServerArgs:
     max_model_len: int | None = None
     device: str = "cuda"
     # vLLM parity: one or more API ids for the same weights/process.
-    # CLI ``nargs="+"``; first name is canonical for metrics / gRPC.
+    # CLI ``nargs="+"`` passes a list; after __post_init__ this holds only the
+    # first (canonical) name as a str, used for metrics / gRPC GetModelInfo.
     served_model_name: str | list[str] | None = None
+    # The remaining --served-model-name values (aliases), in CLI order.
+    extra_served_model_names: list[str] = dataclasses.field(default_factory=list)
     revision: str | None = None
     language_model_only: bool = False
 
@@ -510,6 +513,10 @@ class ServerArgs:
     # None = auto: on for validated paged-MHA architectures (see
     # MIXED_BATCH_DEFAULT_ARCHITECTURES), off otherwise.
     enable_mixed_batch: bool | None = None
+    # UnieInfra: hold new generate requests up to this long (ms) while other
+    # requests are decoding, so requests arriving close together prefill in one
+    # step. 0 is off. Consumed by runtime/engine/request_handler.py.
+    prefill_coalesce_ms: float = 0.0
     # Decode rounds owed to the running decodes after each prefill round; 0 is
     # off (docs/design/scheduler.md §3.3).
     prefill_decode_interval: int = 0
@@ -682,6 +689,9 @@ class ServerArgs:
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
     kvstore_io_backend: str = "kernel"
+    # One Host L2 buffer per attention-TP group when the cache bytes are
+    # identical across it (CacheRecipe.kv_identical_across_attn_tp).
+    kvstore_share_host_across_attn_tp: bool = False
     # When Device prefix-cache pages are copied to Host L2 (--kvstore-write-policy).
     kvstore_write_policy: str = "write_through"
     # Optional L3 storage beneath the compact Host cache.
@@ -1096,28 +1106,31 @@ class ServerArgs:
         if self.tokenizer is None:
             self.tokenizer = self.model
 
+        # The CLI (nargs="+") hands in a list. Keep the first name in
+        # served_model_name as a plain str, which is what the gRPC servicer,
+        # metrics and the PD connector read, and the rest in
+        # extra_served_model_names. Re-running this on an already-normalized
+        # instance (ServerArgs(**asdict(args))) yields the same split.
         if self.served_model_name is None:
-            self.served_model_name = [self.model]
+            requested: list[str] = []
         elif isinstance(self.served_model_name, str):
-            self.served_model_name = [self.served_model_name]
+            requested = [self.served_model_name]
         elif isinstance(self.served_model_name, list):
-            if not self.served_model_name:
-                self.served_model_name = [self.model]
-            else:
-                # Drop empties; keep order; dedupe while preserving first wins.
-                seen: set[str] = set()
-                names: list[str] = []
-                for name in self.served_model_name:
-                    if not name or name in seen:
-                        continue
-                    seen.add(name)
-                    names.append(name)
-                self.served_model_name = names or [self.model]
+            requested = list(self.served_model_name)
         else:
             raise TypeError(
                 "served_model_name must be str | list[str] | None, "
                 f"got {type(self.served_model_name).__name__}"
             )
+        # Drop empties; keep order; dedupe while preserving first wins.
+        names: list[str] = []
+        for name in [*requested, *self.extra_served_model_names]:
+            if name and name not in names:
+                names.append(name)
+        if not names:
+            names = [self.model]
+        self.served_model_name = names[0]
+        self.extra_served_model_names = names[1:]
 
         if self.seed is None:
             self.seed = random.randint(0, 1 << 30)
@@ -1174,17 +1187,15 @@ class ServerArgs:
     @property
     def served_model_names(self) -> list[str]:
         """All served API ids (vLLM-style multi ``--served-model-name``)."""
-        names = self.served_model_name
-        if names is None:
-            return [self.model]
-        if isinstance(names, str):
-            return [names]
-        return list(names)
+        return [self.canonical_served_model_name, *self.extra_served_model_names]
 
     @property
     def canonical_served_model_name(self) -> str:
         """First served name — metrics / gRPC GetModelInfo canonical id."""
-        return self.served_model_names[0]
+        assert isinstance(
+            self.served_model_name, str
+        ), "served_model_name is normalized to a str in resolve_basic_defaults"
+        return self.served_model_name
 
     def resolve_config_aliases(self):
         # Whether the block-drafter widths were given rather than defaulted.
@@ -3550,6 +3561,18 @@ class ServerArgs:
             help="Never mix prefill and decode requests in one iteration.",
         )
         parser.add_argument(
+            "--prefill-coalesce-ms",
+            type=float,
+            default=ServerArgs.prefill_coalesce_ms,
+            help=(
+                "Hold new requests up to this many milliseconds while other "
+                "requests are decoding, so requests that arrive close together "
+                "prefill in one step and pay the step's fixed cost once "
+                "(0 = admit immediately). A request arriving while nothing "
+                "decodes is never held."
+            ),
+        )
+        parser.add_argument(
             "--prefill-decode-interval",
             type=int,
             default=ServerArgs.prefill_decode_interval,
@@ -3670,6 +3693,17 @@ class ServerArgs:
             help="The IO backend for KVStore transfer between CPU and GPU.",
         )
         parser.add_argument(
+            "--kvstore-share-host-across-attn-tp",
+            action="store_true",
+            help="Share one Host L2 buffer across the ranks of an attention-TP "
+            "group when the model's cache bytes are identical on every rank "
+            "(DeepSeek V4.1). The buffer is the group size times one rank's "
+            "--kvstore-size/--kvstore-ratio, so the node pins the same memory "
+            "and L2 holds that many times the pages. Ignored, with a log, for a "
+            "layout whose bytes differ per rank, under --kv-parallel-size > 1, "
+            "or when the group spans nodes.",
+        )
+        parser.add_argument(
             "--kvstore-write-policy",
             type=str,
             choices=["write_through", "write_back"],
@@ -3689,10 +3723,11 @@ class ServerArgs:
         parser.add_argument(
             "--kvstore-storage-backend",
             type=str,
-            choices=["mooncake", "memory"],
+            choices=["mooncake", "file", "memory"],
             default=ServerArgs.kvstore_storage_backend,
             help="L3 store under compact Host (flat) KV. "
             "'mooncake' is Mooncake Store (SGLang/vLLM HiCache equivalent). "
+            "'file' keeps objects on a local disk (NVMe), one file per block. "
             "'memory' is an in-process dict for tests. Requires Host L2 "
             "(do not pass --disable-kvstore).",
         )
@@ -3702,7 +3737,9 @@ class ServerArgs:
             default=ServerArgs.kvstore_storage_backend_extra_config,
             help="JSON object of extra L3 backend settings. For mooncake: "
             "master_server_address, local_hostname, metadata_server, "
-            "global_segment_size, protocol, device_name, tenant_id.",
+            "global_segment_size, protocol, device_name, tenant_id. For file "
+            "(all required): path, capacity_gb (per rank), io_threads, o_direct, "
+            "verify_crc, fsync.",
         )
         # Retraction snapshot pool
         parser.add_argument(

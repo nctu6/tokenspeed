@@ -121,8 +121,6 @@ def test_the_device_builds_the_pd_transfer_peer_from_the_mapping(monkeypatch, ro
         disaggregation_bootstrap_port=8998,
         dist_init_addr="127.0.0.1:1",
         served_model_name="m",
-        # ServerArgs exposes the first --served-model-name as the canonical id.
-        canonical_served_model_name="m",
         app_key="k",
         enable_metrics=False,
         metrics_reporters=None,

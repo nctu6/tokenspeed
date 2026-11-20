@@ -96,7 +96,7 @@ def _resolve_rows(
     return (_LOW32 - (best & _LOW32)).to(tl.int32)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["step"])
 def _block_step_kernel(
     base_ptr,
     base_row_stride,
@@ -108,10 +108,15 @@ def _block_step_kernel(
     embedding_ptr,
     projection_ptr,
     partials_ptr,
+    seed_ptr,
+    temperature_ptr,
+    position_ptr,
+    step,
     rows,
     num_valid,
     vocab_start,
     vocab_size,
+    SAMPLE: tl.constexpr,
     RANK: tl.constexpr,
     RANK_PAD: tl.constexpr,
     ROWS: tl.constexpr,
@@ -155,6 +160,23 @@ def _block_step_kernel(
         mask=row_mask[:, None] & rank_mask[None, :],
         other=0.0,
     )
+    if SAMPLE:
+        # Gumbel-max with the verifier's own noise: the target samples row ``s``
+        # of its next verify with the stream keyed by (seed, position) and the
+        # global token id, so the draft that draws the same noise proposes
+        # exactly the token the target will pick wherever the two logits agree.
+        seed = tl.load(seed_ptr + row_offsets, mask=row_mask, other=0).to(tl.int64)
+        temperature = tl.maximum(
+            tl.load(temperature_ptr + row_offsets, mask=row_mask, other=1.0).to(
+                tl.float32
+            ),
+            1.0e-20,
+        )
+        offset = (
+            tl.load(position_ptr + row_offsets, mask=row_mask, other=0).to(tl.int64)
+            + step
+        )
+        gumbel_seed = tl.randint(seed, offset)
     best = tl.full((ROWS,), _INT64_MIN, tl.int64)
     for sub in tl.static_range(0, BLOCK_V, SUB_V):
         vocab_offsets = tile * BLOCK_V + sub + tl.arange(0, SUB_V)
@@ -173,7 +195,14 @@ def _block_step_kernel(
             other=float("-inf"),
         )
         token_rank = _LOW32 - (vocab_start + vocab_offsets).to(tl.int64)
-        key = (_orderable_key(base + bias).to(tl.int64) << 32) | token_rank[None, :]
+        logit = base + bias
+        if SAMPLE:
+            uniform = tl.maximum(
+                tl.rand(gumbel_seed[:, None], (vocab_start + vocab_offsets)[None, :]),
+                1.0e-7,
+            )
+            logit = logit / temperature[:, None] + (-tl.log(-tl.log(uniform)))
+        key = (_orderable_key(logit).to(tl.int64) << 32) | token_rank[None, :]
         key = tl.where(vocab_mask[None, :], key, _INT64_MIN)
         best = tl.maximum(best, tl.max(key, axis=1))
     tl.store(partials_ptr + row_offsets * N_TILES + tile, best, mask=row_mask)
@@ -235,6 +264,7 @@ def dspark_block_greedy_step(
     num_valid: int,
     partials: torch.Tensor,
     output: torch.Tensor,
+    sampling: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     """Score this rank's vocabulary shard for one block step.
 
@@ -257,6 +287,13 @@ def dspark_block_greedy_step(
             candidates.
         output: ``[rows, block]`` int32 block tokens; column ``step - 1``
             receives the previous step's winner when ``step > 0``.
+        sampling: None for the greedy argmax, else ``(seeds, temperatures,
+            positions)`` per row: ``[rows]`` int64 Philox seeds, ``[rows]``
+            fp32 temperatures and ``[rows]`` int64 Philox offsets of step 0
+            (step ``s`` uses ``positions + s``). The step then draws a
+            Gumbel-max sample of ``logit / temperature`` with the noise
+            ``tl.rand(tl.randint(seed, offset), token_id)`` that the
+            verifier's pool-indexed Gumbel samplers use.
 
     Returns:
         None. ``partials`` and, for ``step > 0``, one ``output`` column are
@@ -310,6 +347,22 @@ def dspark_block_greedy_step(
     ):
         raise ValueError("candidates and partials must not overlap")
     _check_output_column(output, rows, block)
+    if sampling is None:
+        seeds = temperatures = positions = anchor_ids
+    else:
+        seeds, temperatures, positions = sampling
+        if (
+            seeds.shape != (rows,)
+            or temperatures.shape != (rows,)
+            or positions.shape != (rows,)
+            or seeds.dtype != torch.int64
+            or positions.dtype != torch.int64
+            or temperatures.dtype != torch.float32
+        ):
+            raise ValueError(
+                f"sampling needs [{rows}] int64 seeds, fp32 temperatures and "
+                "int64 positions"
+            )
     if rows == 0:
         return
 
@@ -326,10 +379,15 @@ def dspark_block_greedy_step(
         embedding,
         projection,
         partials,
+        seeds,
+        temperatures,
+        positions,
+        step,
         rows,
         num_valid,
         vocab_start,
         embedding.shape[0],
+        SAMPLE=sampling is not None,
         RANK=rank,
         RANK_PAD=max(16, triton.next_power_of_2(rank)),
         ROWS=_ROWS,

@@ -97,7 +97,9 @@ def parse_image_argv(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--residency", default="auto")
     # Ignore video/music-only flags so a shared launcher can pass a superset.
     parser.add_argument("--trust-remote-code", action="store_true", default=False)
-    parser.add_argument("--task-type", "--model-variant", dest="task_type", default=None)
+    parser.add_argument(
+        "--task-type", "--model-variant", dest="task_type", default=None
+    )
     parser.add_argument("--ulysses-degree", "--usp", type=int, default=None)
     parser.add_argument("--ring", type=int, default=None)
     parser.add_argument("--text-encoder-tp-size", type=int, default=None)
@@ -110,7 +112,9 @@ def parse_image_argv(argv: list[str]) -> argparse.Namespace:
             "use --residency device_split on 2 GPUs"
         )
     if (args.text_encoder_tp_size or 1) > 1:
-        raise SystemExit("MiniMax-H3-Image serve does not support --text-encoder-tp-size")
+        raise SystemExit(
+            "MiniMax-H3-Image serve does not support --text-encoder-tp-size"
+        )
     model = args.model_flag or args.model
     if not model:
         raise SystemExit("tokenspeed serve <model> is required for h3image")

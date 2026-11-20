@@ -163,8 +163,15 @@ def _validate(
     layout = getattr(w, "w13_input_layout", "concatenated")
     if upcast_weights:
         activation = getattr(w, "activation", "swiglu")
-        if activation != "swiglu":
-            raise ValueError("Weight-only MXFP4 MoE supports only SwiGLU")
+        if activation not in {"swiglu", "situ"}:
+            raise ValueError("Weight-only MXFP4 MoE supports only SwiGLU and SiTU")
+        if activation == "situ":
+            situ_beta = getattr(w, "activation_situ_beta", None)
+            situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
+            if situ_beta is None or situ_beta <= 0:
+                raise ValueError("SiTU beta must be positive")
+            if situ_linear_beta is not None and situ_linear_beta <= 0:
+                raise ValueError("SiTU linear beta must be positive")
         if x.dtype != torch.bfloat16:
             raise TypeError("Weight-only MXFP4 MoE requires BF16 input")
         if layout not in {"concatenated", "interleaved"}:
@@ -500,14 +507,26 @@ def _stage1_kernel(
                     expert_bias = w13_bias_ptr + expert_offset * 2 * intermediate_size
                     gate_acc += tl.load(expert_bias + gate_rows)[None, :]
                     up_acc += tl.load(expert_bias + up_rows)[None, :]
-                activated = _swiglu(
-                    gate_acc,
-                    up_acc,
-                    swiglu_alpha,
-                    swiglu_limit,
-                    swiglu_beta,
-                    HAS_LIMIT,
-                ).to(tl.bfloat16)
+                if ACTIVATION == "situ":
+                    # Same SiTU as the MXFP4-activation branch, kept in fp32.
+                    gate = (
+                        situ_beta
+                        * libdevice.tanh(gate_acc / situ_beta)
+                        * tl.sigmoid(gate_acc)
+                    )
+                    up = up_acc
+                    if HAS_LINEAR_BETA:
+                        up = situ_linear_beta * libdevice.tanh(up / situ_linear_beta)
+                    activated = (gate * up).to(tl.bfloat16)
+                else:
+                    activated = _swiglu(
+                        gate_acc,
+                        up_acc,
+                        swiglu_alpha,
+                        swiglu_limit,
+                        swiglu_beta,
+                        HAS_LIMIT,
+                    ).to(tl.bfloat16)
                 inter_offsets = (
                     route_ids[:, None] * intermediate_size
                     + n_offset
@@ -754,8 +773,12 @@ def _moe(
     if upcast_weights:
         swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_params(w)
         interleaved = getattr(w, "w13_input_layout", "concatenated") == "interleaved"
-        situ_beta = 1.0
-        situ_linear_beta = None
+        if activation == "situ":
+            situ_beta = float(w.activation_situ_beta)
+            situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
+        else:
+            situ_beta = 1.0
+            situ_linear_beta = None
     else:
         situ_beta = float(getattr(w, "activation_situ_beta", 1.0) or 1.0)
         situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)

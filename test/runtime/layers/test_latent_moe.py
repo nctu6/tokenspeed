@@ -450,6 +450,82 @@ def test_latent_moe_acquires_shared_and_routed_outputs(
     assert len(acquisitions) == 1
 
 
+class _OwnOutputExperts(_Experts):
+    """Experts whose kernel returns its own tensor, ignoring the destination."""
+
+    def forward(
+        self, hidden_states, topk_output, num_global_tokens, max_num_tokens_per_gpu
+    ):
+        return hidden_states + 1
+
+
+class _OwnOutputShared(_Shared):
+    def forward(self, hidden_states, down_out=None):
+        return hidden_states * 4
+
+
+def test_latent_moe_joint_reduce_lands_partials_returned_out_of_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def acquire_outputs(shapes, like, group):
+        return tuple(like.new_full(shape, -100.0) for shape in shapes)
+
+    def reduce_outputs(outputs, group):
+        return outputs[0] + 5, outputs[1] * 2
+
+    monkeypatch.setattr(latent_module, "acquire_all_reduce_outputs", acquire_outputs)
+    monkeypatch.setattr(latent_module, "all_reduce", reduce_outputs)
+
+    layer = _layer(
+        experts=_OwnOutputExperts(),
+        routed_norm=_Norm(),
+        shared_experts=_OwnOutputShared(),
+        joint_reduce=True,
+        expert_parallel_group=(0,),
+    )
+    hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
+
+    actual = layer(hidden_states)
+
+    latent = (hidden_states[:, :2] + 1) * 2 + 3
+    routed = torch.cat((latent, torch.zeros_like(latent)), dim=-1)
+    expected = routed + hidden_states * 4 + 5
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_latent_moe_keeps_shared_experts_serial_under_stream_capture() -> None:
+    packed_calls = []
+
+    def input_projections(hidden_states, shared_out):
+        packed_calls.append(torch.cuda.is_current_stream_capturing())
+        return hidden_states[:, :2].float(), hidden_states[:, :2], hidden_states * 4
+
+    layer = _layer(
+        routed_norm=_Norm(),
+        shared_experts=_Shared(),
+        shared_expert_stream=torch.cuda.Stream(),
+        input_projections=input_projections,
+    )
+    static = torch.zeros(3, 4, device="cuda")
+    # Eager forwards may overlap the shared experts on the auxiliary stream.
+    eager_out = layer(static)
+    assert packed_calls == []
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_out = layer(static)
+    # The captured forward ran serially through the packed projections.
+    assert packed_calls == [True]
+    del eager_out
+
+    hidden_states = torch.arange(12, dtype=torch.float32, device="cuda").view(3, 4)
+    static.copy_(hidden_states)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured_out, layer(hidden_states), rtol=0, atol=0)
+
+
 def test_latent_moe_can_return_separate_residual_components() -> None:
     layer = _layer(
         shared_experts=_Shared(),

@@ -573,7 +573,7 @@ def triton_bf16_moe_routes(
     signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
     traits={
         "weight_dtype": frozenset({"unquant"}),
-        "activation": frozenset({"silu", "situ", "swiglu"}),
+        "activation": frozenset({"silu", "situ", "swiglu", "gelu_tanh"}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
         "supports_ep": frozenset({False}),
@@ -599,8 +599,8 @@ def triton_bf16_precomputed_moe_apply(
     """Apply an FP16/BF16 Triton MoE using precomputed top-k routing.
 
     Args:
-        plan: MoE plan selecting standard SiLU/SwiGLU or SiTU activation.
-            Opt-in ``precision_policy="bf16_route_accum_fp32"`` rounds GEMM1
+        plan: MoE plan selecting standard SiLU/SwiGLU, SiTU or tanh-GELU
+            (GeGLU) activation. Opt-in ``precision_policy="bf16_route_accum_fp32"`` rounds GEMM1
             gate/up outputs to BF16 before FP32 SiLU, rounds every weighted
             BF16 GEMM2 output to BF16, accumulates those routes in FP32, and
             applies the required ``output_scale`` before the final BF16 store.

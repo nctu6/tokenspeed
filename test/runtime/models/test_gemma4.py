@@ -1708,11 +1708,11 @@ def test_dense_config_constructs_without_the_feature_guard_firing() -> None:
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        ({"enable_moe_block": True}, "MoE"),
-        ({"use_second_mlp_block": True}, "MoE"),
-        ({"num_experts": 8}, "MoE"),
-        ({"top_k_experts": 2}, "MoE"),
-        ({"use_double_wide_mlp": True}, "double-wide MLP"),
+        # enable_moe_block (gemma-4-26B-A4B) is supported; only the legacy
+        # second-MLP flag is refused.
+        ({"use_second_mlp_block": True}, "use_second_mlp_block"),
+        # The double-wide MLP only widens KV-shared layers.
+        ({"use_double_wide_mlp": True, "num_kv_shared_layers": 4}, "double-wide MLP"),
         ({"hidden_size_per_layer_input": 256}, "per-layer input embeddings"),
         ({"num_kv_shared_layers": 4}, "KV-sharing"),
     ],

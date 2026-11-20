@@ -30,6 +30,7 @@ large-M dense16 projection shapes.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._device import num_cus
 from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
@@ -43,7 +44,6 @@ LARGEM_NUM_WARPS = 8
 LARGEM_WARPS_M = 2
 LARGEM_WARPS_N = 4
 LARGEM_NUM_XCDS = 8
-LARGEM_NUM_CUS = 256
 LARGEM_GROUP_SIZE_M = 4
 LARGEM_K_TILE_PAIR = 2 * LARGEM_BLOCK_K
 LARGEM_MIN_K = 4 * LARGEM_BLOCK_K
@@ -817,13 +817,13 @@ def supports_gluon_mm_a16w16_prefill_gfx950(M: int, N: int, K: int) -> bool:
     if M < 1 or (N, K) not in _PREFILL_SHAPES:
         return False
     workgroups = triton.cdiv(M, LARGEM_BLOCK_M) * triton.cdiv(N, LARGEM_BLOCK_N)
-    rounds = triton.cdiv(workgroups, LARGEM_NUM_CUS)
-    if workgroups < _PREFILL_MIN_CU_UTILIZATION * rounds * LARGEM_NUM_CUS:
+    rounds = triton.cdiv(workgroups, num_cus())
+    if workgroups < _PREFILL_MIN_CU_UTILIZATION * rounds * num_cus():
         return False
     return (
         K < _PREFILL_LONG_K
         or rounds <= _PREFILL_LONG_K_MAX_ROUNDS
-        or workgroups >= _PREFILL_LONG_K_MIN_CU_UTILIZATION * rounds * LARGEM_NUM_CUS
+        or workgroups >= _PREFILL_LONG_K_MIN_CU_UTILIZATION * rounds * num_cus()
     )
 
 

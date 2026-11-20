@@ -55,6 +55,7 @@ def _padding_stub(intermediate_size: int, tp_size: int = 2, gated: bool = True):
         prefix="model.layers.0.mlp.experts",
         _spec=_SpecStub(intermediate_size=intermediate_size, gated=gated),
     )
+    stub._pad_ispp = MoELayer._pad_ispp.__get__(stub)
     apply = MoELayer._apply_trtllm_ispp_padding.__get__(stub)
     return stub, apply
 
@@ -182,13 +183,15 @@ def test_unquant_padding_uses_the_registered_trtllm_alignment():
             assert spec.traits["ispp_alignment"] == frozenset({alignment})
 
 
-def _planned_unquant_ispp(monkeypatch, activation: str, ispp: int) -> int:
-    """Per-rank intermediate size a BF16 MoELayer plans under flashinfer_trtllm."""
+def _planned_unquant_ispp(
+    monkeypatch, activation: str, ispp: int, backend: str = "flashinfer_trtllm"
+) -> int:
+    """Per-rank intermediate size a BF16 MoELayer plans under ``backend``."""
     plans = []
     monkeypatch.setattr(
         expert_mod,
         "get_moe_backend",
-        lambda: SimpleNamespace(value="flashinfer_trtllm"),
+        lambda: SimpleNamespace(value=backend),
     )
     monkeypatch.setattr(
         expert_mod,
@@ -215,6 +218,81 @@ def _planned_unquant_ispp(monkeypatch, activation: str, ispp: int) -> int:
     )
     (plan,) = plans
     return plan["ispp"]
+
+
+@pytest.mark.parametrize("backend", ["auto", "triton"])
+@pytest.mark.parametrize(
+    "activation, ispp, planned",
+    [
+        # gemma-4-26B-A4B at TP4: 704 / 4 = 176 -> 192 for the Triton kernels.
+        ("gelu_tanh", 176, 192),
+        ("silu", 176, 192),
+        # Already a multiple of 32: unchanged.
+        ("gelu_tanh", 352, 352),
+    ],
+)
+def test_triton_backends_pad_unquant_ispp_to_32(
+    monkeypatch, backend, activation, ispp, planned
+):
+    assert _planned_unquant_ispp(monkeypatch, activation, ispp, backend) == planned
+
+
+@pytest.mark.parametrize("activation", ["gelu_tanh", "silu"])
+def test_padded_tp_shards_reproduce_the_unpadded_moe(activation):
+    """Loading 704 into four 192-wide shards gives the same expert output.
+
+    The loaders shard the checkpoint by the padded partition size, so the
+    ranks hold uneven slices of the real intermediate dimension plus a zero
+    tail; summing the ranks' outputs (the all-reduce) must equal one rank
+    holding the whole expert.
+    """
+    import torch
+
+    from tokenspeed.runtime.layers.moe.weights.loaders import load_w2, load_w13
+
+    torch.manual_seed(0)
+    hidden, inter, tp, padded = 64, 704, 4, 192
+    if activation == "gelu_tanh":
+        act = lambda t: torch.nn.functional.gelu(t, approximate="tanh")  # noqa: E731
+    else:
+        act = torch.nn.functional.silu
+    gate = torch.randn(inter, hidden, dtype=torch.float64)
+    up = torch.randn(inter, hidden, dtype=torch.float64)
+    down = torch.randn(hidden, inter, dtype=torch.float64)
+    x = torch.randn(5, hidden, dtype=torch.float64)
+    reference = (act(x @ gate.T) * (x @ up.T)) @ down.T
+
+    total = torch.zeros_like(reference)
+    for rank in range(tp):
+        w13 = torch.zeros(2 * padded, hidden, dtype=torch.float64)
+        w2 = torch.zeros(hidden, padded, dtype=torch.float64)
+        for shard_id, weight in (("w1", gate), ("w3", up)):
+            load_w13(
+                w13,
+                weight,
+                shard_id,
+                shard_dim=0,
+                tp_rank=rank,
+                is_bias=False,
+                use_presharded_weights=False,
+                do_transpose=False,
+                tp_size=tp,
+            )
+        load_w2(
+            w2,
+            down,
+            "w2",
+            shard_dim=1,
+            tp_rank=rank,
+            is_bias=False,
+            use_presharded_weights=False,
+            do_transpose=False,
+            tp_size=tp,
+        )
+        g, u = w13[:padded], w13[padded:]
+        total += (act(x @ g.T) * (x @ u.T)) @ w2.T
+
+    torch.testing.assert_close(total, reference, rtol=1e-12, atol=1e-10)
 
 
 # 768 intermediate channels at TP4: 192 (1.5 FP8 blocks) per rank.
