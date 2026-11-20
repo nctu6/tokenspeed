@@ -321,6 +321,10 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         draft = copy(config)
         draft.num_hidden_layers = stages
         draft.n_routed_experts = config.dspark_n_routed_experts
+        # A target expert subset (--hf-overrides num_checkpoint_experts) sizes
+        # the target's router rows only; the draft stages hold all of their own
+        # dspark_n_routed_experts experts.
+        draft.num_checkpoint_experts = None
         draft.num_experts_per_tok = config.dspark_num_experts_per_tok
 
         draft.engram_layer_ids = []

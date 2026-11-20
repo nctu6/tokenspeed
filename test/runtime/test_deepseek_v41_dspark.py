@@ -259,6 +259,23 @@ def _draft_checkpoint(model):
     return weights
 
 
+def test_draft_loads_all_its_experts_under_a_target_expert_subset(monkeypatch):
+    # --hf-overrides '{"n_routed_experts": N, "num_checkpoint_experts": M}'
+    # serves the target with its first N experts; the draft's router keeps
+    # every one of its own dspark_n_routed_experts rows.
+    config = _draft_config()
+    config.n_routed_experts = config.dspark_n_routed_experts // 2
+    config.num_checkpoint_experts = config.dspark_n_routed_experts * 3
+    _loader_model(monkeypatch, config, 0, "cpu")
+    model = DeepseekV41ForCausalLMDSpark(
+        SimpleNamespace(text_config=config), _mapping(0, 4, 4), _quant()
+    )
+    assert model.model.config.num_checkpoint_experts is None
+    assert model.model.config.n_routed_experts == config.dspark_n_routed_experts
+    model.load_weights(_draft_checkpoint(model.model).items())
+    assert model.checkpoint_load_report["loaded"] > 0
+
+
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
 def test_draft_checkpoint_strict_shards(monkeypatch, rank):
     config = _draft_config()
