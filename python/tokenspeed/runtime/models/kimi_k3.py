@@ -2019,6 +2019,7 @@ class KimiLinearMoE(nn.Module):
                     else None
                 )
             ),
+            ep_token_layout=None,
         )
 
         if mapping.attn.dp_size > 1:

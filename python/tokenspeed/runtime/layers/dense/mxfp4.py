@@ -116,9 +116,11 @@ class Mxfp4LinearMethod(QuantizeMethodBase):
             layer.weight_scale.data,
             swiglu=layer.mxfp4_swiglu,
         )
-        # Same shape and dtype in the kernel's layout; replacing the data
-        # releases the checkpoint-order copy.
+        # Replacing the data releases the checkpoint-order copies. The weight
+        # keeps its shape and dtype; the scale may change to the kernel's
+        # packed form.
         layer.weight.data = prepared.weight
+        layer.weight_scale.data = prepared.weight_scale
         layer.mxfp4_linear_weight = prepared
 
     def apply(self, layer, x, bias=None):

@@ -93,6 +93,11 @@ class MoELayer(torch.nn.Module):
         routing_mode: str | None = None,
         internal_activation_dtype_override: str | None = None,
         persistent_max_num_tokens_per_gpu: int | None = None,
+        *,
+        # Required: None says no kernel of the layer owns the token exchange
+        # (every backend but DeepGEMM MegaMoE, which refuses a plan without
+        # "scattered" or "replicated"; see moe_plan).
+        ep_token_layout: str | None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -375,7 +380,20 @@ class MoELayer(torch.nn.Module):
             ]
         elif moe_backend == "mega_moe":
             mapping = global_server_args_dict["mapping"]
-            process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
+            if ep_token_layout == "replicated":
+                # Every rank holds the same tokens: the kernel runs alone over
+                # this rank's shard of the experts and the caller sums the
+                # partials. Mixed TP x EP is not served, so one of the two MoE
+                # groups is this rank alone.
+                mega_group = (
+                    mapping.moe.tp_group
+                    if mapping.moe.tp_size == 1
+                    else mapping.moe.ep_group
+                )
+            else:
+                # Each rank brings its own tokens: the kernel spans the EP ranks.
+                mega_group = mapping.moe.ep_group
+            process_group = pg_manager.get_device_process_group(mega_group)
         # --moe-combine-order: how a token's routed contributions meet across
         # the MoE TP-EP group (docs/design/numerics.md, alignment.trainer).
         # ServerArgs already refused MoE TP > 1 and DeepEP under "slot".
@@ -518,6 +536,8 @@ class MoELayer(torch.nn.Module):
                 deepep_low_latency_max_num_tokens_per_gpu
             ),
             persistent_max_num_tokens_per_gpu=persistent_max_num_tokens_per_gpu,
+            ep_token_layout=ep_token_layout,
+            moe_ranks=self.tp_size * self.ep_size,
             features=(
                 frozenset({"batch_invariant"})
                 if global_server_args_dict["numerics"] in BITWISE_ENVELOPES

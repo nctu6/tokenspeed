@@ -1328,13 +1328,6 @@ void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& buil
         // token) would only get a step nobody reads: it occupies the GPU for a
         // whole step after the request is done, and the next prompt queues
         // behind it. At C1 that step is ~18 ms; the follow-up request sees about
-        // half of it as extra queueing. An undeclared budget never qualifies.
-        // Under the overlap schedule the next decode is planned before the
-        // previous result lands. A request whose declared budget is already
-        // covered by the forwards in flight (every forward yields at least one
-        // token) would only get a step nobody reads: it occupies the GPU for a
-        // whole step after the request is done, and the next prompt queues
-        // behind it. At C1 that step is ~18 ms; the follow-up request sees about
         // half of it as extra queueing. An undeclared budget never qualifies,
         // and neither does a request with nothing in flight (see
         // DeclaredBudgetCoveredByInFlight): it still needs its final step.

@@ -283,13 +283,15 @@ def test_lcm_parent_demand_uses_per_group_packing() -> None:
             ),
         )
     )
-    # Dense MLA history plus one unaligned tail page per live request; each
-    # linear-attention state group holds its fixed per-request working set.
-    assert pages[FULL_ATTENTION] == 131_072 // 64 + 16
+    # Dense MLA history plus, per live request, one unaligned tail page and
+    # the page a prefix-tail handover holds; each linear-attention state group
+    # holds its two state slots per request.
+    live_requests = 16
+    assert pages[FULL_ATTENTION] == 131_072 // 64 + 2 * live_requests
     state_ids = [
         spec.group_id for spec in recipe._group_specs if spec.attn_kind == "state"
     ]
-    assert state_ids and all(pages[gid] == 16 * 4 for gid in state_ids)
+    assert state_ids and all(pages[gid] == live_requests * 2 for gid in state_ids)
     expected = sum(-(-pages[gid] // packing[gid]) for gid in pages)
     assert expected == recipe.parents_needed(layout, token_capacity)
     assert expected != sum(pages.values()) // max(packing.values())

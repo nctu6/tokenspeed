@@ -82,6 +82,31 @@ unconditionally at wrapper construction, `enforce_eager` included. A decode
 above the ladder runs the same refresh with no graph; it is a first-class
 path, not a fallback.
 
+The ladder still defaults to cover `max_num_seqs`: an unset
+`--max-cudagraph-capture-size` becomes `--max-num-seqs` (HBM under 25 GB keeps
+its small memory clamp; `--disable-cudagraph-memory-reserve` keeps 160/80
+because the graphs are then paid from headroom, not priced into the KV budget),
+and the default ladder steps 8 up to 160, 16 up to 256 and 32 above, ending at
+`max_num_seqs`. The KV budget probe below samples that ladder, so the extra
+graphs are paid before the cache is sized. Real V4.1 TP2 (2026-11) showed why:
+with the cap at 160 and `--max-num-seqs 512`, decode steps cost 55 ms at batch
+128-159 and 129 ms at 224-287 (eager launch), which dipped RAG throughput at
+C=256. Explicit `--max-cudagraph-capture-size` / `--cudagraph-capture-sizes` are
+used as given; a ladder that stops below `max_num_seqs` logs a warning at
+startup.
+
+The longer ladder is not made memory-aware. Its KV cost is the graph reserve
+that grows with the ladder (V4.1 TP2: 5.3 -> 7.4 GB per rank, KV tokens -9.8%;
+Qwen3.8-27B-FP8 TP1: 1.5 -> 2.6 GB, -1.9%). Where KV binds (V4.1 RAG with 288
+prompts of ~150K tokens at C=192; agentX full mode C=16/64 at ~90-110K tokens;
+KV pages 98-100% used, requests queue) the old cap 160 and the default ladder
+served the same work within run-to-run spread (output tok/s 0.99-1.01x, wall
+2718 s vs 2685 s on V4.1, no errors, no retractions), because the batch there is
+set by KV pages (at most ~190 running requests), not by graph coverage. A cap
+that scales with the KV budget would only re-create the eager step cost above
+the cap at the batch sizes where KV does not bind, so the default stays
+`max_num_seqs`. Pass `--max-cudagraph-capture-size` to trade graphs for KV.
+
 ### Ascend context-parallel decode
 
 Ascend DSA context-parallel decode uses one prepared communicator for fused
@@ -217,8 +242,10 @@ from one first bound to that pool:
   graphs record the buffers a publish drops, and eager kernels cache
   pointers they allocated inside a capture, such as FlashInfer's trtllm-gen
   MoE runner and Qwen4-Exp's uniform index bundles), unfreezes the device-
-  global workspace pool the executor froze before capturing, rebinds the
-  trees, re-runs `bind_cache_groups` and the initialization sequence above,
+  global workspace pool the executor froze before capturing, frees the probe
+  arena (`release_cache_pool`: the serving arena is sized from a memory
+  profile taken before the probe arena existed, so both cannot be resident
+  at once), rebinds the trees, re-runs `bind_cache_groups` and the initialization sequence above,
   freezes the workspace again and captures again.
 * The KV budget reserves what the graphs will cost: a probe binds the
   smallest arena the family can run on (refused, with the numbers, when the

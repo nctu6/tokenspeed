@@ -37,7 +37,8 @@ The new LRU is remaining old slots, installed misses, then protected old slots.
 Reserved/ring rows participate in lookup but cannot be victims.
 
 The hash uses two int32 arrays at a load factor ≤0.5. `hash_geometry` selects
-shared tables up to 128 KiB, and budgeted global tables above that threshold.
+shared tables up to 128 KiB that also fit the device's per-block shared memory
+(64 KiB on SM120), and budgeted global tables otherwise.
 Global `entry_dest` separates canonical destinations from the final output.
 Miss pairs occupy their canonical input positions, with other entries masked;
 the static copy grid therefore requires no CPU read of the miss count.

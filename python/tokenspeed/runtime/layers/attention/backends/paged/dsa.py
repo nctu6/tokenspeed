@@ -156,6 +156,9 @@ class DSABackend(PagedAttentionBackend):
 
     default_kernel_page_size = DSA_SPARSE_PAGE_SIZE
     _make_dense_leaf = staticmethod(_make_dense_leaf)
+    # Features the sparse core must declare (``dsa_decode`` / ``dsa_prefill``
+    # selection), on top of ``batch_invariant`` under a bitwise envelope.
+    core_features: frozenset[str] = frozenset()
 
     # DSA's sparse indexer reads this backend's chunked_prefill_metadata from
     # inside the captured prefill segment, but the prefill graph rebinds only
@@ -235,7 +238,7 @@ class DSABackend(PagedAttentionBackend):
                 "attention",
                 "dsa_prefill",
                 signature,
-                features=frozenset({"batch_invariant"}),
+                features=frozenset({"batch_invariant"}) | self.core_features,
                 static_traits={**traits, "q_len": 1},
                 variable_traits=variable,
                 solution=None,
@@ -250,7 +253,7 @@ class DSABackend(PagedAttentionBackend):
                 "attention",
                 "dsa_decode",
                 signature,
-                features=frozenset({"batch_invariant"}),
+                features=frozenset({"batch_invariant"}) | self.core_features,
                 static_traits={
                     **traits,
                     "q_len": frozenset(range(1, self.spec_num_tokens + 1)),
@@ -1150,6 +1153,7 @@ class DSABackend(PagedAttentionBackend):
             k_scale=1.0,
             return_lse=use_dcp,
             solution=self.kernel_solution,
+            features=self.core_features,
             kernel_plan=self.prefill_kernel_plan,
             slot_order=self.slot_order,
         )
@@ -1231,6 +1235,7 @@ class DSABackend(PagedAttentionBackend):
                 k_scale=1.0,
                 return_lse=False,
                 solution=self.kernel_solution,
+                features=self.core_features,
                 kernel_plan=self.prefill_kernel_plan,
                 slot_order=self.slot_order,
             )
@@ -1375,6 +1380,7 @@ class DSABackend(PagedAttentionBackend):
             k_scale=1.0,
             return_lse=use_dcp,
             solution=self.kernel_solution,
+            features=self.core_features,
             kernel_plan=self.decode_kernel_plan,
             slot_order=self.slot_order,
         )

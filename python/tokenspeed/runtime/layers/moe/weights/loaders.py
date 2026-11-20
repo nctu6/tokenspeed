@@ -380,7 +380,8 @@ def load_per_expert_input_scale(
         loaded_weight: A scalar, or one scale per expert.
         shard_id: Unused; the scale covers the whole projection.
         local_expert_id: Expert this scale belongs to, or None when the tensor
-            already covers every local expert.
+            covers every local expert (copied per expert) or every checkpoint
+            expert under expert parallelism (reduced to the global maximum).
     """
     del shard_id
     value = loaded_weight.detach().to(dtype=torch.float32, device=param.device)
@@ -390,7 +391,14 @@ def load_per_expert_input_scale(
     if value.numel() == 1:
         torch.maximum(param.data, value, out=param.data)
         return
-    if value.numel() != param.data.numel():
+    local, total = param.data.numel(), value.numel()
+    if total > local and total % local == 0:
+        # A fused tensor of every checkpoint expert reaching an EP rank: without
+        # the rank's expert ids here, every local expert takes the global max,
+        # as the scalar path above does.
+        torch.maximum(param.data, value.amax(), out=param.data)
+        return
+    if total != local:
         raise ValueError(
             f"expected one activation scale per expert, got {value.numel()} "
             f"for {param.data.numel()} experts"

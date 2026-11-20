@@ -38,6 +38,11 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+pytestmark = pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] not in (9, 10),
+    reason="FlashMLA kernels are built for SM90/SM100 only",
+)
+
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _TEST_DIR)
 sys.path.insert(0, os.path.dirname(_TEST_DIR))

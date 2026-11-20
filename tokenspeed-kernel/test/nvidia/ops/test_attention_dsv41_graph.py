@@ -148,8 +148,8 @@ def test_sparse_index_scores_match_the_dense_scorer(blocks, pages, table_width):
     from tokenspeed_kernel.ops.attention.dsv41.triton import candidate_scores
     from tokenspeed_kernel.platform import pdl_enabled
 
-    if not deep_gemm.is_hopper_indexer_available():
-        pytest.skip("requires the Hopper FP8 indexer")
+    if not deep_gemm.platform.is_hopper:
+        pytest.skip("the CuTe sparse index scorer is Hopper-only")
     device = torch.device("cuda:0")
     tokens = 5
     cache, _, _, queries, folded, table, visible, candidates, capacity = (
@@ -233,8 +233,8 @@ def test_sparse_index_scores_compile_once_across_table_and_pool_widths():
     from tokenspeed_kernel.ops.attention.dsv41.triton import candidate_scores
     from tokenspeed_kernel.platform import pdl_enabled
 
-    if not deep_gemm.is_hopper_indexer_available():
-        pytest.skip("requires the Hopper FP8 indexer")
+    if not deep_gemm.platform.is_hopper:
+        pytest.skip("the CuTe sparse index scorer is Hopper-only")
     device = torch.device("cuda:0")
     pages = 300
     shapes = [(16, 64), (48, 32), (2048, 256), (2048, 128), (64, 300)]
@@ -338,8 +338,8 @@ def test_sparse_reindex_selects_what_the_dense_score_selects(blocks, pages):
     """
     from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm
 
-    if not deep_gemm.is_hopper_indexer_available():
-        pytest.skip("requires the Hopper FP8 indexer")
+    if not deep_gemm.platform.is_hopper:
+        pytest.skip("the CuTe sparse index scorer is Hopper-only")
     device = torch.device("cuda:0")
     tokens = 4
     # 32 heads: ``index_topk`` routes to the Hopper indexer, and so to the
@@ -427,8 +427,8 @@ def test_sparse_index_scores_address_a_cache_whose_scale_plane_passes_four_gigae
         quantize_index_queries,
     )
 
-    if not deep_gemm.is_hopper_indexer_available():
-        pytest.skip("requires the Hopper FP8 indexer")
+    if not deep_gemm.platform.is_hopper:
+        pytest.skip("the CuTe sparse index scorer is Hopper-only")
     device = torch.device("cuda:0")
     # 132-byte rows give a 2112-element scale page, so the plane passes 2**32
     # at 2_033_899 pages; the field that implies is 17.2 GiB.

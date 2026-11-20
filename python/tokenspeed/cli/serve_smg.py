@@ -76,6 +76,8 @@ DEFAULT_REASONING_PARSER = "passthrough"
 DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
 DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
 DEEPSEEK_V41_REASONING_PARSER = "deepseek_v41"
+GEMMA4_REASONING_PARSER = "gemma4"
+GEMMA4_TOOL_CALL_PARSER = "gemma4"
 GLM_REASONING_PARSER = "glm45"
 GLM_TOOL_CALL_PARSER = "glm47_moe"
 INKLING_REASONING_PARSER = "inkling"
@@ -534,6 +536,20 @@ def _is_deepseek_v4_model(model_id: str | None) -> bool:
     )
 
 
+def _is_gemma4_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+    normalized = model_id.lower().replace("_", "-").rstrip("/")
+    if "gemma-4" in normalized or "gemma4" in normalized.replace("-", ""):
+        return True
+    config = _load_model_config(model_id)
+    architectures = config.get("architectures") or []
+    return config.get("model_type") in {"gemma4", "gemma4_text"} or any(
+        arch in {"Gemma4ForConditionalGeneration", "Gemma4ForCausalLM"}
+        for arch in architectures
+    )
+
+
 def _is_glm_dsa_model(model_id: str | None) -> bool:
     if not model_id:
         return False
@@ -631,6 +647,13 @@ def _args_with_default_model_parsers(
     (``--speculative-eagle-topk`` != 1), which rejects every non-``none``
     grammar backend at startup; the launch keeps the pre-default ``none``
     behavior instead of failing on a flag the operator never passed.
+
+    Gemma 4 gets the ``gemma4`` reasoning and tool-call parsers: its tokenizer
+    declares a ``response_template`` whose ``tool_calls`` field the gateway's
+    template-based (``symphony``/``hf``) parsers reject on every chat request,
+    and with ``enable_thinking`` the model writes its thinking between
+    ``<|channel>thought`` and ``<channel|>``, which only the ``gemma4`` reasoning
+    parser splits from the answer.
     """
     model_id = _get_from_args(gateway_args, "--model") or _get_from_args(
         engine_args, "--model"
@@ -674,6 +697,18 @@ def _args_with_default_model_parsers(
         if "--tool-call-parser" not in gateway_result:
             gateway_result.extend(["--tool-call-parser", DEEPSEEK_V4_TOOL_CALL_PARSER])
 
+    elif _is_gemma4_model(model_id):
+        # The tool-call parser also keeps the gateway off its response_template
+        # default (symphony/hf), which rejects every chat request with HTTP 400
+        # invalid_parser_configuration.
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", GEMMA4_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", GEMMA4_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", GEMMA4_TOOL_CALL_PARSER])
     elif _is_glm_dsa_model(model_id):
         if (
             "--reasoning-parser" not in engine_result

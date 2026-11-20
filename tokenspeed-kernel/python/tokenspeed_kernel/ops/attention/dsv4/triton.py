@@ -34,7 +34,13 @@ import logging
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.ops.attention.dsv4._triton import sparse_mma
+from tokenspeed_kernel.ops.attention.dsv4._triton.paged_mma import paged_mma_decode
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -473,6 +479,98 @@ def triton_dsv4_prefill(
     return output
 
 
+# Measured on SM120, where FlashMLA is not offered and the portable kernel
+# runs every head on CUDA cores. The CuTe DSL leaf (``cute_dsl.py``) registers
+# with the same capability, signature, traits and features.
+_MMA_CAPABILITY = CapabilityRequirement(
+    min_arch_version=ArchVersion(12, 0),
+    max_arch_version=ArchVersion(12, 9),
+    vendors=frozenset({"nvidia"}),
+)
+_MMA_SIGNATURES = frozenset(
+    {
+        format_signature(
+            q=dense_tensor_format(torch.bfloat16),
+            kv=dense_tensor_format(torch.bfloat16),
+        )
+    }
+)
+_MMA_TRAITS = {
+    "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
+    "cache_layout": frozenset({"dense_workspace"}),
+    "metadata_dtypes": frozenset({torch.int32, torch.int64}),
+    "sinks": frozenset({True, False}),
+    "return_lse": frozenset({True, False}),
+}
+
+
+@register_kernel(
+    "attention",
+    "dsv4_prefill",
+    name="triton_dsv4_mma_prefill",
+    solution="triton",
+    capability=_MMA_CAPABILITY,
+    signatures=_MMA_SIGNATURES,
+    traits=_MMA_TRAITS,
+    priority=Priority.PERFORMANT,
+)
+def triton_dsv4_mma_prefill(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    lens: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Selected shared-KV attention on tensor cores for DeepSeek V4 geometry."""
+    if q.dim() != 3 or q.shape[-1] != DEEPSEEK_V4_HEAD_DIM:
+        raise ValueError(f"expected q [tokens, heads, 512], got {tuple(q.shape)}")
+    if q.dtype != torch.bfloat16 or q.stride(-1) != 1:
+        raise ValueError("q must be BF16 with a contiguous last dimension")
+    kv_2d = kv.reshape(-1, kv.shape[-1])
+    if (
+        kv_2d.shape[-1] != DEEPSEEK_V4_HEAD_DIM
+        or kv_2d.dtype != torch.bfloat16
+        or kv_2d.stride(-1) != 1
+    ):
+        raise ValueError("kv rows must be BF16 of width 512 with unit stride")
+    indices_2d = indices.reshape(indices.shape[0], -1)
+    if indices_2d.stride(-1) != 1:
+        indices_2d = indices_2d.contiguous()
+    lens = lens.reshape(-1)
+    if indices_2d.shape[0] != q.shape[0] or lens.shape[0] != q.shape[0]:
+        raise ValueError("selected-attention metadata must have one row per query")
+    sink = None
+    if attn_sink is not None:
+        if attn_sink.numel() < q.shape[1]:
+            raise ValueError("attention sink must provide one value per query head")
+        sink = attn_sink.reshape(-1).to(torch.float32).contiguous()
+    output = out if out is not None else torch.empty_like(q)
+    if output.stride(-1) != 1:
+        raise ValueError("out must have a contiguous last dimension")
+    # The DSA rule picks the head tile; a split gives every chunk its own
+    # program, which pays off only when the rule wants about that many. The
+    # split does not change the result (see ``_triton/sparse_mma.py``).
+    block_h, num_splits = sparse_mma.plan_launch(
+        q.shape[0], q.shape[1], current_platform().sm_count
+    )
+    sparse_mma.sparse_mma_attention(
+        q,
+        kv_2d,
+        indices_2d,
+        lens,
+        sink,
+        output,
+        lse,
+        softmax_scale=softmax_scale,
+        block_h=block_h,
+        split=2 * num_splits >= sparse_mma.num_chunks_for(indices_2d.shape[1])[1],
+    )
+    return output
+
+
 @triton.jit
 def _dsv4_dequantize_selected_cache_rows_kernel(
     cache_ptr,
@@ -689,6 +787,109 @@ def triton_dsv4_decode(
         softmax_scale=softmax_scale,
         out=out,
     )
+
+
+def _selection_rows(values: torch.Tensor, tokens: int) -> torch.Tensor:
+    """``values`` as ``[tokens, width]`` with unit column stride."""
+    rows = values.reshape(tokens, -1)
+    return rows if rows.stride(-1) == 1 else rows.contiguous()
+
+
+@register_kernel(
+    "attention",
+    "dsv4_decode",
+    name="triton_dsv4_mma_decode",
+    solution="triton",
+    capability=_MMA_CAPABILITY,
+    signatures=frozenset(
+        {
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                swa_kv_cache=dense_tensor_format(torch.uint8),
+            )
+        }
+    ),
+    # The fallback where the CuTe DSL is not built (``cute_dsl_dsv4_mma_decode``
+    # reads the same rows in the CuTe core and outranks this leaf at every head
+    # count). Selected where it wins (RTX PRO 6000, graph, 128 window + 512
+    # compressed rows). With more than 16 heads the CuTe DSL dense leaf is
+    # 1.1-1.6x faster than the Triton one this kernel extends, which outweighs
+    # the saved workspace (64 heads 0.7-1.1x, 128 heads 0.73-0.77x of the
+    # workspace route). With 16 heads both routes run the Triton dense kernel,
+    # so the choice never changes a result: the saving shows from 32 tokens
+    # (1.24x at 32, 1.57x at 128, 2.23x at 256) and a handful of tokens is
+    # 0.8x.
+    traits={
+        "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
+        "num_q_heads_max": frozenset({16}),
+        "num_tokens_min": frozenset({32}),
+        # A tile of the selection belongs to one segment.
+        "swa_selected_width_align": frozenset({sparse_mma.BLOCK_N}),
+        "cache_layout": frozenset({"fp8_swa_page_planar"}),
+        "has_extra_segment": frozenset({False, True}),
+        "metadata_dtypes": frozenset({torch.int32, torch.int64}),
+        "sinks": frozenset({True}),
+        "topk_layout": frozenset({"global_slots"}),
+    },
+    priority=Priority.PERFORMANT,
+)
+def triton_dsv4_mma_decode(
+    q: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    swa_slots: torch.Tensor,
+    swa_lens: torch.Tensor,
+    swa_page_size: int,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    extra_kv_cache: torch.Tensor | None = None,
+    extra_slots: torch.Tensor | None = None,
+    extra_lens: torch.Tensor | None = None,
+    extra_page_size: int | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Selected attention that reads the FP8 page-planar rows itself (SM120).
+
+    The result is bitwise that of ``triton_dsv4_decode`` followed by
+    ``triton_dsv4_mma_prefill``, without the BF16 workspace between them
+    (``_triton/paged_mma.py``).
+    """
+    if q.dim() != 3 or q.shape[-1] != DEEPSEEK_V4_HEAD_DIM:
+        raise ValueError(f"expected q [tokens, heads, 512], got {tuple(q.shape)}")
+    if q.dtype != torch.bfloat16 or q.stride(-1) != 1:
+        raise ValueError("q must be BF16 with a contiguous last dimension")
+    tokens = q.shape[0]
+    swa = (
+        swa_kv_cache,
+        "swa_v4",
+        _selection_rows(swa_slots, tokens),
+        swa_lens.reshape(-1),
+        int(swa_page_size),
+    )
+    extra = None
+    if extra_kv_cache is not None:
+        assert extra_slots is not None
+        assert extra_lens is not None
+        assert extra_page_size is not None
+        extra = (
+            extra_kv_cache,
+            "swa_v4",
+            _selection_rows(extra_slots, tokens),
+            extra_lens.reshape(-1),
+            int(extra_page_size),
+        )
+    output = out if out is not None else torch.empty_like(q)
+    if output.stride(-1) != 1:
+        raise ValueError("out must have a contiguous last dimension")
+    paged_mma_decode(
+        q,
+        swa,
+        extra,
+        attn_sink,
+        output,
+        None,
+        softmax_scale=softmax_scale,
+    )
+    return output
 
 
 def _as_int32_block_table(block_table: torch.Tensor) -> torch.Tensor:

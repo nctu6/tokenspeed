@@ -18,3 +18,7 @@
 # Build output trees (Rust gateway, scheduler/kernel build dirs)
 **/target
 **/build
+# Scratch folders (tokenspeed/tmp, DeepGEMM/tmp): mirrors, logs, benchmark
+# output; never part of the build context.
+tmp
+**/tmp

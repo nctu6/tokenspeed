@@ -113,6 +113,7 @@ def test_mm_selects_skinny_for_decode_rows_on_sm120(m, expected, n, device):
         "b_layout": "KN" if n == 1280 else "NK",
         "a_inner_stride_one": True,
         "a_ndim": 2,
+        "is_cuda": True,
         "a_scales_inner_stride_one": True,
         "b_inner_stride_one": True,
         "b_scales_inner_stride_one": True,
@@ -144,6 +145,15 @@ def test_mm_with_batched_rows_keeps_every_row(device):
     ref = a.float() @ b.float().T + bias.float()
     assert got.shape == (1, 40, 1280)
     assert ((got[0].float() - ref).abs() <= _ulp(ref) + 1e-3 * ref.abs().max()).all()
+
+
+def test_mm_with_cpu_operands_does_not_take_the_device_kernel():
+    # Selection is per platform; the Triton kernel cannot read host tensors.
+    a, b, bias = _operands(3, 1280, 1280, 4, "cpu")
+    got = mm(a, b, bias=bias)
+    ref = a.float() @ b.float().T + bias.float()
+    assert got.device.type == "cpu"
+    assert ((got.float() - ref).abs() <= _ulp(ref) + 1e-3 * ref.abs().max()).all()
 
 
 def test_skinny_compiles_nothing_new_across_decode_rows(device):

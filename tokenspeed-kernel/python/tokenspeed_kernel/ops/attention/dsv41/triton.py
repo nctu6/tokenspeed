@@ -24,7 +24,7 @@ import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import resolve_group_slot
 from tokenspeed_kernel.ops.layernorm.triton import reference_rmsnorm_row
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -653,6 +653,48 @@ def index_q_quantize(q, cache_format, out):
     return out
 
 
+def _prefill_workspace_attention(
+    q,
+    prefill_kv,
+    prefill_indices,
+    attn_sink,
+    softmax_scale,
+    out,
+    lse,
+    *,
+    solution,
+):
+    """Attention over a prefill's gathered K/V workspace (``dsv4_prefill``).
+
+    ``solution`` restricts the ``dsv4_prefill`` choice: the portable leaf keeps
+    it on Triton, and the SM120 leaf passes None, so the registry picks the
+    best core for the model's head count.
+    """
+    from tokenspeed_kernel.ops.attention.dsv4 import dsv4_prefill
+
+    if prefill_indices is None:
+        raise ValueError("prefill_kv requires prefill_indices")
+    if attn_sink is not None:
+        attn_sink = attn_sink[: q.shape[1]]
+    out = _output(out, q.shape, q.dtype, q.device)
+    lengths = torch.full(
+        (q.shape[0],), prefill_indices.shape[-1], dtype=torch.int32, device=q.device
+    )
+    dsv4_prefill(
+        q=q.contiguous(),
+        kv=prefill_kv,
+        indices=prefill_indices,
+        lens=lengths,
+        attn_sink=None if attn_sink is None else attn_sink.contiguous(),
+        softmax_scale=softmax_scale,
+        out=out,
+        lse=lse,
+        override=None,
+        solution=solution,
+    )
+    return out
+
+
 @register_kernel(
     "attention",
     "dsv41_selected_attention",
@@ -685,25 +727,16 @@ def selected_attention(
     from tokenspeed_kernel.ops.attention.dsv4 import dsv4_prefill
 
     if prefill_kv is not None:
-        if prefill_indices is None:
-            raise ValueError("prefill_kv requires prefill_indices")
-        out = _output(out, q.shape, q.dtype, q.device)
-        lengths = torch.full(
-            (q.shape[0],), prefill_indices.shape[-1], dtype=torch.int32, device=q.device
-        )
-        dsv4_prefill(
-            q=q.contiguous(),
-            kv=prefill_kv,
-            indices=prefill_indices,
-            lens=lengths,
-            attn_sink=None if attn_sink is None else attn_sink.contiguous(),
-            softmax_scale=softmax_scale,
-            out=out,
-            lse=lse,
-            override=None,
+        return _prefill_workspace_attention(
+            q,
+            prefill_kv,
+            prefill_indices,
+            attn_sink,
+            softmax_scale,
+            out,
+            lse,
             solution="triton",
         )
-        return out
     if prefill_indices is not None:
         raise ValueError("prefill_indices requires prefill_kv")
     if q.ndim != 3 or q.shape[-1] != 512 or q.dtype != torch.bfloat16 or q.shape[1] < 1:
@@ -784,6 +817,205 @@ def selected_attention(
             solution="triton",
         )
     return out
+
+
+# SM120 has no FlashMLA, so decode runs the portable gather above. The kernel
+# below reads the packed rows itself (see ``dsv4/_triton/paged_mma.py``); its
+# result is bitwise the portable route's. Where the CuTe DSL is built,
+# ``cute_dsl_dsv41_mma_selected_attention`` (``cute_dsl_attention.py``) outranks
+# it and falls back to it for the layouts it cannot read.
+_MMA_CAPABILITY = CapabilityRequirement(
+    min_arch_version=ArchVersion(12, 0),
+    max_arch_version=ArchVersion(12, 9),
+    vendors=frozenset({"nvidia"}),
+)
+
+
+def _paged_segment(cache, slots, lens, role, tokens):
+    """``(cache, format, slots, lens, rows)`` for the direct reader, or None.
+
+    The portable route reads the sliding window as ``swa`` rows and the
+    compressed rows as ``global`` rows, whatever their widths; so does this.
+    """
+    from tokenspeed_kernel.ops.attention.dsv4._triton import paged_mma
+
+    if cache is None or cache.ndim != 3 or cache.dtype != torch.uint8:
+        return None
+    if cache.shape[1:] != (64, paged_mma.ROW_BYTES[role]):
+        return None
+    if slots is None or slots.ndim != 2 or slots.shape[0] != tokens:
+        return None
+    if slots.dtype not in (torch.int32, torch.int64) or slots.stride(-1) != 1:
+        return None
+    if (
+        lens is None
+        or lens.shape != (tokens,)
+        or lens.dtype not in (torch.int32, torch.int64)
+    ):
+        return None
+    return cache, role, slots, lens, 64
+
+
+@register_kernel(
+    "attention",
+    "dsv41_selected_attention",
+    name="triton_dsv41_mma_selected_attention",
+    solution="triton",
+    capability=_MMA_CAPABILITY,
+    signatures=_QUERY_SIGNATURES,
+    priority=Priority.PERFORMANT,
+)
+def mma_selected_attention(
+    q,
+    swa_cache,
+    swa_slots,
+    swa_lens,
+    global_cache,
+    global_slots,
+    global_lens,
+    attn_sink,
+    softmax_scale,
+    out,
+    query_chunk_size,
+    schedule,
+    prefill_kv,
+    prefill_indices,
+    *,
+    lse=None,
+):
+    args = (
+        q,
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        global_cache,
+        global_slots,
+        global_lens,
+        attn_sink,
+        softmax_scale,
+        out,
+        query_chunk_size,
+        schedule,
+        prefill_kv,
+        prefill_indices,
+    )
+    if prefill_kv is not None:
+        # The prefill workspace is dense BF16 rows: any registered
+        # ``dsv4_prefill`` core serves it, so the SM120 CuTe DSL core is
+        # selected where it is registered for this head count.
+        return _prefill_workspace_attention(
+            q,
+            prefill_kv,
+            prefill_indices,
+            attn_sink,
+            softmax_scale,
+            out,
+            lse,
+            solution=None,
+        )
+    segments = direct_segments(*args[:8], out, lse, prefill_indices)
+    if segments is None:
+        return selected_attention(*args, lse=lse)
+    from tokenspeed_kernel.ops.attention.dsv4._triton import paged_mma
+
+    swa, extra = segments
+    out = _output(out, q.shape, q.dtype, q.device)
+    paged_mma.paged_mma_decode(
+        q,
+        swa,
+        extra,
+        attn_sink,
+        out,
+        lse,
+        softmax_scale=softmax_scale,
+    )
+    return out
+
+
+def direct_segments(
+    q,
+    swa_cache,
+    swa_slots,
+    swa_lens,
+    global_cache,
+    global_slots,
+    global_lens,
+    attn_sink,
+    out,
+    lse,
+    prefill_indices,
+):
+    """``(swa, extra)`` segments the direct readers can attend, or None.
+
+    Each segment is ``(cache, format, slots, lens, page_rows)`` as
+    ``dsv4/_triton/paged_mma.py`` takes them (``extra`` is None without a
+    compressed cache). None means the inputs need the portable gather: another
+    layout, a window that is not a whole number of tiles, a partial-attention
+    LSE with a sink, and so on. The answer follows the tensors' layout alone,
+    never the batch contents.
+    """
+    if (
+        prefill_indices is not None
+        or q.ndim != 3
+        or q.shape[-1] != 512
+        or q.dtype != torch.bfloat16
+        or q.shape[1] < 1
+        or q.shape[0] < 1
+        or q.stride(-1) != 1
+        or (
+            attn_sink is not None
+            and (attn_sink.shape != (q.shape[1],) or attn_sink.dtype != torch.float32)
+        )
+        or (
+            lse is not None
+            and (
+                attn_sink is not None
+                or lse.shape != q.shape[:2]
+                or lse.dtype != torch.float32
+                or not lse.is_contiguous()
+            )
+        )
+        or (
+            out is not None
+            and (out.shape != q.shape or out.dtype != q.dtype or out.stride(-1) != 1)
+        )
+    ):
+        return None
+    from tokenspeed_kernel.ops.attention.dsv4._triton import sparse_mma
+
+    tokens = q.shape[0]
+    swa = _paged_segment(swa_cache, swa_slots, swa_lens, "swa", tokens)
+    extra = None
+    if global_cache is not None:
+        extra = _paged_segment(
+            global_cache, global_slots, global_lens, "global", tokens
+        )
+        if extra is None:
+            return None
+    elif global_slots is not None or global_lens is not None:
+        return None
+    # A tile of the selection must belong to one segment, and there must be rows
+    if (
+        swa is None
+        or swa[2].shape[1] % sparse_mma.BLOCK_N
+        or swa[2].shape[1] + (0 if extra is None else extra[2].shape[1]) == 0
+    ):
+        return None
+    _same_device(
+        q,
+        (
+            swa_cache,
+            swa_slots,
+            swa_lens,
+            global_cache,
+            global_slots,
+            global_lens,
+            attn_sink,
+            out,
+            lse,
+        ),
+    )
+    return swa, extra
 
 
 def _score(q, weights, cache, slots, process_group):
@@ -1075,7 +1307,12 @@ def _index_finish_parts(scores, ids, k, output, lengths):
     _finish_topk(values, ids.gather(1, positions), output, lengths)
 
 
-@triton.jit
+# Widths and strides follow each batch's histories (a short history selects
+# fewer than k rows), so none of them may key a binary.
+@triton.jit(
+    do_not_specialize=["S0", "I0", "C0", "C1", "O0", "WIDTH", "K"],
+    do_not_specialize_on_alignment=["S0", "I0", "C0", "C1", "O0", "WIDTH", "K"],
+)
 def _finish_topk_kernel(
     Scores,
     Ids,

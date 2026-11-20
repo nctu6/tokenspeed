@@ -491,6 +491,7 @@ def _moe_layer(tp_size, intermediate_size=512):
             prefix="model.layers.1.mlp",
             tp_rank=0,
             tp_size=tp_size,
+            ep_token_layout=None,
         )
     finally:
         torch.set_default_dtype(default_dtype)

@@ -395,6 +395,19 @@ one window lookback more than the bound counts; such a request waits until
 their pages are released, at the latest until it is alone, unless later
 arrivals keep taking the pages.
 
+A sliding group is bounded by its window, not by the prompt, but not by less
+than one prefill chunk: a forward writes every row of the chunk before the
+rows that slid out of the window are released, so the group holds its
+lookback plus `ceil(max_scheduled_tokens / g)` pages (`local_prefill_peak`).
+Every sliding group pays that in parents of its own, so on a pool of a few
+thousand parents the chunk size, not the window, decides how many parents are
+left for the full-attention group and thus the bound. gemma-4-31B-it at TP1
+(five sliding groups, window 1024; 2294 usable 10 MiB parents): 199,487 tokens
+at an 8192 chunk, 240,447 at 4096, 271,167 at 1024
+(`test_sliding_groups_reserve_one_prefill_chunk_of_the_pool`). The bound is
+real, not an undercount; the way to a longer prompt is a smaller chunk or a
+larger pool (`--kv-cache-dtype fp8`).
+
 The `CapacityModel` is deliberately **config-only**: it reads every
 `SchedulerConfig` field that is known before a pool exists and no
 `total_pages`, validating that subset through
@@ -966,11 +979,16 @@ harmless.
 **KV-event descriptors.** With `enable_kv_cache_events`, every Device
 publication is a mutation of a boundary that must already have its token
 descriptor (`registerKvEventPrefixPages`), and `DrainKvEvents` drops the
-descriptor of a boundary with no cached child. A boundary is `BlockStored`
-only while every group holds its child -- the State groups included, whose
-checkpoint exists only at a natural point -- so a hybrid model emits
-`BlockStored` for its prompt end, its finish and its junction cuts, never
-for an interior chunk end's chain hash; a tail's descriptor carries the
+descriptor of a boundary with no cached child in any group. A boundary is
+`BlockStored` only while every KV group holds its child. A State group's
+checkpoint exists only at a natural point, so it does not gate `BlockStored`
+(a hybrid model publishes KV pages only at its prompt end, its finish and its
+junction cuts, never at an interior chunk end), but a cached checkpoint is a
+child: eviction of a boundary's KV cannot take a checkpoint a request still
+pins, so the checkpoint can outlive every KV block of its boundary, and the
+boundary then stays partially resident (no event is out for it) until the
+checkpoint itself is evicted and reports its removal against the surviving
+descriptor. A tail's descriptor carries the
 rows below `T` and the residency check counts a tail's blocks from it. Retraction publishes twice
 without an admission: `retractVictim` registers the newly hashed pages before
 `CacheCompletedBlocks` (as the finish-time publication does), and the

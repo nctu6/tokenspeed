@@ -3020,6 +3020,15 @@ if platform.is_nvidia:
 if platform.is_nvidia:
     from flashinfer import ActivationType, cutlass_fused_moe
 
+    def _act_global_scale(scale: torch.Tensor) -> torch.Tensor:
+        """Activation global scale in the shape cutlass_fused_moe accepts.
+
+        The kernel takes a 0-d scalar or one value per local expert. A shared
+        scale is stored with shape (1,), which it rejects whenever the rank
+        holds more than one expert, so a single element is passed as 0-d.
+        """
+        return scale.reshape(()) if scale.numel() == 1 else scale
+
     def flashinfer_cutlass_nvfp4_moe_weights(plan: dict, w: torch.nn.Module):
         half_w = w.w13_weight.shape[1] // 2
         first_half = w.w13_weight.data[:, :half_w, :].clone()
@@ -3179,10 +3188,10 @@ if platform.is_nvidia:
             output_dtype=torch.bfloat16,
             input_sf=None,
             quant_scales=[
-                w.w13_input_scale_quant,
+                _act_global_scale(w.w13_input_scale_quant),
                 w.w13_blockscale_swizzled.view(torch.int32),
                 w.g1_alphas,
-                w.w2_input_scale_quant,
+                _act_global_scale(w.w2_input_scale_quant),
                 w.w2_blockscale_swizzled.view(torch.int32),
                 w.g2_alphas,
             ],

@@ -34,6 +34,7 @@
 #include <set>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "integration_test_helper.h"
@@ -623,4 +624,106 @@ TEST_F(StateRestoreClaimSuite, TheRestoreClaimsTheCheckpointBeforeEvictingItsTai
     EXPECT_GT(resumed[1], 0);
 }
 
+// KV events of a hybrid model. A natural checkpoint can outlive the KV of its
+// boundary: evicting the KV leaves a checkpoint some request still pins in the
+// index. The boundary then still holds a child, so its token descriptor must
+// survive the drains until the checkpoint itself is evicted.
+class StateKvEventSuite : public StateCheckpointSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = kP;
+        cfg.device_allocator.total_pages = 11;
+        cfg.host_allocator.total_pages = 8;
+        cfg.max_scheduled_tokens = 8;
+        cfg.max_batch_size = 2;
+        cfg.decode_input_tokens = 1;
+        cfg.disable_l2_cache = true;
+        cfg.enable_kv_cache_events = true;
+        for (const std::string& id : {"full", "state0"}) {
+            const bool is_state = id != "full";
+            cfg.cache_groups.push_back(CacheGroupConfig{
+                .group_id = id,
+                .block_granularity = is_state ? 0 : kP,
+                .total_pages = cfg.device_allocator.total_pages,
+                .attn_kind = is_state ? AttnKind::kState : AttnKind::kFull,
+            });
+        }
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    void Add(const std::string& id, std::int32_t num_tokens, std::int32_t first_token, std::int32_t max_new_tokens) {
+        max_new_tokens_[id] = max_new_tokens;
+        Submit(RequestSpec{
+            .request_id = id, .tokens = MakeTokens(num_tokens, first_token), .max_new_tokens = max_new_tokens});
+    }
+
+    // Runs `rounds` scheduling rounds: every scheduled request's forward
+    // lands, a request finishes after its max_new_tokens, and the KV events
+    // are drained after each round into `published_`.
+    void Pump(std::int32_t rounds) {
+        for (std::int32_t round = 0; round < rounds; ++round) {
+            const ExecutionPlan plan = PlanOnce();
+            AckWriteBacks(plan);
+            if (const ForwardBatch* batch = FindForwardBatch(plan)) {
+                const std::size_t num_prefill = batch->extend_prefix_lens.size();
+                for (std::size_t i = 0; i < batch->request_ids.size(); ++i) {
+                    const std::string& id = batch->request_ids[i];
+                    const bool chunk_ends_prompt =
+                        i >= num_prefill ||
+                        batch->extend_prefix_lens[i] + batch->input_lengths[i] >= batch->prefill_lengths[i];
+                    if (!chunk_ends_prompt) {
+                        SendForwardDone(id);
+                        continue;
+                    }
+                    const std::int32_t generated = ++generated_[id];
+                    SendForwardDone(id, {5000 + generated});
+                    if (generated >= max_new_tokens_.at(id)) {
+                        SendFinish(id);
+                    }
+                }
+            }
+            DrainEvents();
+        }
+    }
+
+    void DrainEvents() {
+        for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
+            if (const auto* stored = std::get_if<KvBlockStoredEvent>(&event)) {
+                published_.insert(stored->block_hashes.front());
+            } else {
+                published_.erase(std::get<KvBlockRemovedEvent>(event).block_hashes.front());
+            }
+        }
+    }
+
+    std::map<std::string, std::int32_t> max_new_tokens_;
+    std::map<std::string, std::int32_t> generated_;
+    std::set<std::uint64_t> published_;
+};
+
+// "a" decodes on, pinning the checkpoint of its prompt end, while later
+// prompts evict the KV of that boundary and a drain runs in between; then a
+// later prompt evicts the checkpoint itself. Each eviction is reported against
+// a boundary that still has its descriptor, and the events a consumer folds
+// end empty once the cache is cleared.
+TEST_F(StateKvEventSuite, ACheckpointOutlivingItsKvKeepsTheBoundaryDescriptor) {
+    Add("a", kP + 1, 1, 8);
+    Pump(2);
+    Add("b", kP + 1, 100, 2);
+    Pump(3);
+    Add("c", kP + 1, 200, 2);
+    Pump(8);
+    Add("d", kP + 1, 300, 2);
+    Pump(8);
+    Add("e", kP + 1, 400, 2);
+    Pump(8);
+
+    ASSERT_EQ(scheduler_->DecodingSize() + scheduler_->PrefillSize() + scheduler_->WaitingSize(), 0u)
+        << "every request finished";
+    ASSERT_TRUE(scheduler_->ClearCache());
+    DrainEvents();
+    EXPECT_TRUE(published_.empty());
+}
 }  // namespace tokenspeed::test

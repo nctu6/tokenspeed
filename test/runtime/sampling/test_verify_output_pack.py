@@ -115,7 +115,8 @@ def test_verify_lands_all_three_outputs_in_the_pack(monkeypatch) -> None:
     # Row 0's drafts match the target at every step; row 1's second draft does not.
     candidates = torch.tensor([[7, 10, 11], [8, 13, 99]], device="cuda")
     predict, lengths = backend.verify(
-        SimpleNamespace(next_token_logits=logits),
+        # No fused argmax ids: verify takes the argmax of the logits itself.
+        SimpleNamespace(next_token_logits=logits, next_token_ids=None),
         SimpleNamespace(vocab_mask=None, req_pool_indices=None),
         candidates,
         tree=None,

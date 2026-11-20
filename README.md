@@ -12,6 +12,32 @@ Core components:
 - **Entrypoint**: SMG-integrated AsyncLLM for low-overhead CPU-side request
   handling.
 
+## SM120 (RTX PRO 6000 Blackwell)
+
+TokenSpeed runs natively on SM120 (compute capability 12.0), with no SM100-only fallbacks:
+
+- **GEMMs and indexer**: DeepGEMM SM120 kernels for FP8, MXFP4 and NVFP4 GEMMs, MQA logits, and the DeepSeek-V4.1 indexer.
+- **Attention**: CuTe DSL and Triton tensor-core kernels for DSA, MLA, and DeepSeek-V4.
+- **MoE**: MegaMoE across two PCIe GPUs.
+
+`scripts/install.sh` builds DeepGEMM from the `DeepGEMM` submodule. Serve with `tokenspeed serve` as in the [Launching a Server](https://lightseek.org/tokenspeed/guides/launching) guide.
+
+On Qwen3.8-27B-FP8 (RAG workload, C=1 to 512), TokenSpeed reaches 1.09x to 1.20x the output tokens/s of TensorRT-LLM 1.4.0rc3 at every concurrency, on both TP1 and TP2 (single run per point; TensorRT-LLM TP1 ran with max batch 256 because 512 recurrent states do not fit on one GPU). DeepSeek-V4.1-Flash, Qwen3.8-27B-NVFP4 and Qwen3.5-122B-A10B-NVFP4 also serve on SM120.
+
+Details: [DeepGEMM report](https://github.com/nctu6/DeepGEMM/blob/nctu6/deepgemm_report.md) and [benchmarks](https://github.com/nctu6/DeepGEMM/blob/nctu6/deepgemm_benchmark.md).
+
+<p align="center">
+  <img
+    src="assets/perf/tokenspeed-sm120-performance.png"
+    alt="TokenSpeed vs. TensorRT-LLM on RTX PRO 6000 Blackwell (SM120), Qwen3.8-27B-FP8, TP1 and TP2"
+    width="800"
+  />
+</p>
+
+<p align="center">
+  <em>TokenSpeed vs. TensorRT-LLM on RTX PRO 6000 Blackwell (SM120), Qwen3.8-27B-FP8, TP1 and TP2</em>
+</p>
+
 ## Design
 
 - **One scheduling path, one execution path.** Prefill/decode disaggregation, speculation, CUDA/HIP graphs and compute/communication overlap are parameters of the same path, never a second path.

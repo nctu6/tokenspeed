@@ -17,23 +17,24 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""The DeepGEMM mHC prenorm kernels are built for the SM90/SM100-SM103 window.
+"""The DeepGEMM mHC prenorm kernels run where ``tf32_hc_prenorm_gemm`` does.
 
-Their ``tf32_hc_prenorm_gemm`` cubin raises "Unsupported architecture" at
-runtime on SM120 (workstation Blackwell), so the registry must not pick them
-there: the capability advertises ``max_arch_version = 10.3`` and SM120 falls
-through to the portable Triton mHC path. These tests guard that contract so a
-future edit that widens or drops the cap is caught before a serve-time crash.
+That is Hopper and SM100-SM103, plus SM120 (workstation Blackwell, e.g. RTX PRO
+6000) in DeepGEMM builds with SM120 kernels. Older builds assert "Unsupported
+architecture" on SM120, so there the capability stops at 10.3 and SM120 falls
+through to the portable Triton mHC path. These tests guard both windows so an
+edit that widens or drops the cap is caught before a serve-time crash.
 """
 
 from __future__ import annotations
 
 import pytest
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, PlatformInfo
+from tokenspeed_kernel.thirdparty.deepgemm import deepgemm_supports_sm120
 
 
 def _cap() -> CapabilityRequirement:
-    # The exact window the DeepGEMM mHC kernels declare.
+    # The window the DeepGEMM mHC kernels declare without SM120 kernels.
     return CapabilityRequirement(
         min_arch_version=ArchVersion(9, 0),
         max_arch_version=ArchVersion(10, 3),
@@ -73,8 +74,8 @@ def test_deep_gemm_mhc_window_admits_only_sm90_to_sm103(
 def test_window_excludes_sm120_but_min_only_would_admit_it(
     sm120_platform: PlatformInfo,
 ) -> None:
-    # Without the cap (the pre-fix state) SM120 >= 9.0 would wrongly qualify;
-    # the max_arch_version is what excludes it.
+    # Without the cap SM120 >= 9.0 would qualify; the max_arch_version is what
+    # excludes it for builds without SM120 kernels.
     without_cap = CapabilityRequirement(
         min_arch_version=ArchVersion(9, 0),
         vendors=frozenset({"nvidia"}),
@@ -83,8 +84,7 @@ def test_window_excludes_sm120_but_min_only_would_admit_it(
     assert _cap().satisfied_by(sm120_platform) is False
 
 
-@pytest.mark.usefixtures("fresh_registry")
-def test_registry_picks_triton_mhc_on_sm120_not_deep_gemm(
+def test_registry_offers_deep_gemm_mhc_on_sm120_only_with_sm120_kernels(
     sm120_platform: PlatformInfo,
 ) -> None:
     # Integration against the real residual registrations. Skipped where the
@@ -96,12 +96,15 @@ def test_registry_picks_triton_mhc_on_sm120_not_deep_gemm(
     from tokenspeed_kernel.registry import KernelRegistry
 
     reg = KernelRegistry.get()
+    if reg.get_by_name("deep_gemm_mhc_pre") is None:
+        pytest.skip("the DeepGEMM mHC leaves did not register on this host")
     for mode in ("mhc_mixes", "mhc_pre"):
         specs = reg.get_for_operator("residual", mode, platform=sm120_platform)
         solutions = {s.solution for s in specs}
-        assert (
-            "deep_gemm" not in solutions
-        ), f"{mode}: deep_gemm must be filtered out on SM120, got {solutions}"
+        assert ("deep_gemm" in solutions) is deepgemm_supports_sm120(), (
+            f"{mode}: deep_gemm on SM120 must follow the build's SM120 support, "
+            f"got {solutions}"
+        )
         assert (
             "triton" in solutions
         ), f"{mode}: portable triton must remain on SM120, got {solutions}"

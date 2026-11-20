@@ -476,9 +476,12 @@ public:
     // entries every group holds for that content hash -- one per group block
     // within the prefix granularity for a chain hash (tail_tokens 0), one per
     // group block below T for a tail hash (tail_tokens = T mod P, which the
-    // caller knows from its own publication record), one per state group. The
-    // boundary key's group and offset are ignored; only its namespace and
-    // content hash identify the boundary.
+    // caller knows from its own publication record). kComplete needs every
+    // such KV child. A State group's checkpoint exists only at a natural
+    // point, so it is not required for kComplete, but a cached checkpoint
+    // keeps the boundary from being kNone: kNone means no group holds any
+    // child. The boundary key's group and offset are ignored; only its
+    // namespace and content hash identify the boundary.
     enum class BoundaryResidency { kNone, kPartial, kComplete };
     BoundaryResidency DeviceBoundaryResidency(const CacheKey& boundary, std::int32_t tail_tokens) const;
 

@@ -59,6 +59,7 @@ def _plan_kwargs(monkeypatch, **layer_kwargs) -> dict:
         ),
         layer_index=0,
         prefix="model.layers.0.mlp",
+        ep_token_layout=None,
     )
     kwargs.update(layer_kwargs)
     MoELayer(**kwargs)
@@ -188,3 +189,50 @@ def test_fp32_correction_bias_requires_deepseek_v3_routing(monkeypatch):
                 "routing_method_type": RoutingMethodType.MiniMax2,
             },
         )
+
+
+@pytest.mark.parametrize(
+    "layout, moe_tp, moe_ep, group",
+    [
+        # Scattered tokens (attention DP) span the EP ranks; callers that name
+        # no layout keep that group.
+        ("scattered", 1, 2, (0, 1)),
+        (None, 1, 2, (0, 1)),
+        # Replicated tokens (attention TP) need no exchange: the kernel runs
+        # alone, on whichever of the MoE TP and EP groups is one rank.
+        ("replicated", 1, 2, (0,)),
+        ("replicated", 2, 1, (0,)),
+    ],
+)
+def test_mega_moe_group_follows_the_token_layout(
+    monkeypatch, layout, moe_tp, moe_ep, group
+):
+    shard = (0, 1)
+    solo = (0,)
+    moe = SimpleNamespace(
+        tp_size=moe_tp,
+        ep_size=moe_ep,
+        tp_group=solo if moe_tp == 1 else shard,
+        ep_group=solo if moe_ep == 1 else shard,
+    )
+    process_groups = {shard: object(), solo: object()}
+    monkeypatch.setitem(global_server_args_dict, "mapping", SimpleNamespace(moe=moe))
+    monkeypatch.setattr(
+        expert_module, "get_moe_backend", lambda: SimpleNamespace(value="mega_moe")
+    )
+    monkeypatch.setattr(
+        expert_module.pg_manager,
+        "get_device_process_group",
+        lambda ranks: process_groups[ranks],
+    )
+    plan = _plan_kwargs(
+        monkeypatch,
+        activation="swiglu",
+        ep_rank=0,
+        ep_size=moe_ep,
+        tp_rank=0,
+        tp_size=moe_tp,
+        ep_token_layout=layout,
+    )
+    assert plan["ep_token_layout"] == layout
+    assert plan["process_group"] is process_groups[group]

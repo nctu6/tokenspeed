@@ -97,6 +97,8 @@ def test_deterministic_decode_topk_falls_back_to_flashinfer(monkeypatch):
 
     monkeypatch.setattr(fi_dsa_topk, "top_k", fake_top_k)
     monkeypatch.setattr(fi_dsa_topk, "TopKTieBreak", SimpleNamespace(SMALL="small"))
+    # A GPU where flashinfer's FilteredTopK kernel fits (SM90/SM100).
+    monkeypatch.setattr(fi_dsa_topk, "can_implement_filtered_topk", lambda: True)
 
     logits = torch.randn(2, 8, dtype=torch.float32)
     output = torch.empty(2, 3, dtype=torch.int32)
@@ -109,6 +111,27 @@ def test_deterministic_decode_topk_falls_back_to_flashinfer(monkeypatch):
     assert calls["deterministic"] is True
     assert calls["tie_break"] == "small"
     assert calls["dsa_graph_safe"] is True
+
+
+def test_deterministic_decode_topk_sorts_where_filtered_topk_cannot_run(monkeypatch):
+    """SM120/SM121 lack FilteredTopK's shared memory: ties still go to the lowest column."""
+    if fi_dsa_topk.top_k is None:
+        pytest.skip("flashinfer top_k unavailable")
+    monkeypatch.setattr(fi_dsa_topk, "can_implement_filtered_topk", lambda: False)
+    inf = float("inf")
+    logits = torch.tensor(
+        [
+            [0.0, 0.0, 5.0, 0.0, 0.0, -inf],  # one max, then tied zeros
+            [inf, 0.0, 0.0, inf, 0.0, 0.0],  # forced columns, then tied zeros
+            [-inf, -inf, 1.0, -inf, 2.0, -inf],  # only two finite columns
+        ],
+        dtype=torch.float32,
+    )
+    output = torch.empty(3, 3, dtype=torch.int32)
+
+    fi_dsa_topk.deterministic_decode_topk(logits, output, 3)
+
+    assert [set(row.tolist()) for row in output] == [{2, 0, 1}, {0, 3, 1}, {4, 2, 0}]
 
 
 # ---------------------------------------------------------------------------

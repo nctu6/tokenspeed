@@ -340,6 +340,7 @@ class TestDeepseekV4Config:
 
         moe = SimpleNamespace(
             use_mega_moe=False,
+            ep_token_layout=None,
             n_shared_experts=1,
             shared_experts=shared_experts,
             stream_fork=stream_fork,
@@ -661,6 +662,7 @@ class TestDeepseekV4Config:
 
         moe = SimpleNamespace(
             use_mega_moe=True,
+            ep_token_layout="scattered",
             config=SimpleNamespace(num_experts_per_tok=2, norm_topk_prob=True),
             n_shared_experts=1,
             shared_experts=shared_experts,

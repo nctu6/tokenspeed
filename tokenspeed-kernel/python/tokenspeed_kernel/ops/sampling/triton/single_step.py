@@ -38,8 +38,7 @@ rule as the chain kernel's final sampling; exact zeros are never selected.
 """
 
 import torch
-import triton
-import triton.language as tl
+from tokenspeed_kernel._triton import tl, triton
 
 
 @triton.jit

@@ -374,6 +374,9 @@ def _stage1_kernel(
     problem_start = 0
 
     for expert_id in range(num_experts):
+        # Offsets into the expert-major weights, scales and biases are 64-bit: the weights of one layer
+        # exceed 2**31 elements from 182 experts of the V4.1 shapes on (E * 2I * H / 2 = 4.5e9)
+        expert_offset = expert_id.to(tl.int64)
         group_m = tl.load(expert_counts_ptr + expert_id)
         num_m_tiles = tl.cdiv(group_m, BLOCK_M)
         num_n_tiles = tl.cdiv(intermediate_size, BLOCK_N)
@@ -386,7 +389,7 @@ def _stage1_kernel(
             local_rows = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
             row_mask = local_rows < group_m
             route_ids = tl.load(
-                expert_route_ids_ptr + expert_id * route_count + local_rows,
+                expert_route_ids_ptr + expert_offset * route_count + local_rows,
                 mask=row_mask,
                 other=-1,
             ).to(tl.int32)
@@ -405,7 +408,7 @@ def _stage1_kernel(
             for k_offset in range(0, hidden_size, BLOCK_K):
                 scale_cols = tl.arange(0, BLOCK_K // 32)
                 expert_scale = (
-                    w13_scale_ptr + expert_id * 2 * intermediate_size * scale_k
+                    w13_scale_ptr + expert_offset * 2 * intermediate_size * scale_k
                 )
                 if UPCAST_WEIGHTS:
                     x = tl.load(
@@ -418,7 +421,7 @@ def _stage1_kernel(
                     )
                     packed_offsets = k_offset // 2 + tl.arange(0, BLOCK_K // 2)
                     expert_weight = (
-                        w13_data + expert_id * 2 * intermediate_size * packed_k
+                        w13_data + expert_offset * 2 * intermediate_size * packed_k
                     )
                     gate_packed = tl.load(
                         expert_weight
@@ -501,7 +504,7 @@ def _stage1_kernel(
 
             if UPCAST_WEIGHTS:
                 if HAS_BIAS:
-                    expert_bias = w13_bias_ptr + expert_id * 2 * intermediate_size
+                    expert_bias = w13_bias_ptr + expert_offset * 2 * intermediate_size
                     gate_acc += tl.load(expert_bias + gate_rows)[None, :]
                     up_acc += tl.load(expert_bias + up_rows)[None, :]
                 if ACTIVATION == "situ":
@@ -610,6 +613,9 @@ def _stage2_kernel(
     problem_start = 0
 
     for expert_id in range(num_experts):
+        # Offsets into the expert-major weights, scales and biases are 64-bit: the weights of one layer
+        # exceed 2**31 elements from 182 experts of the V4.1 shapes on (E * 2I * H / 2 = 4.5e9)
+        expert_offset = expert_id.to(tl.int64)
         group_m = tl.load(expert_counts_ptr + expert_id)
         num_m_tiles = tl.cdiv(group_m, BLOCK_M)
         num_n_tiles = tl.cdiv(hidden_size, BLOCK_N)
@@ -622,7 +628,7 @@ def _stage2_kernel(
             local_rows = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
             row_mask = local_rows < group_m
             route_ids = tl.load(
-                expert_route_ids_ptr + expert_id * route_count + local_rows,
+                expert_route_ids_ptr + expert_offset * route_count + local_rows,
                 mask=row_mask,
                 other=-1,
             ).to(tl.int32)
@@ -633,7 +639,7 @@ def _stage2_kernel(
 
             for k_offset in range(0, intermediate_size, BLOCK_K):
                 scale_cols = tl.arange(0, BLOCK_K // 32)
-                expert_scale = w2_scale_ptr + expert_id * hidden_size * scale_k
+                expert_scale = w2_scale_ptr + expert_offset * hidden_size * scale_k
                 if UPCAST_WEIGHTS:
                     intermediate = tl.load(
                         inter_ptr
@@ -644,7 +650,7 @@ def _stage2_kernel(
                         other=0.0,
                     )
                     packed_offsets = k_offset // 2 + tl.arange(0, BLOCK_K // 2)
-                    expert_weight = w2_data + expert_id * hidden_size * packed_k
+                    expert_weight = w2_data + expert_offset * hidden_size * packed_k
                     weight_packed = tl.load(
                         expert_weight
                         + weight_rows[:, None] * packed_k
@@ -698,7 +704,7 @@ def _stage2_kernel(
                     )
 
             if UPCAST_WEIGHTS and HAS_BIAS:
-                acc += tl.load(w2_bias_ptr + expert_id * hidden_size + weight_rows)[
+                acc += tl.load(w2_bias_ptr + expert_offset * hidden_size + weight_rows)[
                     None, :
                 ]
             output_offsets = (

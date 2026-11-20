@@ -144,10 +144,14 @@ def test_model_prepares_routed_workspace_at_serving_limit(monkeypatch):
         torch.nn.Module.__init__(layer)
         layer.is_moe_layer = True
         layer.block_sparse_moe = moe
+        layer.k3_comm = SimpleNamespace(iris_state=None)
         layers.append(layer)
     owner = SimpleNamespace(
-        model=SimpleNamespace(layers=layers),
-        mapping=object(),
+        model=SimpleNamespace(layers=layers, iris_states={}),
+        mapping=SimpleNamespace(
+            attn=SimpleNamespace(tp_group=(0,)),
+            moe=SimpleNamespace(tp_ep_group=(0,)),
+        ),
         config=SimpleNamespace(hidden_size=7168, routed_expert_hidden_size=3584),
     )
     monkeypatch.setattr(kimi_k3, "prepare_k3_all_reduce_buffers", lambda **kw: False)

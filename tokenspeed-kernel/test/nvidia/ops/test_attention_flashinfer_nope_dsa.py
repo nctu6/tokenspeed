@@ -28,6 +28,7 @@ from tokenspeed_kernel.numerics.torch.attention.dsa import (
     torch_dsa_sparse_attention,
 )
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode, dsa_prefill
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 
 PAGE_SIZE = 64
@@ -38,17 +39,15 @@ ATOL = RTOL = 2.0e-2
 
 
 def _flashinfer_nope_available() -> bool:
-    return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] >= 10
-        and KernelRegistry.get().get_by_name("flashinfer_trtllm_nope_dsa_decode")
-        is not None
-    )
+    if not torch.cuda.is_available():
+        return False
+    spec = KernelRegistry.get().get_by_name("flashinfer_trtllm_nope_dsa_decode")
+    return spec is not None and spec.capability.satisfied_by(current_platform())
 
 
 pytestmark = pytest.mark.skipif(
     not _flashinfer_nope_available(),
-    reason="requires Blackwell and FlashInfer native NoPE sparse MLA",
+    reason="requires an SM100-family GPU and FlashInfer native NoPE sparse MLA",
 )
 
 

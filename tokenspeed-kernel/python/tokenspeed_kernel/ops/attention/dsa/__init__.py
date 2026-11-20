@@ -152,6 +152,12 @@ CANDIDATE_LENS_CPU_FEATURE = "candidate_lens_cpu"
 # at construction through :func:`select_dsa_prefill_topk_for_rows`.
 INDEX_K_WORKSPACE_ROWS_FEATURE = "index_k_workspace_rows"
 
+# Feature a ``dsa_decode`` / ``dsa_prefill`` core declares when it reads
+# ``kv_cache`` in place through the cache's own page and token strides. A core
+# without it may reshape the cache into flat rows, which copies a strided view
+# (the dots3-note compact cache) in full on every call; a caller holding such a
+# cache requires the feature instead of pinning a solution.
+STRIDED_KV_CACHE_FEATURE = "strided_kv_cache"
 # Storage of an index-key plane, read off its dtype (README, "Index-K plane
 # formats"): one layout per dtype, never guessed from a row width alone.
 _INDEX_K_FP8_GROUP_SIZE = 128
@@ -432,6 +438,7 @@ def dsa_decode(
     kv_seq_lens: torch.Tensor | None = None,
     *,
     slot_order: str,
+    features: frozenset[str] = frozenset(),
     kernel_plan: KernelPlan | None = None,
 ) -> AttentionResult:
     """Sparse DSA decode over selected global KV slots.
@@ -462,6 +469,8 @@ def dsa_decode(
         out: Optional output buffer.
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
+        features: Features the selected core must declare (for example
+            ``STRIDED_KV_CACHE_FEATURE``); empty requires none.
         kernel_plan: Initialization-time choice; inputs are validated without reselection.
         slot_order: The order the selected slots are reduced in, one of
             ``SLOT_ORDERS``: ``"selection"`` (as the top-k leaf emitted them;
@@ -505,7 +514,7 @@ def dsa_decode(
             "dsa_decode",
             signature,
             traits=traits,
-            features=None,
+            features=features or None,
             solution=solution,
             override=override,
         )
@@ -516,6 +525,7 @@ def dsa_decode(
             "dsa_decode",
             signature,
             traits=traits,
+            features=features or None,
             solution=solution,
             override=override,
         )
@@ -582,6 +592,7 @@ def dsa_prefill(
     kv_seq_lens: torch.Tensor | None = None,
     *,
     slot_order: str,
+    features: frozenset[str] = frozenset(),
     kernel_plan: KernelPlan | None = None,
 ) -> AttentionResult:
     """Sparse DSA prefill over selected global KV slots.
@@ -610,6 +621,8 @@ def dsa_prefill(
         out: Optional output buffer.
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
+        features: Features the selected core must declare (for example
+            ``STRIDED_KV_CACHE_FEATURE``); empty requires none.
         kernel_plan: Initialization-time choice; inputs are validated without reselection.
         slot_order: The order the selected slots are reduced in, as for
             :func:`dsa_decode`. Required keyword.
@@ -646,7 +659,7 @@ def dsa_prefill(
             "dsa_prefill",
             signature,
             traits=traits,
-            features=None,
+            features=features or None,
             solution=solution,
             override=override,
         )
@@ -657,6 +670,7 @@ def dsa_prefill(
             "dsa_prefill",
             signature,
             traits=traits,
+            features=features or None,
             solution=solution,
             override=override,
         )

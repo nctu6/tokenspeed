@@ -42,7 +42,9 @@ def test_rmsnorm_nvfp4_quant_matches_norm_then_flashinfer_bitwise(
     device: str, global_scale: float, width: int
 ) -> None:
     """One launch, with or without PDL, equals affine_rmsnorm then fp4_quantize."""
-    from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
+    # The reference is flashinfer itself: TokenSpeed binds its NVFP4 quantizer on
+    # SM100 only, but flashinfer's runs on every NVFP4 GPU (SM100 and SM120).
+    fp4_quantize = pytest.importorskip("flashinfer").fp4_quantize
 
     torch.manual_seed(3)
     rows, eps, offset = 7, 1e-5, 1.0

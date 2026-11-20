@@ -491,7 +491,7 @@ for gateway discovery.
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
 | `--disable-kda-prefill-graph` | Disable KDA prefill CUDA graphs while retaining ordinary prefill and decode graph settings. Enabled by default for supported `cutedsl_kda` prefill attention when prefill graphs are enabled. |
 | `--disable-cudagraph-memory-reserve` | Size the KV cache from free memory instead of reserving what the device graphs will cost and, on CUDA, what startup keeps resident. |
-| `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. |
+| `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. Defaults to `--max-num-seqs` (160 or 80 with `--disable-cudagraph-memory-reserve`; 8 or 80 on GPUs under 25 GB). Larger decode batches run eagerly and a startup warning names the range. A longer ladder reserves more graph memory before the KV cache is sized (about 2 GB per rank more at 512 sequences on V4.1 TP2, -9.8% KV tokens; 1.1 GB, -1.9% on Qwen3.8-27B-FP8 TP1); lower it to trade graphs for KV capacity on workloads that stay KV-bound. |
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
 | `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
 | `--prefill-graph-capture-batch-sizes` | Request capacities for inline KDA prefill capture. Replay selects the smallest compatible capacity that fits the batch. |
@@ -516,6 +516,21 @@ minimum request count that fits each token bucket within the model context.
 `--chunked-prefill-size` is intentionally separate from
 `--max-num-batched-tokens`: in TokenSpeed it is the scheduler's per-iteration
 issue budget, while `--max-total-tokens` controls the global token pool.
+
+The longest prompt the engine accepts (`max_input` in the startup line
+`Single-request token limit`, also `max_req_input_len` in the gateway's worker
+info) is `min(--max-model-len, what the KV pool holds for one request) - 1`.
+For a model with sliding-window layers the pool term depends on the chunk
+size: every sliding group keeps one whole prefill chunk resident beside its
+window, so the default 8192-token chunk takes about a third of a small pool
+away from the full-attention group
+([scheduler design 1.4](../design/scheduler.md)). gemma-4-31B-it at TP1 on a
+96 GB GPU at `--gpu-memory-utilization 0.90` holds 199,614 tokens with the
+default chunk and cannot serve 256K prompts. Either `--kv-cache-dtype fp8`
+(twice the parents; the cache holds 496,831 tokens for one request) or
+`--chunked-prefill-size 1024` (276,927) reaches `--max-model-len 262144`; `2048` falls 1.2K tokens
+short. Read the startup line to check a configuration. A prompt above the
+limit is rejected per request with a `ValueError` in the input processor.
 
 ## Parallelism
 
@@ -574,7 +589,7 @@ for the online variant.
 | --- | --- |
 | `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. Names are checked against the backend registry at startup, after plugins load, so an installed plugin's backends are accepted too. On SM103 (B300/GB300), `fa4` ranks below every other attention kernel: naming it here or in `--drafter-attention-backend` selects it, and the default selection is unchanged. |
 | `--drafter-attention-backend` | Attention backend for the speculative decoding drafter model; accepts the same names as `--attention-backend`. |
-| `--moe-backend` | MoE backend. |
+| `--moe-backend` | MoE backend. `auto` picks the kernel by capability; for DeepSeek V4.1 on SM120 (RTX PRO 6000) it resolves to `mega_moe` when attention TP equals the MoE TP x EP width (1 or 2 ranks) and no all-to-all backend, EPLB, redundant experts, speculative decoding, PD disaggregation or bitwise `--numerics` envelope is set, and to Marlin otherwise. The startup log says which and why. |
 | `--moe-mxfp4-fp8-activation` | Opt-in: run MXFP4 routed experts with FP8 activations. On Hopper this is the FlashInfer cutlass W4A8 MoE (faster than the default W4A16 kernel, a few percent of extra error on expert outputs). Applies to every MXFP4 expert layer, target and draft; startup fails where the selected MoE backend has no FP8-activation kernel for a layer, when a model's routed experts are not MXFP4, when the model pins another activation precision (Kimi-K3 on Hopper Marlin), or when the layer's SwiGLU is unclamped (the W4A8 FC2 scale relies on the clamp). |
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |
 | `--all2all-backend` | MoE all-to-all backend. |
@@ -622,6 +637,21 @@ model's `tokenizer_config.json` declares a `response_template` and no other
 `--reasoning-parser hf`, and `--tool-call-parser hf` so the bundled
 `tokenspeed-smg` gateway selects both parsers from that template. Naming any
 parser option keeps its existing behavior.
+
+Gemma 4 checkpoints (`gemma-4` ids, `gemma4` model type, or
+`Gemma4ForConditionalGeneration` / `Gemma4ForCausalLM`) get
+`--reasoning-parser gemma4` (engine and gateway) and `--tool-call-parser gemma4`
+unless one is named. Their template's `tool_calls` field is rejected by the
+gateway's template parsers (every chat request answers HTTP 400
+`invalid_parser_configuration`), so the template default does not apply to
+them. With `chat_template_kwargs: {"enable_thinking": true}` the model writes
+its thinking between `<|channel>thought` and `<channel|>`; the `gemma4`
+reasoning parser moves it to `reasoning_content`, and without it the thinking
+stays in `content`.
+
+Gemma 4's tokenizer adds no BOS to raw `/v1/completions` prompts (the same as
+the Hugging Face tokenizer); start such prompts with `<bos>`. Chat requests get
+exactly one BOS from the chat template.
 
 ## Speculative decoding
 

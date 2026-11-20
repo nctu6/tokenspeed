@@ -673,6 +673,7 @@ def dsv4_decode(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.dsv4.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsv4.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv4.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv4.gluon  # noqa: E402,F401
 

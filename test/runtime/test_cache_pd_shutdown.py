@@ -113,6 +113,11 @@ class _EventLoopHarness:
     def _shutdown_complete(self) -> bool:
         return EventLoop._shutdown_complete(self)
 
+    def _should_commit_head(self, in_flight, effective_depth, forward_op) -> bool:
+        return EventLoop._should_commit_head(
+            self, in_flight, effective_depth, forward_op
+        )
+
     def _process_new_requests(self) -> None:
         self.trace.append("process_requests")
         # Exercise the important case where SIGTERM arrives during an

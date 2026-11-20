@@ -91,6 +91,7 @@ def test_gluon_bf16_moe_apply_matches_reference(num_tokens):
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        ep_token_layout=None,
         features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "gluon_bf16_precomputed_moe_apply"

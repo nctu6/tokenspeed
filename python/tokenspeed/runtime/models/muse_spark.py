@@ -1067,6 +1067,7 @@ class MuseSparkMoE(nn.Module):
                 # "swiglu" would force one shared gate/up scale; this model is plain silu(gate) * up.
                 activation="silu",
                 routing_mode="precomputed_topk",
+                ep_token_layout=None,
             )
             self.expert_quant_kind = self.experts._quant_kind
             if self.expert_quant_kind not in {"mxfp4", "nvfp4"}:

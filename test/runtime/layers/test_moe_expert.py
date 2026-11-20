@@ -61,6 +61,7 @@ def test_moe_bf16_route_precision_rejects_unsupported_contract(
                 activation="silu",
                 routing_mode="precomputed_topk",
                 routing_config=policy,
+                ep_token_layout=None,
             )
     finally:
         torch.set_default_dtype(original_dtype)
@@ -140,6 +141,7 @@ def test_moe_layer_rejects_invalid_situ_parameters(
             activation="situ",
             activation_situ_beta=beta,
             activation_situ_linear_beta=linear_beta,
+            ep_token_layout=None,
         )
 
 
@@ -198,6 +200,7 @@ def test_moe_layer_builds_ep8_local_expert_partition(
         activation_situ_beta=4.0,
         activation_situ_linear_beta=25.0,
         routing_mode="precomputed_topk",
+        ep_token_layout=None,
     )
 
     assert layer.num_local_experts == 112
@@ -232,6 +235,7 @@ def test_moe_layer_rejects_uneven_contiguous_ep_partition() -> None:
             layer_index=0,
             ep_rank=0,
             ep_size=3,
+            ep_token_layout=None,
         )
 
 
@@ -266,6 +270,7 @@ def test_moe_layer_uses_mixed_fp8_block_scale_child_config(
         quant_config=quant_config,
         layer_index=0,
         prefix="mtp.layers.0.mlp",
+        ep_token_layout=None,
     )
 
     assert layer.quant_config is quant_config.fp8_block_scales_config
@@ -314,6 +319,7 @@ def test_moe_layer_applies_outer_mixed_exclusion(
         quant_config=quant_config,
         layer_index=0,
         prefix="mtp.layers.0.mlp",
+        ep_token_layout=None,
     )
 
     assert layer.quant_config is quant_config
@@ -360,6 +366,7 @@ def test_moe_layer_requests_dynamic_mxfp4_activations(
         intermediate_size=128,
         quant_config=Mxfp4QuantConfig(),
         layer_index=0,
+        ep_token_layout=None,
     )
 
     assert captured["internal_activation_dtype"] == "mxfp4"
@@ -438,6 +445,7 @@ def vendor_layer(monkeypatch):
             quant_config=None,
             layer_index=0,
             activation="silu",
+            ep_token_layout=None,
         )
         layer_kwargs.update(kwargs)
         layer_kwargs["routing_config"] = dict(VENDOR_POLICY)
@@ -519,6 +527,7 @@ def test_deferred_routes_carry_the_precomputed_weights(monkeypatch) -> None:
                 prefix="mlp",
                 activation="swiglu",
                 routing_mode="precomputed_topk",
+                ep_token_layout=None,
             )
     finally:
         torch.set_default_dtype(original_dtype)

@@ -137,6 +137,9 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         def release_graphs(self):
             events.append(("release", self.generation))
 
+        def release_cache_pool(self):
+            events.append(("release pool", self.generation))
+
         def set_cache_pool(self, target, draft):
             self.generation += 1
             events.append(("rebind", self.generation, target, draft))
@@ -184,7 +187,9 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     monkeypatch.setattr(
         device,
         "current_platform",
-        lambda: SimpleNamespace(is_nvidia=False, restore_stack_limit=nullcontext),
+        lambda: SimpleNamespace(
+            is_nvidia=False, is_cdna4=False, restore_stack_limit=nullcontext
+        ),
     )
     monkeypatch.setattr(
         scheduler_utils,
@@ -223,6 +228,9 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         probe_index = events.index(("capture", 0, 5))
         rebind_index = events.index(("rebind", 1, "target2", "draft2"))
         assert probe_index < rebind_index
+        # The probe arena is freed after its graphs and before the rebuild.
+        release_pool_index = events.index(("release pool", 0))
+        assert events.index(("release", 0)) < release_pool_index < rebind_index
         if has_draft and not prefill_only:
             assert events.index(("warmup", 0, (1,), False)) < probe_index
         if expected_rewarm:
@@ -452,6 +460,19 @@ def _planned(*, num_extends, label=None):
     )
 
 
+def _profiler_activities():
+    """CPU activity, plus CUDA where it exists.
+
+    A profiler session that starts without CUDA activity leaves kineto without
+    CUPTI for the rest of the process, so every later session in it (the GDN
+    verify and PLE launch-count tests) records no kernels.
+    """
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    return activities
+
+
 def _profile_batch(mode):
     """Real immutable scheduler batches, including a resumed prefill chunk."""
     config = SchedulerConfig()
@@ -511,9 +532,7 @@ def test_forward_profile_range_preserves_real_batch_metadata_and_result(mode):
         )
     )
     planned = replace(_planned(num_extends=batch.num_extends()), forward_op=batch)
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU]
-    ) as profiler:
+    with torch.profiler.profile(activities=_profiler_activities()) as profiler:
         assert (
             handle._submit_forward(planned, capture_next_input_ids=True).result()
             is result
@@ -542,7 +561,9 @@ def test_forward_profile_range_preserves_real_batch_metadata_and_result(mode):
         assert metadata["input_lengths"] == [1]
     else:
         assert metadata["request_ids"] == ["new-\\request", 'old-"雪']
-        assert metadata["input_lengths"] == [7, 1]
+        # A long prefill beside a decode is capped at half the reference chunk
+        # (budget 8 -> 4), not the 7 tokens the budget leaves.
+        assert metadata["input_lengths"] == [4, 1]
     inner = next(event for event in profiler.events() if event.name == "cpu_model_work")
     assert inner.thread == ranges[0].thread
     assert inner.time_range.start >= ranges[0].time_range.start
@@ -564,9 +585,7 @@ def test_profile_range_closes_and_propagates_original_forward_exception():
         )
     )
     planned = replace(_planned(num_extends=1), forward_op=batch)
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU]
-    ) as profiler:
+    with torch.profiler.profile(activities=_profiler_activities()) as profiler:
         pending = handle._submit_forward(planned)
         with pytest.raises(RuntimeError) as raised:
             pending.result()

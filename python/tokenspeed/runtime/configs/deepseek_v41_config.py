@@ -41,6 +41,11 @@ class DeepseekV41TextConfig(PretrainedConfig):
                 setattr(self, name, kwargs[name])
         self.rope_parameters = kwargs.get("rope_scaling", {})
         super().__init__(**kwargs)
+        # Routed expert count of the checkpoint when the model keeps only its
+        # first ``n_routed_experts`` (set together through --hf-overrides to
+        # run real weights on fewer GPUs; the router then picks among those).
+        # None: the model has every checkpoint expert.
+        self.num_checkpoint_experts: int | None = kwargs.get("num_checkpoint_experts")
         # These are architectural facts, not V4 defaults: V4.1 has learned,
         # ungrouped routing in every layer and no hash-routed MoE layers.
         self.num_hash_layers = 0

@@ -230,7 +230,7 @@ def test_radio_video_pairs_frames_and_repeats_an_odd_last_frame():
     _assert_close_bf16(out, torch.cat(refs))
 
 
-def test_radio_video_runs_tubelets_in_bounded_passes_bit_for_bit():
+def test_radio_video_runs_tubelets_in_bounded_passes_like_one_pass():
     model = _radio(final_norm=False)
     # Three 4x6 tubelets: passes of two, then one.
     frames, rows, cols = 5, 4, 6
@@ -239,7 +239,10 @@ def test_radio_video_runs_tubelets_in_bounded_passes_bit_for_bit():
         passes = model.embed_video(patches, frames, rows, cols)
         model.video_patches_per_pass = frames * rows * cols
         whole = model.embed_video(patches, frames, rows, cols)
-    assert torch.equal(passes, whole)
+    # Pass size changes the GEMM row count, and cuBLAS picks a different kernel
+    # (so a different bf16 rounding) per row count on some GPUs such as SM120.
+    # Bounding the pass must still not change the result beyond that rounding.
+    _assert_close_bf16(passes, whole.float())
 
 
 SOUND_CONFIG = {
@@ -624,6 +627,14 @@ def test_audio_feature_encodes_every_clip_of_every_item_in_order():
     assert torch.equal(out, expected)
 
 
+# ReLU2 (non-gated) experts run only on the TRT-LLM kernels, which target the
+# SM100 family; other GPUs have no MoE kernel for them.
+requires_relu2_moe_kernel = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="ReLU2 MoE kernels exist only for SM100-family GPUs",
+)
+
+
 def _mtp_omni_config() -> NemotronHOmniConfig:
     """A small Nemotron-H Omni config whose language model has one MTP layer."""
     llm = dict(
@@ -646,6 +657,7 @@ def _mtp_omni_config() -> NemotronHOmniConfig:
     return NemotronHOmniConfig(llm_config=llm)
 
 
+@requires_relu2_moe_kernel
 def test_mtp_draft_reads_the_language_model_mtp_tensors():
     from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
 
@@ -667,6 +679,7 @@ def test_mtp_draft_reads_the_language_model_mtp_tensors():
     assert torch.all(draft.enorm.weight == 2)
 
 
+@requires_relu2_moe_kernel
 def test_kv_cache_scales_reach_the_language_model_and_its_mtp_head():
     from tokenspeed_kernel.ops.attention.prologue import FP8TensorScales
 

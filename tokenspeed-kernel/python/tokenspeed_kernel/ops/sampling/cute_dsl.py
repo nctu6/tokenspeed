@@ -282,6 +282,18 @@ def _validate_argmax_pair_out(logits: torch.Tensor, out: torch.Tensor) -> None:
         raise ValueError("out must be float32 on the same device as logits")
 
 
+def _suppress_nan(logits: torch.Tensor) -> torch.Tensor:
+    """Map NaN to ``-inf`` (keeping ``+-inf``), matching the kernel's reductions.
+
+    The kernel never lets NaN win (IEEE ``NaN > x`` is false) and resolves rows
+    with no element above ``-inf`` to index 0, whereas ``torch.max``/``argmax``
+    treat NaN as the maximum.
+    """
+    return logits.nan_to_num(
+        nan=float("-inf"), posinf=float("inf"), neginf=float("-inf")
+    )
+
+
 def _argmax_torch_fallback(
     logits: torch.Tensor,
     *,
@@ -296,7 +308,7 @@ def _argmax_torch_fallback(
     """
     if out is not None:
         _validate_argmax_out(logits, out)
-    result = torch.argmax(logits, dim=-1)
+    result = torch.argmax(_suppress_nan(logits), dim=-1)
     if out is not None:
         out.copy_(result)
         return out
@@ -323,7 +335,7 @@ def _argmax_pair_torch_fallback(
     else:
         _validate_argmax_pair_out(logits, out)
 
-    max_vals, max_indices = torch.max(logits, dim=-1, keepdim=True)
+    max_vals, max_indices = torch.max(_suppress_nan(logits), dim=-1, keepdim=True)
     out[:, 0:1].copy_(max_vals.to(torch.float32))
     out[:, 1:2].copy_(max_indices.to(torch.float32))
     return out

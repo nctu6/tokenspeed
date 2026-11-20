@@ -352,7 +352,8 @@ def test_large_query_hash_scratch_is_prepaid():
     metadata = dict(plan.workspaces[0].metadata)
     assert metadata["entry_dest"] == 8 * 8 * 2048
     assert metadata["hash_keys"] == metadata["hash_owners"] == 8 * 32768
-    smaller = replace(config, queries=4)
+    # 2 x 2048 selections fit the shared-memory tables of every supported GPU.
+    smaller = replace(config, queries=2)
     small_metadata = smaller.metadata_counts()
     assert small_metadata["hash_keys"] == small_metadata["hash_owners"] == 0
     # The allocator consumes exactly this list, so the global-table mode cannot

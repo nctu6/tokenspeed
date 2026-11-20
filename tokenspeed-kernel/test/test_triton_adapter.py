@@ -124,6 +124,9 @@ def test_kernel_sources_use_tokenspeed_triton_adapter():
     stock_triton_interop = {
         source_root / "ops/attention/kda/_triton/fla.py",
         source_root / "thirdparty/msa/cute/src/common/cute_dsl_utils.py",
+        # Vendored FA4: reads the disassembler of the framework's stock Triton
+        # to dump CuTe DSL SASS.
+        source_root / "thirdparty/fa4_sm90/cute_dsl_utils.py",
     }
     stock_triton_roots = {
         source_root / "thirdparty/gluon_petit",

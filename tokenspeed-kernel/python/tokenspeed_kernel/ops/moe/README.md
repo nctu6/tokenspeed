@@ -373,3 +373,133 @@ hidden width. Some kernels (Triton MXFP4) return no weights; `MoELayer` then
 returns the precomputed route weights it passed in. FP16 inputs, ROCm builds
 without the fused finalizer, and kernels without deferred finalize keep the
 kernel's own finalized output.
+
+## MegaMoE on SM120
+`deep_gemm_sm120_mxfp4_mega_moe_apply` serves the V4 / V4.1 MXFP4 experts on
+SM120 (arch 12.x) for EP 2. It is registered only when the DeepGEMM build
+reports `get_mega_moe_max_ranks(12) >= 2` (`deepgemm_sm120_mega_moe_max_ranks`,
+behind `deepgemm_supports_sm120`). The fused SM100 leaf
+`deep_gemm_mxfp4_mega_moe_apply` stays capped at 10.9 (TMEM, 2-CTA UMMA, NVLink).
+`test_sm120_excludes_sm100_only_leaves.py` checks both rules.
+
+SM120 has no NVLink, so DeepGEMM runs MegaMoE there as a sequence of kernels.
+The ranks write into each other's torch symmetric-memory buffers with peer
+stores over PCIe (CUDA IPC): tokens go out to the owners of their experts, the
+owners run local FP8 x MXFP4 grouped GEMMs and SwiGLU, and the expert rows come
+back to be summed in top-k order. A system-scope epoch barrier in the buffer
+orders the steps, so the call replays in CUDA graphs. Results are bitwise equal
+to a single rank holding all experts. Calls that share the buffer must be
+ordered on one stream per rank. The SM120 leaf keeps the scale rows in order
+(no UTCCP transpose). V4.1's 2304-wide experts are not padded to 2560 there.
+
+`--moe-backend mega_moe` selects it explicitly; `auto` resolves to it for V4.1
+under the gates below. Against what the default path
+runs at EP 2 on SM120,
+Marlin W4A16 plus its all-reduce or all-gather / reduce-scatter, at the same
+served tokens (cold weights, CUDA graph, GPUs on one PCIe switch):
+
+| Tokens per rank | V4 | V4.1 |
+|---|---|---|
+| 1 | 0.95x | 0.96x |
+| 2-1024 | 1.00-1.05x | 0.99-1.02x |
+| 2048-4096 | 1.30x | 1.28-1.35x |
+
+At EP 2 a V4 rank holds 70 GB of routed experts; V4.1 needs at least 4 ranks.
+Details and the per-size table are in DeepGEMM `deepgemm-analysis.md`
+section 9.26.
+
+### Gates for `--moe-backend auto`
+
+`auto` cannot find MegaMoE through `moe_plan` alone: the layer must be built
+around it (token layout, persistent symmetric buffer, scratch the KV planner
+counts after the warm-up), so the runtime asks `mega_moe_auto_available` first
+and then names `mega_moe` (`deepseek_v41_default_moe_backend`,
+`runtime/configs/model_config.py`). The function runs the registry's own
+selection, so each gate is a trait or feature the leaf declares:
+
+| Gate | Declared by the SM120 leaf |
+|---|---|
+| widths | `moe_ranks` {1, 2} (TP x EP; a TP shard has `ep_size` 1), `ep_size` {1, 2} |
+| geometry | `hidden_alignment` 512, `ispp_alignment` 128 |
+| scratch and buffer | `persistent_workspace` (the plan carries a token capacity) |
+| numerics | no `batch_invariant`: FP8 activations and an unverified batch-shape invariance keep it out of every bitwise envelope (`--numerics rl-bitwise`) |
+| measured win | `auto_default`, declared only because it beat Marlin on real V4.1 |
+
+The runtime adds what is not a kernel trait: replicated tokens (attention TP
+equals MoE TP x EP), MXFP4 routed experts, and no all-to-all backend, EPLB,
+redundant experts, speculative decoding or PD disaggregation (not verified with
+this leaf). Tests: `test/test_mega_moe_auto_gates.py` (kernel) and
+`test/runtime/test_deepseek_v41_moe_default.py`.
+
+### Token layouts (`moe_plan(ep_token_layout=...)`)
+
+The plan names how the tokens meet the experts, and the leaf runs the same
+kernels either way. `ep_token_layout` is a required argument of `moe_plan` (and
+of `MoELayer`); `None` means no kernel of the plan owns the token exchange, and
+this leaf refuses it:
+
+- `scattered` (attention DP): each rank brings its own tokens. The call is the
+  push / barrier / dispatch / GEMMs / return / combine protocol above and returns
+  the complete output of this rank's tokens. EP 2 only.
+- `replicated` (attention TP): every rank of the MoE group holds the same
+  tokens, so nothing is exchanged. The kernel runs as one rank (a one-rank
+  process group, no push, no barrier, no return) over this rank's shard of the
+  experts and returns a partial, which the caller sums with the all-reduce a TP
+  layer already does (`combine_order="rank"`). The shard is either a range of
+  experts (`--ep-size 2`; the staged top-k masks the other rank's routes, see
+  `stage_mxfp4_mega_moe_inputs`) or a slice of every expert's intermediate
+  width (MoE TP 2, the default with `--tensor-parallel-size 2` and no
+  `--ep-size`). A slice keeps SwiGLU and the per-32 activation scales inside
+  it, so the activations are quantized exactly as unsharded, and the second GEMM
+  sums over the slice. V4.1's 2304 splits into 1152 = 9 x 128. Widths of one and
+  two ranks are tested; mixed TP x EP is refused.
+
+Real V4.1 (40 layers, first 128 of 384 experts, GPUs 6+7, 2 x 2004 tokens,
+prefill graphs off, median of 9, TPOT from 257 tokens):
+
+| Path | Prefill tok/s | TPOT ms |
+|---|---|---|
+| Marlin TP2 (`auto`) | 15.1K | 10.69 |
+| MegaMoE, attention TP2 + MoE TP2 | 17.0K (1.12x) | 10.66 |
+| MegaMoE, attention TP2 + EP2 | 16.8K (1.11x) | 11.22 |
+| MegaMoE, attention DP2 + EP2 | 19.1K (1.26x) | 14.02 |
+
+The TP2 attention path removes the DP penalty (every DP rank reads the whole
+dense model, +2.6 ms) and the barrier / push / return glue, but an EP range
+leaves one rank with more routed experts than the other at 2 requests (12
+routes over 128 experts), and the all-reduce waits for it: 0.8-1.1 ms per step
+against 0.25-0.3 ms for Marlin. MoE TP splits every expert in half, so both ranks
+read the same bytes, and the all-reduce wait is back to Marlin's. Its grouped
+GEMMs tie Marlin's (3.17 vs 3.3 ms per step) and its glue (staging, dispatch,
+gather, SwiGLU, combine, 0.73 ms) is a little under Marlin's (SiLU, align,
+reduce, fill, 0.8 ms), which makes TPOT a tie, not a win. `auto` therefore still
+selects Marlin: a MegaMoE leaf is selected only for `--moe-backend mega_moe`.
+With several ranks the intermediate rows are sized for the worst routing of
+the largest batch on every rank (about 2.6 GB at 8192 tokens per rank at V4.1
+shapes). DeepGEMM keeps them in one persistent buffer per device, allocated by
+the first call and grown by a larger one; the leaf's warmup runs the largest
+token count before the KV planner measures memory, so the planner counts the
+buffer. Serving on real V4.1 weights (40 layers, 128 experts, GPUs 6+7, 2 x 2K
+tokens): MegaMoE DP2/EP2 prefills 1.25x faster than Marlin TP2 (18.1-18.6K vs
+14.5-14.8K tok/s) and decodes 1.31x slower (13.9 vs 10.6 ms TPOT): attention DP
+reads every dense weight on each GPU (+2.6 ms per step at 2 requests), and the
+MegaMoE glue around the grouped GEMMs (barriers, push, dispatch, gather,
+SwiGLU, return, combine) adds 2.3 ms per step while the GEMMs tie Marlin
+(DeepGEMM `deepgemm-analysis.md` 9.29). A graph timeline of one call at 2
+tokens per rank (V4.1 shapes, cold weights, 195 us) puts the glue on the
+critical path at about 25 us: 13 us before the first GEMM (input staging 2,
+push 2, barrier 3, dispatch 2, gather 4), 2 us between the GEMMs (SwiGLU runs
+under the GEMM's PDL tail) and 10 us after the second (return 4, barrier 3,
+combine 3). Fusing push + barrier + dispatch + gather and return + barrier +
+combine would save about 9 us per layer, 0.36 ms per step (2.6% of the 13.9 ms
+TPOT); the GEMMs are 165 us. Not done: the barrier skew between ranks, which
+is most of the 0.8-1.05 ms the serving trace shows for the two barriers, does
+not shrink with fusion.
+
+## Triton MXFP4 expert offsets
+The Triton MXFP4 stage kernels advance every expert base (weights, scales,
+biases, route ids) in int64. At the V4.1 shapes (384 experts, hidden 5120,
+intermediate 2304) a 32-bit `expert_id * rows * columns` wraps from expert 182
+(stage 1: another expert's weights, silently) and from expert 364 (stage 2: an
+illegal memory access). `test_triton_mxfp4_large_expert_offsets.py` covers both
+boundaries.

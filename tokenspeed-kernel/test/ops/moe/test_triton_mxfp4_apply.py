@@ -20,6 +20,8 @@ def _dequantize(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("activation", ["silu", "situ"])
 # 192 is a multiple of 64 but not 128, like a 640-wide expert sharded by TP2.
+
+
 @pytest.mark.parametrize("intermediate_size", [128, 192])
 def test_triton_mxfp4_moe_matches_torch(
     activation: str, intermediate_size: int
@@ -83,6 +85,7 @@ def test_triton_mxfp4_moe_matches_torch(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        ep_token_layout=None,
         features=frozenset(),
     )
     plan["precision_policy"] = "default"
@@ -130,7 +133,6 @@ def test_triton_mxfp4_moe_matches_torch(
     torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.02)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_triton_weight_only_mxfp4_moe_situ_matches_torch() -> None:
     """Weight-only (BF16 activation) MXFP4 experts with Kimi-K3 SiTU."""
     if not current_platform().is_amd:
@@ -190,6 +192,7 @@ def test_triton_weight_only_mxfp4_moe_situ_matches_torch() -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        ep_token_layout=None,
         features=frozenset(),
     )
     plan["precision_policy"] = "default"
@@ -279,6 +282,7 @@ def test_triton_mxfp4_moe_defers_local_ep_routes() -> None:
         persistent_max_num_tokens_per_gpu=None,
         fast_math=False,
         combine_order="rank",
+        ep_token_layout=None,
         features=frozenset(),
         solution="triton",
     )

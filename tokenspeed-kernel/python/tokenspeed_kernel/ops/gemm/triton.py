@@ -587,6 +587,7 @@ register_kernel(
         "k_align": frozenset({128}),
         "a_inner_stride_one": frozenset({True}),
         "a_ndim": frozenset({2}),
+        "is_cuda": frozenset({True}),
         "b_inner_stride_one": frozenset({True}),
         # Dense BF16 B is the [N, K] weight (A @ B.T, as torch_mm computes);
         # mm labels a square one "KN" because B.shape[0] == K, so both labels

@@ -26,6 +26,7 @@ from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     model_wide_kwargs,
+    read_hf_layer_types,
     resolve_dtype,
 )
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
@@ -63,6 +64,9 @@ class Dots3NoteAttentionConfig(DSAConfig):
             raise ValueError("dots3-note requires the dsa/mla cache-group router")
         hf = model_config.hf_text_config
         dsa_kwargs = DSAConfig._spec_kwargs(server_args, model_config, is_draft)
+        # The recipe declares its own dsa/swa groups, so keep the checkpoint's
+        # labels instead of the equal-depth sub-groups the slab packer wants.
+        dsa_kwargs["cache_layer_types"] = read_hf_layer_types(model_config.hf_config)
         swa = MLAConfig(
             backend_name="mla",
             num_attention_heads=hf.swa_num_attention_heads,

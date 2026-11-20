@@ -131,6 +131,12 @@ class TestQwen35VlmE2E:
         if not current_platform().is_blackwell:
             pytest.skip("Qwen3.5 FP8 VLM requires NVIDIA Blackwell")
 
+        from test.runtime.launch_guard import launch_skip_reason
+
+        reason = launch_skip_reason(MODEL)
+        if reason is not None:
+            pytest.skip(reason)
+
     def test_image_chat_completion(self):
         import requests
 

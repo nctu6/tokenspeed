@@ -304,6 +304,7 @@ class GptOssSparseMoeBlock(nn.Module):
             swiglu_beta=1.0,
             w13_input_layout="interleaved",
             with_bias=True,
+            ep_token_layout=None,
         )
 
         self.router = TinyGemmLinear(

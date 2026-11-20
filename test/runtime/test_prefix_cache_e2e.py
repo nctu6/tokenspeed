@@ -82,6 +82,13 @@ _ACTIVE_MODELS = [
     mc for mc in _MODEL_CASES if not _ONLY_RUN or _ONLY_RUN in mc.model_path
 ]
 
+# Every case pins TRT-LLM MoE (and attention) kernels, which target the SM100
+# family only.
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="the model cases pin TRT-LLM kernels, which run on SM100-family GPUs",
+)
+
 # A long system prompt ensures a substantial prefix that the cache can
 # reuse.  Two different user questions follow the same system prefix so
 # the second request should hit the cached prefix when caching is on.

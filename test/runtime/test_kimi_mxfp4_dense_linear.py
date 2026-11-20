@@ -112,30 +112,49 @@ def test_mxfp4_linear_method_allocates_kimi_shared_and_dense_shapes() -> None:
 
 
 def test_mxfp4_linear_method_preserves_e8m0_bytes_and_keeps_packed_weights() -> None:
+    from tokenspeed_kernel.ops.gemm import (
+        MXFP4_LINEAR_DEEPGEMM_SM120_LAYOUT,
+        MXFP4_LINEAR_LINEAR_LAYOUT,
+    )
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    # Smallest shape every registered MXFP4 linear kernel tiles (N by 64, K by 128).
+    n, k = 64, 128
     layer = _create_weights(
-        input_size_per_partition=64,
-        output_partition_sizes=[4],
+        input_size_per_partition=k,
+        output_partition_sizes=[n],
         params_dtype=torch.float32,
     )
-    packed = _uint8_pattern((4, 32), offset=5)
-    raw_scales = torch.full((4, 2), 127, dtype=torch.uint8)
-
+    packed = _uint8_pattern((n, k // 2), offset=5)
+    raw_scales = torch.full((n, k // 32), 127, dtype=torch.uint8)
     layer.weight.weight_loader(layer.weight, packed)
     layer.weight_scale.weight_loader(layer.weight_scale, _maybe_e8m0(raw_scales))
     assert torch.equal(layer.weight_scale, raw_scales)
 
-    layer.quant_method.process_weights_after_loading(layer)
+    try:
+        layer.quant_method.process_weights_after_loading(layer)
+    except NoKernelFoundError:
+        pytest.skip("no MXFP4 dense linear kernel is registered for this platform")
 
-    assert layer._mxfp4_dense_processed is True
+    prepared = layer.mxfp4_linear_weight
+    # The parameters hold the prepared tensors, not a second copy beside them.
+    assert layer.weight.data_ptr() == prepared.weight.data_ptr()
+    assert layer.weight_scale.data_ptr() == prepared.weight_scale.data_ptr()
     assert layer.weight.dtype == torch.uint8
-    assert layer.weight_scale.dtype == torch.uint8
-    assert torch.equal(layer.weight, packed)
-    assert torch.equal(layer.weight_scale, raw_scales)
-    assert layer.weight_triton_tensor.data_ptr() == layer.weight.data.data_ptr()
-    assert (
-        layer.weight_scale_triton_tensor.data_ptr()
-        == layer.weight_scale.data.data_ptr()
-    )
+    assert tuple(layer.weight.shape) == tuple(packed.shape)
+    if prepared.layout in (
+        MXFP4_LINEAR_LINEAR_LAYOUT,
+        MXFP4_LINEAR_DEEPGEMM_SM120_LAYOUT,
+    ):
+        # These layouts read the checkpoint's packed E2M1 bytes as they are.
+        assert torch.equal(layer.weight, packed)
+    if prepared.layout == MXFP4_LINEAR_LINEAR_LAYOUT:
+        assert layer.weight_scale.dtype == torch.uint8
+        assert torch.equal(layer.weight_scale, raw_scales)
+
+    # A second call keeps the prepared weight.
+    layer.quant_method.process_weights_after_loading(layer)
+    assert layer.mxfp4_linear_weight is prepared
 
 
 def test_mxfp4_linear_method_rejects_non_block_input_partition() -> None:

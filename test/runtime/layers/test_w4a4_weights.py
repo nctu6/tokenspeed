@@ -79,7 +79,7 @@ def test_expert_shards_and_required_flatquant_parameters(transposed, strategy):
     assert flatquant_factors(512) == (16, 32)
 
 
-def _config(bits, *, input_symmetric=True, input_dynamic=True):
+def _config(bits, *, input_symmetric=True, input_dynamic=True, input_strategy="token"):
     return ct.CompressedTensorsConfig.from_config(
         {
             "format": "int-quantized",
@@ -97,7 +97,7 @@ def _config(bits, *, input_symmetric=True, input_dynamic=True):
                         "num_bits": bits,
                         "type": "int",
                         "symmetric": input_symmetric,
-                        "strategy": "token",
+                        "strategy": input_strategy,
                         "dynamic": input_dynamic,
                     },
                 }
@@ -110,7 +110,12 @@ def test_quant_config_int4_int8_and_gpu_boundary(monkeypatch):
     monkeypatch.setattr(ct, "current_platform", lambda: SimpleNamespace(is_npu=True))
     assert _config(4).moe_weight_dtype() == "int4"
     assert _config(8).moe_weight_dtype() == "int8"
-    for kwargs in ({"input_symmetric": False}, {"input_dynamic": False}):
+    # compressed-tensors rejects static per-token activations while parsing, so
+    # the static case uses a per-tensor scale to reach this guard.
+    for kwargs in (
+        {"input_symmetric": False},
+        {"input_dynamic": False, "input_strategy": "tensor"},
+    ):
         with pytest.raises(ValueError, match="unsupported"):
             _config(4, **kwargs).moe_weight_dtype()
     # MoE-only W4A4 must not override the shared Linear scheme.
@@ -146,6 +151,7 @@ def test_w4a4_plan_selects_only_the_fused_kernel():
         solution="flash_npu_chain",
         fast_math=True,
         combine_order="rank",
+        ep_token_layout=None,
         features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "ascend_int4_precomputed_moe_apply"

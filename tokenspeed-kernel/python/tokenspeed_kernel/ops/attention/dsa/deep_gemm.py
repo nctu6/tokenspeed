@@ -16,6 +16,8 @@ from tokenspeed_kernel.ops.attention.dsa.cuda import (
 )
 from tokenspeed_kernel.ops.attention.dsa.cute_dsl import (
     cute_dsl_decode_topk,
+    deepselect_local_topk,
+    deepselect_supports,
     has_cute_dsl_decode_topk,
 )
 from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
@@ -26,6 +28,7 @@ from tokenspeed_kernel.ops.attention.dsa.triton import (
     combine_topk_weights,
     local_topk_to_global_slots,
     mark_forced_initial_local_logits,
+    triton_topk_from_logits,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import (
@@ -37,6 +40,10 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.thirdparty.deepgemm import (
+    SM120_ARCH_MAJOR,
+    deepgemm_supports_sm120,
+)
 
 platform = current_platform()
 
@@ -48,6 +55,34 @@ _CUTE_DSL_DECODE_TOPK_ENABLED = os.environ.get("TS_DSA_DECODE_TOPK_CUTEDSL", "1"
 def _use_cute_dsl_decode_topk() -> bool:
     """Whether the DSA decode top-k should use the CuTe DSL cluster kernel."""
     return _CUTE_DSL_DECODE_TOPK_ENABLED and has_cute_dsl_decode_topk()
+
+
+# The TRT-LLM cluster runner is as fast or faster than DeepSelect until its
+# clusters stop fitting (rows x clusters over the SMs); past that it runs its
+# non-cluster kernel, which loses to DeepSelect's one CTA (or cluster pair) per
+# row on workstation Blackwell. RTX PRO 6000, top-k 2048 of random scores, us per
+# call, TRT-LLM / DeepSelect: 16K x 128 rows 12.4 / 18.2 and 32K x 64 rows
+# 17.1 / 26.1 (TRT-LLM wins), but 32K x 96 rows 31.1 / 25.7, 64K x 128 rows
+# 87.4 / 41.1, 128K x 48 rows 88.6 / 47.0 and 128K x 128 rows 173 / 65.
+_DEEPSELECT_DECODE_MIN_WIDTH = 32768
+_DEEPSELECT_DECODE_MIN_ROWS = 96
+_DEEPSELECT_DECODE_LONG_WIDTH = 65536
+_DEEPSELECT_DECODE_LONG_MIN_ROWS = 48
+
+
+def _use_deepselect_decode_topk(logits: torch.Tensor, topk: int) -> bool:
+    """Whether a decode top-k over ``logits`` should use DeepSelect."""
+    rows, width = logits.shape
+    min_rows = (
+        _DEEPSELECT_DECODE_LONG_MIN_ROWS
+        if width >= _DEEPSELECT_DECODE_LONG_WIDTH
+        else _DEEPSELECT_DECODE_MIN_ROWS
+    )
+    return (
+        width >= _DEEPSELECT_DECODE_MIN_WIDTH
+        and rows >= min_rows
+        and deepselect_supports(logits, topk)
+    )
 
 
 # Leaves can serve a batch-invariant selection only where the lowest-index
@@ -162,6 +197,33 @@ def _check_out(
     return out, lens_out
 
 
+def _dense(tensor: torch.Tensor, device: torch.device, dtype: torch.dtype):
+    """``tensor`` as a contiguous ``dtype`` tensor on ``device``.
+
+    Converts only what differs: ``.to`` and ``.contiguous`` return the tensor
+    itself when nothing changes, but each call still costs host time, once per
+    argument and layer.
+    """
+    if tensor.dtype != dtype or tensor.device != device:
+        tensor = tensor.to(device=device, dtype=dtype)
+    return tensor if tensor.is_contiguous() else tensor.contiguous()
+
+
+def _rows(tensor: torch.Tensor, start: int, end: int) -> torch.Tensor:
+    """Rows ``start:end`` of ``tensor``; the tensor itself if they are all of it.
+
+    A tile that covers every row (a chunk that fits one logits budget, the
+    common case) skips the slice, which is host time for nothing.
+    """
+    return tensor if end - start == tensor.shape[0] else tensor[start:end]
+
+
+def _tile_rows(tensor: torch.Tensor, start: int, end: int) -> torch.Tensor:
+    """Rows ``start:end`` of ``tensor`` as a contiguous tensor."""
+    tensor = _rows(tensor, start, end)
+    return tensor if tensor.is_contiguous() else tensor.contiguous()
+
+
 def _resolve_prefill_tile_max_seqlen_k(
     candidate_lens: torch.Tensor,
     candidate_lens_cpu: torch.Tensor | None,
@@ -171,10 +233,50 @@ def _resolve_prefill_tile_max_seqlen_k(
     max_seqlen_k: int | None,
 ) -> int:
     if candidate_lens_cpu is not None:
-        return int(candidate_lens_cpu[start:end].max().item())
+        return int(_rows(candidate_lens_cpu, start, end).max().item())
     if max_seqlen_k is not None:
         return int(max_seqlen_k)
     return int(candidate_lens[start:end].max().item())
+
+
+def _gather_index_rows(
+    index_k_cache: torch.Tensor,
+    kv_workspace_slots: torch.Tensor,
+    *,
+    head_dim: int,
+    page_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather page-planar FP8 index-K rows and scales into workspace-row order."""
+    num_groups = head_dim // 128
+    row_bytes = head_dim + num_groups * 4
+    flat = index_k_cache.reshape(-1)
+    fp8_view = torch.as_strided(
+        flat.view(torch.float8_e4m3fn),
+        (index_k_cache.shape[0] // int(page_size), int(page_size), head_dim),
+        (int(page_size) * row_bytes, head_dim, 1),
+    )
+    scale_view = torch.as_strided(
+        flat.view(torch.float32),
+        (index_k_cache.shape[0] // int(page_size), int(page_size), num_groups),
+        ((int(page_size) * row_bytes) // 4, num_groups, 1),
+        (int(page_size) * head_dim) // 4,
+    )
+    slots = kv_workspace_slots.to(device=index_k_cache.device, dtype=torch.long)
+    return (
+        fp8_view[slots // int(page_size), slots % int(page_size)],
+        scale_view[slots // int(page_size), slots % int(page_size)],
+    )
+
+
+# SM120 prepares a prefill chunk's scoring inputs with one Triton launch
+# (``dsa_prefill_prepare``) instead of about twenty framework ops: for chunks
+# of a few hundred tokens the leaf is bound by the host, and the fused launch
+# is what lets it beat the Triton leaf there. It computes the canonical
+# token-group FP8 scheme and the ``combine_topk_weights`` product directly, bit
+# for bit what ``quantize_fp8`` selects on SM120 (``test_dsa_prefill_prepare``);
+# other platforms' quantizers are not checked against it, so they keep the
+# framework ops.
+_FUSED_PREFILL_PREPARE = platform.arch_version.major == SM120_ARCH_MAJOR
 
 
 if platform.is_hopper_plus:
@@ -182,6 +284,18 @@ if platform.is_hopper_plus:
     import deep_ep  # noqa: F401
     import deep_gemm
     import trtllm_kernel  # noqa: F401
+
+    # DeepGEMM builds without SM120 kernels fail every indexer call there
+    # ("Unsupported architecture"), so they stop below SM120.
+    _DEEP_GEMM_CAPABILITY = CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 0),
+        max_arch_version=None if deepgemm_supports_sm120() else ArchVersion(10, 3),
+        vendors=frozenset({"nvidia"}),
+    )
+    # TRT-LLM's prefill top-k ships no SM120 kernel image
+    # (cudaErrorNoKernelImageForDevice), so SM120 selects over the same
+    # compressed logits with the portable Triton radix top-k.
+    _USE_TRTLLM_PREFILL_TOPK = platform.arch_version.major != SM120_ARCH_MAJOR
 
     def _deep_gemm_paged_mqa_plan(
         *,
@@ -227,10 +341,7 @@ if platform.is_hopper_plus:
         "dsa_plan",
         name="deep_gemm_dsa_plan",
         solution="deep_gemm",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
+        capability=_DEEP_GEMM_CAPABILITY,
         signatures=frozenset({format_signature()}),
         traits={
             "page_size": frozenset({64}),
@@ -256,10 +367,7 @@ if platform.is_hopper_plus:
         name="deep_gemm_dsa_decode_topk",
         solution="deep_gemm",
         features=_TOPK_FEATURES,
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
+        capability=_DEEP_GEMM_CAPABILITY,
         signatures=frozenset(
             {
                 format_signature(
@@ -390,6 +498,10 @@ if platform.is_hopper_plus:
         local_topk_offsets = torch.empty_like(out)
         if batch_invariant:
             _row_invariant_topk(logits, seq_lens_per_token, local_topk_offsets, topk)
+        elif _use_deepselect_decode_topk(logits_full, topk):
+            deepselect_local_topk(
+                logits_full, seq_lens_per_token, topk, local_topk_offsets
+            )
         elif _use_cute_dsl_decode_topk():
             # CuTe DSL cluster radix top-k: length-aware via seq_lens/q_len_per_req,
             # so no pre-masking needed; same local offsets as the ragged path.
@@ -434,10 +546,7 @@ if platform.is_hopper_plus:
         name="deep_gemm_dsa_prefill_topk",
         solution="deep_gemm",
         features=_PREFILL_TOPK_FEATURES,
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
+        capability=_DEEP_GEMM_CAPABILITY,
         signatures=frozenset(
             {
                 format_signature(
@@ -483,9 +592,9 @@ if platform.is_hopper_plus:
         batch_invariant: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        q = q.contiguous()
-        row_starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
-        row_ends = row_ends.to(device=q.device, dtype=torch.int32).contiguous()
+        q = _dense(q, q.device, q.dtype)
+        row_starts = _dense(row_starts, q.device, torch.int32)
+        row_ends = _dense(row_ends, q.device, torch.int32)
         tokens = q.shape[0]
         out, lens_out = _check_out(
             out,
@@ -494,64 +603,89 @@ if platform.is_hopper_plus:
             topk=topk,
             device=q.device,
         )
-        out.fill_(-1)
-
-        q, weights = _pad_index_heads(q, weights)
-        q_2d = q.view(-1, q.shape[-1])
-        q_fp8, q_scale = quantize_fp8(
-            q_2d,
-            granularity="token_group",
-            group_size=128,
-            scale_encoding="float32",
-        )
-        q_fp8 = q_fp8.view_as(q)
-        scaled_weights = combine_topk_weights(weights, q_scale, softmax_scale)
-        if index_k_fp8 is None or index_k_scale is None:
-            hd = q.shape[-1]
-            num_groups = hd // 128
-            row_bytes = hd + num_groups * 4
-            flat = index_k_cache.reshape(-1)
-            fp8_view = torch.as_strided(
-                flat.view(q_fp8.dtype),
-                (
-                    index_k_cache.shape[0] // int(page_size),
-                    int(page_size),
-                    hd,
-                ),
-                (int(page_size) * row_bytes, hd, 1),
-            )
-            scale_view = torch.as_strided(
-                flat.view(torch.float32),
-                (
-                    index_k_cache.shape[0] // int(page_size),
-                    int(page_size),
-                    num_groups,
-                ),
-                ((int(page_size) * row_bytes) // 4, num_groups, 1),
-                (int(page_size) * hd) // 4,
-            )
-            slots = kv_workspace_slots.to(device=q.device, dtype=torch.long)
-            index_k_fp8 = fp8_view[slots // int(page_size), slots % int(page_size)]
-            index_k_scale = scale_view[slots // int(page_size), slots % int(page_size)]
-        k_fp8 = (
-            index_k_fp8.view(q_fp8.dtype)
-            if index_k_fp8.dtype == torch.uint8
-            else index_k_fp8
-        )
-        kv_fp8 = (k_fp8.contiguous(), index_k_scale.squeeze(-1).contiguous())
-        candidate_lens = (row_ends - row_starts).clamp_min(0)
-        lens_out.copy_(
-            torch.minimum(candidate_lens, torch.full_like(candidate_lens, int(topk)))
-        )
         if tokens == 0:
             return out, lens_out
+
+        has_rows = index_k_fp8 is not None and index_k_scale is not None
+        if _FUSED_PREFILL_PREPARE:
+            from tokenspeed_kernel.ops.attention.dsa._triton.prefill_prepare import (
+                dsa_prefill_prepare,
+            )
+
+            # The kernel also gathers the keys of a page-planar plane it can
+            # address as bytes; other planes are gathered below.
+            gather = (
+                not has_rows
+                and index_k_cache.dtype == torch.uint8
+                and index_k_cache.is_contiguous()
+                and q.shape[-1] == 128
+            )
+            q_fp8, scaled_weights, candidate_lens, k_fp8, k_scale = dsa_prefill_prepare(
+                q,
+                weights if weights.stride(-1) == 1 else weights.contiguous(),
+                row_starts,
+                row_ends,
+                softmax_scale=softmax_scale,
+                topk=int(topk),
+                lens_out=lens_out,
+                out_heads=32 if q.shape[1] == 16 else q.shape[1],
+                index_k_cache=index_k_cache if gather else None,
+                kv_workspace_slots=(
+                    _dense(kv_workspace_slots, q.device, torch.long) if gather else None
+                ),
+                page_size=page_size,
+            )
+            if not gather:
+                k_fp8, k_scale = (
+                    (index_k_fp8, index_k_scale)
+                    if has_rows
+                    else _gather_index_rows(
+                        index_k_cache,
+                        kv_workspace_slots,
+                        head_dim=q.shape[-1],
+                        page_size=page_size,
+                    )
+                )
+                k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+                k_scale = k_scale.squeeze(-1).contiguous()
+            kv_fp8 = (k_fp8.contiguous(), k_scale)
+        else:
+            q, weights = _pad_index_heads(q, weights)
+            q_2d = q.view(-1, q.shape[-1])
+            q_fp8, q_scale = quantize_fp8(
+                q_2d,
+                granularity="token_group",
+                group_size=128,
+                scale_encoding="float32",
+            )
+            q_fp8 = q_fp8.view_as(q)
+            scaled_weights = combine_topk_weights(weights, q_scale, softmax_scale)
+            if not has_rows:
+                index_k_fp8, index_k_scale = _gather_index_rows(
+                    index_k_cache,
+                    kv_workspace_slots,
+                    head_dim=q.shape[-1],
+                    page_size=page_size,
+                )
+            k_fp8 = (
+                index_k_fp8.view(q_fp8.dtype)
+                if index_k_fp8.dtype == torch.uint8
+                else index_k_fp8
+            )
+            kv_fp8 = (k_fp8.contiguous(), index_k_scale.squeeze(-1).contiguous())
+            candidate_lens = (row_ends - row_starts).clamp_min(0)
+            lens_out.copy_(
+                torch.minimum(
+                    candidate_lens, torch.full_like(candidate_lens, int(topk))
+                )
+            )
 
         seq_len_sum = max(int(kv_workspace_slots.numel()), 1)
         if max_logits_bytes is None:
             max_query_rows = tokens
         else:
             max_query_rows = max(1, int(max_logits_bytes) // (seq_len_sum * 4))
-        local_starts_i32 = torch.zeros_like(row_starts)
+        local_starts_i32 = None
         for start in range(0, tokens, max_query_rows):
             end = min(start + max_query_rows, tokens)
             tile_max_seqlen_k = _resolve_prefill_tile_max_seqlen_k(
@@ -564,11 +698,11 @@ if platform.is_hopper_plus:
             if deep_gemm.get_pdl() != pdl_enabled():
                 deep_gemm.set_pdl(pdl_enabled())
             logits = deep_gemm.fp8_mqa_logits(
-                q_fp8[start:end].contiguous(),
+                _tile_rows(q_fp8, start, end),
                 kv_fp8,
-                scaled_weights[start:end].contiguous(),
-                row_starts[start:end],
-                row_ends[start:end],
+                _tile_rows(scaled_weights, start, end),
+                _tile_rows(row_starts, start, end),
+                _tile_rows(row_ends, start, end),
                 clean_logits=False,
                 max_seqlen_k=max(tile_max_seqlen_k, 1),
             )
@@ -577,25 +711,54 @@ if platform.is_hopper_plus:
             )
             mark_forced_initial_local_logits(
                 logits,
-                candidate_lens[start:end],
+                _rows(candidate_lens, start, end),
                 initial_tokens=initial_tokens,
                 local_tokens=local_tokens,
             )
+            tile_out = _rows(out, start, end)
+            tile_starts = _rows(row_starts, start, end)
+            if not batch_invariant and deepselect_supports(logits, int(topk)):
+                # Reports workspace rows directly: local offset + row start.
+                deepselect_local_topk(
+                    logits,
+                    _rows(candidate_lens, start, end),
+                    topk,
+                    tile_out,
+                    index_base=tile_starts,
+                )
+                continue
             if batch_invariant:
-                tile_lens = candidate_lens[start:end]
-                tile_out = out[start:end]
+                tile_lens = _rows(candidate_lens, start, end)
+                tile_out.fill_(-1)
                 _row_invariant_topk(logits, tile_lens, tile_out, topk)
                 tile_out.masked_fill_(tile_out >= tile_lens.view(-1, 1), -1)
-            else:
+            elif _USE_TRTLLM_PREFILL_TOPK:
+                if local_starts_i32 is None:
+                    local_starts_i32 = torch.zeros_like(row_starts)
+                tile_out.fill_(-1)
                 torch.ops.trtllm.indexer_topk_prefill(
                     logits.contiguous(),
                     local_starts_i32[start:end],
-                    candidate_lens[start:end].to(torch.int32).contiguous(),
-                    out[start:end],
+                    _rows(candidate_lens, start, end).to(torch.int32).contiguous(),
+                    tile_out,
                     int(topk),
                 )
-        valid = out >= 0
-        out.copy_(torch.where(valid, out + row_starts.unsqueeze(1), out))
+            else:
+                # Same local offsets (and -1 padding) as the TRT-LLM kernel
+                tile_out.copy_(
+                    triton_topk_from_logits(
+                        logits,
+                        int(topk),
+                        seq_lens=_rows(candidate_lens, start, end),
+                        enable_pdl=pdl_enabled(),
+                    )
+                )
+            # These selectors report offsets local to the row's start
+            tile_out.copy_(
+                torch.where(
+                    tile_out >= 0, tile_out + tile_starts.unsqueeze(1), tile_out
+                )
+            )
         return out, lens_out
 
 
@@ -607,9 +770,7 @@ if platform.is_hopper_plus:
         name="deep_gemm_dsa_index_candidates",
         solution="deep_gemm",
         priority=Priority.PERFORMANT,
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0), vendors=frozenset({"nvidia"})
-        ),
+        capability=_DEEP_GEMM_CAPABILITY,
         signatures=frozenset(
             {
                 format_signature(
@@ -690,5 +851,14 @@ if platform.is_hopper_plus:
             initial_tokens,
             local_tokens,
         )
-        offsets = candidate_topk_offsets(logits, topk)
+        if deepselect_supports(logits, int(topk)):
+            # Selects among each row's own compact candidates (`lengths`); a
+            # short row yields all of them, then -1. Scores masked to -inf
+            # inside the length may be selected too; the gather drops them.
+            offsets = torch.empty(
+                (logits.shape[0], int(topk)), dtype=torch.int32, device=logits.device
+            )
+            deepselect_local_topk(logits, lengths.view(-1), topk, offsets)
+        else:
+            offsets = candidate_topk_offsets(logits, topk)
         return gather_index_candidates(offsets, logits, positions, page_size)

@@ -274,8 +274,10 @@ class TestGdnTokenLevelHitResumeTest:
             backend, conv, recurrent = self._backend()
             X = list(range(PROMPT))
 
-            # Cold X: the prefill and the decodes the scheduler plans.
-            self._submit(scheduler, "a", X, DECODES)
+            # Cold X: the prefill and the decodes the scheduler plans. The
+            # prefill emits a token too, and the scheduler plans no step past
+            # the declared budget, so DECODES decodes take DECODES + 1 tokens.
+            self._submit(scheduler, "a", X, DECODES + 1)
             cold_prefill, cold_output = self._forward(scheduler, backend)
             cold_state_block = int(
                 cold_prefill.block_tables_arrays()["linear_attention"][0][1]
@@ -292,11 +294,12 @@ class TestGdnTokenLevelHitResumeTest:
                 self._land(scheduler, "a", 1000 + step)
             self._finish(scheduler, "a")
 
-            # X[:-1] with one token to generate, as the engine runs it: the
-            # prefill (the junction cut ends its first chunk at the cold run's
-            # KV pages, so there are two), the decode the scheduler plans
-            # before the last chunk lands, then the landing and the finish.
-            self._submit(scheduler, "c", X[:-1], 1)
+            # X[:-1] with two tokens to generate: the prefill (the junction
+            # cut ends its first chunk at the cold run's KV pages, so there
+            # are two), the decode the scheduler plans before the last chunk
+            # lands (a budget of one would end at the prefill), then the
+            # landing and the finish.
+            self._submit(scheduler, "c", X[:-1], 2)
             chunks = []
             while True:
                 short_prefill, short_output = self._forward(scheduler, backend)

@@ -1109,6 +1109,173 @@ def mxfp4_quantize(
     return out, scales
 
 
+@triton.jit
+def _mxfp4_quantize_tile(x):
+    """Quantize ``x[BM, 4, 32]`` to MXFP4 per last-dim group of 32.
+
+    Same numerics as ``_mxfp4_quantize_block``; returns packed ``[BM, 4, 16]``
+    uint8 and the UE8M0 scale byte ``[BM, 4]``.
+    """
+    max_normal: tl.constexpr = 6
+    min_normal: tl.constexpr = 1
+    amax = tl.max(tl.abs(x), axis=2)
+    amax = amax.to(tl.int32, bitcast=True)
+    amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    amax = amax.to(tl.float32, bitcast=True)
+    scale_e8m0_unbiased = tl.log2(amax).floor() - 2
+    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+    scale_byte = scale_e8m0_unbiased.to(tl.uint8) + 127
+    qx = x * tl.exp2(-scale_e8m0_unbiased)[:, :, None]
+    qx = qx.to(tl.uint32, bitcast=True)
+
+    sign = qx & 0x80000000
+    qx = qx ^ sign
+    qx_fp32 = qx.to(tl.float32, bitcast=True)
+    saturate_mask = qx_fp32 >= max_normal
+    denormal_mask = (not saturate_mask) & (qx_fp32 < min_normal)
+    normal_mask = not (saturate_mask | denormal_mask)
+
+    denorm_exp: tl.constexpr = (127 - 1) + (23 - 1) + 1
+    denorm_mask_int: tl.constexpr = denorm_exp << 23
+    denorm_mask_float: tl.constexpr = tl.cast(denorm_mask_int, tl.float32, bitcast=True)
+    denormal_x = qx_fp32 + denorm_mask_float
+    denormal_x = denormal_x.to(tl.uint32, bitcast=True)
+    denormal_x -= denorm_mask_int
+    denormal_x = denormal_x.to(tl.uint8)
+
+    normal_x = qx
+    mant_odd = (normal_x >> (23 - 1)) & 1
+    normal_x += 0xC11FFFFF
+    normal_x += mant_odd
+    normal_x = normal_x >> (23 - 1)
+    normal_x = normal_x.to(tl.uint8)
+
+    e2m1 = tl.full(x.shape, 0x7, dtype=tl.uint8)
+    e2m1 = tl.where(normal_mask, normal_x, e2m1)
+    e2m1 = tl.where(denormal_mask, denormal_x, e2m1)
+    sign_lp = (sign >> (23 + 8 - 1 - 2)).to(tl.uint8)
+    e2m1 = e2m1 | sign_lp
+    e2m1 = tl.reshape(e2m1, [x.shape[0], 4, 16, 2])
+    evens, odds = tl.split(e2m1)
+    return evens | (odds << 4), scale_byte
+
+
+@triton.jit(do_not_specialize=["M", "aligned_m"])
+def _mxfp4_quantize_mn_major_kernel(
+    x_ptr,
+    out_ptr,
+    sf_ptr,
+    M,
+    aligned_m,
+    x_row_stride,
+    out_row_stride,
+    BLOCK_M: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = offs_m < M
+    offs_g = tl.arange(0, 4)
+    offs_e = tl.arange(0, 32)
+    # Wait for the producer of x, then let the GEMM that consumes the output
+    # launch and prefetch its weights while we run. It waits for our completion
+    # before reading the activations and scales.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    offs_k = pid_k * 128 + offs_g[:, None] * 32 + offs_e[None, :]
+    x = tl.load(
+        x_ptr + offs_m[:, None, None] * x_row_stride + offs_k[None, :, :],
+        mask=m_mask[:, None, None],
+        other=0.0,
+    ).to(tl.float32)
+    packed, scale_byte = _mxfp4_quantize_tile(x)
+    offs_p = pid_k * 64 + offs_g[:, None] * 16 + tl.arange(0, 16)[None, :]
+    tl.store(
+        out_ptr + offs_m[:, None, None] * out_row_stride + offs_p[None, :, :],
+        packed,
+        mask=m_mask[:, None, None],
+    )
+    # The four group bytes of a 128-wide K block form one int32 word; words are
+    # laid out MN-major with ``aligned_m`` words per K block.
+    sf_offs = (pid_k * aligned_m + offs_m[:, None]) * 4 + offs_g[None, :]
+    tl.store(sf_ptr + sf_offs, scale_byte, mask=m_mask[:, None])
+
+
+# Largest quantizer grid launched with PDL. A bigger grid runs as a plain kernel:
+# its blocks, launched while the previous GEMM is finishing, wait on that GEMM
+# and take SMs from it (up to 18% slower at M = 4096, K = 7168). Measured on RTX
+# PRO 6000 (188 SMs) with the SM120 MXFP4 GEMM as the consumer.
+_MXFP4_QUANT_PDL_MAX_BLOCKS = 1024
+
+# (dtype, device index) pairs whose PDL and plain variants are both compiled.
+_mn_major_variants_compiled: set[tuple[torch.dtype, int]] = set()
+
+
+def _launch_mn_major_quantize(
+    x: torch.Tensor, out: torch.Tensor, sf: torch.Tensor, pdl: bool
+) -> None:
+    m, k = x.shape
+    block_m = 8
+    _mxfp4_quantize_mn_major_kernel[(triton.cdiv(m, block_m), k // 128)](
+        x,
+        out,
+        sf.view(torch.uint8),
+        m,
+        sf.shape[1],
+        x.stride(0),
+        out.stride(0),
+        BLOCK_M=block_m,
+        ENABLE_PDL=pdl,
+        num_warps=4,
+        **({"launch_pdl": True} if pdl else {}),
+    )
+
+
+def mxfp4_quantize_mn_major_scales(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a BF16/FP16 ``[M, K]`` tensor to MXFP4 with MN-major packed scales.
+
+    Same values as ``mxfp4_quantize``, but the UE8M0 scales are written directly
+    in the layout DeepGEMM's SM120 MXFP4 GEMM reads: four consecutive K-group
+    bytes per int32 word, MN-major, with M aligned up to a multiple of 4.
+
+    Args:
+        x: ``[M, K]`` BF16/FP16 with unit inner stride and K divisible by 128.
+
+    Returns:
+        Packed E2M1 uint8 ``[M, K/2]`` and int32 scales ``[M, K/128]`` with
+        strides ``(1, align4(M))``.
+    """
+    assert x.dtype in (torch.bfloat16, torch.float16) and x.ndim == 2
+    assert x.stride(-1) == 1
+    m, k = x.shape
+    if k % 128 != 0:
+        raise ValueError("mxfp4_quantize_mn_major_scales requires K divisible by 128")
+    aligned_m = (m + 3) // 4 * 4
+    out = torch.empty((m, k // 2), dtype=torch.uint8, device=x.device)
+    # Rows beyond M in the alignment padding are never read into the output.
+    sf = torch.empty((k // 128, aligned_m), dtype=torch.int32, device=x.device)
+    use_pdl = pdl_enabled() and triton.cdiv(m, 8) * (k // 128) <= (
+        _MXFP4_QUANT_PDL_MAX_BLOCKS
+    )
+    if pdl_enabled():
+        # The PDL and plain launches are separate binaries; compile both on the
+        # first call so a later batch size never compiles one mid-serving.
+        key = (x.dtype, x.device.index)
+        if key not in _mn_major_variants_compiled:
+            _mn_major_variants_compiled.add(key)
+            probe = x[:1, :128].contiguous()
+            probe_out = torch.empty((1, 64), dtype=torch.uint8, device=x.device)
+            probe_sf = torch.empty((1, 4), dtype=torch.int32, device=x.device)
+            for pdl in (True, False):
+                _launch_mn_major_quantize(probe, probe_out, probe_sf, pdl)
+    _launch_mn_major_quantize(x, out, sf, use_pdl)
+    return out, sf.T[:m]
+
+
 @register_kernel(
     "quantization",
     "mxfp4",
@@ -1792,3 +1959,98 @@ def _quantize_fp8_group32_swizzled(
             num_stages=1,
         )
     return quantized, scales
+
+
+@triton.jit(do_not_specialize=["M", "aligned_m", "X0"])
+def _fp8_group32_ue8m0_quantize_mn_major(
+    X,
+    Q,
+    S,
+    M,
+    aligned_m,
+    X0,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    # One program: BLOCK_M rows x one 128-wide K block (four groups of 32).
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = rows < M
+    groups = tl.arange(0, 4)
+    columns = pid_k * 128 + groups[:, None] * 32 + tl.arange(0, 32)[None, :]
+    values = tl.load(
+        X + rows[:, None, None].to(tl.int64) * X0 + columns[None, :, :],
+        mask=row_mask[:, None, None],
+        other=0.0,
+    ).to(tl.float32)
+    # Same arithmetic as ``_fp8_group32_ue8m0_quantize``.
+    amax = tl.maximum(tl.max(tl.abs(values), 2), 1.0e-4)
+    raw = amax * (1.0 / 448.0)
+    bits = raw.to(tl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    scale = (exponent << 23).to(tl.float32, bitcast=True)
+    inverse_scale = 1.0 / scale
+    quantized = (values * inverse_scale[:, :, None]).to(tl.float8e4nv)
+    tl.store(
+        Q + rows[:, None, None].to(tl.int64) * K + columns[None, :, :],
+        quantized,
+        mask=row_mask[:, None, None],
+    )
+    # The four group bytes of a K block form one int32 word, MN-major, with
+    # ``aligned_m`` words per K block; rows of the alignment padding store 0.
+    offsets = (pid_k * aligned_m + rows[:, None]).to(tl.int64) * 4 + groups[None, :]
+    tl.store(
+        S + offsets,
+        tl.where(row_mask[:, None], exponent, 0).to(tl.uint8),
+        mask=rows[:, None] < aligned_m,
+    )
+
+
+def quantize_fp8_group32_mn_major_scales(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``[M, K]`` to E4M3 with UE8M0 scales per 32 K, packed MN-major.
+
+    Same codes and scale bytes as ``triton_quantize_fp8_group32_ue8m0``, with
+    the scales written in the layout DeepGEMM's SM120 block-scaled GEMM reads
+    (four K-group bytes per int32 word, MN-major, M aligned up to 4).
+
+    Args:
+        x: BF16/FP16 ``[M, K]`` with unit inner stride and K divisible by 128.
+
+    Returns:
+        E4M3 ``[M, K]`` and int32 scales ``[M, K/128]`` with strides
+        ``(1, align4(M))``.
+    """
+    if (
+        x.ndim != 2
+        or x.dtype not in (torch.bfloat16, torch.float16)
+        or x.stride(1) != 1
+        or x.shape[1] % 128
+    ):
+        raise ValueError(
+            "group-32 MN-major FP8 quantization requires 16-bit [M, K] with unit "
+            "inner stride and K divisible by 128"
+        )
+    m, k = x.shape
+    aligned_m = (m + 3) // 4 * 4
+    quantized = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty((k // 128, aligned_m), dtype=torch.int32, device=x.device)
+    if aligned_m:
+        block_m = 4
+        _fp8_group32_ue8m0_quantize_mn_major[
+            (triton.cdiv(aligned_m, block_m), k // 128)
+        ](
+            x,
+            quantized,
+            scales.view(torch.uint8),
+            m,
+            aligned_m,
+            x.stride(0),
+            K=k,
+            BLOCK_M=block_m,
+            num_warps=2,
+            num_stages=1,
+        )
+    return quantized, scales.T[:m]

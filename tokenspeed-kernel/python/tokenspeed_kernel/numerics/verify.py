@@ -20,7 +20,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from contextlib import contextmanager
+from typing import Any, Iterable, Iterator
 
 import torch
 from tokenspeed_kernel.numerics.comparison import (
@@ -52,6 +53,34 @@ import tokenspeed_kernel.numerics.moe  # noqa: F401
 import tokenspeed_kernel.numerics.quantize  # noqa: F401
 
 __all__ = ["verify_kernel"]
+
+
+@contextmanager
+def _exact_accumulation_reference() -> Iterator[None]:
+    """Run reference kernels with full-precision reductions.
+
+    cuBLAS may split K for skinny GEMMs and add the partial sums in BF16 / FP16
+    (``allow_*_reduced_precision_reduction``, on by default). That makes the
+    reference off by about one ulp of a partial sum, which dwarfs a small
+    output (SM120, M <= 16, K = 7168: 120-2300 elements of a 2048-8192 output
+    differ from the correctly rounded result by up to 2.0, while an FP32
+    reference differs by at most 0.03). The GEMM tolerance assumes FP32
+    accumulation, so the reference must provide it.
+    """
+    matmul = torch.backends.cuda.matmul
+    saved = (
+        matmul.allow_bf16_reduced_precision_reduction,
+        matmul.allow_fp16_reduced_precision_reduction,
+    )
+    matmul.allow_bf16_reduced_precision_reduction = False
+    matmul.allow_fp16_reduced_precision_reduction = False
+    try:
+        yield
+    finally:
+        (
+            matmul.allow_bf16_reduced_precision_reduction,
+            matmul.allow_fp16_reduced_precision_reduction,
+        ) = saved
 
 
 def _as_tolerance_fn(override: ToleranceOverride | None) -> ToleranceFn | None:
@@ -160,7 +189,8 @@ def verify_kernel(
             continue
 
         inputs = generator.generate(**shape)
-        expected = ref_kernel(**inputs)
+        with _exact_accumulation_reference():
+            expected = ref_kernel(**inputs)
         actual = kernel(**inputs)
 
         if not isinstance(actual, torch.Tensor) or not isinstance(

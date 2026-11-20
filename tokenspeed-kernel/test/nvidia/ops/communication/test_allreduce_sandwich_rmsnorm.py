@@ -49,6 +49,7 @@ import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.communication import torch_sandwich_norm
 from tokenspeed_kernel.platform import current_platform
+from torch.utils.cpp_extension import CUDA_HOME
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_nvidia, reason="the MNNVL all-reduce is NVIDIA only"
@@ -58,6 +59,20 @@ F32 = np.float32
 KERNEL_ROOT = Path(__file__).resolve().parents[4]  # tokenspeed-kernel/
 CSRC = KERNEL_ROOT / "python/tokenspeed_kernel/thirdparty/cuda/csrc"
 HEADER = CSRC / "include/flashinfer/comm/trtllm_mnnvl_sandwich_norm.cuh"
+
+
+def _cuobjdump() -> str | None:
+    """The CUDA toolkit's disassembler: on PATH, else in the toolkit PyTorch
+    builds extensions with. A PATH that lacks the toolkit (a venv-only PATH)
+    must not turn these checks into silent skips."""
+    found = shutil.which("cuobjdump")
+    if found is not None:
+        return found
+    if CUDA_HOME is None:
+        return None
+    return shutil.which("cuobjdump", path=str(Path(CUDA_HOME) / "bin"))
+
+
 FUSION_HEADER = CSRC / "include/flashinfer/comm/trtllm_allreduce_fusion.cuh"
 BINDING = CSRC / "trtllm_mnnvl_sandwich_norm.cu"
 
@@ -421,14 +436,25 @@ def _compile_triton_rmsnorm(hidden: int, residual: bool):
     return _compile_for_sm100(_rmsnorm_kernel, signature, constexprs, attrs, **options)
 
 
+def test_cuobjdump_is_found_when_the_toolkit_is_not_on_path(monkeypatch):
+    """Seven SASS checks skipped for a missing disassembler on hosts whose PATH
+    lacked the toolkit while it was installed."""
+    installed = Path(CUDA_HOME or "/nonexistent") / "bin" / "cuobjdump"
+    if not installed.exists():
+        pytest.skip("no CUDA toolkit with cuobjdump here")
+    monkeypatch.setenv("PATH", "")
+    assert _cuobjdump() == str(installed)
+
+
 @pytest.mark.parametrize("hidden", [1024, 4096, 7168])
 @pytest.mark.parametrize("residual", [False, True])
 def test_triton_rmsnorm_compiles_to_the_pinned_arithmetic(tmp_path, hidden, residual):
     """ptxas folds the Triton kernel's mean and epsilon into
     FFMA(s, RN(1 / hidden), eps) before MUFU.RSQ, and no FP32 operation but
     rsqrt flushes subnormals: the operations the epilogue reproduces."""
-    if shutil.which("cuobjdump") is None:
-        pytest.skip("cuobjdump is not on PATH")
+    cuobjdump = _cuobjdump()
+    if cuobjdump is None:
+        pytest.skip("cuobjdump is on neither PATH nor the CUDA toolkit")
     _skip_unless_triton_compiles_for_sm100()
     kernel = _compile_triton_rmsnorm(hidden, residual)
     ptx = kernel.asm["ptx"]
@@ -437,7 +463,7 @@ def test_triton_rmsnorm_compiles_to_the_pinned_arithmetic(tmp_path, hidden, resi
     cubin = tmp_path / "k.cubin"
     cubin.write_bytes(kernel.asm["cubin"])
     sass = subprocess.run(
-        ["cuobjdump", "-sass", str(cubin)], capture_output=True, text=True, check=True
+        [cuobjdump, "-sass", str(cubin)], capture_output=True, text=True, check=True
     ).stdout
     lines = [ln for ln in sass.splitlines() if re.search(r"/\*[0-9a-f]{4}\*/", ln)]
     rsq = next(i for i, ln in enumerate(lines) if "MUFU.RSQ" in ln)
@@ -472,10 +498,11 @@ def test_two_shot_kernels_fit_two_ctas_of_21_warps_per_sm():
         KERNEL_ROOT
         / "python/tokenspeed_kernel/thirdparty/cuda/objs/trtllm_comm/trtllm_comm.so"
     )
-    if shutil.which("cuobjdump") is None or not so.exists():
+    cuobjdump = _cuobjdump()
+    if cuobjdump is None or not so.exists():
         pytest.skip("needs the built trtllm_comm.so and cuobjdump")
     usage = subprocess.run(
-        ["cuobjdump", "--dump-resource-usage", str(so)],
+        [cuobjdump, "--dump-resource-usage", str(so)],
         capture_output=True,
         text=True,
         check=True,

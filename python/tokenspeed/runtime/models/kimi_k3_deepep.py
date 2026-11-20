@@ -117,6 +117,7 @@ class KimiLinearMoEDeepEP(nn.Module):
             },
             routing_mode="precomputed_topk",
             internal_activation_dtype_override="input",
+            ep_token_layout=None,
         )
 
         self.topk = TopK(

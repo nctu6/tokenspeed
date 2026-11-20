@@ -307,7 +307,10 @@ def test_registered_pool_and_router_bind_distinct_leaf_geometries(monkeypatch):
     router.set_cache_pool(pool)
     assert isinstance(router.leaves["dsa"], DSABackend)
     assert isinstance(router.leaves["swa"], MLAAttnBackend)
-    assert router.leaves["dsa"].kernel_solution == "triton"
+    # No solution pin: the leaf asks selection for cores that read the strided
+    # latent cache in place, and the default DSA leaf asks for nothing.
+    assert router.leaves["dsa"].kernel_solution is None
+    assert router.leaves["dsa"].core_features == {"strided_kv_cache"}
     # The dots override must not change the default used by other DSA models.
     from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
         TRTLLMMLABackend,
@@ -317,6 +320,7 @@ def test_registered_pool_and_router_bind_distinct_leaf_geometries(monkeypatch):
         recipe.attn_config, recipe.attn_config.components[0], kernel_page_size=64
     )
     assert isinstance(standard._dense_backend, TRTLLMMLABackend)
+    assert standard.core_features == frozenset()
     assert router.leaves["dsa"].kernel_page_size == 64
     assert router.leaves["swa"].kernel_page_size == 32
     assert router.leaves["dsa"].kv_lora_rank == 512

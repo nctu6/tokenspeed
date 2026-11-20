@@ -419,6 +419,8 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
     owner = object.__new__(PrefillGraph)
     # KDA has no CED narrowing; the split encoder/decoder capture stays off.
     owner._narrowing = None
+    # replay() counts every forward it serves (see PrefillGraph.__init__).
+    owner._stats = {"replay": 0, "mixed_replay": 0, "eager": 0, "real": 0, "padded": 0}
     owner.config = SimpleNamespace(
         global_rank=1,
         context_len=bucket,
@@ -538,6 +540,8 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner = object.__new__(PrefillGraph)
     # KDA has no CED narrowing; the split encoder/decoder capture stays off.
     owner._narrowing = None
+    # replay() counts every forward it serves (see PrefillGraph.__init__).
+    owner._stats = {"replay": 0, "mixed_replay": 0, "eager": 0, "real": 0, "padded": 0}
     owner._expert_load_rows = None
     owner._captures = {
         (8, None): (capture("ordinary"), CapturedForward(torch.ones(8, 4), None)),
@@ -604,6 +608,8 @@ def test_request_bucket_selection_reserves_dummy_scan_tokens(bs, tokens, expecte
     owner = object.__new__(PrefillGraph)
     # KDA has no CED narrowing; the split encoder/decoder capture stays off.
     owner._narrowing = None
+    # replay() counts every forward it serves (see PrefillGraph.__init__).
+    owner._stats = {"replay": 0, "mixed_replay": 0, "eager": 0, "real": 0, "padded": 0}
     owner.disable = False
     owner.dp_size = 1
     owner.attn_backend = SimpleNamespace(step_counter=None)
@@ -663,6 +669,8 @@ def test_outer_capture_records_one_variant_per_configured_request_count():
     owner = object.__new__(PrefillGraph)
     # KDA has no CED narrowing; the split encoder/decoder capture stays off.
     owner._narrowing = None
+    # replay() counts every forward it serves (see PrefillGraph.__init__).
+    owner._stats = {"replay": 0, "mixed_replay": 0, "eager": 0, "real": 0, "padded": 0}
     owner.config = SimpleNamespace(
         global_rank=1,
         context_len=16,

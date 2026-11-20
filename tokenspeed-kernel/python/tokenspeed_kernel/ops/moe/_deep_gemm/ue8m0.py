@@ -55,8 +55,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# First architecture whose only DeepGEMM FP8 block-scale kernel is ``1d1d``.
+# Datacenter Blackwell (SM100 family), whose only DeepGEMM FP8 block-scale
+# kernel is ``1d1d``. SM120 DeepGEMM kernels read FP32 scales like SM90.
 _UE8M0_MIN_ARCH = ArchVersion(10, 0)
+_UE8M0_MAX_ARCH = ArchVersion(10, 9)
 _FP8_MAX = 448.0
 _DISABLE_ENV = "TOKENSPEED_DISABLE_DEEP_GEMM_UE8M0"
 
@@ -65,14 +67,18 @@ def deep_gemm_requires_ue8m0() -> bool:
     """Whether DeepGEMM on this device reads block scales as UE8M0.
 
     Returns:
-        True on sm100+ NVIDIA devices, where DeepGEMM only offers the ``1d1d``
-        FP8 kernel. Set ``TOKENSPEED_DISABLE_DEEP_GEMM_UE8M0=1`` to opt out (for
+        True on sm100-family NVIDIA devices, where DeepGEMM only offers the
+        ``1d1d`` FP8 kernel; False on sm90 and sm120, whose kernels read FP32
+        scales. Set ``TOKENSPEED_DISABLE_DEEP_GEMM_UE8M0=1`` to opt out (for
         example to compare against the unconverted checkpoint).
     """
     if os.environ.get(_DISABLE_ENV) == "1":
         return False
     platform = current_platform()
-    return platform.is_nvidia and platform.arch_version >= _UE8M0_MIN_ARCH
+    return (
+        platform.is_nvidia
+        and _UE8M0_MIN_ARCH <= platform.arch_version <= _UE8M0_MAX_ARCH
+    )
 
 
 def is_ue8m0(scale: torch.Tensor) -> bool:

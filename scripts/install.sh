@@ -66,6 +66,17 @@
 # Building the gateway needs a Rust toolchain, protoc, and maturin -- install.sh
 # installs them if missing.
 #
+# DeepGEMM is a git submodule too (DeepGEMM/, with its own cutlass + deep_jit
+# submodules). It carries the SM120 FP8 GEMM / MQA-logits kernels the published
+# tokenspeed-deepgemm wheel lacks. This is AUTOMATIC: on an SM120 GPU (detected
+# from the hardware) it is built from source and REPLACES the wheel (both
+# install the `deep_gemm` import package); on any other GPU the wheel is kept,
+# because the source build only helps SM120. No flag is needed. The engine
+# install re-pulls the pinned wheel through tokenspeed-kernel's requirements,
+# so this step runs after the engine/kernel steps. Force it on any GPU (or an
+# off-box SM120 build) with:
+#   ./scripts/install.sh --force-deepgemm   (or REINSTALL_DEEPGEMM=1, FORCE_SM120=1)
+#
 # VENV SELECTION. If a venv is ALREADY active, this script installs INTO it
 # instead of creating a second one. "Active" is detected from the interpreter
 # (sys.prefix != sys.base_prefix), so it works both when the venv was entered
@@ -112,6 +123,8 @@ REINSTALL_KERNEL="${REINSTALL_KERNEL:-0}"
 # REINSTALL_SMG forces just the smg gateway (Rust) to rebuild from local source
 # -- use after editing smg/ (e.g. the best_of+stream validator fix).
 REINSTALL_SMG="${REINSTALL_SMG:-0}"
+# REINSTALL_DEEPGEMM forces DeepGEMM to rebuild from the DeepGEMM/ submodule.
+REINSTALL_DEEPGEMM="${REINSTALL_DEEPGEMM:-0}"
 # REINSTALL_FA2 forces a rebuild of the (opt-in) vllm_flash_attn FA2 path.
 # BUILD_FA2 opts into building it at all -- it is OFF by default because it is
 # an optional prefill speedup whose upstream package can shadow the FA4
@@ -127,6 +140,7 @@ for arg in "$@"; do
         --force) REINSTALL=1 ;;
         --force-kernel) REINSTALL_KERNEL=1 ;;
         --force-smg) REINSTALL_SMG=1 ;;
+        --force-deepgemm) REINSTALL_DEEPGEMM=1 ;;
         --force-fa2) REINSTALL_FA2=1 ;;
         --with-fa2) BUILD_FA2=1 ;;
         --force-diffusion) REINSTALL_DIFFUSION=1 ;;
@@ -158,6 +172,48 @@ for d in python tokenspeed-kernel/python tokenspeed-scheduler; do
     fi
 done
 
+# --- SM120 (consumer/workstation Blackwell) auto-detection -------------------
+# The published tokenspeed-deepgemm wheel has no SM120 FP8 GEMM / MQA-logits
+# kernels, so on an SM120 GPU we build DeepGEMM from the submodule instead
+# (faster dense decode + the DeepSeek V3.2 indexer). On any other GPU the
+# source build buys nothing, so we keep the pinned wheel. This is decided
+# automatically from the hardware -- the user passes no flag. --force-deepgemm
+# still forces the source build on any GPU for debugging.
+#
+# Detection order (first that answers wins): the device compute capability from
+# nvidia-smi, else torch's view of device 0. A build host with no visible GPU
+# (common in CI) returns "unknown" and we leave DeepGEMM on the wheel; override
+# with --force-deepgemm or FORCE_SM120=1 when building for SM120 off-box.
+# HAVE_SM120_GPU: 1 (SM120), 0 (not SM120 / no GPU visible). FORCE_SM120=1
+# forces 1. Detection is from nvidia-smi here (it runs before the venv is
+# resolved, so torch is not importable yet); detect_sm120_gpu is re-tried with
+# torch's view once $PY exists, for hosts without nvidia-smi.
+HAVE_SM120_GPU="${FORCE_SM120:-0}"
+SM120_DETECTED="$HAVE_SM120_GPU"  # "", 0, or 1 once a probe has answered
+detect_sm120_gpu() {
+    [[ "$HAVE_SM120_GPU" == "1" ]] && return 0
+    local cap=""
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        # "12.0" for RTX PRO 6000 / RTX 50-series; take device 0.
+        cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' || true)"
+    fi
+    if [[ -z "$cap" && -n "${PY:-}" && -x "${PY:-}" ]]; then
+        cap="$("$PY" - <<'PY' 2>/dev/null || true
+import torch
+if torch.cuda.is_available():
+    major, minor = torch.cuda.get_device_capability(0)
+    print(f"{major}.{minor}")
+PY
+)"
+    fi
+    [[ -n "$cap" ]] && SM120_DETECTED=1  # a probe answered; treat as conclusive
+    # SM120 family is major 12 (12.0 workstation, 12.x consumer).
+    [[ "$cap" == 12.* ]]
+}
+if detect_sm120_gpu; then
+    HAVE_SM120_GPU=1
+fi
+
 # The smg gateway is tracked as a git submodule (see .gitmodules). If this is a
 # git checkout and the submodule has not been populated yet (fresh `git clone`
 # without --recurse-submodules leaves smg/ empty), initialize it so the gateway
@@ -171,6 +227,28 @@ if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/n
         git submodule update --init --recursive smg || \
             err "git submodule update --init smg failed; the smg gateway will not be built from source."
     fi
+    # DeepGEMM is built from source only where it helps: an SM120 GPU, or a
+    # forced/off-box SM120 build. Elsewhere the pinned wheel is kept, so we do
+    # not pull its cutlass + deep_jit submodules. --recursive because it needs
+    # them. No-op when DeepGEMM/ is already populated (rsync'd tree).
+    if [[ "$HAVE_SM120_GPU" == "1" || "$REINSTALL_DEEPGEMM" == "1" ]] \
+        && grep -q '\[submodule "DeepGEMM"\]' .gitmodules 2>/dev/null \
+        && [[ ! -f DeepGEMM/setup.py || ! -d DeepGEMM/third-party/cutlass/include \
+              || ! -d DeepGEMM/third-party/deep_jit/include ]]; then
+        log "SM120 GPU detected (or forced): initializing the DeepGEMM submodule (git submodule update --init --recursive DeepGEMM)"
+        git submodule update --init --recursive DeepGEMM || \
+            err "git submodule update --init DeepGEMM failed; DeepGEMM will not be built from source."
+    fi
+fi
+
+# DeepGEMM source build is for SM120 only. We build from the submodule when the
+# source is present AND (an SM120 GPU is detected OR the source build is forced
+# with --force-deepgemm / REINSTALL_DEEPGEMM=1 / FORCE_SM120=1). On any other
+# GPU the environment keeps the published tokenspeed-deepgemm wheel.
+HAVE_DEEPGEMM_SRC=0
+if [[ -f DeepGEMM/setup.py && -d DeepGEMM/third-party/cutlass/include \
+      && -d DeepGEMM/third-party/deep_jit/include ]]; then
+    HAVE_DEEPGEMM_SRC=1
 fi
 
 # The smg gateway source is optional: present it, we build the local gateway
@@ -271,8 +349,13 @@ export TOKENSPEED_KERNEL_BACKEND=cuda
 # are needed by parts of the build. Skipped automatically if apt-get is absent
 # (e.g. non-Debian host) or if we lack privileges -- install these yourself then.
 install_system_deps() {
+    local _sys_pkgs=(libssl-dev libopenmpi-dev libnuma1 pkg-config)
+    # DeepGEMM's deep_jit includes <elfutils/libdwfl.h> at build time.
+    if [[ "${DEEPGEMM_WORK:-0}" == "1" ]]; then
+        _sys_pkgs+=(libdw-dev)
+    fi
     if ! command -v apt-get >/dev/null 2>&1; then
-        log "apt-get not found; skipping system deps. Ensure these are present: libssl-dev libopenmpi-dev libnuma1 pkg-config"
+        log "apt-get not found; skipping system deps. Ensure these are present: ${_sys_pkgs[*]}"
         return 0
     fi
     local SUDO=""
@@ -280,7 +363,7 @@ install_system_deps() {
         if command -v sudo >/dev/null 2>&1; then
             SUDO="sudo"
         else
-            log "not root and no sudo; skipping system deps. Ensure these are present: libssl-dev libopenmpi-dev libnuma1 pkg-config"
+            log "not root and no sudo; skipping system deps. Ensure these are present: ${_sys_pkgs[*]}"
             return 0
         fi
     fi
@@ -289,7 +372,6 @@ install_system_deps() {
     # half-configured nvidia-dkms for a kernel that was purged) any apt-get
     # install can abort under `set -e` even though nothing here needs
     # installing. FORCE_SYSTEM_DEPS=1 keeps the old always-run-apt behaviour.
-    local _sys_pkgs=(libssl-dev libopenmpi-dev libnuma1 pkg-config)
     _sys_deps_present() {
         local p st
         for p in "${_sys_pkgs[@]}"; do
@@ -302,14 +384,11 @@ install_system_deps() {
         skip "System dependencies already installed (${_sys_pkgs[*]}); skipping apt (FORCE_SYSTEM_DEPS=1 to run apt anyway)"
         return 0
     fi
-    log "Installing system dependencies (libssl-dev libopenmpi-dev libnuma1 pkg-config)"
+    log "Installing system dependencies (${_sys_pkgs[*]})"
     # ADDON: tolerate apt failures caused by unrelated packages, as long as the
     # packages WE need end up installed. The apt path itself is unchanged.
     if ! { $SUDO apt-get update && $SUDO apt-get install -y --no-install-recommends \
-        libssl-dev \
-        libopenmpi-dev \
-        libnuma1 \
-        pkg-config; }; then
+        "${_sys_pkgs[@]}"; }; then
         if command -v dpkg-query >/dev/null 2>&1 && _sys_deps_present; then
             err "apt-get reported an error (likely an unrelated broken dpkg/DKMS package), but ${_sys_pkgs[*]} are installed; continuing."
             err "Inspect with: sudo dpkg --audit; sudo apt-get check"
@@ -662,6 +741,20 @@ build_and_install_smg() {
 # Dockerfile's vllm-flash-attention step.
 VLLM_FLASH_ATTN_REPO="${VLLM_FLASH_ATTN_REPO:-https://github.com/vllm-project/flash-attention}"
 VLLM_FLASH_ATTN_REF="${VLLM_FLASH_ATTN_REF:-main}"
+# --- DeepGEMM from the DeepGEMM/ submodule ----------------------------------
+# Replaces the published tokenspeed-deepgemm wheel, which owns the same
+# `deep_gemm` import package and would otherwise shadow (or be shadowed by)
+# the source build. Kernels are JIT-compiled at runtime, so the build is a
+# single host extension and needs no CUDA_ARCH_LIST.
+build_and_install_deepgemm() {
+    log "Removing published DeepGEMM wheels that own the deep_gemm package"
+    "$PY" -m pip uninstall -y tokenspeed-deepgemm deep_gemm deep-gemm >/dev/null 2>&1 || true
+    rm -rf DeepGEMM/build DeepGEMM/dist DeepGEMM/*.egg-info
+    log "Building + installing DeepGEMM from DeepGEMM/ (non-editable, no deps)"
+    # DG_FORCE_BUILD=1: never fetch the upstream prebuilt wheel (no SM120 kernels).
+    DG_FORCE_BUILD=1 MAX_JOBS="$MAX_JOBS" "$PY" -m pip install ./DeepGEMM --no-build-isolation --no-deps
+}
+
 build_and_install_vllm_flash_attn() {
     if ! command -v git >/dev/null 2>&1; then
         err "git not found; cannot build vllm_flash_attn from source. Install git and re-run, or the sm_120 FA2 prefill path stays on the Triton fallback."
@@ -778,6 +871,29 @@ if [[ "$HAVE_SMG_SRC" == "1" ]]; then
     fi
 fi
 
+# nvidia-smi may be absent on the build host (torch sees the GPU but the CLI is
+# not installed). Now that $PY is resolved, re-probe via torch if the early
+# nvidia-smi probe was inconclusive, so SM120 is still auto-detected there.
+if [[ "$HAVE_SM120_GPU" != "1" && "$SM120_DETECTED" != "1" ]]; then
+    if detect_sm120_gpu; then
+        HAVE_SM120_GPU=1
+    fi
+fi
+
+# DeepGEMM source build: ONLY on SM120 (auto-detected) or when forced. The
+# published wheel has no SM120 kernels, so on SM120 we replace it from source;
+# on every other GPU the wheel is the right answer and we leave it alone.
+# Within that gate, (re)build on a fresh/forced install, when the source build
+# is not installed yet, or when the published wheel came back (a dependency
+# reinstall re-pulls tokenspeed-deepgemm, shadowing the source build).
+DEEPGEMM_WORK=0
+if [[ "$HAVE_DEEPGEMM_SRC" == "1" && ( "$HAVE_SM120_GPU" == "1" || "$REINSTALL_DEEPGEMM" == "1" ) ]]; then
+    if [[ "$FRESH" == "1" || "$REINSTALL_DEEPGEMM" == "1" ]] \
+        || ! have_dist deep_gemm || have_dist tokenspeed-deepgemm; then
+        DEEPGEMM_WORK=1
+    fi
+fi
+
 # vllm_flash_attn (sm_120 FA2): OPT-IN ONLY. This is an optional prefill
 # speedup, not required to serve -- prefill falls back to the Triton
 # prefill kernel when it is absent. It is deliberately NOT built on a plain or
@@ -791,15 +907,15 @@ if [[ "$BUILD_FA2" == "1" || "$REINSTALL_FA2" == "1" ]]; then
     FA2_WORK=1
 fi
 
-if [[ "$FRESH" == "1" || "$KERNEL_WORK" == "1" || "$SMG_WORK" == "1" || "$FA2_WORK" == "1" ]]; then
+if [[ "$FRESH" == "1" || "$KERNEL_WORK" == "1" || "$SMG_WORK" == "1" || "$FA2_WORK" == "1" || "$DEEPGEMM_WORK" == "1" ]]; then
     # System build deps and the pip build front-ends are only needed when we
     # actually compile. Skipping them on a no-op run keeps it fast and offline.
     install_system_deps
     # ADDON: resolve CUDA_HOME/nvcc (and optionally apt-install userspace toolkit)
-    # before any source build. Fatal only when the CUDA kernel is going to be
-    # compiled; smg/FA2-only runs just warn.
+    # before any source build. Fatal only when the CUDA kernel or DeepGEMM is
+    # going to be built (both need CUDA_HOME); smg/FA2-only runs just warn.
     if ! ensure_cuda_home; then
-        if [[ "$FRESH" == "1" || "$KERNEL_WORK" == "1" ]]; then
+        if [[ "$FRESH" == "1" || "$KERNEL_WORK" == "1" || "$DEEPGEMM_WORK" == "1" ]]; then
             exit 1
         fi
     fi
@@ -870,6 +986,18 @@ elif [[ "$KERNEL_WORK" == "1" ]]; then
         --no-build-isolation --no-deps --force-reinstall
 fi
 
+# --- DeepGEMM (SM120 kernels) from the DeepGEMM/ submodule --------------------
+# After the engine/kernel steps, which can re-pull the pinned wheel.
+if [[ "$DEEPGEMM_WORK" == "1" ]]; then
+    build_and_install_deepgemm
+elif [[ "$HAVE_DEEPGEMM_SRC" == "1" && "$HAVE_SM120_GPU" == "1" ]]; then
+    skip "DeepGEMM already installed from source (SM120). Rebuild after editing DeepGEMM/ with: REINSTALL_DEEPGEMM=1 ./scripts/install.sh"
+elif [[ "$HAVE_DEEPGEMM_SRC" == "1" ]]; then
+    skip "No SM120 GPU detected; keeping the published tokenspeed-deepgemm wheel (the source build only helps SM120). Force with: ./scripts/install.sh --force-deepgemm"
+else
+    skip "DeepGEMM/ source not present; keeping the published tokenspeed-deepgemm wheel (no SM120 kernels)"
+fi
+
 # --- smg gateway (Rust) from local source ------------------------------------
 # Independent of the kernel branches: rebuild the OpenAI gateway (+ proto +
 # servicer) from smg/ so the best_of+stream fix is in effect. Skipped when the
@@ -923,15 +1051,36 @@ fi
 # Editable-install note: `md.files()` may return None (or omit source paths) for
 # an `-e` install, so fall back to locating the package via its top-level import
 # path (metadata origin / __init__) without importing it.
-if [[ "$FRESH" != "1" && "$KERNEL_WORK" != "1" && "$SMG_WORK" != "1" && "$FA2_WORK" != "1" ]]; then
+if [[ "$DEEPGEMM_WORK" == "1" ]]; then
+    log "Verifying the DeepGEMM source build won (metadata inspection, no import)"
+    "$PY" - <<'PY'
+import importlib.metadata as md
+import pathlib
+import sys
+
+try:
+    md.version("tokenspeed-deepgemm")
+    sys.exit("ERROR: the published tokenspeed-deepgemm wheel is still installed.")
+except md.PackageNotFoundError:
+    pass
+ver = md.version("deep_gemm")
+print("installed deep_gemm:", ver)
+init = next((f for f in md.files("deep_gemm") or [] if f.as_posix() == "deep_gemm/__init__.py"), None)
+if init is None or "get_supported_arch_majors" not in pathlib.Path(init.locate()).read_text():
+    sys.exit("ERROR: installed deep_gemm lacks get_supported_arch_majors (no SM120 kernels).")
+print("deep_gemm source build + SM120 API OK")
+PY
+fi
+
+if [[ "$FRESH" != "1" && "$KERNEL_WORK" != "1" && "$SMG_WORK" != "1" && "$FA2_WORK" != "1" && "$DEEPGEMM_WORK" != "1" ]]; then
     log "Done. No build was needed. Activate with:  source \"$VENV_DIR/bin/activate\""
     exit 0
 fi
 
 # The kernel verification below only makes sense when a kernel build happened;
-# an smg-only or FA2-only run has nothing to verify there.
+# an smg-, FA2- or DeepGEMM-only run has nothing to verify there.
 if [[ "$FRESH" != "1" && "$KERNEL_WORK" != "1" ]]; then
-    log "Done (gateway/FA2 rebuilt). Activate with:  source \"$VENV_DIR/bin/activate\""
+    log "Done (gateway/FA2/DeepGEMM rebuilt). Activate with:  source \"$VENV_DIR/bin/activate\""
     exit 0
 fi
 

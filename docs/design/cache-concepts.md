@@ -1066,8 +1066,12 @@ Its responsibilities:
   — only the token descriptor the event carries and whether that event is
   currently out. A mutation only marks its boundary for reconcile;
   `DrainKvEvents` reconciles each marked boundary against its residency and
-  reports the net change (published exactly while fully resident), then drops
-  descriptors of boundaries with no cached child. Nothing is decided
+  reports the net change (published exactly while every KV group holds its
+  child), then drops descriptors of boundaries with no cached child in any
+  group. A State group's checkpoint does not gate "fully resident", but it
+  does count as a cached child: eviction of a boundary's KV leaves a checkpoint
+  that a request still pins, and its later eviction must still find the
+  descriptor. Nothing is decided
   mid-`Admit`, so one admission may evict a boundary's last cached copy and
   then store the request's own copy without any ordering hazard.
 

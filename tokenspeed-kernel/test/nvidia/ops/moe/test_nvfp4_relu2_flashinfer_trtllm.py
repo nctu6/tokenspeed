@@ -330,6 +330,7 @@ def test_moe_plan_selects_the_relu2_kernels(routing_mode):
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        ep_token_layout=None,
         features=frozenset(),
     )
     expected = {
@@ -363,5 +364,6 @@ def test_moe_plan_rejects_an_intermediate_width_off_128_rows():
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            ep_token_layout=None,
             features=frozenset(),
         )

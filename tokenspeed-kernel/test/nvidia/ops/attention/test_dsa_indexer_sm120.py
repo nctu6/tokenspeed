@@ -1,0 +1,310 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""DeepGEMM indexers with DeepSelect top-k on SM120, on real hardware.
+
+V3.2 DSA leaves (decode and prefill) select with the in-tree CuTe DSL
+DeepSelect kernel where it beats the TRT-LLM and Triton selectors; the V4.1
+FP8 index-row leaf scores with DeepGEMM and selects with the same kernel.
+"""
+
+import math
+
+import pytest
+import torch
+from tokenspeed_kernel.platform import Platform
+from tokenspeed_kernel.thirdparty.deepgemm import (
+    SM120_ARCH_MAJOR,
+    deepgemm_supports_sm120,
+)
+
+pytestmark = pytest.mark.skipif(
+    not (
+        Platform.get().is_nvidia
+        and Platform.get().arch_version.major == SM120_ARCH_MAJOR
+        and deepgemm_supports_sm120()
+    ),
+    reason="SM120 with a DeepGEMM build that has SM120 kernels only",
+)
+
+PAGE, HEADS, DIM = 64, 64, 128
+
+
+def _index_cache(num_pages):
+    """Page-planar FP8 index-K cache: 64 E4M3 rows then 64 FP32 scales per page."""
+    keys = torch.randn(num_pages, PAGE, DIM, device="cuda", dtype=torch.bfloat16)
+    scales = keys.abs().amax(-1).float().clamp_min(1e-4) / 448.0
+    cache = torch.empty(num_pages, PAGE * (DIM + 4), device="cuda", dtype=torch.uint8)
+    cache[:, : PAGE * DIM] = (
+        (keys / scales[..., None])
+        .to(torch.float8_e4m3fn)
+        .view(num_pages, -1)
+        .view(torch.uint8)
+    )
+    cache[:, PAGE * DIM :] = scales.view(torch.uint8).view(num_pages, -1)
+    return cache.view(num_pages * PAGE, DIM + 4)
+
+
+@pytest.fixture
+def spy(monkeypatch):
+    """Record the logits and lengths the leaf hands to DeepSelect."""
+    from tokenspeed_kernel.ops.attention.dsa import deep_gemm as dsa_deep_gemm
+
+    calls = []
+    real = dsa_deep_gemm.deepselect_local_topk
+
+    def record(logits, lengths, topk, out, index_base=None):
+        calls.append((logits.clone(), lengths.clone()))
+        return real(logits, lengths, topk, out, index_base=index_base)
+
+    monkeypatch.setattr(dsa_deep_gemm, "deepselect_local_topk", record)
+    return calls
+
+
+def _assert_exact_topk(offsets, logits, lengths, topk):
+    """Each row holds the float32 top-k of its first ``lengths`` columns."""
+    for row in range(offsets.shape[0]):
+        end = int(lengths[row])
+        chosen = offsets[row][offsets[row] >= 0].long()
+        count = min(topk, end)
+        assert chosen.numel() == count, (row, end, chosen.numel())
+        assert chosen.unique().numel() == count
+        assert chosen.max() < end if count else True
+        reference = logits[row, :end].topk(count).values
+        picked = logits[row, chosen].sort(descending=True).values
+        torch.testing.assert_close(picked, reference, atol=0, rtol=0)
+
+
+def test_prefill_topk_selects_the_exact_top_k(spy):
+    from tokenspeed_kernel.ops.attention.dsa import deep_gemm as dsa_deep_gemm
+
+    torch.manual_seed(0)
+    topk, num_tokens, prefix = 2048, 640, 5000
+    num_keys = prefix + num_tokens
+    cache = _index_cache(math.ceil(num_keys / PAGE))
+    slots = torch.arange(num_keys, device="cuda", dtype=torch.int64)
+    row_starts = torch.zeros(num_tokens, device="cuda", dtype=torch.int32)
+    row_ends = prefix + 1 + torch.arange(num_tokens, device="cuda", dtype=torch.int32)
+    q = torch.randn(num_tokens, HEADS, DIM, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(num_tokens, HEADS, device="cuda", dtype=torch.float32)
+    out, lens = dsa_deep_gemm.deep_gemm_dsa_prefill_topk(
+        q,
+        weights,
+        slots,
+        row_starts,
+        row_ends,
+        topk=topk,
+        softmax_scale=DIM**-0.5,
+        index_k_cache=cache,
+        page_size=PAGE,
+        max_seqlen_k=num_keys,
+    )
+    assert len(spy) == 1, "prefill must select with DeepSelect"
+    logits, lengths = spy[0]
+    assert lens.tolist() == lengths.clamp_max(topk).tolist()
+    _assert_exact_topk(out, logits, lengths, topk)
+
+
+@pytest.mark.parametrize(
+    ("batch", "context", "uses_deepselect"),
+    [(96, 32768, True), (48, 65536, True), (4, 32768, False), (96, 16384, False)],
+)
+def test_decode_topk_selects_the_exact_top_k(batch, context, uses_deepselect, spy):
+    from tokenspeed_kernel.ops.attention.dsa import deep_gemm as dsa_deep_gemm
+
+    torch.manual_seed(1)
+    topk = 2048
+    seq_lens = torch.randint(
+        context * 3 // 4, context + 1, (batch,), device="cuda", dtype=torch.int32
+    )
+    max_pages = math.ceil(context / PAGE)
+    cache = _index_cache(batch * max_pages)
+    block_table = torch.randperm(
+        batch * max_pages, device="cuda", dtype=torch.int32
+    ).view(batch, max_pages)
+    q = torch.randn(batch, HEADS, DIM, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(batch, HEADS, device="cuda", dtype=torch.float32)
+    seq_lens_2d = seq_lens.view(-1, 1).contiguous()
+    plan = dsa_deep_gemm.deep_gemm_dsa_plan(page_size=PAGE, seq_lens_2d=seq_lens_2d)
+    slots, lens = dsa_deep_gemm.deep_gemm_dsa_decode_topk(
+        q,
+        weights,
+        seq_lens,
+        block_table,
+        page_size=PAGE,
+        topk=topk,
+        softmax_scale=DIM**-0.5,
+        index_k_cache=cache,
+        seq_lens_2d=seq_lens_2d,
+        plan=plan,
+    )
+    assert (len(spy) == 1) is uses_deepselect
+    assert lens.tolist() == seq_lens.clamp_max(topk).tolist()
+    if uses_deepselect:
+        logits, lengths = spy[0]
+        assert lengths.tolist() == seq_lens.tolist()
+        # The leaf maps local offsets to physical slots; invert that to compare
+        pages = block_table.long()
+        for row in range(batch):
+            chosen = slots[row][slots[row] >= 0].long()
+            local = torch.empty_like(chosen)
+            page_of = {int(p): i for i, p in enumerate(pages[row].tolist())}
+            for i, slot in enumerate(chosen.tolist()):
+                local[i] = page_of[slot // PAGE] * PAGE + slot % PAGE
+            end = int(lengths[row])
+            reference = logits[row, :end].topk(topk).values
+            picked = logits[row, local].sort(descending=True).values
+            torch.testing.assert_close(picked, reference, atol=0, rtol=0)
+
+
+def test_deepselect_rejects_what_it_cannot_read():
+    from tokenspeed_kernel.ops.attention.dsa.cute_dsl import deepselect_supports
+
+    good = torch.randn(4, 4096, device="cuda")
+    assert deepselect_supports(good, 2048)
+    assert not deepselect_supports(good, 4096)  # beyond the largest capacity
+    assert not deepselect_supports(good.double(), 2048)
+    assert not deepselect_supports(good.t(), 2048)
+    assert not deepselect_supports(torch.randn(4, 4098, device="cuda")[:, :4097], 2048)
+    assert not deepselect_supports(torch.randn(4, 4097, device="cuda")[:, 1:], 2048)
+
+
+def test_deepselect_local_topk_splits_more_rows_than_one_grid_holds():
+    from tokenspeed_kernel.ops.attention.dsa.cute_dsl import deepselect_local_topk
+
+    torch.manual_seed(3)
+    rows, width, topk = 70000, 3000, 512
+    logits = torch.randn(rows, width, device="cuda")
+    lengths = torch.randint(1, width + 1, (rows,), device="cuda", dtype=torch.int32)
+    out = torch.empty(rows, topk, device="cuda", dtype=torch.int32)
+    deepselect_local_topk(logits, lengths, topk, out)
+    sample = torch.cat([torch.arange(0, 40), torch.arange(65500, 65600)])
+    _assert_exact_topk(out[sample], logits[sample], lengths[sample], topk)
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_index_candidates_select_the_top_scores_of_a_shard(monkeypatch, spy, topk):
+    """A rank's owned pages hold more candidates than top-k for long rows.
+
+    The leaf selects with DeepSelect over each row's compact candidates; it
+    must keep the same scores as the framework top-k over the same logits
+    (any valid top-k has the same score multiset, whatever the tie order),
+    return distinct in-range logical positions, and pad short rows with -1.
+    """
+    from tokenspeed_kernel.ops.attention.dsa import deep_gemm as dsa_deep_gemm
+
+    torch.manual_seed(7)
+    pages, ranks, rank = 300, 4, 1
+    table_row = torch.arange(1, pages + 1, device="cuda", dtype=torch.int32)
+    owned = (table_row - 1) % ranks == rank
+    local_row = torch.where(owned, (table_row - 1) // ranks + 1, -1).to(torch.int32)
+    cache = _index_cache(int(owned.sum()) + 1)
+    # Long rows (more owned candidates than top-k), short rows, a row with
+    # nothing owned (the first token) and a request that does not exist.
+    causal = torch.tensor(
+        [19200, 12000, 9000, 4096, 3000, 700, 130, 1, 0, 5000],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    requests = torch.zeros_like(causal)
+    requests[-1] = -1
+    q = torch.randn(causal.numel(), HEADS, DIM, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(causal.numel(), HEADS, device="cuda")
+    kwargs = dict(
+        page_size=PAGE,
+        topk=topk,
+        softmax_scale=DIM**-0.5,
+        initial_tokens=4,
+        local_tokens=8,
+    )
+    leaf = dsa_deep_gemm.deep_gemm_dsa_index_candidates
+    args = (q, weights, cache, local_row[None, :], requests, causal)
+    offsets, scores = leaf(*args, **kwargs)
+    assert len(spy) == 1, "the shard's candidates must be selected with DeepSelect"
+    monkeypatch.setattr(dsa_deep_gemm, "deepselect_supports", lambda *_: False)
+    ref_offsets, ref_scores = leaf(*args, **kwargs)
+
+    for row in range(causal.numel()):
+        valid = offsets[row] >= 0
+        mine = offsets[row][valid].long()
+        assert mine.unique().numel() == mine.numel()
+        assert (mine < max(int(causal[row]), 1)).all()
+        assert (offsets[row][~valid] == -1).all()
+        assert torch.all(scores[row][~valid] == -torch.inf)
+        got = scores[row][valid].sort().values
+        want = ref_scores[row][ref_offsets[row] >= 0].sort().values
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    ("rows", "topk"), [(3, 512), (128, 2048), (1024, 2048), (1025, 2048)]
+)
+def test_deepselect_local_topk_does_not_depend_on_where_values_go(rows, topk):
+    """Indices are the same whether the unused scores land in the shared sink or in a fresh tensor.
+    Up to 1024 x 2048 values come from one buffer per device (the host does not
+    allocate for them); a larger request gets its own tensor.
+    """
+    from tokenspeed_kernel.ops.attention.dsa._cute_dsl import deep_select
+    from tokenspeed_kernel.ops.attention.dsa.cute_dsl import deepselect_local_topk
+
+    torch.manual_seed(rows)
+    width = 4096
+    logits = torch.randn(rows, width, device="cuda")
+    lengths = torch.randint(1, width + 1, (rows,), device="cuda", dtype=torch.int32)
+    out = torch.empty(rows, topk, device="cuda", dtype=torch.int32)
+    deepselect_local_topk(logits, lengths, topk, out)
+    expected, values = deep_select.deepselect_topk(
+        logits,
+        lengths,
+        topk,
+        capacity=deep_select.capacity_for(topk),
+        cluster_size=1,
+        values=torch.empty(rows, topk, device="cuda"),
+    )
+    _assert_exact_topk(out[:64], logits[:64], lengths[:64], topk)
+    # The explicit-values call selects the same score multiset in every row.
+    for row in range(min(rows, 16)):
+        mine = logits[row].gather(0, out[row][out[row] >= 0].long()).sort().values
+        theirs = values[row][expected[row] >= 0].sort().values
+        assert torch.equal(mine, theirs)
+    sink = deep_select.values_sink(rows, topk, logits.device)
+    assert sink.shape == (rows, topk) and sink.is_contiguous()
+    shared = rows * topk <= 1024 * 2048
+    other = deep_select.values_sink(1, 512, logits.device)
+    assert (sink.data_ptr() == other.data_ptr()) is shared
+
+
+def test_values_sink_is_not_created_inside_a_graph_capture(monkeypatch):
+    """A buffer made during a capture would live in the graph's private pool."""
+    from tokenspeed_kernel.ops.attention.dsa._cute_dsl import deep_select
+
+    monkeypatch.setattr(deep_select, "_VALUES_SINK", {})
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        values = deep_select.values_sink(8, 512, torch.device("cuda", 0))
+    assert values.shape == (8, 512)
+    assert deep_select._VALUES_SINK == {}
+    # An eager call creates it, and a later capture shares it.
+    eager = deep_select.values_sink(8, 512, torch.device("cuda", 0))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        captured = deep_select.values_sink(4, 512, torch.device("cuda", 0))
+    assert captured.data_ptr() == eager.data_ptr()

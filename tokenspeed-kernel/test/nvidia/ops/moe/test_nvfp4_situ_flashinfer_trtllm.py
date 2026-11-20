@@ -438,6 +438,7 @@ def test_moe_plan_selects_nvfp4_situ_routed_kernel(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        ep_token_layout=None,
         features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"
@@ -556,6 +557,7 @@ def test_nvfp4_silu_plan_executes_and_replays(
         internal_activation_dtype="input",
         fast_math=True,
         combine_order="rank",
+        ep_token_layout=None,
         features=frozenset(),
         solution="flashinfer_trtllm",
     )

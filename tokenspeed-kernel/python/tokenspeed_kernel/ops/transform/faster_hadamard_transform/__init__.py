@@ -21,7 +21,11 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -36,7 +40,14 @@ if platform.is_nvidia:
         "hadamard_transform",
         name="fast_hadamard_transform",
         solution="fast_hadamard_transform",
-        capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+        # The tokenspeed-fast-hadamard-transform wheel ships sm_90/sm_100/sm_103
+        # cubins and no PTX: other GPUs (e.g. SM120) cannot launch it and use the
+        # Triton leaf.
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
         signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
         priority=Priority.PERFORMANT,
     )

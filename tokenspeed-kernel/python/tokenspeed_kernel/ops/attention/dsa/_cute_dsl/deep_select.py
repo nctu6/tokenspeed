@@ -44,6 +44,15 @@ leader runs one more compaction over the gathered candidates. This mirrors
 DeepSelect's cluster variant and is what makes small batches with long rows
 fast on Hopper, whose GPCs accept portable 8-CTA clusters (H20 included).
 
+Workstation Blackwell (SM120) allows 99 KiB of dynamic shared memory per block,
+where the configuration above needs 207 KB (survivors, a 12K-pair candidate
+buffer and a three-stage ring of 8192-entry rounds). The same code runs there
+with a compact profile, chosen at import from the platform: 256 threads (rounds
+of 4096 entries, whose in-order tail is the row's last full round), a two-stage
+ring, and a 3072-pair candidate buffer that takes each round's hits in two
+groups of warps and compacts first whenever a group would overflow it. That is
+93 KB at the largest capacity and leaves the selected indices unchanged.
+
 Departures from the CUDA implementation: the main rounds stream through a
 plain three-stage ``cp.async.bulk`` shared-memory ring instead of
 TMA-swizzled buffers (only the init window is loaded straight into
@@ -63,22 +72,40 @@ import cutlass.cute as cute
 import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.utils.smem_allocator import SmemAllocator
+from tokenspeed_kernel.platform import current_platform
 
-# Geometry shared with DeepSelect's FP32 configuration.
-NUM_THREADS = 512
+# Workstation Blackwell (SM120) allows 99 KiB of dynamic shared memory per
+# block against 227 KiB on Hopper and datacenter Blackwell, so it runs the same
+# algorithm on half-size rounds (see the constants below).
+_COMPACT_SMEM = (
+    current_platform().is_nvidia and current_platform().arch_version.major == 12
+)
+
+# Geometry shared with DeepSelect's FP32 configuration. The compact profile
+# halves the CTA (256 threads, 4096 entries per round), keeps two ring stages
+# and takes round hits in two groups of warps, so that the candidate buffer
+# only has to hold half a round.
+NUM_THREADS = 256 if _COMPACT_SMEM else 512
 NUM_WARPS = NUM_THREADS // 32
 ELEMS_PER_THREAD = 16
-ROUND_ELEMS = NUM_THREADS * ELEMS_PER_THREAD  # 8192 entries per round
+ROUND_ELEMS = NUM_THREADS * ELEMS_PER_THREAD  # 8192 (4096 compact) per round
 SEG_ELEMS = 512  # one warp visits one segment per round
 SEGS_PER_ROUND = ROUND_ELEMS // SEG_ELEMS
 TAIL_ELEMS = 4096  # the row suffix that is always visited in order
 TAIL_SEGS = TAIL_ELEMS // SEG_ELEMS
 # Candidates accumulated before a compaction. DeepSelect uses 4096; the 64
 # fewer slots keep the max_topk=2048 configuration within Hopper's 227 KiB of
-# dynamic shared memory (survivors + candidates + ring + histograms).
-RECONSTRUCT_THRESHOLD = 4032
-# The check runs after a round, so up to a full round of hits may follow.
-INCOMING_SLOTS = RECONSTRUCT_THRESHOLD + ROUND_ELEMS
+# dynamic shared memory (survivors + candidates + ring + histograms). The
+# compact profile compacts earlier: 3072 candidate slots next to 2048
+# survivors and a two-stage ring take 93 KB.
+RECONSTRUCT_THRESHOLD = 1024 if _COMPACT_SMEM else 4032
+# Warps whose hits of one round are appended together. A group's hits must fit
+# the buffer, and a compaction runs first when they would not.
+INSERT_GROUPS = 2 if _COMPACT_SMEM else 1
+GROUP_WARPS = NUM_WARPS // INSERT_GROUPS
+# The check after a round leaves room for one more group of hits: a whole round
+# on the full profile, where it never overflows.
+INCOMING_SLOTS = 3072 if _COMPACT_SMEM else RECONSTRUCT_THRESHOLD + ROUND_ELEMS
 RADIX_BUCKETS = 256
 # Keys outside the bucket under refinement (or padding slots) are counted in a
 # sink slot past the real buckets, which keeps the histogram passes branch-free.
@@ -89,7 +116,7 @@ RADIX_SLOTS = RADIX_BUCKETS + 4
 NUM_HISTS = 3
 # Shared-memory ring for the main rounds: NUM_STAGES - 1 rounds are in flight
 # while one is being filtered.
-NUM_STAGES = 3
+NUM_STAGES = 2 if _COMPACT_SMEM else 3
 SEG_BYTES = SEG_ELEMS * 4
 SUPPORTED_MAX_TOPK = (512, 1024, 2048)
 SUPPORTED_CLUSTER_SIZES = (1, 2, 4, 8)
@@ -104,6 +131,8 @@ PLACEHOLDER_PAIR = (NEG_INF_BITS << 32) | 0xFFFFFFFF
 
 assert SEGS_PER_ROUND == NUM_WARPS
 assert TAIL_SEGS <= SEGS_PER_ROUND
+# One group of hits (512 per warp) must fit the candidate buffer.
+assert GROUP_WARPS * SEG_ELEMS <= INCOMING_SLOTS
 
 
 @cute.jit
@@ -735,6 +764,7 @@ class DeepSelectTopK:
         ends: cute.Tensor,
         out: cute.Tensor,
         values: cute.Tensor,
+        bases: cute.Tensor,
     ):
         max_topk = cutlass.const_expr(self.max_topk)
 
@@ -747,6 +777,8 @@ class DeepSelectTopK:
         topk = cutlass.Int32(out.shape[1])
         end = cutlass.Int32(ends[row])
         end = cutlass.max(cutlass.min(end, width), cutlass.Int32(0))
+        # Selected indices are reported as ``bases[row] + column``.
+        base = cutlass.Int32(bases[row])
 
         smem = SmemAllocator()
         survivors = smem.allocate_tensor(
@@ -786,7 +818,7 @@ class DeepSelectTopK:
                     if i < end:
                         score = scores[row, i]
                         if score == score:
-                            index = cutlass.Int32(i)
+                            index = cutlass.Int32(i) + base
                             value = score
                     out[row, i] = index
                     values[row, i] = value
@@ -795,6 +827,7 @@ class DeepSelectTopK:
                 scores,
                 out,
                 values,
+                base,
                 row,
                 rank,
                 end,
@@ -816,6 +849,7 @@ class DeepSelectTopK:
         scores,
         out,
         values,
+        base,
         row,
         rank,
         end,
@@ -848,9 +882,16 @@ class DeepSelectTopK:
         num_segs = (end + cutlass.Int32(SEG_ELEMS - 1)) // cutlass.Int32(SEG_ELEMS)
         num_perm_segs = cutlass.Int32(0)
         if num_segs > SEGS_PER_ROUND:
-            num_perm_segs = (
-                (num_segs - 1) // cutlass.Int32(TAIL_SEGS) * cutlass.Int32(TAIL_SEGS)
-            )
+            if cutlass.const_expr(TAIL_SEGS == SEGS_PER_ROUND):
+                # The init window is the tail alone, so the tail is the row's
+                # last full round: it then holds at least max_topk real entries.
+                num_perm_segs = num_segs - cutlass.Int32(TAIL_SEGS)
+            else:
+                num_perm_segs = (
+                    (num_segs - 1)
+                    // cutlass.Int32(TAIL_SEGS)
+                    * cutlass.Int32(TAIL_SEGS)
+                )
         num_perm_elems = num_perm_segs * SEG_ELEMS
         tail_elems = end - num_perm_elems
         tail_padded = num_segs * SEG_ELEMS
@@ -1001,34 +1042,59 @@ class DeepSelectTopK:
             if lane == 0:
                 warp_cnt[parity_base + warp] = warp_total
             cute.arch.barrier()
-            entry = warp_cnt[parity_base + (lane & (NUM_WARPS - 1))]
+            counts = warp_cnt[parity_base + (lane & (NUM_WARPS - 1))]
             if lane >= NUM_WARPS:
-                entry = cutlass.Int32(0)
-            round_total = cute.arch.warp_redux_sync(entry, "add")
-            if lane >= warp:
-                entry = cutlass.Int32(0)
-            dst = (
-                num_incomers
-                + cute.arch.warp_redux_sync(entry, "add")
-                + lane_inclusive
-                - n_hits
-            )
-            # Hits are rare, so walking the set bits (re-reading the value from
-            # the ring, since the bit index is dynamic) beats touching all 16
-            # entries again.
-            mask = hit_mask
-            while mask != 0:
-                e = _lowest_set_bit(mask)
-                mask = mask & (mask - 1)
-                # Entry e of this lane sits at chunk e // 4, element e % 4.
-                off = ((e >> cutlass.Int32(2)) << cutlass.Int32(7)) + (
-                    e & cutlass.Int32(3)
+                counts = cutlass.Int32(0)
+            # The round's hits are appended group by group (a single group on
+            # the full profile). A group that would overflow the buffer first
+            # compacts it; the hits were found against the older threshold,
+            # which only admits extra candidates.
+            for g in cutlass.range_constexpr(INSERT_GROUPS):
+                entry = counts
+                if (lane < g * GROUP_WARPS) | (lane >= (g + 1) * GROUP_WARPS):
+                    entry = cutlass.Int32(0)
+                group_total = cute.arch.warp_redux_sync(entry, "add")
+                if num_incomers + group_total > INCOMING_SLOTS:
+                    threshold_bits = self._reconstruct(
+                        survivors,
+                        cur,
+                        incoming,
+                        num_incomers,
+                        topk,
+                        hist,
+                        tidx,
+                        warp,
+                        lane,
+                    )
+                    threshold = _bits_f32(threshold_bits)
+                    cur = cur ^ 1
+                    num_incomers = cutlass.Int32(0)
+                if lane >= warp:
+                    entry = cutlass.Int32(0)
+                dst = (
+                    num_incomers
+                    + cute.arch.warp_redux_sync(entry, "add")
+                    + lane_inclusive
+                    - n_hits
                 )
-                incoming[dst] = _pack_pair(
-                    seg_base + lane * 4 + off, _f32_bits(ring[slot + off])
-                )
-                dst = dst + 1
-            num_incomers = num_incomers + round_total
+                if (warp >= g * GROUP_WARPS) & (warp < (g + 1) * GROUP_WARPS):
+                    # Hits are rare, so walking the set bits (re-reading the
+                    # value from the ring, since the bit index is dynamic)
+                    # beats touching all 16 entries again.
+                    mask = hit_mask
+                    while mask != 0:
+                        e = _lowest_set_bit(mask)
+                        mask = mask & (mask - 1)
+                        # Entry e of this lane sits at chunk e // 4, element
+                        # e % 4.
+                        off = ((e >> cutlass.Int32(2)) << cutlass.Int32(7)) + (
+                            e & cutlass.Int32(3)
+                        )
+                        incoming[dst] = _pack_pair(
+                            seg_base + lane * 4 + off, _f32_bits(ring[slot + off])
+                        )
+                        dst = dst + 1
+                num_incomers = num_incomers + group_total
             seg = _advance_perm(seg, round_stride, perm_len)
             if (num_incomers >= RECONSTRUCT_THRESHOLD) & (m + 1 < main_rounds):
                 threshold_bits = self._reconstruct(
@@ -1077,7 +1143,10 @@ class DeepSelectTopK:
         if rank == 0:
             for i in range(tidx, topk, NUM_THREADS):
                 pair = survivors[cur * max_topk + i]
-                out[row, i] = _pair_index(pair)
+                index = _pair_index(pair)
+                if index >= 0:
+                    index = index + base
+                out[row, i] = index
                 values[row, i] = _pair_value(pair)
 
     # ------------------------------------------------------------------
@@ -1090,11 +1159,12 @@ class DeepSelectTopK:
         ends: cute.Tensor,
         out: cute.Tensor,
         values: cute.Tensor,
+        bases: cute.Tensor,
         stream,
     ):
         cluster_size = cutlass.const_expr(self.cluster_size)
         num_rows = scores.shape[0]
-        self.kernel(scores, ends, out, values).launch(
+        self.kernel(scores, ends, out, values, bases).launch(
             grid=(cluster_size, num_rows, 1),
             block=(NUM_THREADS, 1, 1),
             cluster=(
@@ -1112,6 +1182,7 @@ MAX_TOPK = SUPPORTED_MAX_TOPK[-1]
 SCORE_ALIGNMENT = 4
 
 
+@functools.cache
 def capacity_for(topk: int) -> int:
     """The smallest compiled survivor capacity that serves ``topk``."""
     for capacity in SUPPORTED_MAX_TOPK:
@@ -1120,6 +1191,7 @@ def capacity_for(topk: int) -> int:
     raise ValueError(f"topk must be in [1, {MAX_TOPK}], got {topk}")
 
 
+@functools.cache
 def cluster_sizes_for(capacity: int) -> tuple[int, ...]:
     """Cluster sizes whose gathered survivors fit the candidate buffer."""
     return tuple(
@@ -1131,7 +1203,7 @@ def cluster_sizes_for(capacity: int) -> tuple[int, ...]:
 def compiled_selector(capacity: int, cluster_size: int, device_index: int):
     """Compile (once per configuration and device) the selector.
 
-    The compiled callable takes ``(scores, ends, indices, values)`` as torch
+    The compiled callable takes ``(scores, ends, indices, values, bases)`` as torch
     tensors and runs on the caller's current CUDA stream, so it is safe to
     replay inside a CUDA graph once compiled.
     """
@@ -1151,6 +1223,9 @@ def compiled_selector(capacity: int, cluster_size: int, device_index: int):
     values = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32, (rows, topk), stride_order=(1, 0), assumed_align=4
     )
+    bases = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (rows,), stride_order=(0,)
+    )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     # cute.compile targets the current device, not the operands'.
     with torch.cuda.device(device_index):
@@ -1160,6 +1235,7 @@ def compiled_selector(capacity: int, cluster_size: int, device_index: int):
             ends,
             indices,
             values,
+            bases,
             stream=stream,
             options="--enable-tvm-ffi",
         )
@@ -1191,8 +1267,10 @@ def warmup(capacities: tuple[int, ...], device: torch.device) -> None:
 
 
 # Rows below this width finish in a couple of rounds; the cluster gather and
-# extra compaction would cost more than the split saves.
-CLUSTER_MIN_WIDTH = 4 * ROUND_ELEMS
+# extra compaction would cost more than the split saves. The threshold is the
+# same 32768 entries on both profiles (measured on an RTX PRO 6000: a 2-CTA
+# split loses below it and gains 10-20% from 64K entries on).
+CLUSTER_MIN_WIDTH = 32768
 
 
 def choose_cluster_size(rows: int, width: int, capacity: int, sm_count: int) -> int:
@@ -1204,14 +1282,22 @@ def choose_cluster_size(rows: int, width: int, capacity: int, sm_count: int) -> 
     and once ``rows * cluster_size`` exceeds roughly 60% of the SMs (80% for
     pairs) a second wave queues up and doubles the time. Measured on an
     H20 (78 SMs): 8-CTA clusters serve up to 6 rows, 4-CTA up to 12, 2-CTA
-    up to 32.
+    up to 32. On the compact profile (one CTA per SM) the candidate buffer
+    only gathers up to 2-CTA clusters at capacity 2048 and 4-CTA clusters
+    below it, and the budgets are the measured residency limits.
     """
     if width < CLUSTER_MIN_WIDTH:
         return 1
     for cluster_size in reversed(cluster_sizes_for(capacity)):
         if cluster_size == 1:
             continue
-        budget = sm_count * 5 // 6 if cluster_size == 2 else sm_count * 5 // 8
+        if _COMPACT_SMEM:
+            # One CTA fills an SM, so clusters tile the GPU almost completely:
+            # 2-CTA clusters stay in one wave up to 92 rows and 4-CTA clusters
+            # up to 40 rows on an RTX PRO 6000 (188 SMs), then the time doubles.
+            budget = sm_count * 19 // 20 if cluster_size == 2 else sm_count * 17 // 20
+        else:
+            budget = sm_count * 5 // 6 if cluster_size == 2 else sm_count * 5 // 8
         if rows * cluster_size <= budget:
             return cluster_size
     return 1
@@ -1226,6 +1312,7 @@ def deepselect_topk(
     cluster_size: int,
     indices: torch.Tensor | None = None,
     values: torch.Tensor | None = None,
+    index_base: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Indices and values of the ``topk`` largest entries of every row.
 
@@ -1259,20 +1346,27 @@ def deepselect_topk(
     """
     if scores.ndim != 2 or scores.dtype != torch.float32 or not scores.is_cuda:
         raise ValueError("scores must be a CUDA FP32 [rows, width] matrix")
+    rows, width = scores.shape
+    row_stride, column_stride = scores.stride()
     if (
-        scores.stride(1) != 1
-        or scores.stride(0) % SCORE_ALIGNMENT
-        or scores.stride(0) < scores.shape[1]
+        column_stride != 1
+        or row_stride % SCORE_ALIGNMENT
+        or row_stride < width
         or scores.data_ptr() % (SCORE_ALIGNMENT * 4)
     ):
         raise ValueError(
             f"scores rows must be unit-stride with a stride multiple of {SCORE_ALIGNMENT} "
             "elements from a 16-byte aligned base"
         )
-    rows = scores.shape[0]
-    if ends.shape != (rows,) or ends.dtype != torch.int32 or not ends.is_contiguous():
+    device = scores.device
+    if (
+        ends.ndim != 1
+        or ends.shape[0] != rows
+        or ends.dtype != torch.int32
+        or not ends.is_contiguous()
+    ):
         raise ValueError("ends must be contiguous int32 [rows]")
-    if ends.device != scores.device:
+    if ends.device != device:
         raise ValueError("ends must live on the scores device")
     if capacity not in SUPPORTED_MAX_TOPK or not 1 <= topk <= capacity:
         raise ValueError(
@@ -1285,25 +1379,93 @@ def deepselect_topk(
             f"choose from {cluster_sizes_for(capacity)}"
         )
     if indices is None:
-        indices = torch.empty((rows, topk), dtype=torch.int32, device=scores.device)
+        indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    elif not _is_dense(indices, torch.int32, rows, topk, device):
+        raise ValueError(
+            f"indices must be a contiguous {torch.int32} [rows, topk] tensor on the scores device"
+        )
     if values is None:
-        values = torch.empty((rows, topk), dtype=torch.float32, device=scores.device)
-    for name, tensor, dtype in (
-        ("indices", indices, torch.int32),
-        ("values", values, torch.float32),
+        values = torch.empty((rows, topk), dtype=torch.float32, device=device)
+    elif not _is_dense(values, torch.float32, rows, topk, device):
+        raise ValueError(
+            f"values must be a contiguous {torch.float32} [rows, topk] tensor on the scores device"
+        )
+    if index_base is None:
+        index_base = _zero_bases(rows, device)
+    elif (
+        index_base.ndim != 1
+        or index_base.shape[0] != rows
+        or index_base.dtype != torch.int32
+        or not index_base.is_contiguous()
+        or index_base.device != device
     ):
-        if (
-            tensor.shape != (rows, topk)
-            or tensor.dtype != dtype
-            or not tensor.is_contiguous()
-            or tensor.device != scores.device
-        ):
-            raise ValueError(
-                f"{name} must be a contiguous {dtype} [rows, topk] tensor on the scores device"
-            )
+        raise ValueError("index_base must be a contiguous int32 [rows] tensor")
     if rows == 0:
         return indices, values
-    compiled_selector(capacity, cluster_size, scores.device.index)(
-        scores, ends, indices, values
+    compiled_selector(capacity, cluster_size, device.index)(
+        scores, ends, indices, values, index_base
     )
     return indices, values
+
+
+def _is_dense(
+    tensor: torch.Tensor, dtype: torch.dtype, rows: int, topk: int, device: torch.device
+) -> bool:
+    """Whether ``tensor`` is a contiguous ``[rows, topk]`` tensor of ``dtype`` on ``device``."""
+    return (
+        tensor.ndim == 2
+        and tensor.shape[0] == rows
+        and tensor.shape[1] == topk
+        and tensor.dtype == dtype
+        and tensor.is_contiguous()
+        and tensor.device == device
+    )
+
+
+_VALUES_SINK: dict[torch.device, torch.Tensor] = {}
+_VALUES_SINK_ELEMENTS = 1024 * 2048
+
+
+def values_sink(rows: int, topk: int, device: torch.device) -> torch.Tensor:
+    """A ``[rows, topk]`` FP32 destination for ``values`` that the caller never reads.
+
+    The selector writes the scores of what it selects; a caller that wants
+    only the indices still pays an allocation of ``rows * topk`` floats per
+    call, host time that a small chunk cannot hide. Up to ``1024 * 2048``
+    elements are views of one buffer per device (created on the first eager
+    call, like :func:`_zero_bases`); its contents are undefined, and kernels
+    in flight on other streams may overwrite them. Larger requests, and any
+    request while a capture has no buffer yet, get a fresh tensor.
+    """
+    sink = _VALUES_SINK.get(device)
+    if rows * topk > _VALUES_SINK_ELEMENTS or (
+        sink is None and torch.cuda.is_current_stream_capturing()
+    ):
+        return torch.empty((rows, topk), dtype=torch.float32, device=device)
+    if sink is None:
+        sink = torch.empty(_VALUES_SINK_ELEMENTS, dtype=torch.float32, device=device)
+        _VALUES_SINK[device] = sink
+    return sink.as_strided((rows, topk), (topk, 1))
+
+
+_ZERO_BASES: dict[torch.device, torch.Tensor] = {}
+_ZERO_BASES_ROWS = 1 << 16
+
+
+def _zero_bases(rows: int, device: torch.device) -> torch.Tensor:
+    """``[rows]`` int32 zeros on ``device``.
+
+    Up to ``_ZERO_BASES_ROWS`` rows come from one buffer per device, made on the
+    first eager call. A capture never creates it (a buffer allocated inside a
+    CUDA graph would live in the graph's pool and dangle once the graph is
+    freed), and rows past the buffer get a fresh tensor.
+    """
+    zeros = _ZERO_BASES.get(device)
+    if zeros is None and rows <= _ZERO_BASES_ROWS:
+        if torch.cuda.is_current_stream_capturing():
+            return torch.zeros(rows, dtype=torch.int32, device=device)
+        zeros = torch.zeros(_ZERO_BASES_ROWS, dtype=torch.int32, device=device)
+        _ZERO_BASES[device] = zeros
+    if zeros is None or rows > _ZERO_BASES_ROWS:
+        return torch.zeros(rows, dtype=torch.int32, device=device)
+    return zeros[:rows]

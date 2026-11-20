@@ -212,6 +212,7 @@ def _planned_unquant_ispp(
         tp_size=tp_size,
         activation=activation,
         activation_situ_beta=1.0 if activation == "situ" else None,
+        ep_token_layout=None,
     )
     (plan,) = plans
     return plan["ispp"]

@@ -46,6 +46,8 @@ __all__ = [
     "latent_moe_decode_pipeline_available",
     "latent_moe_expert_shared",
     "latent_moe_input_projections",
+    "MEGA_MOE_AUTO_FEATURE",
+    "mega_moe_auto_available",
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
@@ -254,6 +256,21 @@ def dispatch_topk_ids(topk_ids: torch.Tensor, dispatch: ExpertDispatch) -> torch
 #     hand the kernel the raw top-k (zero-expert ids intact, weights kept).
 #     Only kernels declaring ``combine_order={"slot", ...}`` are eligible.
 COMBINE_ORDERS = ("rank", "slot")
+
+# How the tokens meet the experts when they are split over EP ranks
+# (``moe_plan(ep_token_layout=...)``), for kernels that own the exchange of
+# tokens themselves (MegaMoE):
+#
+# ``"scattered"``
+#     Every EP rank brings its own tokens (attention DP). The kernel moves each
+#     route to the rank of its expert and back, and returns the complete output
+#     of this rank's tokens.
+# ``"replicated"``
+#     Every EP rank holds the same tokens (attention TP). The kernel moves
+#     nothing: it runs this rank's experts over all tokens and returns this
+#     rank's partial, which the caller sums over the group
+#     (``combine_order="rank"``).
+EP_TOKEN_LAYOUTS = ("scattered", "replicated")
 
 # ===-----------------------------------------------------------------------===#
 # Latent-MoE input projections
@@ -1354,6 +1371,8 @@ def _build_traits(
     internal_activation_dtype: str | None,
     with_bias: bool,
     combine_order: str,
+    ep_token_layout: str | None,
+    moe_ranks: int | None,
 ) -> dict[str, Any]:
     if internal_activation_dtype is None:
         internal_activation_dtype = "input"
@@ -1365,6 +1384,8 @@ def _build_traits(
     # Seller-declared: excludes only kernels declaring another order; the
     # post-selection check turns a silent kernel down for "slot".
     traits["combine_order"] = combine_order
+    if ep_token_layout is not None:
+        traits["ep_token_layout"] = ep_token_layout
     if activation is not None:
         traits["activation"] = activation
     if requires_deferred_finalize:
@@ -1383,6 +1404,10 @@ def _build_traits(
         # (for example the gfx950 K3 EP8 Gluon path) do not become automatic
         # winners for unvalidated EP degrees.
         traits["ep_size"] = int(ep_size)
+    if moe_ranks is not None:
+        # TP x EP ranks sharing the layer, for kernels validated at some
+        # widths only (``ep_size`` alone misses a TP-sharded layer).
+        traits["moe_ranks"] = int(moe_ranks)
 
     if ispp is not None:
         traits["ispp"] = int(ispp)
@@ -1499,6 +1524,8 @@ def moe_plan(
     features: frozenset[str],
     solution: str | None = None,
     fp32_correction_bias: bool = False,
+    ep_token_layout: str | None,
+    moe_ranks: int | None = None,
 ) -> dict:
     """Create a MoE execution plan.
 
@@ -1569,6 +1596,15 @@ def moe_plan(
             the caller must not reduce; it needs a kernel declaring the
             ``combine_order`` trait with ``"slot"`` and, for ``ep_size > 1``,
             the EP process group. Required keyword.
+        ep_token_layout: How the tokens are split over the EP ranks for a
+            kernel that owns the exchange itself, one of ``EP_TOKEN_LAYOUTS``
+            (see there), or None when the plan has no such kernel (every
+            kernel but MegaMoE). Required keyword. A kernel declaring the
+            ``ep_token_layout`` trait is eligible only for the layouts it
+            lists, and checks the plan names one.
+        moe_ranks: TP x EP ranks the layer spans. A kernel declaring a
+            ``moe_ranks`` trait is eligible only for the widths it lists;
+            None leaves the width unconstrained.
         features: Registered capabilities the apply kernel must declare, e.g.
             ``frozenset({"batch_invariant"})``, which plans the kernel once
             from static geometry (``KernelPlan``); empty for ordinary
@@ -1597,6 +1633,11 @@ def moe_plan(
         raise ValueError(
             f"combine_order must be one of {list(COMBINE_ORDERS)}, got "
             f"{combine_order!r}"
+        )
+    if ep_token_layout is not None and ep_token_layout not in EP_TOKEN_LAYOUTS:
+        raise ValueError(
+            f"ep_token_layout must be one of {list(EP_TOKEN_LAYOUTS)} or None, "
+            f"got {ep_token_layout!r}"
         )
     if combine_order == "slot" and ep_size is not None and ep_size > 1:
         if process_group is None:
@@ -1627,6 +1668,8 @@ def moe_plan(
         internal_activation_dtype=internal_activation_dtype,
         with_bias=with_bias,
         combine_order=combine_order,
+        ep_token_layout=ep_token_layout,
+        moe_ranks=moe_ranks,
     )
     traits["persistent_workspace"] = persistent_max_num_tokens_per_gpu is not None
 
@@ -1710,6 +1753,7 @@ def moe_plan(
         "persistent_max_num_tokens_per_gpu": persistent_max_num_tokens_per_gpu,
         "fast_math": fast_math,
         "combine_order": combine_order,
+        "ep_token_layout": ep_token_layout,
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
@@ -1723,6 +1767,81 @@ def moe_plan(
         "internal_activation_dtype": internal_activation_dtype,
         "fp32_correction_bias": fp32_correction_bias,
     }
+
+
+def mega_moe_auto_available(
+    *,
+    hidden: int,
+    ispp: int,
+    num_experts: int,
+    top_k: int,
+    ep_size: int,
+    moe_ranks: int,
+    ep_token_layout: str,
+    activation_clamped: bool,
+    features: frozenset[str],
+) -> bool:
+    """Whether ``--moe-backend auto`` may run this MXFP4 layer on MegaMoE.
+
+    MegaMoE needs the layer to be built around it (token layout, persistent
+    symmetric buffers and scratch that the memory plan counts), so ``auto``
+    cannot find it through ``moe_plan`` alone: the caller asks here first and
+    selects ``mega_moe`` explicitly on True. This runs the registry's own
+    selection for a MegaMoE leaf, so every gate is a trait or feature the leaf
+    declares:
+
+    * widths: ``moe_ranks``, ``ep_size``, ``hidden_alignment`` and
+      ``ispp_alignment`` (geometry the kernels were validated on);
+    * numerics: FP8 activations are outside every bitwise envelope, so a
+      request for ``batch_invariant`` finds no leaf unless the leaf declares
+      that feature (none does until its invariance is verified);
+    * memory: ``persistent_workspace`` (the planned scratch and symmetric
+      buffer the warm-up grows before the KV planner measures);
+    * the measured decision: ``MEGA_MOE_AUTO_FEATURE`` is declared only by a
+      leaf that beat the default backend (callers include it in ``features``).
+
+    Args:
+        hidden: MoE input width.
+        ispp: Intermediate size per MoE TP rank.
+        num_experts: Global routed expert count.
+        top_k: Routed experts per token.
+        ep_size: MoE expert-parallel size.
+        moe_ranks: MoE TP x EP ranks.
+        ep_token_layout: One of ``EP_TOKEN_LAYOUTS``.
+        activation_clamped: Whether the SwiGLU has a clamp limit.
+        features: Features the leaf must declare: ``MEGA_MOE_AUTO_FEATURE``,
+            plus ``batch_invariant`` under a bitwise numerics envelope.
+
+    Returns:
+        True when a registered MegaMoE leaf passes every gate on this platform.
+    """
+    traits = _build_traits(
+        weight_dtype="mxfp4",
+        activation="swiglu",
+        requires_deferred_finalize=False,
+        routing_mode="precomputed_topk",
+        a2a_backend=None,
+        ep_size=ep_size,
+        ispp=ispp,
+        hidden=hidden,
+        num_experts=num_experts,
+        top_k=top_k,
+        swiglu_form="standard",
+        activation_clamped=activation_clamped,
+        expert_id_repeats=False,
+        fp8_scale_block_shape=None,
+        internal_activation_dtype=None,
+        with_bias=False,
+        combine_order="rank",
+        ep_token_layout=ep_token_layout,
+        moe_ranks=moe_ranks,
+    )
+    traits["persistent_workspace"] = True
+    try:
+        _select_moe_apply(torch.bfloat16, traits, "mega_moe", features)
+    except NoKernelFoundError:
+        return False
+    return True
 
 
 def moe_process_weights(plan: dict, w: torch.nn.Module):
@@ -1901,6 +2020,7 @@ import tokenspeed_kernel.ops.moe.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.deep_ep  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: E402,F401
+from tokenspeed_kernel.ops.moe.deep_gemm import MEGA_MOE_AUTO_FEATURE  # noqa: E402
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.marlin  # noqa: E402,F401

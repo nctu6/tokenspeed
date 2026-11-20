@@ -26,6 +26,7 @@ import os
 import subprocess
 import sys
 import time
+from test.runtime.launch_guard import launch_skip_reason
 
 import pytest
 import requests
@@ -255,6 +256,18 @@ MESH_CASES = {
 
 
 class TestKimiK25:
+
+    # A plain (non-unittest) class: pytest runs setup_class, never setUpClass.
+    @classmethod
+    def setup_class(cls):
+        reason = launch_skip_reason(MODEL, min_gpus=WORLD_SIZE)
+        if reason is not None:
+            pytest.skip(reason)
+
+    def _require_draft(self, draft: str):
+        reason = launch_skip_reason(draft, min_gpus=WORLD_SIZE)
+        if reason is not None:
+            pytest.skip(reason)
 
     def _run_quality_checks(self, case: MeshCase):
         port = _next_server_port()

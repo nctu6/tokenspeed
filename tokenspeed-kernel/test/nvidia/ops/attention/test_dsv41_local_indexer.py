@@ -29,8 +29,8 @@ from tokenspeed_kernel.ops.attention import dsv41
 def test_local_reindex_graph_matches_replicated(width, topk, full):
     from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm as native
 
-    if not torch.cuda.is_available() or not native.is_hopper_indexer_available():
-        pytest.skip("Native local Reindex currently requires Hopper")
+    if not torch.cuda.is_available() or not native.is_fp8_indexer_available():
+        pytest.skip("requires the FP8 index-row indexer (Hopper or SM120)")
     torch.manual_seed(37)
     cache = torch.zeros(17, 64, 132, dtype=torch.uint8, device="cuda")
     keys = torch.randn(17 * 64, 128, device="cuda", dtype=torch.bfloat16)
@@ -51,6 +51,11 @@ def test_local_reindex_graph_matches_replicated(width, topk, full):
     weights = torch.rand(width, 32, device="cuda", dtype=torch.bfloat16)
     if full:
         candidates = None
+    elif not native.platform.is_hopper:
+        # Only Hopper has a scorer that reads just the candidate pool; SM120
+        # would score each rank's whole history, so a local Reindex stays portable.
+        assert not dsv41.local_index_supported(q, cache, candidates)
+        pytest.skip("native local Reindex is Hopper-only")
     assert dsv41.local_index_supported(q, cache, candidates)
 
     def local():
