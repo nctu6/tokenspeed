@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
 
@@ -28,6 +29,7 @@ from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
+    block_draft_is_causal,
     is_block_drafter,
     model_wide_kwargs,
     resolve_cache_layer_types,
@@ -38,12 +40,15 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 @dataclass(kw_only=True)
 class MLAConfig(SoftmaxAttnConfig):
+    is_latent_kv: ClassVar[bool] = True
+
     kv_lora_rank: int
     qk_nope_head_dim: int
     qk_rope_head_dim: int
     v_head_dim: int
     scaling: float
     kv_cache_dim: int
+    min_kv_split: int | None = None
 
     @classmethod
     def _spec_kwargs(
@@ -75,6 +80,7 @@ class MLAConfig(SoftmaxAttnConfig):
             scaling=model_config.scaling,
             kv_cache_dim=model_config.kv_lora_rank + model_config.qk_rope_head_dim,
             cache_layer_types=cache_layer_types,
+            min_kv_split=server_args.min_kv_split,
         )
 
     @classmethod
@@ -83,6 +89,9 @@ class MLAConfig(SoftmaxAttnConfig):
     ) -> AttnConfig:
         draft_block_decode = is_block_drafter(
             server_args.speculative_algorithm, is_draft
+        )
+        draft_block_causal = draft_block_decode and block_draft_is_causal(
+            model_config.hf_config
         )
         spec = cls(**cls._spec_kwargs(server_args, model_config, is_draft))
         return AttnConfig(
@@ -93,6 +102,12 @@ class MLAConfig(SoftmaxAttnConfig):
                 is_draft,
                 kv_cache_dtype=resolve_dtype(server_args.kv_cache_dtype),
                 draft_block_decode=draft_block_decode,
+                draft_block_causal=draft_block_causal,
+                # An MTP depth plans the target's own DSA attention and
+                # computes the same query-context shard, sharing the target's
+                # history gather. Plain MLA cannot shard, and __post_init__
+                # refuses it as a target.
+                shards_query_context=spec.is_dsa,
             ),
         )
 

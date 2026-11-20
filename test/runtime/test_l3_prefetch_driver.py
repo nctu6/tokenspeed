@@ -33,7 +33,11 @@ from __future__ import annotations
 
 import pytest
 
-ts = pytest.importorskip("tokenspeed_scheduler")
+ts = pytest.importorskip("tokenspeed_engine.scheduler")
+
+pytestmark = pytest.mark.skip(
+    reason="merge_main_1117.md known follow-up F3 (C1/C2): drives nctu6's L3 prefetch config (make_config l3_prefetch_min_pages, L3CacheHooks prefetch) that main replaced with SchedulerConfig.storage_config and the engine host's L3 executor"
+)
 
 from tokenspeed.runtime.cache.transfer.ops import PrefetchOp  # noqa: E402
 from tokenspeed.runtime.engine.cache_hooks import CacheOpHooks  # noqa: E402

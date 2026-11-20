@@ -39,9 +39,6 @@ dependencies = [
     "dill",
     "einops",
     "fastapi",
-    # Keep the gRPC helpers aligned with SMG's generated protobuf code.
-    "grpcio-health-checking==1.81.1",
-    "grpcio-reflection==1.81.1",
     "hf_transfer",
     "huggingface_hub",
     "modelscope",
@@ -57,7 +54,6 @@ dependencies = [
     "pillow",
     "prometheus-client",
     "psutil",
-    "pybase64",
     "pybind11",
     "pydantic",
     "py-spy",
@@ -73,16 +69,15 @@ dependencies = [
     "tiktoken",
     "torch",
     "torchvision",
-    "tokenspeed-kernel>=0.1.4.dev0",
-    "tokenspeed-mooncake>=0.3.13.post20260929",
-    "tokenspeed-scheduler>=0.1.41",
+    "tokenspeed-kernel>=0.1.5.dev0",
+    "tokenspeed-mooncake>=0.3.13.post20261026",
+    "tokenspeed-engine>=0.1.1.dev0",
+    # The nctu6 fork builds smg/ (submodule) at these versions; scripts/install.sh
+    # replaces these published wheels with the source build. Do not move to the
+    # PyPI 1.16 wheels, which would override the fork.
     "tokenspeed-smg==1.13.0.post20261019",
     "tokenspeed-smg-grpc-proto==0.4.27.post20261019",
     "tokenspeed-smg-grpc-servicer==0.14.0.post20261019",
-    # Tag-capable sleep/wake allocator (region(tag, enable_cpu_backup)/pause/
-    # resume). Bundles cu12/cu13 binaries; import-guarded so it's a no-op unless
-    # --enable-memory-saver is set. See runtime/utils/torch_memory_saver_adapter.py.
-    "torch_memory_saver==0.0.9.post1",
     "tqdm",
     "transformers==5.12.0",
     "uv",
@@ -102,6 +97,15 @@ ts = "tokenspeed.cli:main"
 [project.optional-dependencies]
 # Capped: 0.1.9 clones internally, so a release that stops would alias silently.
 instanttensor = ["instanttensor>=0.1.9,<0.2"]
+# MiniMax-H3 (video) + MiniMax-Music3 (WAV) ModularPipeline. Grouped as an
+# extra for lean pip-only installs; ./scripts/install.sh installs these by
+# DEFAULT (same as other implemented-model deps; additive, no kernel upgrade).
+diffusion = [
+    "diffusers>=0.43.0",
+    "av",
+    "imageio-ffmpeg",
+    "soundfile",
+]
 
 [tool.setuptools]
 license-files = ["LICENSE", "THIRDPARTYNOTICES"]

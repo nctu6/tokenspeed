@@ -27,7 +27,7 @@ point in the ``tokenspeed.plugins`` group whose target is a no-argument
 ``TOKENSPEED_DISABLE_PLUGINS=a,b`` skips entry points by name.
 
 Every process that builds a ``ModelConfig`` calls :func:`ensure_loaded` first,
-so the frontend, the scheduler and the encode loop all resolve plugin
+so the frontend, the engine ranks and the encode ranks all resolve plugin
 architectures the same way. Loading also runs the kernel package's own plugin
 discovery, which registers plugin kernels before any model selects one.
 
@@ -52,7 +52,7 @@ logger = get_colorful_logger(__name__)
 ENTRY_POINT_GROUP = "tokenspeed.plugins"
 DISABLE_ENV_VAR = "TOKENSPEED_DISABLE_PLUGINS"
 # Bumped whenever a class or protocol on the plugin contract changes.
-PLUGIN_API_VERSION = 3
+PLUGIN_API_VERSION = 4
 
 __all__ = [
     "DISABLE_ENV_VAR",

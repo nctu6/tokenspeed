@@ -35,6 +35,7 @@ requests by (cross-attention slot, page row) the way the scheduler would.
 from __future__ import annotations
 
 import dataclasses
+import zlib
 from collections.abc import Callable, Sequence
 
 import torch
@@ -125,9 +126,20 @@ class Request:
     page_row: int
     tokens: list[int]
     audio: torch.Tensor
-    # The scheduler's request id: the model encodes a request's audio iff its
-    # slot does not already hold this request's encoder output.
+    # The scheduler's request id; the model keys a slot's owner by the
+    # admission id derived from it (``admission_id_for``).
     rid: str
+
+    @property
+    def admission_id(self) -> int:
+        return admission_id_for(self.rid)
+
+
+def admission_id_for(rid: str) -> int:
+    """A stable admission id per test request id (the scheduler assigns real
+    ones): the model encodes an admission's audio iff its slot does not already
+    hold that admission's encoder output."""
+    return zlib.crc32(rid.encode())
 
 
 class WhisperRuntime:
@@ -159,10 +171,10 @@ class WhisperRuntime:
             dtype=torch.bfloat16,
             kv_cache_dtype=torch.bfloat16,
             kv_cache_quant_method="none",
-            prefix_granularity=PAGE,
             kernel_page_size=PAGE,
             context_len=CONTEXT_LEN,
             max_bs=max_bs,
+            max_resident_requests=max_bs,
             components=(spec,),
         )
         # Page 0 is the null page; every request row needs its own pages after it.
@@ -275,6 +287,7 @@ class WhisperRuntime:
                 for r in requests
             ],
             request_ids=[r.rid for r in requests],
+            admission_ids=[r.admission_id for r in requests],
             request_pool_indices=[r.slot for r in requests],
             extend_prefix_lens=list(prefix_lens),
             extend_seq_lens=extend_lens,

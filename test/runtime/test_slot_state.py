@@ -92,6 +92,9 @@ from tokenspeed.runtime.sampling.backends.flashinfer_full import (  # noqa: E402
 from tokenspeed.runtime.sampling.backends.greedy import (  # noqa: E402
     GreedySamplingBackend,
 )
+from tokenspeed.runtime.sampling.backends.sonic import (  # noqa: E402
+    SonicSamplingBackend,
+)
 from tokenspeed.runtime.sampling.backends.triton import (  # noqa: E402
     TritonSamplingBackend,
 )
@@ -107,13 +110,18 @@ SAMPLING_BACKENDS = (
     FlashInferFullSamplingBackend,
     TritonSamplingBackend,
     TritonFullSamplingBackend,
+    SonicSamplingBackend,
 )
 
-# One request-pool geometry for every owner: max_bs decode rows, one sink row
-# (max_req_pool_size = max_bs + 1) and the graph-padding row past it.
-MAX_BS = 9
-MAX_REQ_POOL_SIZE = MAX_BS + 1
-POOL_ROWS = MAX_REQ_POOL_SIZE + 1  # 11: RuntimeStates, drafters, Inkling (max_bs + 2)
+# The per-slot buffers each sampling backend's rid-flip reset must write.
+SCATTERED_SLOT_STATE = {SonicSamplingBackend: ("state.temperature", "state.seeds")}
+
+# Forward buffers are smaller than the resident slot domain. Round trips below
+# restore slots above MAX_BS, as a decode server with extra receive slots does.
+MAX_BS = 4
+MAX_RESIDENT_REQUESTS = 9
+MAX_REQ_POOL_SIZE = MAX_RESIDENT_REQUESTS + 1
+POOL_ROWS = MAX_REQ_POOL_SIZE + 1
 SPEC_TOKENS = 4
 VOCAB = 32
 HIDDEN = 8
@@ -127,6 +135,7 @@ HIDDEN = 8
 def _runtime_states(*, draft_probs: bool, trees: bool, history: bool) -> RuntimeStates:
     states = RuntimeStates(
         req_pool_size=MAX_REQ_POOL_SIZE,
+        input_vocab_size=VOCAB,
         vocab_size=VOCAB,
         output_length=SPEC_TOKENS,
         device="cpu",
@@ -135,6 +144,7 @@ def _runtime_states(*, draft_probs: bool, trees: bool, history: bool) -> Runtime
         states.init_draft_probs(spec_num_tokens=SPEC_TOKENS, reject_threshold=2.0)
     if trees:
         states.init_draft_trees(SPEC_TOKENS)
+        states.init_draft_tree_q(SPEC_TOKENS, num_slots=2, num_candidates=4)
     if history:
         states.init_ngram_state(3)
         states.init_request_token_history(16)
@@ -199,7 +209,7 @@ class _Leaf(AttentionBackend):
 def _inkling() -> InklingAttnBackend:
     conv_pool = InklingConvStatePool(
         num_layers=2,
-        num_slots=MAX_BS + 2,
+        num_slots=POOL_ROWS,
         conv_dim=HIDDEN,
         ring_size=5,
         dtype=torch.bfloat16,
@@ -212,7 +222,7 @@ def _kpool_pool() -> HybridGlm53FlashTokenToKVPool:
     pool = HybridGlm53FlashTokenToKVPool.__new__(HybridGlm53FlashTokenToKVPool)
     pool._kpool_tail_workspace = _KPoolTailWorkspace(
         options=None,
-        storage=torch.zeros((2, 2, MAX_BS + 2, 3, HIDDEN), dtype=torch.bfloat16),
+        storage=torch.zeros((2, 2, POOL_ROWS, 3, HIDDEN), dtype=torch.bfloat16),
         row_by_layer={0: 0, 1: 1},
     )
     return pool
@@ -230,15 +240,18 @@ def _dsa(pool, *, is_draft: bool) -> DSABackend:
 
 def _sampling_backend(cls) -> SamplingBackend:
     """A sampling backend over the test pool geometry, on the CPU."""
+    sonic = cls is SonicSamplingBackend
+    draft_probs = cls is not GreedySamplingBackend
     config = SamplingBackendConfig(
         synthetic_acceptance_length=None,
-        enable_speculative_sampling=cls is not GreedySamplingBackend,
+        enable_speculative_sampling=draft_probs,
         sampling_stream="batch",
         logprob_order="torch",
         max_bs=MAX_BS,
         max_draft_tokens_per_req=SPEC_TOKENS,
         max_req_pool_size=MAX_REQ_POOL_SIZE,
-        vocab_size=VOCAB,
+        # sonic's top-k reduction needs at least 512 columns.
+        vocab_size=512 if sonic else VOCAB,
         device="cpu",
     )
     # The Triton backends size a scratch buffer by the SM count.
@@ -277,7 +290,7 @@ def _randomize(rows: list[torch.Tensor]) -> None:
             row.copy_(torch.randint(1, 100, row.shape).to(row.dtype))
 
 
-RESTORED = "req-restored"
+RESTORED = 1
 
 
 def _round_trip(
@@ -297,10 +310,10 @@ def _round_trip(
     assert exporter.slot_state_bytes() % SLOT_STATE_ALIGNMENT == 0
     image = torch.full((exporter.slot_state_bytes(),), 0xEE, dtype=torch.uint8)
 
-    exporter.export_slot_state(src_slot, image, None, request_id=RESTORED)
+    exporter.export_slot_state(src_slot, image, None, admission_id=RESTORED)
     for row in source_rows:
         row.zero_()
-    exporter.import_slot_state(dst_slot, image, None, request_id=RESTORED)
+    exporter.import_slot_state(dst_slot, image, None, admission_id=RESTORED)
 
     for index, (restored, original) in enumerate(
         zip(exporter.slot_state_rows(dst_slot), expected)
@@ -381,8 +394,8 @@ def test_runtime_states_image_whether_the_candidates_are_real(candidates_real):
     assert bool(states.spec_candidates_ready[3]) is candidates_real
     states.spec_candidates_ready[7] = not candidates_real  # the new slot's past
     image = torch.empty((states.slot_state_bytes(),), dtype=torch.uint8)
-    states.export_slot_state(3, image, None, request_id="restored")
-    states.import_slot_state(7, image, None, request_id="restored")
+    states.export_slot_state(3, image, None, admission_id=1)
+    states.import_slot_state(7, image, None, admission_id=1)
     assert bool(states.spec_candidates_ready[7]) is candidates_real
     assert torch.equal(states.future_input_map[7], states.future_input_map[3])
 
@@ -415,14 +428,15 @@ def test_dsa_kpool_tail_round_trip_once_per_arena():
 
 
 @pytest.mark.parametrize("cls", SAMPLING_BACKENDS, ids=lambda cls: cls.__name__)
-def test_sampling_backend_round_trip_continues_where_the_victim_stopped(cls):
+@pytest.mark.parametrize("dst_slot", [4, 8])
+def test_sampling_backend_round_trip_continues_where_the_victim_stopped(cls, dst_slot):
     """A restored request samples as the unretracted run would: its scalars,
     penalty history, bias and coin generator land in the new slot, and the
-    next prepare_step sees no rid flip there -- so nothing is re-initialised."""
+    next prepare_step sees the same admission -- so nothing is re-initialised."""
     backend = _sampling_backend(cls)
-    victim, params = "req-victim", _sampling_params("req-victim")
+    victim, params = 1, _sampling_params("req-victim")
     params.logit_bias = {"3": 2.0, "7": -1.5}
-    src_slot, dst_slot = 4, 8
+    src_slot = 4
     # The victim's steps so far: scattered scalars (and a generator) on its
     # first step, then some accumulated history.
     backend.prepare_step([victim], [src_slot], [params], num_tokens_per_req=2)
@@ -441,10 +455,10 @@ def test_sampling_backend_round_trip_continues_where_the_victim_stopped(cls):
 
     assert backend.slot_state_bytes() % SLOT_STATE_ALIGNMENT == 0
     image = torch.full((backend.slot_state_bytes(),), 0xEE, dtype=torch.uint8)
-    backend.export_slot_state(src_slot, image, None, request_id=victim)
+    backend.export_slot_state(src_slot, image, None, admission_id=victim)
     for row in rows:
         row.zero_()
-    backend.import_slot_state(dst_slot, image, None, request_id=victim)
+    backend.import_slot_state(dst_slot, image, None, admission_id=victim)
     assert all(
         torch.equal(a, b) for a, b in zip(backend.slot_state_rows(dst_slot), expected)
     )
@@ -457,7 +471,7 @@ def test_sampling_backend_round_trip_continues_where_the_victim_stopped(cls):
     if cls is GreedySamplingBackend:
         assert backend.slot_state_bytes() == 0
         return
-    assert backend._last_rid_per_slot[dst_slot] == victim
+    assert backend._last_admission_per_slot[dst_slot] == victim
     assert all(
         torch.equal(a, b) for a, b in zip(backend.slot_state_rows(dst_slot), expected)
     )
@@ -477,7 +491,7 @@ def test_sampling_backend_round_trip_continues_where_the_victim_stopped(cls):
 
 
 @pytest.mark.parametrize("cls", SAMPLING_BACKENDS[1:], ids=lambda cls: cls.__name__)
-@pytest.mark.parametrize("previous_occupant", [None, "req-previous"])
+@pytest.mark.parametrize("previous_occupant", [None, 2])
 def test_sampling_backend_images_an_unprepared_slot_as_nobodys(cls, previous_occupant):
     """A PD decode role's request retracted between its landing and its first
     decode never went through prepare_step: the slot is either untouched or
@@ -486,28 +500,34 @@ def test_sampling_backend_images_an_unprepared_slot_as_nobodys(cls, previous_occ
     the request's first prepare_step resets it from its own SamplingParams,
     exactly as the unretracted first decode would have."""
     backend = _sampling_backend(cls)
-    victim, params = "req-victim", _sampling_params("req-victim", temperature=0.3)
+    victim, params = 1, _sampling_params("req-victim", temperature=0.3)
     src_slot, dst_slot = 4, 8
     if previous_occupant is not None:
         backend.prepare_step(
-            [previous_occupant], [src_slot], [_sampling_params(previous_occupant)]
+            [previous_occupant], [src_slot], [_sampling_params(str(previous_occupant))]
         )
     image = torch.full((backend.slot_state_bytes(),), 0xEE, dtype=torch.uint8)
-    backend.export_slot_state(src_slot, image, None, request_id=victim)
+    backend.export_slot_state(src_slot, image, None, admission_id=victim)
     assert not read_prepared_marker(image)
     assert torch.all(image[PREPARED_MARKER_BYTES:] == 0xEE), "no payload imaged"
 
     # The new slot held someone else; the restore makes it nobody's.
-    backend.prepare_step(["req-stale"], [dst_slot], [_sampling_params("req-stale")])
-    backend.import_slot_state(dst_slot, image, None, request_id=victim)
-    assert backend._last_rid_per_slot[dst_slot] is None
+    backend.prepare_step([3], [dst_slot], [_sampling_params("req-stale")])
+    backend.import_slot_state(dst_slot, image, None, admission_id=victim)
+    assert backend._last_admission_per_slot[dst_slot] is None
     with patch.object(type(backend), "_reset_slot", wraps=backend._reset_slot) as reset:
         backend.prepare_step([victim], [dst_slot], [params], num_tokens_per_req=2)
     reset.assert_called_once()
     assert reset.call_args.args[:2] == (dst_slot, params)
-    assert backend._last_rid_per_slot[dst_slot] == victim
-    assert float(backend._temperature_pool[dst_slot]) == pytest.approx(0.3)
-    assert int(backend._seed_pool[dst_slot]) == int(params.seed)
+    assert backend._last_admission_per_slot[dst_slot] == victim
+    per_slot = _per_slot_tensors(backend, {POOL_ROWS})
+    temperature, seed = (
+        per_slot[name]
+        for name in SCATTERED_SLOT_STATE.get(cls, ("_temperature_pool", "_seed_pool"))
+    )
+    # sonic keeps its temperature in bf16.
+    assert float(temperature[dst_slot]) == pytest.approx(0.3, abs=2**-8)
+    assert int(seed[dst_slot]) == int(params.seed)
     if isinstance(backend, FlashInferSamplingBackend):
         # The coin stream starts from the request's own seed: the step above
         # drew its coins from a generator seeded by the reset.
@@ -522,8 +542,8 @@ def test_sampling_backend_images_an_unprepared_slot_as_nobodys(cls, previous_occ
 def test_a_leaf_without_slot_state_images_nothing():
     leaf = _Leaf()
     assert leaf.slot_state_bytes() == 0
-    leaf.export_slot_state(0, torch.zeros(0, dtype=torch.uint8), None, request_id="r")
-    leaf.import_slot_state(0, torch.zeros(0, dtype=torch.uint8), None, request_id="r")
+    leaf.export_slot_state(0, torch.zeros(0, dtype=torch.uint8), None, admission_id=1)
+    leaf.import_slot_state(0, torch.zeros(0, dtype=torch.uint8), None, admission_id=1)
 
 
 def test_model_executor_lists_every_owner_once_and_the_layout_is_fixed():
@@ -558,7 +578,7 @@ def test_model_executor_lists_every_owner_once_and_the_layout_is_fixed():
         executor.sampling_backend,
     )
     # Slot 2 of the sampling backend must have been prepared to be imaged.
-    executor.sampling_backend.prepare_step(["r2"], [2], [_sampling_params("r2")])
+    executor.sampling_backend.prepare_step([2], [2], [_sampling_params("r2")])
 
     # The layout measures every owner once at construction and only slices
     # afterwards: no owner is asked its size again on export or import.
@@ -576,13 +596,13 @@ def test_model_executor_lists_every_owner_once_and_the_layout_is_fixed():
     with patch.object(
         RuntimeStates, "slot_state_bytes", side_effect=AssertionError("re-measured")
     ):
-        layout.export(2, image, None, request_id="r2")
+        layout.export(2, image, None, admission_id=2)
         for row in rows(2):
             row.zero_()
-        layout.import_(6, image, None, request_id="r6")
+        layout.import_(6, image, None, admission_id=2)
     assert all(torch.equal(a, b) for a, b in zip(rows(6), expected))
     with pytest.raises(ValueError, match="need"):
-        layout.export(2, image[:-SLOT_STATE_ALIGNMENT], None, request_id="r2")
+        layout.export(2, image[:-SLOT_STATE_ALIGNMENT], None, admission_id=2)
 
     class _Unpadded:
         def slot_state_bytes(self):
@@ -604,7 +624,7 @@ def _is_runtime_component(value) -> bool:
     return (
         not isinstance(value, (torch.Tensor, torch.nn.Module, SlotStateExporter))
         and hasattr(value, "__dict__")
-        and type(value).__module__.startswith("tokenspeed.")
+        and type(value).__module__.startswith(("tokenspeed.", "tokenspeed_kernel."))
     )
 
 
@@ -690,6 +710,14 @@ def test_drafter_slot_state_is_complete():
     _assert_slot_state_complete(eagle, exporter=eagle, slot_domains={POOL_ROWS})
 
 
+def test_native_block_drafter_slot_state_is_complete(tmp_path):
+    from test.runtime.test_inkling2_drafter import build_native_drafter
+
+    drafter, _, _, _, _ = build_native_drafter(tmp_path, MAX_BS, "cpu", {}, 40)
+    _assert_slot_state_complete(drafter, exporter=drafter, slot_domains={POOL_ROWS})
+    assert drafter.slot_state_bytes() == 0
+
+
 def test_backend_slot_state_is_complete():
     inkling = _inkling()
     _assert_slot_state_complete(inkling, exporter=inkling, slot_domains={POOL_ROWS})
@@ -704,7 +732,7 @@ def test_sampling_backend_slot_state_is_complete(cls):
     _assert_slot_state_complete(backend, exporter=backend, slot_domains={POOL_ROWS})
     # The declared constant pools exist, are per-slot, and really are constant.
     per_slot = _per_slot_tensors(backend, {POOL_ROWS})
-    for name in SamplingBackend.constant_slot_state:
+    for name in cls.constant_slot_state:
         assert name in per_slot
         assert per_slot[name].abs().sum() == 0
     # Every per-slot thing the rid-flip reset writes is in the image.
@@ -712,9 +740,9 @@ def test_sampling_backend_slot_state_is_complete(cls):
         exported = _storage_ids(backend.slot_state_rows(0))
         written = []
         for name, tensor in per_slot.items():
-            if name in SamplingBackend.constant_slot_state:
+            if name in cls.constant_slot_state:
                 continue
-            if name in SamplingBackend.token_derived_slot_state:
+            if name in cls.token_derived_slot_state:
                 # Derived scratch is neither restored nor changed by admission.
                 tensor[2].fill_(197)
                 before = tensor.clone()
@@ -726,7 +754,8 @@ def test_sampling_backend_slot_state_is_complete(cls):
             if tensor[2].abs().sum() != 0:
                 written.append(name)
             assert tensor.untyped_storage().data_ptr() in exported, name
-        assert "_temperature_pool" in written and "_seed_pool" in written
+        expected = SCATTERED_SLOT_STATE.get(cls, ("_temperature_pool", "_seed_pool"))
+        assert set(expected) <= set(written), written
 
 
 def test_completeness_check_catches_an_unexported_buffer():
@@ -746,7 +775,7 @@ def test_sampling_offsets_recompute_after_restore_to_another_slot(cls):
 
     backend = _sampling_backend(cls)
     rid = "offset-restore"
-    backend.prepare_step([rid], [4], [_sampling_params(rid)], num_tokens_per_req=2)
+    backend.prepare_step([1], [4], [_sampling_params(rid)], num_tokens_per_req=2)
     frontier = torch.zeros(POOL_ROWS, dtype=torch.int32)
     frontier[4] = 130
     info = SamplingBatchInfo(
@@ -756,9 +785,9 @@ def test_sampling_offsets_recompute_after_restore_to_another_slot(cls):
     )
     assert backend._prepare_sampling_offsets(info)[4].item() == 1025
     image = torch.empty(backend.slot_state_bytes(), dtype=torch.uint8)
-    backend.export_slot_state(4, image, None, request_id=rid)
+    backend.export_slot_state(4, image, None, admission_id=1)
     backend._sampling_offsets_pool[8] = -99
-    backend.import_slot_state(8, image, None, request_id=rid)
+    backend.import_slot_state(8, image, None, admission_id=1)
     # RuntimeStates restores the accepted frontier separately. A destination's
     # stale scratch must not affect the position regenerated for the next draw.
     frontier[8] = frontier[4]
@@ -828,11 +857,13 @@ def _blob_record(executor: ModelExecutor) -> tuple[list, int, str]:
     segments = [
         (type(owner).__name__, begin, end) for owner, begin, end in layout.segments
     ]
-    executor.sampling_backend.prepare_step(["r2"], [2], [_sampling_params("r2")])
+    # Admission 22 in slot 2, the same id the export below asks for, so the
+    # image carries the sampling payload and not the marker alone.
+    executor.sampling_backend.prepare_step([22], [2], [_sampling_params("r2")])
     torch.manual_seed(1)
     _randomize([row for owner in exporters for row in owner.slot_state_rows(2)])
     image = torch.zeros(layout.nbytes, dtype=torch.uint8)
-    layout.export(2, image, None, request_id="r2")
+    layout.export(2, image, None, admission_id=22)
     digest = hashlib.sha256(image.numpy().tobytes()).hexdigest()
     return segments, layout.nbytes, digest
 
@@ -851,17 +882,20 @@ _RECORDED_BLOBS = {
         "e1687bc19b77fe34cdccaf276813a737c4f30f0075e210dbef2497c5a6b4347f",
     ),
     "eagle": (
+        # RuntimeStates is 96 bytes wider than on F: the sampled-tree draft
+        # distributions (future_draft_q: q, q_ids, slot, pos) are slot state
+        # since the main merge; re-recorded on the merged tree.
         [
-            ("RuntimeStates", 0, 672),
-            ("InklingAttnBackend", 672, 848),
-            ("_Leaf", 848, 848),
-            ("InklingAttnBackend", 848, 1024),
-            ("_Leaf", 1024, 1024),
-            ("Eagle", 1024, 1040),
-            ("TritonFullSamplingBackend", 1040, 1376),
+            ("RuntimeStates", 0, 768),
+            ("InklingAttnBackend", 768, 944),
+            ("_Leaf", 944, 944),
+            ("InklingAttnBackend", 944, 1120),
+            ("_Leaf", 1120, 1120),
+            ("Eagle", 1120, 1136),
+            ("TritonFullSamplingBackend", 1136, 1472),
         ],
-        1376,
-        "76da900930377f7934f303342aa00b2447a20e71c3b0e9511395acb878ece62e",
+        1472,
+        "288e02fbd021b4d62448ae2457a00adf9ad72a65ced8747127f524e24e0d5fa8",
     ),
     "plain": (
         [
@@ -920,16 +954,16 @@ def test_model_owned_exporters_follow_the_runtime_owners_in_the_blob():
     torch.manual_seed(3)
     _randomize(cross.slot_state_rows(2))
     expected = [row.clone() for row in cross.slot_state_rows(2)]
-    cross.claim_slot(2, "r2")
+    cross.claim_slot(2, 22)
     image = torch.zeros(layout.nbytes, dtype=torch.uint8)
-    layout.export(2, image, None, request_id="r2")
-    layout.import_(7, image, None, request_id="r2")
+    layout.export(2, image, None, admission_id=22)
+    layout.import_(7, image, None, admission_id=22)
     assert all(torch.equal(a, b) for a, b in zip(cross.slot_state_rows(7), expected))
-    assert cross.owner_of(7) == "r2"
+    assert cross.owner_of(7) == 22
 
 
 # ----------------------------------------------------------------------
-# Whisper's cross-attention KV: a model-owned, request-keyed owner.
+# Whisper's cross-attention KV: a model-owned, admission-keyed owner.
 # ----------------------------------------------------------------------
 
 # Small enough to stay off the slot domain: padded_len 8 (2 pages of 4),
@@ -999,16 +1033,16 @@ def test_cross_attention_cache_round_trip_restores_rows_and_claims_the_slot():
     torch.manual_seed(5)
     _randomize([cross.k, cross.v])
     cross.claim_slot(3, RESTORED)
-    cross.claim_slot(9, "req-stale")
+    cross.claim_slot(9, 90)
     expected = [row.clone() for row in cross.slot_state_rows(3)]
     k_before, v_before = cross.k.clone(), cross.v.clone()
 
     image = torch.full((cross.slot_state_bytes(),), 0xEE, dtype=torch.uint8)
-    cross.export_slot_state(3, image, None, request_id=RESTORED)
+    cross.export_slot_state(3, image, None, admission_id=RESTORED)
     assert read_prepared_marker(image)
     for row in cross.slot_state_rows(3):
         row.zero_()
-    cross.import_slot_state(9, image, None, request_id=RESTORED)
+    cross.import_slot_state(9, image, None, admission_id=RESTORED)
 
     assert all(torch.equal(a, b) for a, b in zip(cross.slot_state_rows(9), expected))
     assert cross.owner_of(9) == RESTORED
@@ -1022,7 +1056,7 @@ def test_cross_attention_cache_round_trip_restores_rows_and_claims_the_slot():
         )
 
 
-@pytest.mark.parametrize("previous_occupant", [None, "req-previous"])
+@pytest.mark.parametrize("previous_occupant", [None, 55])
 def test_cross_attention_cache_images_an_unowned_slot_as_nobodys(previous_occupant):
     """**Validates: Requirement 3.7.** A victim retracted before its audio was
     encoded into its slot (the slot is nobody's, or a previous occupant's)
@@ -1033,22 +1067,22 @@ def test_cross_attention_cache_images_an_unowned_slot_as_nobodys(previous_occupa
     _randomize([cross.k, cross.v])
     if previous_occupant is not None:
         cross.claim_slot(3, previous_occupant)
-    cross.claim_slot(9, "req-stale")
+    cross.claim_slot(9, 90)
     dst_rows = [row.clone() for row in cross.slot_state_rows(9)]
 
     image = torch.full((cross.slot_state_bytes(),), 0xEE, dtype=torch.uint8)
-    cross.export_slot_state(3, image, None, request_id="req-victim")
+    cross.export_slot_state(3, image, None, admission_id=56)
     assert not read_prepared_marker(image)
     assert torch.all(image[PREPARED_MARKER_BYTES:] == 0xEE), "no payload imaged"
-    cross.import_slot_state(9, image, None, request_id="req-victim")
+    cross.import_slot_state(9, image, None, admission_id=56)
 
     assert cross.owner_of(9) is None
     assert all(torch.equal(a, b) for a, b in zip(cross.slot_state_rows(9), dst_rows))
     assert cross.owner_of(3) == previous_occupant, "export does not change ownership"
 
 
-def _audio_context(requests: list[tuple[str, int]], prefix_lens: list[int]):
-    """An extend's multimodal context: one audio window per ``(rid, slot)``."""
+def _audio_context(requests: list[tuple[int, int]], prefix_lens: list[int]):
+    """An extend's multimodal context: one audio window per ``(admission, slot)``."""
     from tokenspeed.runtime.multimodal.inputs import (
         Modality,
         MultimodalDataItem,
@@ -1068,7 +1102,8 @@ def _audio_context(requests: list[tuple[str, int]], prefix_lens: list[int]):
             )
             for index in range(len(requests))
         ],
-        request_ids=[rid for rid, _ in requests],
+        request_ids=[f"r{admission}" for admission, _ in requests],
+        admission_ids=[admission for admission, _ in requests],
         request_pool_indices=[slot for _, slot in requests],
         extend_prefix_lens=list(prefix_lens),
         extend_seq_lens=[1] * len(requests),
@@ -1076,8 +1111,8 @@ def _audio_context(requests: list[tuple[str, int]], prefix_lens: list[int]):
     )
 
 
-def _to_encode(cross, requests, prefix_lens) -> list[tuple[str, int]]:
-    """The ``(rid, slot)`` pairs the model's extend would run the encoder for."""
+def _to_encode(cross, requests, prefix_lens) -> list[tuple[int, int]]:
+    """The ``(admission, slot)`` pairs the model's extend would run the encoder for."""
     from tokenspeed.runtime.models.whisper import _audio_features_to_encode
 
     features, slots, rids = _audio_features_to_encode(
@@ -1094,28 +1129,141 @@ def test_cross_attention_encodes_a_request_iff_its_slot_is_not_its_own():
     decides whether an extend runs the encoder: a fresh request encodes; a
     continuation of the slot's owner skips it at any prefix; a new request
     in a slot a finished one encoded re-encodes even with a prefix hit (no
-    finish event releases the slot -- the different request id is the
+    finish event releases the slot -- the different admission id is the
     signal); a restored image claims its slot, a not-prepared one leaves it
     for the next extend to encode."""
     cross = _cross_cache()
     # Fresh admits encode.
-    assert _to_encode(cross, [("a", 2), ("b", 5)], [0, 0]) == [("a", 2), ("b", 5)]
-    for rid, slot in (("a", 2), ("b", 5)):
-        cross.claim_slot(slot, rid)  # what encode_audio records
+    assert _to_encode(cross, [(1, 2), (2, 5)], [0, 0]) == [(1, 2), (2, 5)]
+    for admission, slot in ((1, 2), (2, 5)):
+        cross.claim_slot(slot, admission)  # what encode_audio records
     # Their continuations (chunked prefill, recompute into the same slot) do not.
-    assert _to_encode(cross, [("a", 2), ("b", 5)], [4, 0]) == []
-    # "a" finished; "c" lands in slot 2 with a prefix hit: it does not own it.
-    assert _to_encode(cross, [("c", 2), ("b", 5)], [3, 7]) == [("c", 2)]
-    cross.claim_slot(2, "c")
-    # "b" is resumed by recompute into slot 2, now "c"'s: it encodes again.
-    assert _to_encode(cross, [("b", 2)], [6]) == [("b", 2)]
+    assert _to_encode(cross, [(1, 2), (2, 5)], [4, 0]) == []
+    # 1 finished; 3 lands in slot 2 with a prefix hit: it does not own it.
+    assert _to_encode(cross, [(3, 2), (2, 5)], [3, 7]) == [(3, 2)]
+    cross.claim_slot(2, 3)
+    # 2 is resumed by recompute into slot 2, now 3's: it encodes again.
+    assert _to_encode(cross, [(2, 2)], [6]) == [(2, 2)]
 
-    # A snapshot of "b" (slot 5) restored into slot 7 claims slot 7 for "b".
+    # A snapshot of 2 (slot 5) restored into slot 7 claims slot 7 for 2.
     image = torch.empty((cross.slot_state_bytes(),), dtype=torch.uint8)
-    cross.export_slot_state(5, image, None, request_id="b")
-    cross.import_slot_state(7, image, None, request_id="b")
-    assert _to_encode(cross, [("b", 7)], [6]) == []
+    cross.export_slot_state(5, image, None, admission_id=2)
+    cross.import_slot_state(7, image, None, admission_id=2)
+    assert _to_encode(cross, [(2, 7)], [6]) == []
     # A victim whose audio never ran here restores as nobody's and encodes.
-    cross.export_slot_state(4, image, None, request_id="d")
-    cross.import_slot_state(8, image, None, request_id="d")
-    assert _to_encode(cross, [("d", 8)], [2]) == [("d", 8)]
+    cross.export_slot_state(4, image, None, admission_id=4)
+    cross.import_slot_state(8, image, None, admission_id=4)
+    assert _to_encode(cross, [(4, 8)], [2]) == [(4, 8)]
+
+
+def test_cross_attention_encodes_again_for_a_reused_request_id():
+    """A request id reused by a new admission is a different owner: its slot
+    still holds the previous admission's rows, so the extend encodes."""
+    cross = _cross_cache()
+    cross.claim_slot(2, 1)
+    assert _to_encode(cross, [(1, 2)], [4]) == []
+    context = _audio_context([(1, 2)], [4])
+    context.admission_ids = [9]
+    from tokenspeed.runtime.models.whisper import _audio_features_to_encode
+
+    features, slots, admissions = _audio_features_to_encode(context, cross)
+    assert features is not None and (slots, admissions) == ([2], [9])
+
+
+@pytest.mark.parametrize("cls", SAMPLING_BACKENDS[1:], ids=lambda cls: cls.__name__)
+def test_new_admission_replaces_sampling_parameters_and_history(cls):
+    backend = _sampling_backend(cls)
+    old = _sampling_params("reused", seed=17, logit_bias={"3": 4.0})
+    backend.prepare_step([41], [4], [old], num_tokens_per_req=2)
+    for row in backend.slot_state_rows(4):
+        if row.ndim == 1 and row.dtype == torch.int32:
+            row.fill_(7)
+    current = _sampling_params(
+        "reused",
+        seed=123,
+        temperature=0.0,
+        min_p=0.0,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        repetition_penalty=1.0,
+    )
+    backend.prepare_step([42], [4], [current], num_tokens_per_req=2)
+    fresh = _sampling_backend(cls)
+    fresh.prepare_step([42], [4], [current], num_tokens_per_req=2)
+    for actual, expected in zip(
+        backend.slot_state_rows(4), fresh.slot_state_rows(4), strict=True
+    ):
+        assert torch.equal(actual, expected)
+    if isinstance(backend, FlashInferSamplingBackend):
+        assert torch.equal(
+            backend._cpu_generator_per_slot[4].get_state(),
+            fresh._cpu_generator_per_slot[4].get_state(),
+        )
+
+
+@pytest.mark.parametrize("cls", SAMPLING_BACKENDS[1:], ids=lambda cls: cls.__name__)
+@pytest.mark.parametrize("destination", [4, 8])
+def test_snapshot_before_new_admissions_first_prepare_omits_previous_payload(
+    cls, destination
+):
+    backend = _sampling_backend(cls)
+    backend.prepare_step([41], [4], [_sampling_params("reused", seed=17)])
+    image = torch.full((backend.slot_state_bytes(),), 0xEE, dtype=torch.uint8)
+    backend.export_slot_state(4, image, None, admission_id=42)
+    assert not read_prepared_marker(image)
+    assert torch.all(image[PREPARED_MARKER_BYTES:] == 0xEE)
+    backend.import_slot_state(destination, image, None, admission_id=42)
+    current = _sampling_params("reused", seed=123, temperature=0.3)
+    backend.prepare_step([42], [destination], [current])
+    fresh = _sampling_backend(cls)
+    fresh.prepare_step([42], [destination], [current])
+    for actual, expected in zip(
+        backend.slot_state_rows(destination),
+        fresh.slot_state_rows(destination),
+        strict=True,
+    ):
+        assert torch.equal(actual, expected)
+    if isinstance(backend, FlashInferSamplingBackend):
+        assert torch.equal(
+            backend._cpu_generator_per_slot[destination].get_state(),
+            fresh._cpu_generator_per_slot[destination].get_state(),
+        )
+
+
+def _v41_confidence_drafter(monkeypatch):
+    from test.runtime.test_deepseek_v41_dspark import _draft_config
+    from test.runtime.test_deepseek_v41_model import _loader_model, _mapping, _quant
+
+    from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
+        DeepseekV41DSpark,
+    )
+    from tokenspeed.runtime.models.deepseek_v41_dspark import (
+        DeepseekV41ForCausalLMDSpark,
+    )
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    config = _draft_config()
+    _loader_model(monkeypatch, config, 0, "cpu")
+    mapping = _mapping(0, 4, 4)
+    model = DeepseekV41ForCausalLMDSpark(
+        SimpleNamespace(text_config=config), mapping, _quant()
+    )
+    monkeypatch.setitem(global_server_args_dict, "enable_dsv41_adaptive_dspark", True)
+    states = RuntimeStates(
+        MAX_REQ_POOL_SIZE, config.vocab_size, config.vocab_size, 6, device="cpu"
+    )
+    return DeepseekV41DSpark(
+        spec_num_tokens=6,
+        spec_num_steps=5,
+        draft_model_runner=SimpleNamespace(model=model, mapping=mapping, device="cpu"),
+        attn_backend=None,
+        token_to_kv_pool=None,
+        runtime_states=states,
+        input_buffers=_input_buffers(),
+        vocab_size=config.vocab_size,
+    )
+
+
+def test_v41_confidence_slot_state_is_complete(monkeypatch):
+    drafter = _v41_confidence_drafter(monkeypatch)
+    _assert_slot_state_complete(drafter, exporter=drafter, slot_domains={POOL_ROWS})

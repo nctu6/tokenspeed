@@ -1,0 +1,97 @@
+name: TokenSpeed Engine Rust Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tokenspeed-engine/**"
+      - "tokenspeed-scheduler/**"
+      - "test/ci_system/engine_cache.py"
+      - "test/ci_system/install_tokenspeed_engine.sh"
+      - "test/ci_system/test_engine_cache.py"
+      - ".github/workflows/tokenspeed-engine-test.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "tokenspeed-engine/**"
+      - "tokenspeed-scheduler/**"
+      - "test/ci_system/engine_cache.py"
+      - "test/ci_system/install_tokenspeed_engine.sh"
+      - "test/ci_system/test_engine_cache.py"
+      - ".github/workflows/tokenspeed-engine-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tokenspeed-engine-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tokenspeed-engine
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ts-scheduler compiles the scheduler and its nanobind module into the
+      # host extension, as the scheduler wheel build does.
+      - name: Install the C++ build dependencies
+        run: |
+          # CMake and Ninja come from the Python build requirements below.
+          # Use the runner's installed OpenSSL headers before refreshing apt.
+          if ! sudo apt-get install -y --no-install-recommends libssl-dev; then
+            sudo apt-get update -o Acquire::Retries=5
+            sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 libssl-dev
+          fi
+          mapfile -t build_requirements < <(python ../test/ci_system/engine_cache.py --build-requirements)
+          python -m pip install "${build_requirements[@]}" numpy pytest
+          echo "PYO3_PYTHON=$(which python)" >> "$GITHUB_ENV"
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Identify native build environment
+        id: engine-environment
+        # Assign first so bash -e propagates a key-computation failure instead
+        # of writing an empty key that silently stops invalidating the cache.
+        run: |
+          key=$(python ../test/ci_system/engine_cache.py --environment-key)
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tokenspeed-engine
+          cache-workspace-crates: true
+          key: ${{ steps.engine-environment.outputs.key }}-${{ hashFiles('tokenspeed-scheduler/**', 'tokenspeed-engine/crates/ts-scheduler/**', 'tokenspeed-engine/crates/ts-grammar/**') }}
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Test engine cache invalidation
+        run: python -m pytest -q ../test/ci_system/test_engine_cache.py
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      # The wheel the engine installs: the frontend and host extensions.
+      - name: Build the wheel
+        run: |
+          python -m pip wheel . --no-deps --no-build-isolation -w dist
+          python -m pip install --no-deps dist/tokenspeed_engine-*.whl
+          cd /tmp && python -c 'import os, tokenspeed_engine; from tokenspeed_engine._host import run_host; assert os.access(tokenspeed_engine.host_binary(), os.X_OK)'

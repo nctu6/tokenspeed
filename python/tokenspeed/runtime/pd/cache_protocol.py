@@ -18,13 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Cache transfer contract and per-request PD protocol.
+"""The cache transfer contract a PD rank publishes.
 
 The cache recipe owns semantic group specs and the transfer schema, while the
 memory planner owns physical geometry. PD transports those objects directly
-instead of maintaining a second physical layout schema. This module owns the
-wire contract, request block manifests, producer-step projection, and peer
-validation.
+instead of maintaining a second physical layout schema: this module binds
+them into the wire contract, and the producer schedule layerwise streaming
+follows. Everything a transfer reads off the contract -- routes, block
+manifests, copies -- is planned by the engine host (``ts-pd``).
 """
 
 from __future__ import annotations
@@ -55,11 +56,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
 )
 
 MAX_CACHE_CONTRACT_WIRE_BYTES = 256 << 10
-MAX_CACHE_MANIFEST_WIRE_BYTES = 2 << 20
 
 
 class CacheContractError(ValueError):
-    """A cache pool, peer, or scheduler violated the runtime cache contract."""
+    """A cache pool or its plan violated the runtime cache contract."""
 
 
 def _dump_wire_json(value: object, *, name: str, maximum: int) -> bytes:
@@ -75,20 +75,6 @@ def _dump_wire_json(value: object, *, name: str, maximum: int) -> bytes:
     return result
 
 
-def _load_wire_json(raw: bytes, *, name: str, maximum: int) -> dict:
-    if not raw or len(raw) > maximum:
-        raise CacheContractError(f"{name} payload must be 1..{maximum} bytes")
-    try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise CacheContractError(f"invalid {name} JSON") from exc
-    if not isinstance(value, dict):
-        raise CacheContractError(f"{name} payload must be a JSON object")
-    return value
-
-
-# No ``slots``: like ``CacheMemoryPlan``, the frozen contract caches its
-# lookup index in ``__dict__``; dataclass fields alone define the wire form.
 @dataclass(frozen=True)
 class CacheTransferContract:
     """Thin PD wire envelope around the cache-owned plan and group specs."""
@@ -108,6 +94,15 @@ class CacheTransferContract:
                 f"missing={sorted(plan_group_ids - spec_group_ids)}, "
                 f"extra={sorted(spec_group_ids - plan_group_ids)}"
             )
+        # Tail copy-in needs the window to cover the sink's partial prefix page.
+        for spec in self.group_specs:
+            if (
+                spec.sink_tokens
+                and spec.sliding_window_tokens < self.plan.prefix_granularity
+            ):
+                raise CacheContractError(
+                    "sink retention requires sliding_window_tokens >= prefix_granularity"
+                )
         self.transfer_schema.validate(self.plan)
         if self.field_addresses is not None:
             if not isinstance(self.field_addresses, dict):
@@ -119,6 +114,13 @@ class CacheTransferContract:
                 for p in self.field_addresses.values()
             ):
                 raise CacheContractError("field addresses must be nonzero uint64")
+
+    def to_wire_bytes(self) -> bytes:
+        return _dump_wire_json(
+            self,
+            name="cache transfer contract",
+            maximum=MAX_CACHE_CONTRACT_WIRE_BYTES,
+        )
 
     def field_address(self, base: int, field_id: str) -> int:
         if self.field_addresses is not None:
@@ -160,13 +162,6 @@ class CacheTransferContract:
 
     def field_dtype(self, field_id: str) -> str:
         return self.plan.field(field_id).dtype
-
-    def to_wire_bytes(self) -> bytes:
-        return _dump_wire_json(
-            self,
-            name="cache transfer contract",
-            maximum=MAX_CACHE_CONTRACT_WIRE_BYTES,
-        )
 
     @classmethod
     def from_wire_bytes(cls, raw: bytes) -> "CacheTransferContract":
@@ -221,33 +216,6 @@ class CacheTransferContract:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise CacheContractError("invalid cache transfer contract") from exc
-
-
-def build_cache_transfer_contract(
-    *,
-    plan: CacheMemoryPlan,
-    buffer: object,
-    group_specs: Sequence[CacheGroupSpec],
-    transfer_schema: CacheTransferSchema = CacheTransferSchema(),
-) -> tuple[CacheTransferContract, int]:
-    """Bind one cache memory plan to its semantics and raw slab."""
-    specs = tuple(group_specs)
-    contract = CacheTransferContract(
-        plan=plan,
-        group_specs=specs,
-        transfer_schema=transfer_schema,
-    )
-    if (
-        str(buffer.dtype) != "torch.uint8"
-        or not buffer.is_contiguous()
-        or buffer.storage_offset() != 0
-        or buffer.data_ptr() != buffer.untyped_storage().data_ptr()
-        or int(buffer.nbytes) != plan.arena_bytes
-    ):
-        raise CacheContractError(
-            "cache transfer buffer must be the contiguous uint8 arena owner"
-        )
-    return contract, buffer.data_ptr()
 
 
 def build_arena_cache_transfer_contract(
@@ -325,6 +293,36 @@ def build_cache_fields_by_producer_step(
     ):
         raise ValueError("cache producer schedule must cover every resident field")
     return schedule
+
+
+__all__ = [
+    "CacheContractError",
+    "CacheFieldPartition",
+    "CacheFieldTransferSpec",
+    "CacheProducerSchedule",
+    "CacheTransferContract",
+    "CacheTransferSchema",
+    "build_cache_fields_by_producer_step",
+    "build_cache_transfer_schema",
+    "build_arena_cache_transfer_contract",
+]
+
+
+# --- definitions restored from the pre-merge branch (D3-3) ---
+
+MAX_CACHE_MANIFEST_WIRE_BYTES = 2 << 20
+
+
+def _load_wire_json(raw: bytes, *, name: str, maximum: int) -> dict:
+    if not raw or len(raw) > maximum:
+        raise CacheContractError(f"{name} payload must be 1..{maximum} bytes")
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CacheContractError(f"invalid {name} JSON") from exc
+    if not isinstance(value, dict):
+        raise CacheContractError(f"{name} payload must be a JSON object")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -668,23 +666,31 @@ def build_cache_layerwise_block_selection(
     return CachePDLayerwiseBlockSelection(groups=tuple(selections))
 
 
-__all__ = [
-    "CacheContractError",
-    "CacheFieldPartition",
-    "CacheFieldTransferSpec",
-    "CachePDBlockManifest",
-    "CachePDGroupBlocks",
-    "CachePDLayerwiseGroupSelection",
-    "CachePDLayerwiseBlockSelection",
-    "CacheProducerSchedule",
-    "CacheTransferContract",
-    "CacheTransferSchema",
-    "build_cache_fields_by_producer_step",
-    "build_cache_block_manifest",
-    "build_cache_layerwise_block_selection",
-    "build_cache_transfer_schema",
-    "build_cache_transfer_contract",
-    "build_arena_cache_transfer_contract",
-    "validate_cache_manifest",
-    "validate_cache_peer_layout",
-]
+# --- definitions restored from the pre-merge branch (D3-3) ---
+
+
+def build_cache_transfer_contract(
+    *,
+    plan: CacheMemoryPlan,
+    buffer: object,
+    group_specs: Sequence[CacheGroupSpec],
+    transfer_schema: CacheTransferSchema = CacheTransferSchema(),
+) -> tuple[CacheTransferContract, int]:
+    """Bind one cache memory plan to its semantics and raw slab."""
+    specs = tuple(group_specs)
+    contract = CacheTransferContract(
+        plan=plan,
+        group_specs=specs,
+        transfer_schema=transfer_schema,
+    )
+    if (
+        str(buffer.dtype) != "torch.uint8"
+        or not buffer.is_contiguous()
+        or buffer.storage_offset() != 0
+        or buffer.data_ptr() != buffer.untyped_storage().data_ptr()
+        or int(buffer.nbytes) != plan.arena_bytes
+    ):
+        raise CacheContractError(
+            "cache transfer buffer must be the contiguous uint8 arena owner"
+        )
+    return contract, buffer.data_ptr()

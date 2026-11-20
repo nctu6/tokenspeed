@@ -25,7 +25,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from enum import Enum, auto
 from typing import Any
 
@@ -290,10 +290,10 @@ class MultimodalInputs(msgspec.Struct, eq=False, kw_only=True, array_like=True):
 class MultimodalForwardContext:
     """Per-forward multimodal metadata for prefill embedding replacement.
 
-    A snapshot handed to the data plane inside a forward closure: the
-    ``mm_inputs`` here are shallow copies, so the control plane's later edits
-    to a request's live ``multimodal_inputs`` (M-RoPE position extension as
-    the request generates) are invisible to a forward already in flight.
+    A snapshot a forward reads: the ``mm_inputs`` here are shallow copies, so
+    later rounds' edits to a request's live ``multimodal_inputs`` (M-RoPE
+    position extension as the request generates) are invisible to a forward
+    already in flight.
     """
 
     mm_inputs: list[MultimodalInputs | None]
@@ -306,6 +306,11 @@ class MultimodalForwardContext:
     extend_seq_lens: list[int]
     # The forward token bound, which caps each encoder call; a larger item runs alone.
     max_encoder_tokens: int
+    # The batch's admission ids, aligned with ``request_ids``: the immutable
+    # identity of each admission, which a model keys per-slot state by (a
+    # request id may be reused; see ``SlotStateExporter``). None only where
+    # the caller builds a context for a model that keeps no such state.
+    admission_ids: list[int] | None = None
 
     def has_inputs(self) -> bool:
         return bool(self.mm_inputs and any(x is not None for x in self.mm_inputs))
@@ -335,16 +340,23 @@ def _resolve_mrope_delta_scalar(mm_input: MultimodalInputs) -> None:
         mm_input.mrope_position_delta_scalar = int(delta.flatten()[0].item())
 
 
-def multimodal_context_for_forward(forward_op, rid_to_state, max_encoder_tokens: int):
+def multimodal_context_for_forward(
+    forward_op,
+    rid_to_state,
+    max_encoder_tokens: int,
+    admission_ids: Sequence[int],
+):
     """Assemble the batch's :class:`MultimodalForwardContext` from per-request
     state.
 
     Args:
         forward_op: The forward op about to dispatch; supplies the batch's
             request ids and extend geometry.
-        rid_to_state: The output processor's request-id -> state map, whose
-            states carry each request's ``multimodal_inputs``.
+        rid_to_state: Request id -> the request as the data plane holds it,
+            carrying its ``multimodal_inputs``.
         max_encoder_tokens: The forward token bound, which caps each encoder call.
+        admission_ids: The batch's admission ids, aligned with
+            ``forward_op.request_ids``.
 
     Returns:
         A ``MultimodalForwardContext`` aligned to the batch order, or ``None``
@@ -358,9 +370,9 @@ def multimodal_context_for_forward(forward_op, rid_to_state, max_encoder_tokens:
         item = getattr(state, "multimodal_inputs", None) if state else None
         if item is not None:
             # Resolve the decode delta here rather than letting the forward
-            # write it back: the data plane must not edit a control-plane
-            # object, and resolving on the live struct keeps the value across
-            # rounds, which a per-round snapshot could not.
+            # write it back: a launched forward must not edit the live
+            # struct, and resolving on it keeps the value across rounds,
+            # which a per-round snapshot could not.
             _resolve_mrope_delta_scalar(item)
             # Snapshot. The struct is small and its tensors are shared by
             # reference; what the copy buys is that this batch's view of
@@ -369,7 +381,7 @@ def multimodal_context_for_forward(forward_op, rid_to_state, max_encoder_tokens:
             # ``mm_items`` stay shared and mutable by DESIGN — the data plane
             # writes ``encoded``/``feature`` through them mid-forward; that
             # is the registered multimodal exception to the capture contract
-            # (see forward_thread.py, rule 5).
+            # (see execution/device.py, rule 5).
             item = copy.copy(item)
         mm_inputs.append(item)
         has_mm = has_mm or item is not None
@@ -383,4 +395,5 @@ def multimodal_context_for_forward(forward_op, rid_to_state, max_encoder_tokens:
         extend_prefix_lens=list(forward_op.extend_prefix_lens),
         extend_seq_lens=list(forward_op.input_lengths[:num_extends]),
         max_encoder_tokens=max_encoder_tokens,
+        admission_ids=list(admission_ids),
     )

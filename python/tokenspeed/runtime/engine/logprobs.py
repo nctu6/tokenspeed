@@ -18,30 +18,58 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Logprob assembly for the async frontend — two dialects, one compute path.
-
-The scheduler/sampler emit format-neutral wire arrays on ``recv_obj``
-(``recv_obj.{input,output}_{token,top}_logprobs_{val,idx}`` etc.). This
-processor renders them into the ``logprobs_info`` payload the per-request
-``RequestOutputCollector`` merges, in whichever dialect the request asked for:
-
-- ``"vllm"`` -> ``meta_info["logprobs"]`` as ``list[dict[token_id, Logprob]]``
-  (one dict per generated token) plus a running ``cumulative_logprob``.
-- ``"sglang"`` -> ``meta_info["output_token_logprobs"]`` (and the top-k /
-  token-id variants) as lists of ``(logprob, token_id, text|None)`` tuples.
-- ``"both"`` -> emit both (opt-in; doubles the payload).
-
-Only the renderers differ; the underlying wire arrays are computed once.
-
-For streaming, ``OutputProcessor`` retains only ``cumulative_logprob`` across
-frames; lists contain the current frame's positions. The collector appends
-those lists and keeps the latest cumulative scalar when coalescing frames.
-"""
+"""Which logprobs an engine returns beyond the sampled tokens': the facts the
+engine host's ingress checks each request's logprob asks against
+(``ts-control``'s ``LogprobServability``)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+
+@dataclass(frozen=True)
+class LogprobServability:
+    """Which logprobs an engine can return, as its ingress checks a request.
+
+    Attributes:
+        enable_output_logprobs: ``--enable-output-logprobs``: the sampler
+            gathers the sampled tokens' logprobs.
+        supports_prompt_logprobs: The engine's startup verdict
+            (``DeviceSpecs.supports_prompt_logprobs``): its model keeps every
+            prompt row's activations.
+        logprob_order: ``--logprob-order``; the top-k alternatives need
+            ``torch``.
+        pipeline_parallel: The engine runs pipeline stages.
+        disaggregated: The engine is one role of a disaggregated deployment.
+        vocab_size: The model's vocabulary size.
+    """
+
+    enable_output_logprobs: bool
+    supports_prompt_logprobs: bool
+    logprob_order: str
+    pipeline_parallel: bool
+    disaggregated: bool
+    vocab_size: int
+
+    @classmethod
+    def of(
+        cls, server_args, *, supports_prompt_logprobs: bool, vocab_size: int
+    ) -> LogprobServability:
+        """The servability of an engine started with ``server_args``."""
+        return cls(
+            enable_output_logprobs=server_args.enable_output_logprobs,
+            supports_prompt_logprobs=supports_prompt_logprobs,
+            logprob_order=server_args.logprob_order,
+            pipeline_parallel=(
+                server_args.mapping is not None and server_args.mapping.has_pp
+            ),
+            disaggregated=server_args.disaggregation_mode != "null",
+            vocab_size=vocab_size,
+        )
+
+
+# --- definitions restored from the pre-merge branch (D3-3) ---
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.async_llm import AsyncLLM

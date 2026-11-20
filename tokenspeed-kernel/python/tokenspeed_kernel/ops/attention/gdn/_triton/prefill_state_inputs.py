@@ -22,9 +22,16 @@
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import current_platform
 
 
-@triton.jit
+@triton.jit(
+    **(
+        {"do_not_specialize_on_alignment": ["state_in", "state_out"]}
+        if current_platform().is_npu
+        else {}
+    )
+)
 def _prepare_prefill_state_inputs_kernel(
     conv_states,
     ssm_states,
@@ -99,6 +106,8 @@ def prepare_prefill_state_inputs(
     ssm_states: torch.Tensor,
     state_in_blocks: torch.Tensor,
     state_out_blocks: torch.Tensor,
+    *,
+    dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Copy resumed conv windows and gather/zero recurrent inputs in one launch.
 
@@ -110,12 +119,13 @@ def prepare_prefill_state_inputs(
             As required by cache ownership, a destination cannot overwrite
             another request's input snapshot; source==destination is allowed
             for that request's private in-place evolution.
+        dtype: Recurrent input dtype; conversion is fused into the gather.
 
     Returns:
         Contiguous [requests, heads, key, value] recurrent inputs and bool
         [requests] history flags. Fresh recurrent rows are exactly zero;
         fresh conv windows are unchanged. The recurrent cache and null block
-        are untouched. GPU supports arbitrary cache strides without index
+        are untouched. CUDA and Ascend support arbitrary cache strides without index
         casts or scratch gathers; CPU retains the PyTorch reference.
     """
     if conv_states.ndim != 3 or ssm_states.ndim != 4:
@@ -132,13 +142,13 @@ def prepare_prefill_state_inputs(
         for tensor in (ssm_states, state_in_blocks, state_out_blocks)
     ):
         raise ValueError("prefill caches and indices must be on the same device")
-    if not conv_states.is_cuda:
+    if conv_states.device.type not in ("cuda", "npu"):
         has_initial_state = state_in_blocks > 0
         safe_inputs = torch.where(
             has_initial_state, state_in_blocks, state_out_blocks
         ).to(torch.int64)
         conv_states[state_out_blocks.long()] = conv_states[safe_inputs]
-        recurrent = ssm_states[safe_inputs]
+        recurrent = ssm_states[safe_inputs].to(dtype)
         recurrent.masked_fill_(~has_initial_state[:, None, None, None], 0)
         return recurrent, has_initial_state
 
@@ -146,7 +156,7 @@ def prepare_prefill_state_inputs(
     recurrent = torch.empty(
         (rows, *ssm_states.shape[1:]),
         device=ssm_states.device,
-        dtype=ssm_states.dtype,
+        dtype=dtype,
     )
     has_initial_state = torch.empty(
         rows, dtype=torch.bool, device=state_in_blocks.device

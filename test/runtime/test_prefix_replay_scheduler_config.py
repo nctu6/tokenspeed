@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("tokenspeed_scheduler")
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+pytest.importorskip("tokenspeed_engine.scheduler")
+
+from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.engine.scheduler_utils import (
     make_config,
     resolve_dspark_prefix_replay_tokens,
@@ -22,14 +26,19 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
+        max_resident_requests=8,
         prefix_granularity=2,
         num_host_pages=0,
         disable_l2_cache=True,
         enable_l3_storage=False,
         role="fused",
         num_snapshot_pages=1,
+        host_group_packing=(),
         max_retracted_requests=0,
-        l3_prefetch_min_pages=0,
+        host_write_policy="write_through",
+        prefill_decode_interval=0,
+        prefill_decode_min_interval=0,
+        storage_config=None,
         **kwargs,
     )
 
@@ -137,14 +146,25 @@ def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> N
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
+        max_resident_requests=8,
         prefix_granularity=2,
         num_host_pages=8,
         disable_l2_cache=False,
         enable_l3_storage=enable_l3_storage,
         role="fused",
         num_snapshot_pages=1,
+        host_group_packing=(),
         max_retracted_requests=0,
-        l3_prefetch_min_pages=2 if enable_l3_storage else 0,
+        host_write_policy="write_through",
+        prefill_decode_interval=0,
+        prefill_decode_min_interval=0,
+        storage_config=(
+            StorageRuntimeConfig.from_extra_config(
+                None, host_blocks=7, prefix_granularity=2
+            ).scheduler
+            if enable_l3_storage
+            else None
+        ),
         enable_kv_cache_events=False,
         decode_input_tokens=1,
         overlap_schedule_depth=0,

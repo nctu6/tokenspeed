@@ -157,6 +157,7 @@ def _executor_config(prefill_graph_max_tokens: int = 256):
         max_num_seqs=NUM_SLOTS - 1,
         chunked_prefill_size=1024,
         vocab_size=128,
+        input_vocab_size=128,
         context_len=64,
         physical_context_len=64,
         device="cuda",
@@ -189,6 +190,9 @@ def test_whisper_audio_prefill_is_eligible_for_the_prefill_graph():
     same answer as the same forward without audio.
     """
     from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
 
     model = build_whisper(NUM_SLOTS, seed=0)
     runtime = WhisperRuntime(model, max_bs=NUM_SLOTS)
@@ -203,6 +207,7 @@ def test_whisper_audio_prefill_is_eligible_for_the_prefill_graph():
         token_to_kv_pool=runtime.pool,
         input_buffers=None,
         config=_executor_config(),
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
     )
     assert not graph.disable, (
         "the prefill CUDA graph is disabled for Whisper: its decoder prefill "
@@ -249,6 +254,7 @@ class _ForwardProbe:
                 for r in requests
             ],
             request_ids=[r.rid for r in requests],
+            admission_ids=[r.admission_id for r in requests],
             request_pool_indices=[r.slot for r in requests],
             extend_prefix_lens=[0] * bs,
             extend_seq_lens=[len(r.tokens) for r in requests],
@@ -315,6 +321,7 @@ class _LiveExtend:
                 for r in requests
             ],
             request_ids=[r.rid for r in requests],
+            admission_ids=[r.admission_id for r in requests],
             request_pool_indices=[r.slot for r in requests],
             extend_prefix_lens=[0] * bs,
             extend_seq_lens=lens,
@@ -369,7 +376,13 @@ class _LiveExtend:
         """The executor's graph route: ``PrefillGraph.replay``."""
         self.init_metadata()
         assert graph.can_run(self.ctx, self.multimodal_context)
-        out = graph.replay(self.ctx, self.input_ids, self.multimodal_context)
+        # Whisper reads no request-token history (requires_request_token_history=False).
+        out = graph.replay(
+            self.ctx,
+            self.input_ids,
+            self.multimodal_context,
+            request_token_history=None,
+        )
         return out.next_token_logits.float().clone()
 
 
@@ -386,6 +399,9 @@ def test_whisper_audio_prefill_graph_replay_equals_eager():
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
     from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
 
     max_tokens = 32
     model = build_whisper(NUM_SLOTS, seed=3)
@@ -410,6 +426,7 @@ def test_whisper_audio_prefill_graph_replay_equals_eager():
         token_to_kv_pool=runtime.pool,
         input_buffers=ib,
         config=_executor_config(prefill_graph_max_tokens=max_tokens),
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
     )
     assert not graph.disable
     graph.capture(None, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)

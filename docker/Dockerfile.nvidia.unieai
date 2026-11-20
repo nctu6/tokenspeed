@@ -102,6 +102,11 @@ COPY . /workspace
 # is missing symbols the engine imports, so the server dies at startup with e.g.
 #   ImportError: cannot import name 'allgather_dual_rmsnorm'
 #              from 'tokenspeed_kernel.ops.communication'
+# tokenspeed-engine (the Rust ts-host rank binary every engine rank runs, plus
+# its frontend client binding) is built from tokenspeed-engine/ by
+# test/ci_system/install_tokenspeed_engine.sh, the same step Dockerfile.nvidia
+# uses. It runs before ./python so the dependency resolves to this build, not
+# a PyPI wheel.
 # Installing the engine first (letting it satisfy its many third-party deps --
 # fastapi, grpcio, transformers, the tokenspeed-smg* stack, torch_memory_saver,
 # plus the diffusion extra for H3/Music3), THEN reinstalling the local kernel
@@ -119,6 +124,7 @@ RUN python3 -m pip install cmake ninja && \
     FLASHINFER_CUDA_ARCH_LIST="${CUDA_ARCH_LIST}" \
     TOKENSPEED_KERNEL_BACKEND=cuda \
     python3 -m pip install tokenspeed-kernel/python/ --no-build-isolation && \
+    WORKSPACE=/workspace bash test/ci_system/install_tokenspeed_engine.sh && \
     python3 -m pip install tokenspeed-scheduler/ && \
     python3 -m pip install "./python[diffusion]" --no-build-isolation && \
     MAX_JOBS=${MAX_JOBS} \
@@ -128,7 +134,7 @@ RUN python3 -m pip install cmake ninja && \
         --no-build-isolation --no-deps --force-reinstall && \
     python3 -m pip install tokenspeed-scheduler/ --no-deps --force-reinstall && \
     python3 -m pip install "torchao>=0.10.0" && \
-    python3 -m pip install "diffusers>=0.40.0" av imageio-ffmpeg soundfile
+    python3 -m pip install "diffusers>=0.43.0" av imageio-ffmpeg soundfile
 
 # DeepGEMM from the DeepGEMM/ submodule, after the engine/kernel installs that
 # re-pull the pinned tokenspeed-deepgemm wheel. That wheel owns the same
@@ -243,6 +249,7 @@ text = pathlib.Path(init.locate()).read_text()
 if "allgather_dual_rmsnorm" not in text:
     sys.exit("ERROR: installed kernel lacks allgather_dual_rmsnorm.")
 print("kernel source + symbol OK")
+print("installed tokenspeed-engine:", md.version("tokenspeed-engine"))
 # Diffusion deps (H3/Music3) -- metadata only; do not import heavy stacks here.
 for dist in ("diffusers", "av", "imageio-ffmpeg", "soundfile"):
     try:

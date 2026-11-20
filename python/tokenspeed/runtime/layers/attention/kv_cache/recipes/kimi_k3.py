@@ -22,8 +22,13 @@
 
 The MLA layers and the KDA state layers live in one arena at P=128. MLA pages
 are dense and pin the smallest packing whose plane width covers one per-layer
-KDA state (12 at attn tp=8); the state groups pack to match the MLA plane's
-byte width so no parent is wasted.
+KDA state (12 at attn tp=8 with the default FP32 state, 6 with BF16); the state
+groups pack to match the MLA plane's byte width so no parent is wasted.
+
+Kimi-K3.1 (a DSA target config) adds one index-K plane per MLA target layer
+in the full-attention group, beside its latent plane: the index keys share
+the latent rows' pages, prefix matches, transfers and lifetime. Index-K
+planes hold no KDA state, so they do not change the packing.
 """
 
 from __future__ import annotations
@@ -35,18 +40,26 @@ from functools import cached_property
 import torch
 from typing_extensions import override
 
+from tokenspeed.runtime.layers.attention.configs.dsa import (
+    DSAConfig,
+    dsa_history_gather_workspace_bytes,
+    dsa_kvp_history_prefill,
+)
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheRecipe,
-    kda_verify_scratch_in_pool,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+    kda_recurrent_state_dtype,
     kda_replay_supported,
     kda_verify_workspace_bytes,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
+    index_k_field,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
@@ -198,11 +211,20 @@ class KimiK3Recipe(CacheRecipe):
     @property
     @override
     def max_padding_fraction(self) -> float:
-        # A draft adds MLA planes of its own; the target-only bound would
-        # reject the wider arena they imply.
-        return float("inf") if self.num_draft_layers else 0.25
+        # Draft MLA and K3.1 index-K planes widen the arena past the target-only bound.
+        if self.num_draft_layers or self.num_index_k_planes:
+            return float("inf")
+        return 0.25
 
     # ---- fields ----
+
+    @cached_property
+    def num_index_k_planes(self) -> int:
+        """Index-K planes: one per target MLA layer under a DSA target
+        config (Kimi-K3.1), none for Kimi-K3. Draft layers never get one."""
+        if not isinstance(self.attn_config.component(MLAConfig), DSAConfig):
+            return 0
+        return sum(group_id == FULL_ATTENTION for group_id in self.target_group_ids)
 
     @cached_property
     def _kda_shapes(self):
@@ -227,6 +249,10 @@ class KimiK3Recipe(CacheRecipe):
             raise ValueError("Kimi-K3 cache requires a linear-attention component")
         return (linear_attn.conv_state_shape, linear_attn.temporal_state_shape)
 
+    @cached_property
+    def _recurrent_dtype(self) -> torch.dtype:
+        return kda_recurrent_state_dtype(self.server_args)
+
     @override
     def fields_for_layer(
         self, layer_id: int, group_id: str, occurrence: int
@@ -240,14 +266,19 @@ class KimiK3Recipe(CacheRecipe):
             )
             spec = config.component(MLAConfig)
             latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
-            return (
-                CacheFieldSpec(
-                    f"layer.{layer_id}.latent_kv",
-                    plane_id,
-                    (self.prefix_granularity, 1, latent_width),
-                    scatter_stored_dtype_name(config.kv_cache_dtype),
-                ),
+            latent = CacheFieldSpec(
+                f"layer.{layer_id}.latent_kv",
+                plane_id,
+                (self.prefix_granularity, 1, latent_width),
+                scatter_stored_dtype_name(config.kv_cache_dtype),
             )
+            if isinstance(spec, DSAConfig):
+                # Own plane (latent stride = payload), same group: moves with latent.
+                return (
+                    latent,
+                    index_k_field(config, self.prefix_granularity, layer_id),
+                )
+            return (latent,)
         conv_shape, recurrent_shape = self._kda_shapes
         return (
             CacheFieldSpec(
@@ -261,7 +292,7 @@ class KimiK3Recipe(CacheRecipe):
                 f"layer.{layer_id}.recurrent_state",
                 plane_id,
                 recurrent_shape,
-                cache_dtype_name(torch.float32),
+                cache_dtype_name(self._recurrent_dtype),
                 exact_page_stride=False,
             ),
         )
@@ -271,8 +302,11 @@ class KimiK3Recipe(CacheRecipe):
     @override
     def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
         fields_by_group = {spec.group_id: fields for spec, fields in groups}
-        mla_page_bytes = next(
-            field.payload_bytes for field in fields_by_group[FULL_ATTENTION]
+        # First MLA layer's latent page: KDA state rides beside it in plane slot.0.
+        mla_page_bytes = sum(
+            field.payload_bytes
+            for field in fields_by_group[FULL_ATTENTION]
+            if field.plane_id == "slot.0"
         )
         first_state = f"{LINEAR_ATTENTION}_0"
         linear_plane_bytes = sum(
@@ -296,20 +330,34 @@ class KimiK3Recipe(CacheRecipe):
 
     @override
     def check_layout(self, layout: CacheLayout) -> None:
-        """One plane per MLA layer, plus one per draft layer -- no more.
+        """One plane per MLA layer, the draft's own, and one index-K plane
+        per DSA layer -- no more.
 
         The KDA state groups pack to the MLA plane's byte width precisely so
         they ride inside those planes; a plane of their own means the packing
         did not divide and the parent grew.
+
+        A draft layer costs one plane when it plans the target's attention (an
+        MTP depth: one latent) and two when it plans its own family (a DFlash
+        GQA stack: K and V head rows), because the planes a layer occupies are
+        the fields its config declares.
         """
         num_mla_layers = sum(
             group_id == FULL_ATTENTION for group_id in self.target_group_ids
         )
-        expected = num_mla_layers + self.num_draft_layers
+        planes_per_draft_layer = (
+            1
+            if self.draft_attn_config is None
+            or self.draft_attn_config.component(MLAConfig) is not None
+            else 2
+        )
+        num_draft_planes = planes_per_draft_layer * self.num_draft_layers
+        expected = num_mla_layers + num_draft_planes + self.num_index_k_planes
         if len(layout.plane_bytes) != expected:
             raise ValueError(
                 f"Kimi-K3 LCM requires {num_mla_layers} target planes (one per "
-                f"MLA layer) plus {self.num_draft_layers} draft planes, got "
+                f"MLA layer) plus {num_draft_planes} draft planes and "
+                f"{self.num_index_k_planes} index-K planes, got "
                 f"{len(layout.plane_bytes)}"
             )
 
@@ -317,44 +365,40 @@ class KimiK3Recipe(CacheRecipe):
 
     @cached_property
     def replay_kda(self) -> bool:
-        """Whether verify commits by replaying from one conv checkpoint row."""
-        if self.server_args.speculative_algorithm is None:
-            return False
+        """Whether target decode uses replay, including the one-token window."""
         return kda_replay_supported(self.attn_config)
 
     @override
-    def verify_scratch_in_pool(self) -> bool:
-        return kda_verify_scratch_in_pool(self.server_args, self.attn_config)
-
-    @override
     def workspace_bytes(self) -> int:
-        """KDA verify staging reserved outside the cache arena."""
-        if (
-            self.server_args.speculative_algorithm is None
-            or self.server_args.disaggregation_mode == "prefill"
-        ):
-            # Verify staging exists for the target's verify step; the prefill
-            # role only ever writes committed prompt state.
-            return 0
-        return kda_verify_workspace_bytes(
+        """KDA verify staging reserved outside the cache arena, plus the DSA
+        history gather workspace of a KVP prefill over gathered histories
+        (``dsa_kvp_history_prefill``)."""
+        history = 0
+        if dsa_kvp_history_prefill(self.attn_config):
+            history = dsa_history_gather_workspace_bytes(
+                self.attn_config, max_model_len=self.attn_config.context_len
+            )
+        if self.server_args.disaggregation_mode == "prefill":
+            return history
+        width = max(int(self.attn_config.speculative_num_draft_tokens or 1), 1)
+        if width == 1 and not self.replay_kda:
+            return history
+        return history + kda_verify_workspace_bytes(
             self.attn_config,
             self.groups(),
-            draft_token_num=int(self.server_args.speculative_num_draft_tokens),
+            draft_token_num=width,
             replay_kda=self.replay_kda,
         )
 
     # ---- capacity: the scheduler's concurrency decides, then a search ----
 
     @override
-    def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        budgeted = self._budgeted_parents(
-            self.cache_budget_bytes - self.workspace_bytes(), layout.lcm_block_bytes
-        )
+    def select_num_lcm_blocks(self, layout: CacheLayout, *, max_lcm_blocks: int) -> int:
         if self.token_limit is None:
-            return budgeted
+            return max_lcm_blocks
         # A token limit caps history, not the unsharded KDA working set.
         # Use the same per-group demand as the inverse capacity calculation.
-        return min(budgeted, self.parents_needed(layout, self.token_limit))
+        return min(max_lcm_blocks, self.parents_needed(layout, self.token_limit))
 
     @override
     def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:

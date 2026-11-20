@@ -29,12 +29,13 @@ the next layer's ``input_layernorm`` or the final norm). Under
 one call of
 :func:`tokenspeed.runtime.layers.layernorm.sandwich_rmsnorm_with_allreduce`: the
 comm manager hands the partial on unreduced and the sandwich norm passes it
-through. The helper fuses the call into one MNNVL launch where the group's
-workspace serves it; elsewhere it runs the all-reduce and the two Triton norms
-the option-off forward runs, with the same arguments, so such a call equals the
-option-off boundary bit for bit. A fused call differs from it only in
-summation order: the two sums of squares, and the all-reduce sum where the
-option-off all-reduce does not take the MNNVL path (IPC, NCCL).
+through. The helper fuses the call into one MNNVL launch per slice of rows the
+group's workspace holds, where that workspace serves it; elsewhere it runs the
+all-reduce and the two Triton norms the option-off forward runs, with the same
+arguments, so such a call equals the option-off boundary bit for bit. A fused
+call differs from it only in summation order: the two sums of squares, and the
+all-reduce sum where the option-off all-reduce does not take the MNNVL path
+(IPC, NCCL).
 
 The choice is made once, at model construction, from launch options every rank
 shares, so every rank and every module of a boundary agree. The option is
@@ -51,6 +52,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -178,7 +180,18 @@ def _boundary(norm, x, residual, out, x_scale, residual_scale):
     if residual is None or out is not None:
         raise _deferred(norm, "no residual or an out tensor")
     mapping = norm._sandwich_mapping
-    return sandwich_rmsnorm_with_allreduce(
+    # As BeamRMSNorm: a norm whose consumer runs an FP8 GEMM on these rows
+    # (``_token_fp8_consumer``) has the boundary write them per-token FP8 too
+    # and offers them, so the consumer skips its own quantization.
+    consumer = norm._token_fp8_consumer
+    token_fp8 = None
+    if consumer is not None and consumer.takes_token_fp8(x):
+        token_fp8 = (
+            torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device),
+            torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device),
+        )
+    fp8_kwargs = {} if token_fp8 is None else {"token_fp8_out": token_fp8}
+    result = sandwich_rmsnorm_with_allreduce(
         x,
         residual,
         norm._sandwich_producer,
@@ -187,7 +200,11 @@ def _boundary(norm, x, residual, out, x_scale, residual_scale):
         group=mapping.attn.tp_group,
         x_scale=x_scale,
         residual_scale=residual_scale,
+        **fp8_kwargs,
     )
+    if token_fp8 is not None:
+        consumer.offer_token_fp8(result[0], *token_fp8)
+    return result
 
 
 class BeamSandwichNorm(BeamRMSNorm):
@@ -245,6 +262,5 @@ def install_beam_sandwich_fusion(model: Any) -> None:
         "Beam sandwich all-reduce boundaries: through "
         "sandwich_rmsnorm_with_allreduce "
         f"(x{len(boundaries)} per forward; fused where the MNNVL workspace serves "
-        f"the call, at most {global_server_args_dict['comm_fusion_max_num_tokens']} "
-        "tokens)"
+        "the call, one launch per slice of rows it holds)"
     )

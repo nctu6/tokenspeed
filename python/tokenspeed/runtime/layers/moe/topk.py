@@ -123,7 +123,8 @@ class ExpertLocationDispatchInfo:
             layer_id=layer_id,
             ep_dispatch_algorithm=ep_dispatch_algorithm,
             # The per-rank static map is computed on first request, so a
-            # replicated-input EP server never builds it.
+            # replicated-input EP server never builds it; all-to-all serving
+            # builds it with the placement (build_expert_placement).
             partial_logical_to_rank_dispatch_physical_map=(
                 expert_location_metadata.rank_dispatch_map()[layer_id]
                 if static and all_to_all_ep
@@ -376,6 +377,23 @@ class TopKConfig:
     num_sink_experts: int = 0
     sink_global_scale: torch.Tensor | None = None
 
+    @property
+    def uses_sigmoid_bias_topk(self) -> bool:
+        """Whether ``select_experts`` routes with the sigmoid-bias top-k kernel.
+
+        Rows may still leave it per call: a padding mask, an expert placement
+        the kernel cannot map, or more routes than experts.
+        """
+        return (
+            self.num_sink_experts == 0
+            and self.use_grouped_topk
+            and self.correction_bias is not None
+            and self.num_expert_group == 1
+            and self.topk_group == 1
+            and self.num_fused_shared_experts == 0
+            and self.routed_scaling_factor is not None
+        )
+
 
 class StandardTopKOutput(NamedTuple):
     """Precomputed routing; logits may be omitted once IDs and weights suffice."""
@@ -533,6 +551,7 @@ class TopK(torch.nn.Module):
         output_format: TopKOutputFormat | None = None,
         num_token_non_padded: torch.Tensor | None = None,
         expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
+        out: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> TopKOutput:
         output_format = (
             output_format or self.topk_config.output_format or TopKOutputFormat.STANDARD
@@ -541,6 +560,8 @@ class TopK(torch.nn.Module):
             router_logits = simulated_router_logits(router_logits)
 
         if output_format == TopKOutputFormat.BYPASSED:
+            if out is not None:
+                raise ValueError("Bypassed routing does not accept output buffers")
             return BypassedTopKOutput(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -556,6 +577,7 @@ class TopK(torch.nn.Module):
                 topk_config=self.topk_config,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
+                out=out,
             )
 
     def empty_topk_output(
@@ -616,6 +638,7 @@ def select_experts(
     *,
     num_token_non_padded: torch.Tensor | None = None,
     expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> StandardTopKOutput:
 
     top_k = topk_config.top_k
@@ -695,11 +718,8 @@ def select_experts(
                 mapped_in_kernel = True
             num_experts = router_logits.shape[1]
             use_sigmoid_bias_topk = (
-                0 < top_k <= num_experts
-                and num_expert_group == 1
-                and topk_group == 1
-                and num_fused_shared_experts == 0
-                and routed_scaling_factor is not None
+                topk_config.uses_sigmoid_bias_topk
+                and 0 < top_k <= num_experts
                 and num_token_non_padded is None
                 and (
                     expert_location_dispatch_info is None
@@ -717,8 +737,14 @@ def select_experts(
                     correction_bias=correction_bias,
                     logical_to_physical_map=logical_to_physical_map,
                     topk_weights_dtype=topk_config.topk_weights_dtype,
+                    topk_indices_dtype=out[1].dtype if out is not None else torch.int32,
+                    out=out,
                 )
             else:
+                if out is not None:
+                    raise ValueError(
+                        "Selected routing configuration cannot write output buffers"
+                    )
                 topk_weights, topk_ids = minimax_biased_grouped_topk(
                     hidden_states,
                     router_logits,

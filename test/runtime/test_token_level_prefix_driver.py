@@ -30,16 +30,21 @@ and its first chunk starts right at the hit.
 
 from __future__ import annotations
 
+from test.ci_system.ci_register import register_cuda_ci
+
 import numpy as np
 import pytest
 
-ts = pytest.importorskip("tokenspeed_scheduler")
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
+ts = pytest.importorskip("tokenspeed_engine.scheduler")
+
+from test.runtime.scheduler_driver import (  # noqa: E402
     advance_scheduler,
-    make_config,
     make_extend_result_event,
 )
+
+from tokenspeed.runtime.engine.scheduler_utils import make_config  # noqa: E402
 
 PAGE = 16
 PROMPT = list(range(40))  # 2 hash-complete pages and an 8-token tail
@@ -68,14 +73,19 @@ def _scheduler(*, with_state: bool = False) -> ts.Scheduler:
             num_device_pages=64 + 1,
             max_scheduled_tokens=256,
             max_batch_size=4,
+            max_resident_requests=4,
             prefix_granularity=PAGE,
             num_host_pages=0,
             disable_l2_cache=True,
             enable_l3_storage=False,
             role="fused",
             num_snapshot_pages=1,
+            host_group_packing=(),
             max_retracted_requests=0,
-            l3_prefetch_min_pages=0,
+            host_write_policy="write_through",
+            prefill_decode_interval=0,
+            prefill_decode_min_interval=0,
+            storage_config=None,
             cache_groups=groups,
         )
     )

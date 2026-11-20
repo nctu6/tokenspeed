@@ -163,7 +163,8 @@ def test_generate_request_is_tagged_positional_tuple():
     raw = msgspec.msgpack.decode(_encode_payload(req))
     assert isinstance(raw, list)
     assert raw[0] == "TokenizedGenerateReqInput"
-    assert len(raw) == 25  # tag + 24 fields (data_parallel_rank appended last)
+    # tag + 27 fields; data_parallel_rank is the 24th, later tails are appended
+    assert len(raw) == 28
     assert raw[1] == "x"  # rid
     assert raw[2] is None  # http_worker_ipc
     assert raw[3] is None  # input_text
@@ -317,7 +318,8 @@ def test_slim_out_carries_logprob_columns():
 
 
 def test_slim_out_is_tagged_positional_tuple():
-    """The wire form pins SMG's exact 14-element positional contract."""
+    """The wire form pins SMG's positional contract: the first 14 elements are
+    fixed, and tails appended after them (the decoder skips them)."""
     out = _make_batch_out(
         output_token_logprobs_val=[[-0.5]], output_token_logprobs_idx=[[10]]
     )
@@ -332,7 +334,7 @@ def test_slim_out_is_tagged_positional_tuple():
     raw = msgspec.msgpack.decode(_encode_payload(slim))
     assert isinstance(raw, list)
     assert raw[0] == "BatchTokenIDOutSlim"
-    assert len(raw) == 14
+    assert len(raw) == 26  # tag + 25 fields; SMG reads the first 14 and skips the rest
     assert raw[1] == ["r1"]  # rids
     assert raw[2] == [[10, 11]]  # output_ids
     assert raw[3] == ["length"]  # finished_reasons

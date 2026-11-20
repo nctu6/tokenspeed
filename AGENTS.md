@@ -17,6 +17,9 @@ people and average people is more than tenfold.
 * Before any work, check for a local Python venv and, if one exists, activate
   it.
 * If a local Python venv exists, don't install pip packages outside it.
+* For kernel or forward-path iteration, serve with `--allow-reload-forward` and
+  run `ts reload-forward` after each edit instead of restarting; validate the
+  final change on a freshly started server before opening a PR.
 
 ## Code changes
 
@@ -40,6 +43,15 @@ people and average people is more than tenfold.
   does not justify defaulting a behavioral choice.
 * Wrappers must preserve explicitly supplied arguments and must not silently
   discard unsupported arguments.
+* Avoid defensive fallback. Propagate errors and fail explicitly by default.
+  Introduce fallback or automatic recovery only when justified by a concrete,
+  documented need.
+* Kernels must generalize beyond example configurations. Restrictions on
+  tensor shape/layout/contiguity, communication topology, SM versions/counts,
+  model names must reflect correctness requirements or measured performance
+  tradeoffs, not just tested configurations. Derive launch parameters from
+  inputs and hardware properties where possible. Verify the intended kernel
+  is selected; passing through a fallback can hide performance regressions.
 * Use absolute imports instead of relative imports.
 * Use f-strings for Python string interpolation, including logging messages.
   Keep format templates required by APIs such as `strftime` and logging
@@ -52,11 +64,10 @@ people and average people is more than tenfold.
   state, including fallback values that hide missing declarations.
 * Use the repository's full MIT license header for copyright notices; do not use
   an abbreviated copyright-only header.
-* Before creating commits, run `pre-commit run --all-files` to format.
-* Do not substitute a narrower lint command for the repository hook before
-  committing. Always run the exact `pre-commit run --all-files` command and
-  commit any formatter changes it makes.
-* When creating commits, sign off on behalf of the author.
+* Before creating commits, run exactly `pre-commit run --all-files` and
+  include any formatter changes. Do not substitute a narrower lint command.
+* When creating commits, sign off on behalf of the author. Do not list AI agents
+  as co-authors.
 
 ## Design principles
 
@@ -94,16 +105,25 @@ change.
   between prefix matching, allocation, and page geometry.
 * `docs/design/scheduler.md` — the C++ scheduler's admission granularity,
   what triggers retraction in each engine role, and the recovery protocol.
+* `docs/design/prefill-delay.md` — the fused prefill gate: attention-DP
+  agreement, ALL/ANY windows, live admission watermarks, and resident progress.
 * `docs/design/unified_path.md` — the unified decode path: one
   refresh-in-place metadata contract for eager and CUDA-graph decode, the
   padding contract, buffer sizing, and what stays graph-only.
 * `docs/design/attention-prologue.md` — the one entry between projections
   and core attention: QK norm, RoPE, quantization, and the KV write, the
   numerics contract every solution meets, and who writes the cache.
+* `docs/design/tracing.md` — OTLP trace export: the retrospective span
+  built at a request's release, its GenAI attributes and session
+  grouping, the never-blocking export thread, and what stays out.
 * `docs/design/tree-speculation.md` — draft-tree speculation: the tree as a
   parameter of the chain path (compaction), position vs slot, one tree
   attention path (trtllm-gen prefix plus window cascade), and position-keyed
   sampled verify.
+* `docs/design/monokernel.md` — decode monokernels: one persistent launch
+  per decoder layer, stages handing off through tagged mailboxes, every
+  layer of a forward launching or none, the per-step state, shared cache
+  layouts, and the deadlock rule.
 
 ## Public pull requests
 
@@ -123,6 +143,12 @@ change.
   boundary.
 * Third-party kernel libraries belong under `tokenspeed-kernel`; avoid direct
   runtime dependencies or imports that bypass it.
+* Runtime code (`python/tokenspeed/`) should dispatch kernels across hardware
+  platforms through the `tokenspeed-kernel` registry (`select_kernel`,
+  `KernelPlan.select()`, or the family-level ops built on them) rather than
+  importing a specific solution or branching on the platform at the call site.
+  When a call site must bypass the registry, add a comment there explaining
+  why.
 * If a dependency repeatedly breaks during version upgrades or slows project
   progress, consider removing it entirely or at least making it optional.
 
@@ -134,6 +160,36 @@ change.
   kernels on `gfx1201`.
 * NPU support targets only one or two specific models. There are currently no
   plans to expand NPU model coverage.
+
+## tokenspeed-scheduler
+
+Inside the root `tokenspeed-scheduler/` directory:
+
+* Prefer RAII to manual bookkeeping in the C++ scheduler. Tie each resource
+  or registration that a request or an in-flight operation holds (cache
+  blocks, pool slots, transfer or storage tickets, side-table entries keyed
+  by an id) to an owning handle whose destructor releases it, and keep that
+  handle in the object whose lifetime it shares, usually an FSM state or the
+  request itself. Avoid paired acquire/release calls, hand-kept counters and
+  erase-on-teardown code spread across call sites. `CacheBlockRef`,
+  `ReqPoolIndex` and `StorageLease` are the models to follow.
+* Check integer overflow in the C++ scheduler. Token counts and positions,
+  page, block and slot indices and LCM block ids are 32-bit, and they grow
+  with request length and pool size (a million-token request, a Host pool of
+  10^8 pages). Widen a factor to `std::int64_t` before multiplying, e.g.
+  pages times page size, parents times packing, tokens times bytes per
+  token, or requests times blocks per request; casting the product is too
+  late. Write rounded-up divisions and bound checks so they cannot overflow
+  themselves (`n / d + (n % d != 0)` rather than `(n + d - 1) / d` near the
+  limit). Check the range before narrowing a `std::size_t` or `std::int64_t`
+  to `std::int32_t`, including values handed to Python or the Rust engine.
+  Validate integer config fields and request limits against ranges that
+  leave room for the rounding and offsets applied later (a token limit just
+  under `INT32_MAX` overflows once rounded up to a block). Watch unsigned
+  subtraction, mixed signed/unsigned comparisons, and `std::abs` or negation
+  of a value that can be `INT32_MIN`. Reviews should check every new or
+  changed computation on such counts; when a value can reach 2^31 in a
+  supported configuration, add a test at that bound.
 
 ## tokenspeed-scheduler releases
 
@@ -152,6 +208,21 @@ Follow this sequence:
 4. Once the new version is available on PyPI, update the main TokenSpeed
    project's `tokenspeed-scheduler` dependency requirement in
    `python/pyproject.toml` through a follow-up PR targeting `main`.
+
+## tokenspeed-engine
+
+Inside the root `tokenspeed-engine/` directory:
+
+* Prefer RAII to manual bookkeeping in Rust code too. Tie each resource,
+  registration or in-flight count that a request, a queued job or a thread
+  holds to a guard whose `Drop` releases it, and move that guard with the
+  work it covers, such as inside the job a channel carries, so a panic, an
+  early return or a dropped channel releases it as well. Avoid paired
+  increment/decrement or insert/remove calls and cleanup code spread across
+  call sites. A `Drop` that may run while a thread unwinds must not panic,
+  since a second panic aborts the process: take the locks it needs even if
+  poisoned. `ExitNotice` (`ts-host`) and `RequestStream` (`ts-client`) are
+  the models to follow.
 
 ## tokenspeed-kernel
 
@@ -199,14 +270,42 @@ Inside the root `tokenspeed-kernel/` directory:
   widths, split counts computed from the batch size), must be runtime
   arguments, or be bucketed first (such as `next_power_of_2`) when the kernel
   needs a compile-time bound. The same holds for template arguments of other
-  JITs such as DeepGEMM. Reviews should check every new or changed kernel
-  signature and launch site for this. Kernels should have tests to guard
-  against excessive scalar parameter specialization with
-  `assert_no_triton_compile` from `test/utils.py`. Tensor parameters need no
-  such test. At runtime, `tokenspeed_kernel.compile_monitor` logs every
-  Triton compilation after startup and names a parameter that keeps taking
-  new values. CI serves with `TOKENSPEED_JIT_COMPILE_CHECK=error`, so such a
-  parameter fails the model tests.
+  JITs such as DeepGEMM, for static CuTe DSL tensor dimensions, and for the
+  key under which a caller caches a `cute.compile` result, which must hold
+  only what the kernel specializes on. Call CuTe DSL kernels through their
+  compiled functions; a direct `@cute.jit` call traces on every call. Reviews
+  should check every new or changed kernel signature and launch site for this.
+  Kernels should have tests to guard against excessive scalar parameter
+  specialization with `assert_no_triton_compile` or `assert_no_cute_compile`
+  from `test/utils.py`. Triton tensor parameters need no such test. At runtime,
+  `tokenspeed_kernel.compile_monitor` logs every Triton and CuTe DSL
+  compilation after startup and names a parameter that keeps taking new
+  values, a call site that keeps recompiling known specializations, and a
+  direct `@cute.jit` call. CI serves with
+  `TOKENSPEED_JIT_COMPILE_CHECK=error`, so any of these fails the model tests.
+* Integer offsets into global memory must not overflow int32. Compute in
+  int64 every offset whose bound grows with a runtime count: a token,
+  request, page, slot, or expert index times a stride, or a product of sizes
+  such as `num_tokens * vocab_size`. Cast a factor before multiplying
+  (`pid.to(tl.int64) * stride`, `Int64(page) * stride`); casting the product
+  is too late. Byte and bit counts reach 2^31 sooner than element counts.
+  Do not rely on argument types: Triton passes an integer argument as i32
+  while its value fits, so the product of two fitting values still wraps;
+  `tl.program_id`, `tl.arange`, CuTe DSL `Int32` values, and layout sizes
+  such as `cute.cosize` are 32-bit as well. Offsets bounded by model
+  dimensions, such as those inside a tile or row, stay int32: advance the
+  base pointer once per program in int64, then add int32 tile offsets. This
+  keeps 64-bit integer math out of inner loops and matches AMD buffer loads,
+  which take 32-bit offsets from a 64-bit base. A kernel that keeps a
+  runtime-scaled offset in int32 for speed must assert the bound on the host
+  where the tensor is sized, with a comment saying why. Kernels indexed by
+  runtime counts should have a test whose largest offset exceeds 2^31 in the
+  unit the kernel computes, touching only the far end (such as the last
+  pages of a large pool) to stay cheap. Reviews should check every new or
+  changed offset computation for this. To debug an illegal memory access in
+  a Triton or Gluon kernel, rerun it with `TRITON_DEBUG=1`, which asserts on
+  int32 overflow in `+`, `-`, and `*`. This rule applies to every kernel
+  package in the repository, including `tokenspeed-mla/`.
 
 ## tokenspeed-kernel-amd
 
@@ -216,8 +315,8 @@ Inside the root `tokenspeed-kernel-amd/` directory:
 * Add JIT `launch_metadata` for Proton use alongside the Triton/Gluon kernels.
 * AMD Gluon kernel tests should live in `tokenspeed-kernel/test/amd/` to reuse
   common platform utilities and reference computations.
-* The compile-time parameter rule in the `tokenspeed-kernel` section applies
-  to these kernels too.
+* The compile-time parameter rule and the int32 offset overflow rule in the
+  `tokenspeed-kernel` section apply to these kernels too.
 * Put per-kernel contract and algorithm details in
   `python/tokenspeed_kernel_amd/ops/README.md`.
 * For Triton/Gluon kernels, one name should thread the whole stack: the

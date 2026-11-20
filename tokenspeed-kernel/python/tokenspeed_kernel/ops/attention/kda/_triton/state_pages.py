@@ -32,6 +32,8 @@ writes the accepted state to the live slot.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import pdl_enabled
@@ -53,6 +55,7 @@ def _state_input_page(table, row, table_stride, live):
 def _verify_state_blocks_kernel(
     table,
     pages_out,
+    live_pages_out,
     bs,
     table_stride,
     BLOCK: tl.constexpr,
@@ -64,11 +67,14 @@ def _verify_state_blocks_kernel(
     live = row < bs
     page = _state_input_page(table, row, table_stride, live)
     tl.store(pages_out + row, page.to(tl.int32), mask=live)
+    if live_pages_out is not None:
+        working = tl.load(table + row * table_stride + 1, mask=live, other=0)
+        tl.store(live_pages_out + row, working.to(tl.int32), mask=live)
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
 
-def _torch_verify_state_blocks(table, batch_size, pages_out):
+def _torch_verify_state_blocks(table, batch_size, pages_out, live_pages_out):
     """Portable spelling, kept for non-CUDA callers (the backends' CPU tests)."""
     rows = table[:batch_size]
     checkpoint = rows[:, STATE_INPUT_SLOT]
@@ -76,6 +82,8 @@ def _torch_verify_state_blocks(table, batch_size, pages_out):
     pages_out[:batch_size].copy_(
         torch.where(checkpoint > 0, checkpoint, working).to(torch.int32)
     )
+    if live_pages_out is not None:
+        live_pages_out[:batch_size].copy_(working)
 
 
 def _check_state_table(table: torch.Tensor, batch_size: int) -> None:
@@ -95,13 +103,16 @@ def verify_state_blocks(
     *,
     batch_size: int,
     pages_out: torch.Tensor,
+    live_pages_out: torch.Tensor | None = None,
 ) -> None:
     """Resolve the committed-state page each request's verify reads.
 
     Args:
         table: Group block table ``[>=batch_size, 2]``, dense inner.
         batch_size: Live requests.
-        pages_out: INT32 destination ``[>=batch_size]``.
+        pages_out: INT32 source-page destination ``[>=batch_size]``.
+        live_pages_out: Optional INT32 live-page destination of the same shape.
+            Omission resolves only the input pages.
     """
     enable_pdl = pdl_enabled()
     _check_state_table(table, batch_size)
@@ -114,14 +125,168 @@ def verify_state_blocks(
     if batch_size == 0:
         return
     if not table.is_cuda:
-        return _torch_verify_state_blocks(table, batch_size, pages_out)
+        return _torch_verify_state_blocks(table, batch_size, pages_out, live_pages_out)
 
     block = 256
     _verify_state_blocks_kernel[(triton.cdiv(batch_size, block),)](
         table,
         pages_out,
+        live_pages_out,
         batch_size,
         table.stride(0),
+        BLOCK=block,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+
+
+# Groups one verify_state_groups launch resolves; more fall back to one launch each.
+MAX_VERIFY_GROUPS = 4
+
+
+@triton.jit
+def _verify_group_rows(
+    table, table_stride, pages_out, live_pages_out, row, live, rows, pad_page
+):
+    """One group's verify pages over a row block; rows past the batch are padding."""
+    page = _state_input_page(table, row, table_stride, live)
+    tl.store(pages_out + row, tl.where(live, page, pad_page).to(tl.int32), mask=rows)
+    if live_pages_out is not None:
+        working = tl.load(table + row * table_stride + 1, mask=live, other=0)
+        tl.store(
+            live_pages_out + row,
+            tl.where(live, working, pad_page).to(tl.int32),
+            mask=rows,
+        )
+
+
+# The group tables are views into one packed upload, at offsets that move with the batch.
+@triton.jit(
+    do_not_specialize=[
+        "bs",
+        "padded_bs",
+        "pad_page",
+        "stride0",
+        "stride1",
+        "stride2",
+        "stride3",
+    ],
+    do_not_specialize_on_alignment=["table0", "table1", "table2", "table3"],
+)
+def _verify_state_groups_kernel(
+    table0,
+    stride0,
+    pages0,
+    live0,
+    table1,
+    stride1,
+    pages1,
+    live1,
+    table2,
+    stride2,
+    pages2,
+    live2,
+    table3,
+    stride3,
+    pages3,
+    live3,
+    bs,
+    padded_bs,
+    pad_page,
+    NUM_GROUPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    live = row < bs
+    rows = row < padded_bs
+    _verify_group_rows(table0, stride0, pages0, live0, row, live, rows, pad_page)
+    if NUM_GROUPS > 1:
+        _verify_group_rows(table1, stride1, pages1, live1, row, live, rows, pad_page)
+    if NUM_GROUPS > 2:
+        _verify_group_rows(table2, stride2, pages2, live2, row, live, rows, pad_page)
+    if NUM_GROUPS > 3:
+        _verify_group_rows(table3, stride3, pages3, live3, row, live, rows, pad_page)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def verify_state_groups(
+    tables: Sequence[torch.Tensor],
+    *,
+    batch_size: int,
+    padded_batch_size: int,
+    pages_out: Sequence[torch.Tensor],
+    live_pages_out: Sequence[torch.Tensor] | None,
+    pad_page: int,
+) -> None:
+    """Resolve every state group's verify pages and pad the graph rows at once.
+
+    Each group gets :func:`verify_state_blocks` for its live rows, and rows
+    ``[batch_size, padded_batch_size)`` of its outputs get ``pad_page``. Up to
+    :data:`MAX_VERIFY_GROUPS` groups on CUDA share one launch.
+
+    Args:
+        tables: Per-group block tables ``[>=batch_size, 2]``, dense inner.
+        batch_size: Live requests.
+        padded_batch_size: Rows to write in every output, padding included.
+        pages_out: Per-group INT32 source-page destinations
+            ``[>=padded_batch_size]``, unit stride.
+        live_pages_out: Per-group INT32 live-page destinations of the same
+            shape, or None to resolve only the source pages.
+        pad_page: The page padding rows get in every output.
+    """
+    if len(pages_out) != len(tables) or (
+        live_pages_out is not None and len(live_pages_out) != len(tables)
+    ):
+        raise ValueError("every state group needs its own page outputs")
+    if not 0 <= batch_size <= padded_batch_size:
+        raise ValueError("need 0 <= batch_size <= padded_batch_size")
+    outputs = list(pages_out) + list(live_pages_out or ())
+    for table in tables:
+        _check_state_table(table, batch_size)
+    for out in outputs:
+        if out.stride(0) != 1 or out.dtype != torch.int32:
+            raise ValueError("verify state pages must be unit-stride INT32 rows")
+        if out.numel() < padded_batch_size:
+            raise ValueError("outputs cannot hold padded_batch_size rows")
+    if padded_batch_size == 0 or not tables:
+        return
+    if len(tables) > MAX_VERIFY_GROUPS or not all(
+        t.is_cuda for t in [*tables, *outputs]
+    ):
+        for i, table in enumerate(tables):
+            live = None if live_pages_out is None else live_pages_out[i]
+            verify_state_blocks(
+                table,
+                batch_size=batch_size,
+                pages_out=pages_out[i],
+                live_pages_out=live,
+            )
+            pages_out[i][batch_size:padded_batch_size].fill_(pad_page)
+            if live is not None:
+                live[batch_size:padded_batch_size].fill_(pad_page)
+        return
+
+    enable_pdl = pdl_enabled()
+    args = []
+    for i in range(MAX_VERIFY_GROUPS):
+        j = min(i, len(tables) - 1)
+        args += [
+            tables[j],
+            tables[j].stride(0),
+            pages_out[j],
+            None if live_pages_out is None else live_pages_out[j],
+        ]
+    block = 256
+    _verify_state_groups_kernel[(triton.cdiv(padded_batch_size, block),)](
+        *args,
+        batch_size,
+        padded_batch_size,
+        pad_page,
+        NUM_GROUPS=len(tables),
         BLOCK=block,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
@@ -242,4 +407,125 @@ def commit_state_pages(
         BLOCK=block,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
+    )
+
+
+@triton.jit(
+    do_not_specialize=["bs", "draft_tokens", "out_stride"],
+    do_not_specialize_on_alignment=["table_base"],
+)
+def _commit_state_groups_kernel(
+    accepted,
+    table_base,
+    tables,
+    pages_out,
+    reads_out,
+    steps_out,
+    bs,
+    draft_tokens,
+    out_stride,
+    BLOCK: tl.constexpr,
+):
+    group = tl.program_id(1)
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    live = row < bs
+    # A group table may be a separate allocation, outside table_base's buffer.
+    # Form its full address before indexing rows so AMD buffer loads do not
+    # interpret a cross-allocation offset as an offset within table_base.
+    table_address = table_base.to(tl.int64) + tl.load(tables + group * 4) * 4
+    table = table_address.to(tl.pointer_type(tl.int32))
+    reads = tl.load(tables + group * 4 + 3).to(tl.pointer_type(tl.int32))
+    source = tl.load(reads + row, mask=live, other=-1)
+    tl.store(reads_out + group * out_stride + row, source, mask=live)
+    table_stride = tl.load(tables + group * 4 + 1)
+    # Accepted length includes the target token, as in commit_state_pages.
+    steps = tl.minimum(
+        tl.maximum(tl.load(accepted + row, mask=live, other=1).to(tl.int64), 1),
+        draft_tokens,
+    )
+    # Latest scheduler ABI: commit always writes the live slot, even when
+    # verify read a different immutable prefix checkpoint from slot 0.
+    page = tl.load(table + row * table_stride + 1, mask=live, other=0)
+    tl.store(pages_out + group * out_stride + row, page, mask=live)
+    if group == 0:
+        tl.store(steps_out + row, steps.to(tl.int32), mask=live)
+
+
+def commit_state_groups(
+    accepted_length: torch.Tensor,
+    table_base: torch.Tensor,
+    tables: torch.Tensor,
+    *,
+    batch_size: int,
+    draft_tokens: int,
+    pages_out: torch.Tensor,
+    reads_out: torch.Tensor,
+    steps_out: torch.Tensor,
+) -> None:
+    """Resolve live write slots for all state groups in one GPU launch.
+
+    Args:
+        accepted_length: Contiguous accepted counts, including the target token.
+        table_base: INT32 tensor anchoring the current packed page tables.
+            Its address can change between eager launches without changing
+            the descriptors. A captured launch retains this tensor address.
+        tables: Contiguous INT64 [groups, 4] descriptors. Each row holds a
+            signed offset from table_base in INT32 elements, its row stride,
+            its number of columns and an INT32 source-page vector address.
+            The caller keeps the referenced tables alive through completion.
+        batch_size: Number of live request rows.
+        draft_tokens: Maximum accepted count for the current window.
+        pages_out: INT32 [groups, batch_size] destination block indices.
+        reads_out: INT32 [groups, batch_size] copied source block indices.
+        steps_out: INT32 [batch_size] clamped accepted counts.
+
+    Returns:
+        None. The caller owns all output storage.
+    """
+    if tables.ndim != 2 or tables.shape[1] != 4 or not tables.is_contiguous():
+        raise ValueError("state table descriptors must be contiguous [groups, 4]")
+    if tables.dtype != torch.int64:
+        raise ValueError("state table descriptors must use INT64")
+    if (
+        pages_out.shape != (tables.shape[0], batch_size)
+        or reads_out.shape != pages_out.shape
+    ):
+        raise ValueError("destination blocks must have shape [groups, batch_size]")
+    if any(
+        x.dtype != torch.int32 for x in (table_base, pages_out, reads_out, steps_out)
+    ):
+        raise ValueError("page tables, blocks and accepted counts must use INT32")
+    if min(accepted_length.numel(), steps_out.numel()) < batch_size:
+        raise ValueError("commit metadata does not cover the live batch")
+    if draft_tokens < 1:
+        raise ValueError("verify width must be positive")
+    if any(
+        not x.is_contiguous()
+        for x in (accepted_length, pages_out, reads_out, steps_out)
+    ):
+        raise ValueError("commit metadata must be contiguous")
+    if any(
+        x.device != tables.device
+        for x in (
+            accepted_length,
+            table_base,
+            pages_out,
+            reads_out,
+            steps_out,
+        )
+    ):
+        raise ValueError("commit metadata must use the descriptor device")
+    if batch_size == 0 or tables.shape[0] == 0:
+        return
+    _commit_state_groups_kernel[(triton.cdiv(batch_size, 256), tables.shape[0])](
+        accepted_length,
+        table_base,
+        tables,
+        pages_out,
+        reads_out,
+        steps_out,
+        batch_size,
+        draft_tokens,
+        pages_out.stride(0),
+        BLOCK=256,
     )

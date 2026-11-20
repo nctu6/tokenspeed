@@ -134,13 +134,14 @@ class TestGenerateReqInputPlumbing:
         with pytest.raises((ValueError), match=("batch size")):
             obj.normalize_batch_and_arguments()
 
-    def test_tokenized_field_is_last_on_the_wire(self):
+    def test_tokenized_field_keeps_its_wire_position(self):
         # array_like msgspec structs encode positionally: declaration order IS
         # the wire contract, documented append-only. The SMG-direct msgpack
         # transport decodes TokenizedGenerateReqInput straight off the wire,
-        # so the new field must stay the last one.
+        # so the field keeps its position (the 24th field) and later fields
+        # are only appended after it.
         fields = msgspec.structs.fields(TokenizedGenerateReqInput)
-        assert (fields[-1].name) == ("data_parallel_rank")
+        assert [field.name for field in fields].index("data_parallel_rank") == 23
 
 
 class TestIngressValidation:

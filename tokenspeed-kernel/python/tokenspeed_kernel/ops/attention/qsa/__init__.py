@@ -21,9 +21,13 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 
 import torch
-from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.ops.attention.qsa.metadata import QSASparseMetadata, QSAWorkspace
+from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens, is_warming_up
+from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import resolve_kernel_override, select_kernel
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
     dense_tensor_format,
@@ -88,6 +92,20 @@ LSE_LN = math.log2(math.e)
 # ===-----------------------------------------------------------------------===#
 
 
+def _warmup_uses_cute_dsl(
+    mode: str,
+    kernel_name: str,
+    *,
+    override: str | None,
+    solution: str | None,
+) -> bool:
+    """Apply dispatch precedence: a resolved override takes priority over solution."""
+    effective_override = resolve_kernel_override("attention", mode, override)
+    if effective_override is not None:
+        return effective_override in ("cute_dsl", kernel_name)
+    return solution in (None, "cute_dsl")
+
+
 def select_qsa_sparse_attention_kernel(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -95,6 +113,9 @@ def select_qsa_sparse_attention_kernel(
     selected_slots: torch.Tensor,
     *,
     max_seqlen_q: int | None,
+    k_scale: float | torch.Tensor | None,
+    v_scale: float | torch.Tensor | None,
+    sparse_metadata: QSASparseMetadata | None,
     override: str | None,
     solution: str | None,
 ):
@@ -106,7 +127,20 @@ def select_qsa_sparse_attention_kernel(
         The selected kernel.
     """
 
+    from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+        can_use_cute_dsl_fp8_prefill_layout,
+    )
+
     query_width = 1 if max_seqlen_q is None else max_seqlen_q
+    supported_tma_gather_layout = False
+    if max_seqlen_q is None and sparse_metadata is not None:
+        from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+            can_use_cute_dsl_tma_gather_qsa,
+        )
+
+        supported_tma_gather_layout = can_use_cute_dsl_tma_gather_qsa(
+            q, k_cache, v_cache, sparse_metadata
+        )
     traits = {
         "batch_size": q.shape[0] // query_width,
         "q_len": query_width,
@@ -114,8 +148,30 @@ def select_qsa_sparse_attention_kernel(
         "num_kv_heads": k_cache.shape[1],
         "head_dim": q.shape[-1],
         "value_head_dim": v_cache.shape[-1],
+        "equal_head_dims": q.shape[-1] == k_cache.shape[-1] == v_cache.shape[-1],
         "selected_width": selected_slots.shape[1],
         "is_decode": max_seqlen_q is not None,
+        "has_sparse_metadata": sparse_metadata is not None,
+        "block_size": None if sparse_metadata is None else sparse_metadata.block_size,
+        "block_topk": (
+            None
+            if sparse_metadata is None
+            else sparse_metadata.selected_blocks.shape[1]
+        ),
+        "q_heads_per_kv": (
+            q.shape[1] // k_cache.shape[1]
+            if q.shape[1] % k_cache.shape[1] == 0
+            else None
+        ),
+        "page_size": None if sparse_metadata is None else sparse_metadata.page_size,
+        "scalar_scales": not isinstance(k_scale, torch.Tensor)
+        and not isinstance(v_scale, torch.Tensor),
+        "unscaled_kv": k_scale is None and v_scale is None,
+        "supported_tma_gather_layout": supported_tma_gather_layout,
+        "supported_fp8_prefill_layout": max_seqlen_q is None
+        and can_use_cute_dsl_fp8_prefill_layout(
+            q, k_cache, v_cache, selected_slots, sparse_metadata
+        ),
     }
     signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
     return select_kernel(
@@ -141,6 +197,7 @@ def qsa_sparse_attention(
     v_scale: float | torch.Tensor | None,
     override: str | None,
     solution: str | None,
+    sparse_metadata: QSASparseMetadata | None,
 ) -> torch.Tensor:
     """Attend to a per-query list of physical QSA KV-cache slots.
 
@@ -167,17 +224,22 @@ def qsa_sparse_attention(
         override: Optional registered kernel name or solution override.
         solution: Optional kernel solution selected through normal capability
             and shape filtering.
+        sparse_metadata: Logical representation of the same slots, enabling
+            grouped attention kernels. Pass ``None`` explicitly for direct-slot
+            kernels. Unsupported geometries use the physical slots.
 
     Returns:
         Attention output shaped
         ``[tokens, query_heads, value_head_dim]`` with the query dtype.
 
-    The SM100/SM103 CuTe DSL implementation is preferred when its specialization
-    matches a uniform decode. Prefill and mixed/ragged queries use FlashInfer
-    FA2 on supported NVIDIA architectures; other decode geometries retain
-    the registered fallback. GFX950 uses the Gluon kernel and other AMD GPUs
-    the portable Triton kernel. Kernel
-    selection preserves this distinction before adapting ragged inputs to
+    The CuTe DSL implementation is preferred for supported uniform decode on
+    SM100/SM103/SM107. SM107 BF16 prefill with compatible logical metadata uses
+    TMA gather; SM100/SM103 use FlashInfer PrimTS QSA for supported BF16 inputs
+    with logical metadata. SM107 FP8 prefill uses native CuTe FP8 Q/P operands
+    for its supported dense geometry; these extra roundings can change outputs.
+    Other supported NVIDIA inputs retain FA2.
+    GFX950 uses the Gluon kernel and other AMD GPUs the portable Triton kernel.
+    Selection preserves prefill versus decode before adapting ragged inputs to
     independent one-token query rows.
     """
 
@@ -190,19 +252,48 @@ def qsa_sparse_attention(
         raise ValueError("QSA max_seqlen_q must be positive")
     if q.shape[0] % query_width:
         raise ValueError("QSA query rows must be divisible by max_seqlen_q")
+    if sparse_metadata is not None:
+        sparse_metadata.validate(
+            q.shape[0], selected_slots.shape[1], query_width=max_seqlen_q
+        )
     if q.shape[0] == 0:
         return q.new_empty((0, q.shape[1], v_cache.shape[-1]))
     if k_cache.shape[0] < 2 or v_cache.shape[0] < 2:
         raise ValueError("QSA caches must include slot 1 for masked reads")
+    if is_warming_up() and _warmup_uses_cute_dsl(
+        "qsa_sparse_attention",
+        "cute_dsl_blackwell_qsa_sparse_attention",
+        override=override,
+        solution=solution,
+    ):
+        from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+            _warmup_qsa_sparse_attention,
+        )
+
+        _warmup_qsa_sparse_attention(
+            q,
+            k_cache,
+            v_cache,
+            selected_slots,
+            max_rows=get_autotune_max_num_tokens(),
+        )
     kernel = select_qsa_sparse_attention_kernel(
         q,
         k_cache,
         v_cache,
         selected_slots,
         max_seqlen_q=max_seqlen_q,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        sparse_metadata=sparse_metadata,
         override=override,
         solution=solution,
     )
+    metadata_kwargs = {}
+    if "qsa_sparse_metadata" in KernelRegistry.get().get_by_name(kernel.name).features:
+        metadata_kwargs["sparse_metadata"] = sparse_metadata
+        # Grouped attention reads request boundaries from its logical metadata.
+        query_width = max_seqlen_q
     return kernel(
         q,
         k_cache,
@@ -213,6 +304,117 @@ def qsa_sparse_attention(
         metadata_capacity_rows=metadata_capacity_rows,
         k_scale=k_scale,
         v_scale=v_scale,
+        **metadata_kwargs,
+    )
+
+
+# ===-----------------------------------------------------------------------===#
+# QSA BF16 KV Scratch
+# ===-----------------------------------------------------------------------===#
+
+
+def qsa_bf16_scratch_pages(seq_lens: Iterable[int], page_size: int) -> int:
+    """Scratch pages one ``qsa_bf16_kv_scratch`` call needs.
+
+    Args:
+        seq_lens: Host lengths (cached prefix plus new tokens) of the call's
+            requests, in page-table row order.
+        page_size: Tokens per page-table entry.
+
+    Returns:
+        ``1 + sum(ceil(seq_len / page_size))``: the reserved page 0 and every
+        page of every request.
+    """
+    if page_size <= 0:
+        raise ValueError("QSA BF16 scratch page size must be positive")
+    return 1 + sum(-(-int(length) // page_size) for length in seq_lens)
+
+
+def qsa_bf16_kv_scratch(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    selected_slots: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    num_requests: int,
+    page_size: int,
+    scratch_pages: int,
+    k_scratch: torch.Tensor,
+    v_scratch: torch.Tensor,
+    page_map: torch.Tensor,
+    out_slots: torch.Tensor,
+    enable_pdl: bool,
+    override: str | None,
+    solution: str | None,
+) -> torch.Tensor:
+    """Copy one call's FP8 KV pages into a BF16 scratch and remap its slots.
+
+    Request ``r`` owns scratch pages ``[first_r, first_r + n_r)``, with
+    ``n_r = ceil(seq_lens[r] / page_size)`` and ``first_r = 1 + sum_{s < r}
+    n_s``: its page-table columns ``[0, n_r)`` are copied there in order,
+    converted exactly from E4M3 to BF16, the values an FP8 kernel reading the
+    cache at unit scale computes. Scratch page 0 is never written; padded
+    slots keep their ids and attention kernels read slot 1 for them, so the
+    caller keeps page 0 finite.
+
+    Args:
+        k_cache: FP8 E4M3FN keys ``[cache_slots, kv_heads, head_dim]``, heads
+            contiguous within a slot.
+        v_cache: Values with the keys' shape, dtype and slot stride.
+        selected_slots: Int32 physical slots ``[rows, width]`` with contiguous
+            columns; non-positive entries are padding. Every positive slot
+            must lie in its request's first ``n_r`` pages; one that does not
+            reads a stale ``page_map`` entry and becomes padding or another
+            page of this call, never an address past the copied pages.
+        page_table: Physical page ids ``[>= num_requests, pages]`` with
+            contiguous columns.
+        seq_lens: Device lengths ``[>= num_requests]``, equal to the host
+            lengths ``scratch_pages`` was computed from.
+        num_requests: Leading page-table rows to copy.
+        page_size: Tokens per page-table entry.
+        scratch_pages: ``qsa_bf16_scratch_pages`` of the host lengths; the
+            copy launch covers scratch pages ``[1, scratch_pages)``.
+        k_scratch: Contiguous BF16 keys ``[scratch_slots, kv_heads,
+            head_dim]`` holding at least ``scratch_pages`` whole pages.
+        v_scratch: BF16 values with the scratch keys' shape.
+        page_map: Contiguous int32 workspace with at least one entry per
+            cache page. For valid slots and lengths its prior contents are
+            never read: the copy writes every entry the remap reads, so it may
+            alias memory that is free until the remap finishes.
+        out_slots: Int32 output ``[rows, width]`` with contiguous columns.
+        enable_pdl: Use programmatic dependent launch where supported.
+        override: Optional registered kernel name or solution override.
+        solution: Optional kernel solution.
+
+    Returns:
+        ``out_slots``: each positive slot ``p * page_size + o`` rewritten to
+        ``page_map[p] * page_size + o``; padding unchanged.
+    """
+    kernel = select_kernel(
+        "attention",
+        "qsa_bf16_kv_scratch",
+        format_signature(
+            k_cache=dense_tensor_format(k_cache.dtype),
+            k_scratch=dense_tensor_format(k_scratch.dtype),
+        ),
+        solution=solution,
+        override=override,
+    )
+    return kernel(
+        k_cache,
+        v_cache,
+        selected_slots,
+        page_table,
+        seq_lens,
+        num_requests=num_requests,
+        page_size=page_size,
+        scratch_pages=scratch_pages,
+        k_scratch=k_scratch,
+        v_scratch=v_scratch,
+        page_map=page_map,
+        out_slots=out_slots,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -267,6 +469,7 @@ def qsa_block_scores(
         traits={"num_heads": query.shape[1], "head_dim": query.shape[2]},
         solution=solution,
         override=override,
+        features=frozenset({"logits"}),
     )
     return kernel(
         query,
@@ -307,6 +510,16 @@ def qsa_block_topk_select(
         at the threshold may select different column ids across solutions.
     """
 
+    from tokenspeed_kernel.ops.attention.qsa.cuda import (
+        warn_if_cuda_topk_unavailable,
+    )
+
+    warn_if_cuda_topk_unavailable(
+        logits.dtype,
+        topk,
+        solution=solution,
+        override=override,
+    )
     kernel = select_kernel(
         "attention",
         "qsa_block_topk_select",
@@ -314,6 +527,7 @@ def qsa_block_topk_select(
         traits={"topk": topk},
         solution=solution,
         override=override,
+        features=frozenset({"logits"}),
     )
     return kernel(
         logits,
@@ -332,6 +546,7 @@ def qsa_block_topk_stream(
     *,
     page_size: int,
     block_topk: int,
+    queries_per_request: int | None,
     max_partial_bytes: int,
     enable_pdl: bool,
     override: str | None,
@@ -347,6 +562,7 @@ def qsa_block_topk_stream(
         complete_blocks: Fully compressed block count per row.
         page_size: Compressed rows per page.
         block_topk: Blocks selected per row.
+        queries_per_request: Uniform request-run width or None for ragged rows.
         max_partial_bytes: Memory budget for partial top-k buffers.
         enable_pdl: Use programmatic dependent launch where supported.
         override: Optional registered kernel name.
@@ -357,6 +573,40 @@ def qsa_block_topk_stream(
         invalid entries are ``-1``.
     """
 
+    from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+        can_use_cute_dsl_qwen4_exp_qsa_block_topk,
+    )
+
+    supported_layout = can_use_cute_dsl_qwen4_exp_qsa_block_topk(
+        query,
+        key_cache,
+        page_table,
+        request_indices,
+        complete_blocks,
+        page_size=page_size,
+        block_topk=block_topk,
+        queries_per_request=queries_per_request,
+        max_partial_bytes=max_partial_bytes,
+    )
+    if is_warming_up() and _warmup_uses_cute_dsl(
+        "qsa_block_topk_stream",
+        "cute_dsl_qwen4_exp_qsa_block_topk",
+        override=override,
+        solution=solution,
+    ):
+        from tokenspeed_kernel.ops.attention.qsa.cute_dsl import _warmup_qsa_stream_topk
+
+        _warmup_qsa_stream_topk(
+            query,
+            key_cache,
+            page_table,
+            request_indices,
+            complete_blocks,
+            page_size=page_size,
+            block_topk=block_topk,
+            max_partial_bytes=max_partial_bytes,
+            enable_pdl=enable_pdl,
+        )
     kernel = select_kernel(
         "attention",
         "qsa_block_topk_stream",
@@ -364,9 +614,16 @@ def qsa_block_topk_stream(
             query=dense_tensor_format(query.dtype),
             key_cache=dense_tensor_format(key_cache.dtype),
         ),
-        traits={"num_heads": query.shape[1], "head_dim": query.shape[2]},
+        traits={
+            "num_q_heads": query.shape[1],
+            "head_dim": query.shape[2],
+            "page_size": page_size,
+            "block_topk": block_topk,
+            "supported_layout": supported_layout,
+        },
         solution=solution,
         override=override,
+        features=frozenset({"stream"}),
     )
     return kernel(
         query,
@@ -376,6 +633,7 @@ def qsa_block_topk_stream(
         complete_blocks,
         page_size=page_size,
         block_topk=block_topk,
+        queries_per_request=queries_per_request,
         max_partial_bytes=max_partial_bytes,
         enable_pdl=enable_pdl,
     )
@@ -392,50 +650,69 @@ def qwen4_exp_qsa_block_topk(
     block_topk: int,
     queries_per_request: int | None,
     max_partial_bytes: int,
-    algorithm: str,
+    max_logits_bytes: int,
+    path: str,
     enable_pdl: bool,
+    solution: str | None,
+    override: str | None,
 ) -> torch.Tensor:
-    """Select the highest-scoring compressed blocks for each query row.
+    """Select the highest-scoring compressed blocks through kernel selection.
 
     Args:
         query: Query tensor shaped ``[rows, heads, head_dim]``.
         key_cache: Flattened compressed keys shaped ``[slots, 1, head_dim]``.
-        page_table: Raw compressed-cache block ids shaped ``[requests, max_pages]``,
-            with holes and padding normalized to zero; one entry per logical page.
-        request_indices: Owning request id per query row.
-        complete_blocks: Fully compressed block counts shaped ``[rows]``.
+        page_table: Physical compressed-cache pages shaped ``[requests, pages]``
+            with contiguous columns; holes and padding are zero.
+        request_indices: Contiguous owning request id per query row.
+        complete_blocks: Contiguous fully compressed block counts shaped
+            ``[rows]``, between zero and the page-table capacity.
         page_size: Compressed-cache rows covered by one logical page.
-        block_topk: Blocks selected per row; must be a power of two and at
-            least 64.
-        queries_per_request: Uniform number of consecutive query rows per
-            request, or None for ragged/mixed layouts. A positive width must
-            divide ``rows``; the caller guarantees that each width-sized run
-            has one owning request. Logits scoring shares K tiles within these
-            runs while preserving each row's complete-block frontier.
-        max_partial_bytes: Memory budget for the partial top-k buffers
-            (``stream`` algorithm only).
-        algorithm: ``"stream"`` fuses scoring and selection without
-            materializing scores; ``"logits"`` materializes the
-            ``[rows, num_blocks]`` FP32 scores with ``qsa_block_scores`` and
-            selects them with ``qsa_block_topk_select``.
-        enable_pdl: Wait for query/cache/metadata producers and release
-            successor setup early between scoring and selection on NVIDIA GPUs.
+        block_topk: Power-of-two blocks selected per row, at least 64.
+        queries_per_request: Uniform consecutive query rows per request, or
+            ``None`` for ragged/mixed runs. A positive width must divide rows;
+            callers guarantee one owner per run. Each row keeps its frontier.
+        max_partial_bytes: Global scratch budget for streaming selection,
+            excluding the output. Grouped CuTe streaming needs no scratch.
+        max_logits_bytes: Score-matrix budget for ``auto``. Exceeding it
+            selects streaming regardless of query size.
+        path: ``"logits"`` materializes FP32 scores then radix-selects;
+            ``"stream"`` fuses scoring and selection. ``"auto"`` uses the
+            query-row count, table capacity and supported layout, independently
+            of prefill/decode. Explicit paths bypass the logits budget.
+        enable_pdl: Explicit programmatic dependent launch ordering.
+        solution: Optional registered backend, such as ``"cute_dsl"`` or
+            ``"triton"``, filtered within the selected path.
+        override: Optional registered kernel name or backend override.
 
     Returns:
-        Int32 block ids shaped ``[rows, block_topk]``, in no particular order;
-        invalid entries are ``-1``.
+        Int32 logical block ids shaped ``[rows, block_topk]``, padded with
+        ``-1``. Output order and boundary tie ids are unspecified.
     """
+    from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+        can_use_cute_dsl_qwen4_exp_qsa_block_topk,
+    )
 
-    if query.ndim != 3 or key_cache.ndim != 3:
-        raise ValueError("Qwen4-Exp QSA block top-k expects rank-three tensors")
-    if block_topk < 64 or (block_topk & (block_topk - 1)):
-        raise ValueError("Qwen4-Exp QSA block top-k needs a power-of-two topk >= 64")
-    if algorithm not in ("stream", "logits"):
+    if query.ndim != 3 or key_cache.ndim != 3 or page_table.ndim != 2:
+        raise ValueError("QSA block top-k expects rank-three Q/K and a rank-two table")
+    if block_topk < 64 or block_topk & (block_topk - 1):
+        raise ValueError("QSA block top-k needs a power-of-two topk >= 64")
+    if path not in ("auto", "stream", "logits"):
         raise ValueError(
-            "Qwen4-Exp QSA block top-k algorithm must be 'stream' or 'logits', "
-            f"got {algorithm!r}"
+            f"QSA top-k path must be 'auto', 'stream' or 'logits', got {path!r}"
         )
     rows = query.shape[0]
+    if key_cache.shape[1:] != (1, query.shape[2]):
+        raise ValueError("QSA keys must have one head with the query head dimension")
+    if request_indices.shape != (rows,) or complete_blocks.shape != (rows,):
+        raise ValueError("QSA block top-k metadata must have one entry per query row")
+    if (
+        page_table.stride(1) != 1
+        or not request_indices.is_contiguous()
+        or not complete_blocks.is_contiguous()
+    ):
+        raise ValueError(
+            "QSA block top-k requires contiguous table columns and row metadata"
+        )
     if queries_per_request is not None and (
         queries_per_request < 1 or rows % queries_per_request
     ):
@@ -445,7 +722,53 @@ def qwen4_exp_qsa_block_topk(
         return torch.full(
             (rows, block_topk), -1, dtype=torch.int32, device=query.device
         )
-    if algorithm == "logits":
+
+    supported_layout = can_use_cute_dsl_qwen4_exp_qsa_block_topk(
+        query,
+        key_cache,
+        page_table,
+        request_indices,
+        complete_blocks,
+        page_size=page_size,
+        block_topk=block_topk,
+        queries_per_request=queries_per_request,
+        max_partial_bytes=max_partial_bytes,
+    )
+    if path == "auto":
+        # Keep shape routing independent of live device frontiers.
+        min_stream_rows = 512 if num_blocks >= 16384 else 8192
+        prefer_stream = supported_layout and rows >= min_stream_rows
+        fits_logits = rows * num_blocks * 4 <= max_logits_bytes
+        path = "stream" if prefer_stream or not fits_logits else "logits"
+        # A logits startup must still prepare later stream calls. Stream calls
+        # share the warmup in qsa_block_topk_stream below.
+        if (
+            path == "logits"
+            and is_warming_up()
+            and _warmup_uses_cute_dsl(
+                "qsa_block_topk_stream",
+                "cute_dsl_qwen4_exp_qsa_block_topk",
+                override=override,
+                solution=solution,
+            )
+        ):
+            from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+                _warmup_qsa_stream_topk,
+            )
+
+            _warmup_qsa_stream_topk(
+                query,
+                key_cache,
+                page_table,
+                request_indices,
+                complete_blocks,
+                page_size=page_size,
+                block_topk=block_topk,
+                max_partial_bytes=max_partial_bytes,
+                enable_pdl=enable_pdl,
+            )
+
+    if path == "logits":
         scores = qsa_block_scores(
             query,
             key_cache,
@@ -455,16 +778,16 @@ def qwen4_exp_qsa_block_topk(
             page_size=page_size,
             queries_per_request=queries_per_request,
             enable_pdl=enable_pdl,
-            override=None,
-            solution=None,
+            solution=solution,
+            override=override,
         )
         return qsa_block_topk_select(
             scores,
             block_topk,
             lengths=complete_blocks,
             enable_pdl=enable_pdl,
-            override=None,
-            solution=None,
+            solution=solution,
+            override=override,
         )
     return qsa_block_topk_stream(
         query,
@@ -474,10 +797,11 @@ def qwen4_exp_qsa_block_topk(
         complete_blocks,
         page_size=page_size,
         block_topk=block_topk,
+        queries_per_request=queries_per_request,
         max_partial_bytes=max_partial_bytes,
         enable_pdl=enable_pdl,
-        override=None,
-        solution=None,
+        solution=solution,
+        override=override,
     )
 
 
@@ -487,15 +811,20 @@ import tokenspeed_kernel.ops.attention.qsa.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.qsa.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.qsa.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.qsa.flashinfer  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.qsa.flashinfer_prims  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.qsa.gluon  # noqa: E402,F401
 
 # isort: on
 
 
 __all__ = [
+    "qsa_bf16_kv_scratch",
+    "qsa_bf16_scratch_pages",
     "qsa_block_scores",
     "qsa_block_topk_select",
     "qsa_block_topk_stream",
     "qsa_sparse_attention",
+    "QSASparseMetadata",
+    "QSAWorkspace",
     "qwen4_exp_qsa_block_topk",
 ]

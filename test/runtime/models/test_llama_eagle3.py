@@ -161,10 +161,10 @@ def test_sliding_window_draft_layer_rides_a_sliding_cache_group(
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
         kv_cache_mxfp8=False,
-        prefix_granularity=64,
         kernel_page_size=64,
         context_len=1024,
         max_bs=2,
+        max_resident_requests=2,
     )
     draft_attn_config = AttnConfig(
         components=(replace(target, cache_layer_types=("sliding_attention",)),),

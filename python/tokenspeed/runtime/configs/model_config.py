@@ -35,12 +35,10 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
-from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
-    DEEPSEEK_V4_PAGE_SIZE,
-    TRTLLM_MHA_PAGE_SIZE,
-)
 from tokenspeed.runtime.layers.pooler import PoolingType
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
+from tokenspeed.runtime.layers.quantization.inkling2 import is_inkling2_manifest_stub
+from tokenspeed.runtime.layers.rotary_embedding import yarn_get_mscale
 from tokenspeed.runtime.plugins import ensure_loaded
 from tokenspeed.runtime.plugins.registry import resolve_model_profile
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -57,19 +55,13 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_ALGORITHMS,
     count_dspark_stages,
     read_checkpoint_block_size,
+    resolve_block_sample_from_anchor,
     resolve_block_widths,
     validate_block_widths,
 )
 
 logger = get_colorful_logger(__name__)
 
-_DEEPSEEK_V4_ARCHITECTURES = frozenset(
-    {
-        "DeepseekV4ForCausalLM",
-        "DeepseekV4ForCausalLMDSpark",
-        "DeepseekV4ForCausalLMNextN",
-    }
-)
 _QWEN4_EXP_ARCHITECTURES = frozenset(
     {
         "Qwen4ExpForConditionalGeneration",
@@ -137,7 +129,8 @@ class _AttentionFamilySpec:
     configure: Callable[[object, ServerArgs], None]
     # A name, or a function of the launch returning one (None: no default).
     default_backend: str | Callable[[ServerArgs], str | None] | None = None
-    default_prefix_granularity: int | None = None
+    # ``configure`` reads ``--dsa-index-k-format``; other models refuse it.
+    takes_index_k_format: bool = False
 
 
 def override_model_config(model_config, ext_yaml):
@@ -157,40 +150,11 @@ def override_model_config(model_config, ext_yaml):
             logger.info(f"Override model config: {k!s}={new_v!r}")
 
 
-def is_deepseek_v4(config: PretrainedConfig) -> bool:
-    return resolve_architecture(config) in _DEEPSEEK_V4_ARCHITECTURES
-
-
 def is_qwen4_exp(config: PretrainedConfig) -> bool:
     return (
         getattr(config, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}
         or resolve_architecture(config) in _QWEN4_EXP_ARCHITECTURES
     )
-
-
-def is_deepseek_v4_nextn(config: PretrainedConfig) -> bool:
-    return resolve_architecture(config) == "DeepseekV4ForCausalLMNextN"
-
-
-def configure_deepseek_v4_attention(model_config, server_args: ServerArgs) -> None:
-    """Derive DeepSeek V4's MLA-like dimensions for runtime setup."""
-    del server_args  # the geometry follows the checkpoint alone
-
-    hf_config = model_config.hf_config
-    model_config.head_dim = hf_config.head_dim
-    model_config.attention_arch = AttentionArch.MLA
-    model_config.kv_lora_rank = hf_config.head_dim
-    model_config.qk_rope_head_dim = hf_config.qk_rope_head_dim
-    model_config.qk_nope_head_dim = hf_config.head_dim - hf_config.qk_rope_head_dim
-    model_config.v_head_dim = hf_config.head_dim
-    model_config.index_head_dim = getattr(hf_config, "index_head_dim", None)
-    model_config.scaling = 1 / math.sqrt(model_config.head_dim)
-    rope_scaling = getattr(hf_config, "rope_scaling", None)
-    if rope_scaling:
-        mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
-        scaling_factor = rope_scaling["factor"]
-        mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-        model_config.scaling = model_config.scaling * mscale * mscale
 
 
 def configure_deepseek_v41_attention(model_config, server_args: ServerArgs) -> None:
@@ -207,6 +171,30 @@ def configure_deepseek_v41_attention(model_config, server_args: ServerArgs) -> N
     model_config.scaling = hf.head_dim**-0.5
 
 
+def configure_kimi_k31_attention(model_config, server_args: ServerArgs) -> None:
+    """Kimi-K3.1: DSA geometry with the indexer's keys stored as FP8 with scales.
+
+    ``fp8_scaled`` keys take 132 bytes per token per layer against 256 for
+    ``bf16``, so 8x MI350X at the default memory utilization fits 15 rather
+    than 12 requests of 50K input tokens. AIME26 and OpenAI MRCR (2 needles,
+    up to 45K tokens) score the same on both formats within run-to-run
+    noise. The checkpoint's BF16 indexer weights (``KimiK3Config`` rejects
+    ``indexer_use_fp8: true``) do not pin the serving format of the keys.
+    ``--dsa-index-k-format mxfp4`` stores 68-byte rows instead, refused under
+    bitwise numerics.
+    """
+    _configure_dsa_geometry(model_config)
+    index_k_format = server_args.dsa_index_k_format or "fp8_scaled"
+    if index_k_format == "mxfp4" and server_args.numerics in BITWISE_ENVELOPES:
+        raise ValueError(
+            "--dsa-index-k-format mxfp4 is not supported under --numerics "
+            f"{server_args.numerics}"
+        )
+    model_config.index_k_format = index_k_format
+    # K3.1 keeps all DSA ops in one eager break narrowing padded replays to live rows.
+    model_config.dsa_padded_prefill_replay = True
+
+
 def configure_dsa_attention(model_config, server_args: ServerArgs) -> None:
     """Derive MLA latent plus DSA indexer geometry (GLM-DSA, DeepSeek-V3.2).
 
@@ -215,6 +203,11 @@ def configure_dsa_attention(model_config, server_args: ServerArgs) -> None:
     same geometry under every launch.
     """
     del server_args
+    _configure_dsa_geometry(model_config)
+
+
+def _configure_dsa_geometry(model_config) -> None:
+    """The MLA latent plus DSA indexer geometry, with ``fp8_scaled`` keys."""
     mla_config = (
         model_config.hf_text_config
         if hasattr(model_config.hf_text_config, "kv_lora_rank")
@@ -301,7 +294,6 @@ def configure_dots3_note_attention(model_config, server_args: ServerArgs) -> Non
         server_args,
         name="dots3-note",
         default_backend="mla" if is_mtp else "dsa",
-        default_prefix_granularity=None,
         is_draft_worker=is_mtp,
     )
     configure = configure_mla_attention if is_mtp else configure_dsa_attention
@@ -342,9 +334,8 @@ def beam_default_attention_backend(server_args: ServerArgs) -> str | None:
     """Beam's ``--attention-backend`` when the launch names none.
 
     The TRT-LLM-gen paged FMHA leaf (``trtllm``) where it was admitted: NVIDIA
-    SM100 to SM103, a BF16 KV cache, a ``--prefix-granularity`` holding whole
-    64-token leaf pages, ``--numerics auto`` (its decode picks the KV split
-    count per batch bucket, which rl-bitwise excludes) and no
+    SM100 to SM103, a BF16 KV cache, ``--numerics auto`` (its decode picks the
+    KV split count per batch bucket, which rl-bitwise excludes) and no
     ``attention.mha_*`` kernel override (the leaf calls FlashInfer directly, so
     such an override would be silently ignored). Otherwise None: the backend
     stays unset, i.e. today's ranked ``mha`` leaf. One INFO line says which, and
@@ -360,13 +351,6 @@ def beam_default_attention_backend(server_args: ServerArgs) -> str | None:
     ):
         # An auto KV cache takes the model dtype (auto: the checkpoint's).
         reason = f"--kv-cache-dtype auto follows --dtype {server_args.dtype}, not BF16"
-    if not reason and server_args.prefix_granularity % TRTLLM_MHA_PAGE_SIZE:
-        # A cache block must hold whole leaf pages (group_tables rejects it at
-        # startup); the unset mha leaf takes the block as its page instead.
-        reason = (
-            f"--prefix-granularity {server_args.prefix_granularity} is not a "
-            f"multiple of the leaf's {TRTLLM_MHA_PAGE_SIZE}-token pages"
-        )
     if not reason and server_args.numerics != "auto":
         reason = (
             f"--numerics {server_args.numerics}: the TRT-LLM decode splits KV "
@@ -625,7 +609,6 @@ _ATTENTION_FAMILY_SPECS = (
         name="dots3-note",
         architectures=frozenset({"Dots3NoteForCausalLM", "Dots3NoteForCausalLMNextN"}),
         configure=configure_dots3_note_attention,
-        default_prefix_granularity=128,
     ),
     _AttentionFamilySpec(
         name="DeepSeek V4.1",
@@ -634,21 +617,19 @@ _ATTENTION_FAMILY_SPECS = (
         ),
         configure=configure_deepseek_v41_attention,
         default_backend="deepseek_v41",
-        default_prefix_granularity=256,
-    ),
-    _AttentionFamilySpec(
-        name="DeepSeek V4",
-        architectures=_DEEPSEEK_V4_ARCHITECTURES,
-        configure=configure_deepseek_v4_attention,
-        # V4 kernels need P to be a multiple of their fixed page; default to
-        # exactly one page rather than restating the number.
-        default_prefix_granularity=DEEPSEEK_V4_PAGE_SIZE,
     ),
     _AttentionFamilySpec(
         name="GLM",
         architectures=_DSA_ARCHITECTURES,
         configure=configure_dsa_attention,
         default_backend="dsa",
+    ),
+    _AttentionFamilySpec(
+        # K3's MLA plus a DSA indexer: the hybrid resolver picks the dsa leaf under KDA.
+        name="Kimi-K3.1",
+        architectures=frozenset({"KimiK31ForConditionalGeneration"}),
+        configure=configure_kimi_k31_attention,
+        takes_index_k_format=True,
     ),
     _AttentionFamilySpec(
         name="MLA",
@@ -659,7 +640,6 @@ _ATTENTION_FAMILY_SPECS = (
         name="MiniMax MSA",
         architectures=_MSA_ARCHITECTURES,
         configure=configure_minimax_m3_attention,
-        default_prefix_granularity=128,
     ),
     _AttentionFamilySpec(
         name="Beam",
@@ -690,6 +670,23 @@ def _resolve_attention_family(
         if any(arch in spec.architectures for arch in architectures):
             return spec
     return None
+
+
+def refuse_untaken_index_k_format(
+    family: _AttentionFamilySpec | None, architecture: str, server_args: ServerArgs
+) -> None:
+    """Refuse ``--dsa-index-k-format`` for a target whose attention family
+    does not read it, rather than serving the model's own format silently."""
+    if server_args.dsa_index_k_format is None or (
+        family is not None and family.takes_index_k_format
+    ):
+        return
+    takers = ", ".join(
+        s.name for s in _ATTENTION_FAMILY_SPECS if s.takes_index_k_format
+    )
+    raise ValueError(
+        f"--dsa-index-k-format applies only to {takers}, not {architecture}"
+    )
 
 
 def _is_dflash2_mla(
@@ -796,7 +793,9 @@ def _apply_block_spec_widths(
 
     Args:
         server_args: Server args whose speculative widths are checked, or set
-            when they were left at their defaults.
+            when they were left at their defaults. Explicit widths may draft
+            fewer tokens than the checkpoint's block, except for DeepSeek V4.1
+            DSpark, whose drafter always drafts the whole block.
         hf_config: The draft checkpoint's config.
         hf_text_config: Its text config, searched first.
 
@@ -815,7 +814,10 @@ def _apply_block_spec_widths(
             block_size,
             server_args.speculative_num_steps,
             server_args.speculative_num_draft_tokens,
+            allow_shorter=resolve_architecture(hf_config)
+            != "DeepseekV41ForCausalLMDSpark",
         )
+        return block_size
     num_steps, num_draft_tokens = resolve_block_widths(algorithm, block_size)
     server_args.speculative_num_steps = num_steps
     server_args.speculative_num_draft_tokens = num_draft_tokens
@@ -827,25 +829,13 @@ def _apply_attention_defaults(
     *,
     name: str,
     default_backend: str | Callable[[ServerArgs], str | None] | None,
-    default_prefix_granularity: int | None,
     is_draft_worker: bool,
 ) -> None:
-    """Fill launch arguments the user left at their defaults.
+    """Fill the attention backend the user left at its default.
 
     A callable ``default_backend`` is asked only when the backend field it
     would fill is unset, and may return None to leave it unset.
     """
-    if default_prefix_granularity is not None:
-        granularity_default = ServerArgs.__dataclass_fields__[
-            "prefix_granularity"
-        ].default
-        if server_args.prefix_granularity == granularity_default:
-            logger.info(
-                f"{name!s} default prefix_granularity="
-                f"{default_prefix_granularity:d}; pass --prefix-granularity "
-                f"with a value other than {granularity_default:d} to keep that value.",
-            )
-            server_args.prefix_granularity = default_prefix_granularity
     if callable(default_backend):
         unset = (
             server_args.drafter_attention_backend
@@ -890,8 +880,6 @@ def _derive_num_attention_layers(
         # Encoder keeps no paged KV; cross-KV lives outside the arena.
         # Size the pool for decoder self-attention only.
         return int(getattr(hf_config, "decoder_layers", num_hidden_layers))
-    if is_deepseek_v4_nextn(hf_config):
-        num_attention_layers = int(getattr(hf_config, "num_nextn_predict_layers", 1))
     if any(arch in _DOUBLE_ATTENTION_LAYER_ARCHITECTURES for arch in architectures):
         num_attention_layers = num_hidden_layers * 2
     if any(arch in _CACHE_LAYER_VIEW_ARCHITECTURES for arch in architectures):
@@ -945,6 +933,7 @@ class ModelConfig:
             validate_drafter_algorithm(server_args.speculative_algorithm)
             require_plugin_draft_checkpoint(server_args)
         self.model_path = model_path
+        self.is_draft_worker = bool(is_draft_worker)
         self.revision = revision
         self.quantization = quantization
         self.mapping = server_args.mapping
@@ -996,42 +985,30 @@ class ModelConfig:
             resolved_profile[1] if resolved_profile is not None else None
         )
         self.spec_block_size: int | None = None
+        self.draft_sample_from_anchor: bool = False
         if is_draft_worker:
             self.spec_block_size = _apply_block_spec_widths(
                 server_args, self.hf_config, self.hf_text_config
             )
+            algorithm = server_args.speculative_algorithm
+            if algorithm in BLOCK_SPEC_ALGORITHMS:
+                self.draft_sample_from_anchor = resolve_block_sample_from_anchor(
+                    algorithm, self.hf_text_config, self.hf_config
+                )
         self.dspark_prefix_replay_tokens: int | None = None
         if (
             is_draft_worker
             and getattr(server_args, "speculative_algorithm", None) == "DSPARK"
-            and resolve_architecture(self.hf_config)
-            in ("DeepseekV4ForCausalLMDSpark", "DeepseekV41ForCausalLMDSpark")
+            and resolve_architecture(self.hf_config) == "DeepseekV41ForCausalLMDSpark"
         ):
             if self.spec_block_size is None:
                 raise ValueError(
                     "DSPARK same-checkpoint decoding requires the checkpoint to "
                     "declare dspark_block_size."
                 )
-            dspark_window_size = int(
-                getattr(
-                    self.hf_text_config,
-                    "dspark_window_size",
-                    128,
-                )
-            )
-            if dspark_window_size <= 0:
-                raise ValueError(
-                    "DSPARK captured-context window size must be positive; "
-                    f"got {dspark_window_size}."
-                )
             # V4.1 keeps its windows in the SWA cache group, so a prefix hit
-            # already carries them; V4 rebuilds a drafter-private ring instead.
-            self.dspark_prefix_replay_tokens = (
-                0
-                if resolve_architecture(self.hf_config)
-                == "DeepseekV41ForCausalLMDSpark"
-                else dspark_window_size
-            )
+            # already carries them and nothing needs replaying.
+            self.dspark_prefix_replay_tokens = 0
             dspark_num_stages = count_dspark_stages(
                 model_path,
                 revision=revision,
@@ -1043,6 +1020,13 @@ class ModelConfig:
             self.hf_text_config.dspark_num_stages = dspark_num_stages
             if self.hf_config is not self.hf_text_config:
                 self.hf_config.dspark_num_stages = dspark_num_stages
+        elif (
+            is_draft_worker
+            and resolve_architecture(self.hf_config)
+            == "Inkling2ForConditionalGenerationMTP"
+        ):
+            # Context K/V lives in the shared full-history group; nothing to replay.
+            self.dspark_prefix_replay_tokens = 0
         if (
             is_draft_worker
             and resolve_architecture(self.hf_config)
@@ -1143,6 +1127,13 @@ class ModelConfig:
                 "Running in encoder-only mode: the language model will not "
                 "be constructed or loaded (encode role)."
             )
+        if server_args.decode_monokernel and not is_draft_worker:
+            # The model reads the switch from its text config. ServerArgs
+            # accepts it only for DECODE_MONOKERNEL_ARCHITECTURES, whose
+            # text config classes declare the field (default False). A
+            # draft's config has no such class: load_model_config declares
+            # the field on it from its target.
+            self.hf_text_config.decode_monokernel = True
         self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -1217,6 +1208,8 @@ class ModelConfig:
         # hook names it (configure_dsa_attention: "fp8_scaled"); None for a
         # model without an indexer, and DSAConfig refuses None.
         self.index_k_format: str | None = None
+        # Rank-uniform: all DSA ops run in one eager break that narrows padded replays.
+        self.dsa_padded_prefill_replay: bool = False
 
         # MLA/DSA families carry per-head dimension metadata that does not
         # follow the standard hidden_size / num_attention_heads derivation above.
@@ -1228,14 +1221,21 @@ class ModelConfig:
             self.hf_config,
             self.hf_text_config,
         )
+        # A profile's own hook answers for the flags it reads, and the target
+        # answers for the launch its drafts share.
+        if (
+            server_args is not None
+            and self.model_profile is None
+            and not is_draft_worker
+        ):
+            refuse_untaken_index_k_format(
+                attention_family, resolve_architecture(self.hf_config), server_args
+            )
         if self.model_profile is not None:
             _apply_attention_defaults(
                 server_args,
                 name=resolve_architecture(self.hf_config),
                 default_backend=self.model_profile.default_attention_backend,
-                default_prefix_granularity=(
-                    self.model_profile.default_prefix_granularity
-                ),
                 is_draft_worker=bool(is_draft_worker),
             )
             self.model_profile.configure_attention(self, server_args)
@@ -1244,7 +1244,6 @@ class ModelConfig:
                 server_args,
                 name=attention_family.name,
                 default_backend=attention_family.default_backend,
-                default_prefix_granularity=attention_family.default_prefix_granularity,
                 is_draft_worker=bool(is_draft_worker),
             )
             attention_family.configure(self, server_args)
@@ -1298,7 +1297,20 @@ class ModelConfig:
                 )
                 if nextn_layers is not None and nextn_layers > 0:
                     self.num_attention_layers = nextn_layers
-        self.vocab_size = self.hf_text_config.vocab_size
+        self.input_vocab_size = self.hf_text_config.vocab_size
+        self.vocab_size = getattr(self.hf_text_config, "output_vocab_size", None)
+        if self.vocab_size is None:
+            self.vocab_size = self.input_vocab_size
+
+        if not (
+            type(self.input_vocab_size) is int
+            and type(self.vocab_size) is int
+            and 0 < self.vocab_size <= self.input_vocab_size
+        ):
+            raise ValueError(
+                "Vocabulary sizes must be integers satisfying 0 < output <= input; "
+                f"got input_vocab_size={self.input_vocab_size!r}, vocab_size={self.vocab_size!r}"
+            )
 
         # Verify quantization
         self._verify_quantization()
@@ -1423,10 +1435,17 @@ class ModelConfig:
 
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if (
+            quant_cfg == {}
+            and resolve_architecture(self.hf_config)
+            == "Inkling2ForConditionalGenerationMTP"
+        ):
+            # The BF16 draft is explicitly unquantized; never read the target's manifest.
+            return None
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
-        if quant_cfg is None:
+        if quant_cfg is None or is_inkling2_manifest_stub(quant_cfg):
             # modelopt NVFP4 checkpoints store quant config in hf_quant_config.json
             # Resolve the local snapshot directory (model_path may be a HF hub ID)
             if os.path.isdir(self.model_path):
@@ -1452,6 +1471,8 @@ class ModelConfig:
                 if os.path.isfile(hf_quant_path):
                     with open(hf_quant_path, encoding="utf-8") as f:
                         hf_quant = json.load(f)
+                    if hf_quant.get("quant_method") == "inkling2":
+                        return hf_quant
                     quant_algo = hf_quant.get("quantization", {}).get("quant_algo", "")
                     if quant_algo:
                         quant_cfg = {
@@ -1525,17 +1546,18 @@ class ModelConfig:
                 )
 
     def get_hf_eos_token_id(self) -> set[int] | None:
+        # An EOS id may be 0, so test for presence rather than truthiness.
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
-        if eos_ids:
+        if eos_ids is not None:
             # it can be either int or list of int
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
-        if eos_ids is None:
+        else:
             eos_ids = set()
         if self.hf_generation_config:
             generation_eos_ids = getattr(
                 self.hf_generation_config, "eos_token_id", None
             )
-            if generation_eos_ids:
+            if generation_eos_ids is not None:
                 generation_eos_ids = (
                     {generation_eos_ids}
                     if isinstance(generation_eos_ids, int)
@@ -1751,8 +1773,10 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Qwen3ASRForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "Glm53FlashForConditionalGeneration",
         "InklingForConditionalGeneration",
+        "Inkling2ForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
         # Audio in, tokens out: same multimodal request shape as an image,
         # even though Whisper is encoder-decoder rather than audio-prefix.
@@ -1787,9 +1811,3 @@ def is_audio_model(model_architectures: list[str] | None):
         "MuseSparkForConditionalGeneration",
     }
     return any(arch in audio_architectures for arch in model_architectures or [])
-
-
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0

@@ -1,6 +1,8 @@
 import subprocess
 import sys
 import textwrap
+from importlib.util import find_spec
+from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -8,10 +10,12 @@ import pytest
 import torch
 
 from tokenspeed.runtime.distributed.comm_backend import iris as iris_module
+from tokenspeed.runtime.distributed.comm_backend import nccl as nccl_module
 from tokenspeed.runtime.distributed.comm_backend.auto import (
     AutoBackend,
     Collective,
     Route,
+    ordered_fold_sum,
 )
 from tokenspeed.runtime.distributed.comm_backend.iris import (
     IrisBackend,
@@ -21,6 +25,13 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
     TrtllmAllReduceBackend,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+# These cases fake AMD, whose Iris reach check imports an AMD-only package.
+needs_iris = pytest.mark.skipif(
+    find_spec("iris") is None, reason="iris is packaged for ROCm only"
+)
 
 
 def test_runtime_import_without_iris():
@@ -97,6 +108,52 @@ def test_iris_ordinary_all_reduce_keeps_512_kib_limit(monkeypatch):
     assert backend.producer_direct_max_bytes == 1024 * 1024
 
 
+class _OrdinaryReduction:
+    """A prepared reduction that admits payloads up to max_numel elements."""
+
+    def __init__(self, max_numel: int):
+        self.max_numel = max_numel
+        self.reduced = []
+
+    def can_reduce_ordinary(self, tensor, *, rccl_fallback: bool) -> bool:
+        assert rccl_fallback
+        return tensor.numel() <= self.max_numel
+
+    def reduce_ordinary(self, tensor):
+        self.reduced.append(tensor)
+        return tensor
+
+
+def test_installed_reduction_serves_its_group_past_the_staged_limit(monkeypatch):
+    backend = IrisBackend(Mock(), producer_direct_max_bytes=1024 * 1024)
+    monkeypatch.setattr(
+        iris_module, "current_platform", lambda: SimpleNamespace(is_amd=True)
+    )
+    group, other_group = tuple(range(8)), tuple(range(8, 16))
+    reduction = _OrdinaryReduction(max_numel=172 * 8192)
+    backend.install_ordinary_all_reduce(group, reduction)
+
+    def rows(count):
+        return torch.empty((count, 8192), dtype=torch.bfloat16, device="meta")
+
+    draft_rows = rows(172)
+    assert backend.can_run(draft_rows, group)
+    assert backend.all_reduce(draft_rows, group) is draft_rows
+    assert reduction.reduced == [draft_rows]
+
+    # Other groups, unsupported operations, and payloads the reduction
+    # declines reach the fallback.
+    max_op = torch.distributed.ReduceOp.MAX
+    larger = rows(173)
+    assert not backend.can_run(draft_rows, other_group)
+    assert not backend.can_run(draft_rows, group, op=max_op)
+    assert not backend.can_run(larger, group)
+    backend.all_reduce(draft_rows, other_group)
+    backend.all_reduce(draft_rows, group, op=max_op)
+    backend.all_reduce(larger, group)
+    assert reduction.reduced == [draft_rows]
+
+
 def test_iris_preparation_caps_only_ordinary_staging(monkeypatch):
     backend = IrisBackend(Mock(), producer_direct_max_bytes=256)
     group = (0, 1)
@@ -126,6 +183,7 @@ def test_iris_preparation_caps_only_ordinary_staging(monkeypatch):
     assert len(created) == 1
 
 
+@needs_iris
 def test_public_preparation_preserves_capacities(backend, monkeypatch):
     from tokenspeed.runtime.distributed.comm_ops import prepare_all_reduce_buffers
 
@@ -241,6 +299,52 @@ def test_nccl_collection_uses_single_tensor_path():
     assert all(output is tensor for output, tensor in zip(outputs, tensors))
 
 
+def _bytes(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.view(torch.uint8)
+
+
+@pytest.mark.parametrize(
+    "shape, dtype, dim",
+    [
+        ((5, 3, 576), torch.float8_e4m3fn, 1),  # 8-byte words
+        ((6, 7), torch.uint8, -1),  # runs of 7 bytes
+        ((1, 6), torch.bfloat16, -1),  # one outer index: no relayout
+        ((2, 3), torch.float32, 0),
+    ],
+)
+def test_nccl_all_gather_concatenates_the_ranks_inputs_along_dim(
+    monkeypatch, shape, dtype, dim
+):
+    # AMD relayouts in 8-byte words; test_comm_ops gathers through movedim.
+    monkeypatch.setattr(
+        nccl_module, "current_platform", lambda: SimpleNamespace(is_amd=True)
+    )
+    group = (0, 1, 2, 3)
+    backend = NcclBackend()
+    backend._resources[group] = {
+        "pynccl_comm": None,
+        "device_group": None,
+        "world_size": len(group),
+    }
+    inputs = [
+        (
+            torch.randint(0, 256, shape, dtype=torch.uint8).view(dtype)
+            if dtype.itemsize == 1
+            else torch.randint(-(2**15), 2**15, shape, dtype=torch.int32).to(dtype)
+        )
+        for _ in group
+    ]
+
+    def land_rank_major(output, tensor, _group):
+        _bytes(output).copy_(torch.cat([_bytes(x) for x in inputs]))
+
+    backend.all_gather_single = land_rank_major
+    out = backend.all_gather(inputs[0], group, dim)
+
+    assert out.dtype == dtype
+    assert torch.equal(_bytes(out), torch.cat([_bytes(x) for x in inputs], dim))
+
+
 def test_trtllm_collection_uses_fallback_single_tensor_path():
     fallback = Mock()
     fallback.all_reduce.side_effect = lambda tensor, _group, op: tensor
@@ -266,6 +370,7 @@ def test_force_deterministic_rsag_preserves_two_tensor_nccl_grouping(
     backend._nccl.all_reduce.assert_not_called()
 
 
+@needs_iris
 def test_amd_collection_past_iris_capacity_uses_grouped_rccl(
     backend,
     monkeypatch,
@@ -286,6 +391,7 @@ def test_amd_collection_past_iris_capacity_uses_grouped_rccl(
     backend._nccl.all_reduce_two.assert_called_once_with(*tensors, group, op=None)
 
 
+@needs_iris
 def test_acquire_all_reduce_outputs_uses_iris(backend, monkeypatch):
     monkeypatch.setattr(
         "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
@@ -310,6 +416,7 @@ def test_acquire_all_reduce_outputs_uses_iris(backend, monkeypatch):
     )
 
 
+@needs_iris
 def test_acquire_all_reduce_outputs_amd_uses_base_when_iris_is_ineligible(
     backend,
     monkeypatch,
@@ -366,6 +473,7 @@ def test_acquire_all_reduce_outputs_preserves_trtllm(backend, monkeypatch):
     backend._iris.acquire_all_reduce_outputs.assert_not_called()
 
 
+@needs_iris
 @pytest.mark.parametrize("num_outputs", [1, 2])
 def test_symmetric_outputs_route_back_to_iris(backend, monkeypatch, num_outputs):
     monkeypatch.setattr(
@@ -382,6 +490,7 @@ def test_symmetric_outputs_route_back_to_iris(backend, monkeypatch, num_outputs)
     backend._nccl.all_reduce.assert_not_called()
 
 
+@needs_iris
 def test_prepared_symmetric_outputs_bypass_default_size_gate(backend, monkeypatch):
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
     monkeypatch.setattr(
@@ -510,12 +619,16 @@ def test_batch_invariant_all_reduce_folds_the_gathered_partials_in_rank_order(
     routing, monkeypatch
 ):
     _switches(monkeypatch, force=False, invariant=True)
+    routing._trtllm_ar.has_trtllm_ar.return_value = False
+    monkeypatch.setattr(
+        AutoBackend, "_multicast_reachable", staticmethod(lambda g: False)
+    )
     # Two partials whose sum rounds differently in bf16 than in fp32: the fold
     # accumulates in fp32 and rounds once.
     mine = torch.full((4, 16), 1.0, dtype=torch.bfloat16)
     peer = torch.full((4, 16), 2.0**-9, dtype=torch.bfloat16)
     routing._nccl.all_gather.side_effect = lambda tensor, group, dim: torch.cat(
-        [mine, peer]
+        [mine, peer], dim=dim
     )
     tensor = mine.clone()
 
@@ -529,6 +642,44 @@ def test_batch_invariant_all_reduce_folds_the_gathered_partials_in_rank_order(
     routing._nccl.all_gather.reset_mock()
     routing.all_reduce((mine.clone(), mine.clone()), GROUP)
     assert routing._nccl.all_gather.call_count == 2
+
+
+def test_batch_invariant_all_reduce_takes_the_trtllm_fold_where_it_serves(
+    routing, monkeypatch
+):
+    _switches(monkeypatch, force=False, invariant=True)
+    monkeypatch.setattr(
+        AutoBackend, "_multicast_reachable", staticmethod(lambda g: False)
+    )
+    routing._trtllm_ar.has_trtllm_ar.return_value = True
+    folded = torch.full((4, 16), 3.0, dtype=torch.bfloat16)
+    routing._trtllm_ar.ordered_all_reduce.return_value = folded
+    routing._nccl.all_gather.side_effect = lambda tensor, group, dim: torch.cat(
+        [tensor, tensor], dim=dim
+    )
+    gather_fold = torch.full((4, 16), 2.0, dtype=torch.bfloat16)
+    assert routing.all_reduce(torch.ones(4, 16, dtype=torch.bfloat16), GROUP) is folded
+
+    # The rsag override keeps the fold off the symmetric-memory workspace.
+    _switches(monkeypatch, force=True, invariant=True)
+    tensor = torch.ones(4, 16, dtype=torch.bfloat16)
+    assert routing.all_reduce(tensor, GROUP) is tensor
+    assert torch.equal(tensor, gather_fold)
+
+    # A shape the workspace does not serve takes the gather and the fold.
+    _switches(monkeypatch, force=False, invariant=True)
+    routing._trtllm_ar.ordered_all_reduce.return_value = None
+    tensor = torch.ones(4, 16, dtype=torch.bfloat16)
+    assert routing.all_reduce(tensor, GROUP) is tensor
+    assert torch.equal(tensor, gather_fold)
+
+
+def test_ordered_fold_sum_stores_a_zero_sum_as_positive_zero():
+    # The torch fold matches the kernels: only an all -0.0 sum would keep its sign.
+    parts = torch.tensor([[-0.0, -0.0, 1.0], [-0.0, 0.0, -1.0]])
+    out = torch.empty(3)
+    ordered_fold_sum(parts, out)
+    assert out.view(torch.int32).tolist() == [0, 0, 0]
 
 
 def test_batch_invariant_all_reduce_refuses_order_dependent_non_sum(

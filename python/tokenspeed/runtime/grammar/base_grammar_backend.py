@@ -22,7 +22,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Base classes for grammar-guided constrained decoding backends."""
+"""The grammar interface the data plane drives, and the bitmask apply."""
 
 import time
 from collections import OrderedDict
@@ -32,6 +32,53 @@ from threading import Event, Lock
 from typing import Any
 
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+
+class BaseGrammarObject:
+    """A request's grammar matcher as the data plane drives it: the bitmask
+    fills, and on the capturable path the accepts and rollbacks
+    (``HostGrammar``, over the matcher the Rust host owns)."""
+
+    # Cache bookkeeping of the Python grammar backends (BaseGrammarBackend).
+    is_invalid: bool = False
+    expires_at: float | None = None
+
+    @property
+    def expired(self) -> bool:
+        return False
+
+    @property
+    def memory_size_bytes(self) -> int:
+        """Host memory held by this grammar object (an estimate), counted
+        against RETAINED_GRAMMAR_LIMIT_BYTES. Every backend must define it:
+        without it the bound would count only the keys."""
+        raise NotImplementedError()
+
+
+def get_apply_vocab_mask_func(grammar_backend: str):
+    """Return the backend-specific in-place vocab-mask-apply function.
+
+    The function's signature is ``(logits, vocab_mask) -> None``. It is
+    stored on ``SamplingBatchInfo.apply_vocab_mask`` so the captured
+    sampler can call it without branching on backend. Only xgrammar is
+    wired up today; add branches here when new backends are added.
+    """
+    if grammar_backend == "xgrammar":
+
+        from xgrammar import apply_token_bitmask_inplace
+
+        # xgrammar's native signature is (logits, bitmask, *, ...);
+        # adapt to the canonical (logits, vocab_mask) kwargs the
+        # sampler uses.
+        def _apply(logits, vocab_mask):
+            apply_token_bitmask_inplace(logits, vocab_mask)
+
+        return _apply
+
+    raise ValueError(f"Unsupported grammar backend: {grammar_backend}")
+
+
+# --- definitions restored from the pre-merge branch (D3-3) ---
 
 # Bound on the compiled grammars kept after a request was admitted with them,
 # by their size estimate plus key size, so that a request repeating a
@@ -56,25 +103,6 @@ class CacheEntry:
     # callers for the same key reuse this instead of submitting duplicate
     # tasks that would saturate the executor on repeated same-schema traffic.
     future: Future | None = None
-
-
-class BaseGrammarObject:
-    """Base for compiled grammar wrappers. Concrete backends subclass this."""
-
-    is_invalid: bool = False
-    expires_at: float | None = None
-
-    @property
-    def expired(self) -> bool:
-
-        return False
-
-    @property
-    def memory_size_bytes(self) -> int:
-        """Host memory held by this grammar object (an estimate), counted
-        against RETAINED_GRAMMAR_LIMIT_BYTES. Every backend must define it:
-        without it the bound would count only the keys."""
-        raise NotImplementedError()
 
 
 class InvalidGrammarObject(BaseGrammarObject):
@@ -542,26 +570,3 @@ def create_grammar_backend(
     # preambles and carried known P1 bugs around state cloning + reasoning
     # initialization.
     return grammar_backend
-
-
-def get_apply_vocab_mask_func(grammar_backend: str):
-    """Return the backend-specific in-place vocab-mask-apply function.
-
-    The function's signature is ``(logits, vocab_mask) -> None``. It is
-    stored on ``SamplingBatchInfo.apply_vocab_mask`` so the captured
-    sampler can call it without branching on backend. Only xgrammar is
-    wired up today; add branches here when new backends are added.
-    """
-    if grammar_backend == "xgrammar":
-
-        from xgrammar import apply_token_bitmask_inplace
-
-        # xgrammar's native signature is (logits, bitmask, *, ...);
-        # adapt to the canonical (logits, vocab_mask) kwargs the
-        # sampler uses.
-        def _apply(logits, vocab_mask):
-            apply_token_bitmask_inplace(logits, vocab_mask)
-
-        return _apply
-
-    raise ValueError(f"Unsupported grammar backend: {grammar_backend}")

@@ -25,7 +25,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
-import tokenspeed_scheduler as ts
+import tokenspeed_engine.scheduler as ts
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -47,6 +47,7 @@ def test_scheduler_stats_partition_lcm_blocks(packing, active_parents, cached_pa
     config.max_retracted_requests = 0
     config.max_scheduled_tokens = 16
     config.max_batch_size = 8
+    config.max_resident_requests = 8
     config.decode_input_tokens = 1
     config.overlap_schedule_depth = 0
     config.disable_l2_cache = True

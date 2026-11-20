@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
+from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
@@ -123,7 +124,9 @@ class CacheOpHooks:
             replica_groups.append((pp_size, pp_cpu_group))
         self._replica_groups = replica_groups
 
-    def count_plan_ops(self, execution_plan) -> int:
+    def count_plan_ops(
+        self, execution_plan, *, request_admission: Callable[[str], int]
+    ) -> int:
         """Count the cache ops this plan will put in flight.
 
         ``DeviceHandle.execute`` submits them, from the same plan (write-backs
@@ -134,6 +137,11 @@ class CacheOpHooks:
         store, restore or prefetch batch is one ticket, acknowledged on its
         own. Call this with the SAME plan and only when ``execute`` will run:
         a plan counted but never submitted leaves ops in flight forever.
+
+        Args:
+            execution_plan: The round's plan.
+            request_admission: Resolves a request ID to its admission
+                identity, as for ``ForwardThreadDevice.execute``.
 
         Returns:
             The number of ``SnapshotOp`` requests in the plan — one per
@@ -150,7 +158,9 @@ class CacheOpHooks:
         if self._device is None:
             return 0
         num_snapshot_ops = 0
-        for op in cache_ops_from_plan(execution_plan):
+        for op in cache_ops_from_plan(
+            execution_plan, request_admission=request_admission
+        ).device:
             if isinstance(op, (SnapshotOp, RestoreOp, PrefetchOp)):
                 self._num_inflight += 1
                 self._num_open += 1

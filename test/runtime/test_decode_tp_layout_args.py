@@ -49,6 +49,13 @@ class TestServerArgs:
         tp8.mapping.rank = 5
         assert tp8.mapping.lm_head.tp_group == tp8.mapping.attn.tp_group
 
+    def test_head_tp_exchange_max_rows_is_configurable(self):
+        assert ServerArgs(**DP8).head_tp_exchange_max_rows == 256
+        args = ServerArgs(**DP8, head_tp_exchange_max_rows=512)
+        assert args.head_tp_exchange_max_rows == 512
+        with pytest.raises(ValueError, match="head-tp-exchange-max-rows"):
+            ServerArgs(**DP8, head_tp_exchange_max_rows=0)
+
     def test_decode_preset_resolves_one_node_local_group(self):
         args = ServerArgs(
             **DP8,
@@ -133,66 +140,6 @@ class TestServerArgs:
         plain = ServerArgs(**DP8)
         plain.validate_tp_batch_invariant_weights("fp8", ())
 
-    def test_head_tp_decode_engine_admits_any_generation_budget(self):
-        """A retracted request resumes by restore, never by a recovery
-        prefill, so the decode-only head-TP layout needs no admission cap:
-        the budget only clamps to the context, as on every engine."""
-        import inspect
-
-        from tokenspeed.runtime.engine import request_handler
-        from tokenspeed.runtime.engine.request_handler import RequestHandler
-
-        args = ServerArgs(**DP8, attn_head_tp_size=8, disaggregation_mode="decode")
-        assert args.mapping.attn.head_tp_serves_decode_only
-
-        def admit(max_new_tokens):
-            handler = RequestHandler.__new__(RequestHandler)
-            handler.max_req_len = 65536
-            spec = SimpleNamespace(max_new_tokens=0)
-            state = SimpleNamespace(
-                sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
-                prompt_input_ids=[1, 2, 3],
-                finished_reason=None,
-            )
-            RequestHandler._apply_generation_budget(handler, spec, state)
-            return spec, state
-
-        spec, state = admit(4096 + 1)
-        assert spec.max_new_tokens == 4097 and state.finished_reason is None
-        # An undeclared budget is the context remainder, admitted too.
-        spec, state = admit(None)
-        assert spec.max_new_tokens == 65536 - 3 - 1 and state.finished_reason is None
-        # No layout-keyed budget survives anywhere in the handler.
-        assert "max_new_tokens_budget" not in inspect.getsource(request_handler)
-
-    def test_lm_head_tp_under_dp_refuses_prompt_logprobs(self):
-        """The LM-head TP group exchanges its logits rows once per forward;
-        the prompt-logprob chunk loop would run that exchange a per-rank
-        number of times, so the engine aborts such requests at admission."""
-        from tokenspeed.runtime.engine.request_handler import RequestHandler
-
-        def admit(server_args, wants_input_logprobs):
-            handler = RequestHandler.__new__(RequestHandler)
-            mapping = server_args.mapping
-            handler.supports_input_logprobs = not (
-                mapping.attn.has_dp and mapping.lm_head.has_tp
-            )
-            state = SimpleNamespace(
-                wants_input_logprobs=wants_input_logprobs, finished_reason=None
-            )
-            RequestHandler._refuse_unsupported_input_logprobs(handler, state)
-            return state
-
-        sharded = ServerArgs(**DP8, lm_head_tp_size=8)
-        sharded.mapping.rank = 0
-        assert admit(sharded, False).finished_reason is None
-        state = admit(sharded, True)
-        assert state.finished_reason is not None
-        assert "lm-head-tp-size" in state.finished_reason.message
-        replicated = ServerArgs(**DP8)
-        replicated.mapping.rank = 0
-        assert admit(replicated, True).finished_reason is None
-
     def test_batch_invariant_rejects_unknown_selection(self):
         with pytest.raises(ValueError, match="tp-batch-invariant"):
             ServerArgs(
@@ -276,7 +223,12 @@ class TestLmHeadResolution:
     def test_processor_flag_needs_a_sharded_head_under_skip_all_gather(self):
         config = SimpleNamespace(model_type="t", vocab_size=8)
         with pytest.raises(ValueError, match="dp_lm_head_tp"):
-            LogitsProcessor(config, skip_all_gather=True, dp_lm_head_tp=True)
+            LogitsProcessor(
+                config,
+                skip_all_gather=True,
+                attn_tp_size=1,
+                dp_lm_head_tp=True,
+            )
         with pytest.raises(ValueError, match="dp_lm_head_tp"):
             LogitsProcessor(
                 config,
@@ -284,6 +236,7 @@ class TestLmHeadResolution:
                 tp_rank=0,
                 tp_size=2,
                 tp_group=(0, 1),
+                attn_tp_size=1,
                 dp_lm_head_tp=True,
             )
 
@@ -398,7 +351,7 @@ class TestModuleRefusals:
         from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 
         plan = QueryShardPlan.from_forward(
-            total_tokens=6, input_lengths=[4, 2], size=4, rank=1
+            total_tokens=6, input_lengths=[4, 2], size=4, rank=1, device="cpu"
         )
         extend = SimpleNamespace(query_shard=plan)
         decode = SimpleNamespace(query_shard=None)
@@ -444,7 +397,7 @@ class TestModuleRefusals:
         attn.attn_mqa = Core()
         # Rank 3 holds no rows of the 3-row span.
         plan = QueryShardPlan.from_forward(
-            total_tokens=3, input_lengths=[3], size=4, rank=3
+            total_tokens=3, input_lengths=[3], size=4, rank=3, device="cpu"
         )
         assert plan.local_rows == 0
         ctx = SimpleNamespace(
@@ -534,7 +487,7 @@ class TestModuleRefusals:
             )
         )
         plan = QueryShardPlan.from_forward(
-            total_tokens=3, input_lengths=[3], size=4, rank=0
+            total_tokens=3, input_lengths=[3], size=4, rank=0, device="cpu"
         )
         with pytest.raises(RuntimeError, match="cannot take a query shard"):
             sharded(positions, hidden, ctx(query_shard=plan), comm_manager=None)

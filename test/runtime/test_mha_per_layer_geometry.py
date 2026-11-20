@@ -54,7 +54,6 @@ from tokenspeed.runtime.layers.attention.configs.base import (
 )
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
-    _config_bytes_per_token,
     _config_kv_head_counts,
     _config_layer_fields,
     _mha_layer_fields,
@@ -108,9 +107,9 @@ def _mha_config(
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="auto",
         kv_cache_mxfp8=False,
-        prefix_granularity=_PREFIX_GRANULARITY,
         context_len=4096,
         max_bs=1,
+        max_resident_requests=1,
         components=(spec,),
     )
 
@@ -124,7 +123,9 @@ def _kv_shapes(config: AttnConfig, num_layers: int) -> list[tuple[int, ...]]:
         group_id = (
             layer_types[layer_id] if layer_id < len(layer_types) else "full_attention"
         )
-        fields = _mha_layer_fields(config, layer_id, layer_id, group_id, 0)
+        fields = _mha_layer_fields(
+            config, _PREFIX_GRANULARITY, layer_id, layer_id, group_id, 0
+        )
         # fields[0] is the K page; .shape is (prefix_granularity, kv_heads, head_dim)
         shapes.append(tuple(fields[0].shape))
     return shapes
@@ -176,7 +177,10 @@ class PerLayerGeometryFieldTest(unittest.TestCase):
         sliding_cell = 16 * 256 * 2 * elem
         full_cell = 4 * 512 * 2 * elem
         expected = (10 * sliding_cell) + (2 * full_cell)
-        self.assertEqual(_config_bytes_per_token(config, num_layers), expected)
+        self.assertEqual(
+            config.component(MHAConfig).total_cache_bytes_per_token(config, num_layers),
+            expected,
+        )
 
 
 class PerLayerPlaneScopingTest(unittest.TestCase):
@@ -190,7 +194,9 @@ class PerLayerPlaneScopingTest(unittest.TestCase):
     """
 
     def _plane_ids(self, config, layer_id, group_id, occurrence):
-        fields = _mha_layer_fields(config, layer_id, layer_id, group_id, occurrence)
+        fields = _mha_layer_fields(
+            config, _PREFIX_GRANULARITY, layer_id, layer_id, group_id, occurrence
+        )
         return tuple(f.plane_id for f in fields)
 
     def test_full_and_sliding_share_the_slab_plane_when_per_layer(self):
@@ -264,7 +270,10 @@ class UniformDefaultInvariantTest(unittest.TestCase):
             cache_layer_types=("full_attention",) * 6,
         )
         cell = config.cache_cell_size()
-        self.assertEqual(_config_bytes_per_token(config, 6), cell * 6)
+        self.assertEqual(
+            config.component(MHAConfig).total_cache_bytes_per_token(config, 6),
+            cell * 6,
+        )
 
     def test_uniform_tp_shards_the_single_kv_head_count(self):
         config = _mha_config(
@@ -452,6 +461,7 @@ def _pack_gemma4(config: AttnConfig):
     def fields_for_layer(layer_id, group_id, occurrence):
         return _config_layer_fields(
             config,
+            prefix_granularity=_PREFIX_GRANULARITY,
             layer_id=layer_id,
             local_layer_id=layer_id,
             group_id=group_id,
@@ -462,13 +472,13 @@ def _pack_gemma4(config: AttnConfig):
         layer_types=tuple(spec.cache_layer_types),
         group_ids=group_ids,
         sliding_window_tokens=spec.sliding_window_tokens,
-        prefix_granularity=config.prefix_granularity,
+        prefix_granularity=_PREFIX_GRANULARITY,
         fields_for_layer=fields_for_layer,
         pd_disaggregation_enabled=False,
     )
     layout = pack(
         groups,
-        prefix_granularity=config.prefix_granularity,
+        prefix_granularity=_PREFIX_GRANULARITY,
         cache_blocks_per_lcm_block=None,
         alignment=1,
         max_padding_fraction=1.0,

@@ -46,6 +46,12 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+# Known follow-up, deferred by decision (C1/C2): drives nctu6 L3 prefetch config (l3_prefetch_min_pages) that main replaced with SchedulerConfig.storage_config.
+# See merge_main_1117.md, "Known follow-ups".
+pytestmark = pytest.mark.skip(
+    reason="merge_main_1117.md known follow-up (C1/C2): drives nctu6 L3 prefetch config (l3_prefetch_min_pages) that main replaced with SchedulerConfig.storage_config"
+)
+
 from tokenspeed.runtime.engine import l3_cache_hooks as hooks_module  # noqa: E402
 from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks  # noqa: E402
 

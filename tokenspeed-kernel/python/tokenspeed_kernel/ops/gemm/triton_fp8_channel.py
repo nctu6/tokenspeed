@@ -235,9 +235,11 @@ _FP8_CHANNEL_SCALE = ScaleFormat(storage_dtype=torch.float32, granularity="chann
     "mm",
     name="triton_mm_fp8_channel_small_m",
     solution="triton",
+    # Its tiles take 120 KiB of shared memory per block; SM120 offers 99 KiB,
+    # so the launch fails there.
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
-        max_arch_version=ArchVersion(10, 3),
+        max_arch_version=ArchVersion(10, 7),
         vendors=frozenset({"nvidia"}),
     ),
     signatures=format_signatures(

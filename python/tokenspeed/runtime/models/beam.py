@@ -59,10 +59,9 @@ from tokenspeed_kernel.ops.quantization import (
     silu_and_mul_quantize_fp8,
 )
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from torch import nn
 
-from tokenspeed.runtime.configs.model_config import beam_default_platform
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -72,12 +71,14 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.attention.gating import apply_attention_output_gate
+from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
@@ -111,7 +112,6 @@ from tokenspeed.runtime.models.beam_quant import (
     beam_quant_policy,
 )
 from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3MoE
-from tokenspeed.runtime.models.llama import LlamaMLP
 from tokenspeed.runtime.models.qwen3 import Qwen3Attention
 from tokenspeed.runtime.utils import add_prefix, make_layers, set_weight_attrs
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -133,10 +133,9 @@ BEAM_MOE_FP8_POLICY = "fp8ch_vendor_fp32_route"
 
 
 def beam_kernels() -> bool:
-    """Whether Beam's Triton kernels serve its calls: NVIDIA SM100 to SM103, where
-    each was checked byte for byte against the Torch statements it replaces
-    (``beam_default_platform``). Elsewhere Beam runs the statements."""
-    return not beam_default_platform()
+    """Whether Beam's generic Triton kernels support this platform."""
+    platform = current_platform()
+    return platform.is_nvidia and platform.arch_version >= ArchVersion(9, 0)
 
 
 # The hidden size the residual boundary's one-launch kernel was checked at.
@@ -204,11 +203,10 @@ class BeamRMSNorm(RMSNorm):
     The weight is stored in the checkpoint dtype.
 
     An input norm whose attention runs its Q/K/V and gate projections as one
-    FP8 GEMM (``BeamDecoderLayer`` sets ``_token_fp8_consumer``) normalizes
-    that attention's decode rows with ``rmsnorm_quantize_fp8``
-    (``quantization.rmsnorm_fp8``), whose launch also writes them quantized per
-    token, and offers the codes to the attention, which then skips its own
-    quantization of the rows.
+    FP8 GEMM, or a post-attention norm whose dense MLP runs gate/up as an FP8
+    GEMM (``BeamDecoderLayer`` sets ``_token_fp8_consumer``), also writes its
+    decode rows quantized per token in the same launch and offers them to that
+    consumer, which then skips its own quantization of the rows.
     """
 
     # No depth-scale pair of its own: a scale reaches this norm only as an
@@ -218,6 +216,7 @@ class BeamRMSNorm(RMSNorm):
     def __init__(self, hidden_size: int, eps: float, dtype: torch.dtype) -> None:
         super().__init__(hidden_size=hidden_size, eps=eps)
         self.weight.data = self.weight.data.to(dtype=dtype)
+        self._token_fp8_consumer: BeamAttention | BeamMLP | None = None
 
     def forward(
         self,
@@ -230,7 +229,7 @@ class BeamRMSNorm(RMSNorm):
     ):
         if residual is None and (x_scale is not None or residual_scale is not None):
             raise ValueError("x_scale and residual_scale need a residual")
-        consumer = self.__dict__.get("_token_fp8_consumer")
+        consumer = self._token_fp8_consumer
         if out is None and consumer is not None and consumer.takes_token_fp8(x):
             return self._forward_token_fp8(
                 consumer, x, residual, x_scale, residual_scale
@@ -276,16 +275,17 @@ class BeamRMSNorm(RMSNorm):
 
     def _forward_token_fp8(
         self,
-        consumer: "BeamAttention",
+        consumer: "BeamAttention | BeamMLP",
         x: torch.Tensor,
         residual: torch.Tensor | None,
         x_scale: float | None,
         residual_scale: float | None,
     ):
-        """``forward`` for the rows the attention's fused FP8 GEMM reads: one
-        ``rmsnorm_quantize_fp8`` launch normalizes them as ``forward`` does
-        (with a residual, the BF16-rounded sum of the scaled pair) and also
-        writes them quantized per token for the attention."""
+        """Normalize the consumer's rows and quantize them in one launch.
+
+        With a residual, the norm reads the BF16-rounded sum of the scaled
+        pair, as ``forward`` does, before writing per-token FP8 for the GEMM.
+        """
         rejection = scale_pair_rejection(x_scale, residual_scale)
         if rejection:
             raise ValueError(f"x_scale / residual_scale: {rejection}")
@@ -482,6 +482,19 @@ def _dynamic_fp8_channel_linear(layer: nn.Module) -> bool:
     )
 
 
+def _plain_bf16_linear(layer: nn.Module, input_size: int) -> bool:
+    """An unquantized BF16 linear without bias on the registry's GEMM, with its
+    loaded contiguous ``[N, input_size]`` weight."""
+    return (
+        isinstance(layer.quant_method, UnquantizedLinearMethod)
+        and not layer.quant_method.batch_invariant
+        and layer.bias is None
+        and layer.weight.dtype == torch.bfloat16
+        and layer.weight.is_contiguous()
+        and layer.weight.shape[1] == input_size
+    )
+
+
 class BeamAttention(Qwen3Attention):
     """Qwen3's GQA projections and full/sliding attention setup, with Beam's
     output gate and its own Q/K norms, RoPE and SSMax."""
@@ -558,6 +571,10 @@ class BeamAttention(Qwen3Attention):
         # dequantized at load where no FP8 GEMM is registered).
         self.register_buffer("qkv_gate_weight", None, persistent=False)
         self.register_buffer("qkv_gate_scale", None, persistent=False)
+        # Q, K, V and the output gate as one BF16 GEMM on NVIDIA: the [N, K]
+        # weight both unquantized projections view, which
+        # process_weights_after_loading makes; None otherwise.
+        self.register_buffer("qkv_gate_bf16", None, persistent=False)
         # A one-element FP32 1 where decode rows run the fused GEMM unscaled on
         # the vendor per-tensor FP8 GEMM (fp8_unscaled_linear) and the Q/K norm
         # kernel applies the scales; None otherwise.
@@ -567,7 +584,7 @@ class BeamAttention(Qwen3Attention):
         self._token_fp8: tuple[torch.Tensor, ...] | None = None
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        """Put the Q/K/V and output gate FP8 weights in one buffer.
+        """Put the Q/K/V and output gate weights in one buffer.
 
         The loader visits a module before its children, so this runs before
         the two projections' own processing: their weights and channel scales
@@ -575,9 +592,22 @@ class BeamAttention(Qwen3Attention):
         buffer (Q/K/V rows, then the gate rows), which that processing keeps
         (the weight becomes its ``[K, N]`` transpose, the scales stay). The
         fused GEMM and the separate projections read the same bytes.
+        Unquantized BF16 weights on NVIDIA become views of one ``[N, K]`` BF16
+        buffer the same way.
         """
         projections = (self.qkv_proj, self.gate_proj)
-        if self.qkv_gate_weight is not None:
+        if self.qkv_gate_weight is not None or self.qkv_gate_bf16 is not None:
+            return
+        # NVIDIA only: on AMD, kernel_mm would bypass apply's gfx1250 kernel.
+        if current_platform().is_nvidia and all(
+            _plain_bf16_linear(p, self.hidden_size) for p in projections
+        ):
+            # At decode sizes one wide GEMM beats two split-K ones.
+            rows = [p.weight.shape[0] for p in projections]
+            weight = torch.cat([p.weight.data for p in projections])
+            for projection, w in zip(projections, weight.split(rows), strict=True):
+                projection.weight.data = w
+            self.qkv_gate_bf16 = weight
             return
         if not all(_dynamic_fp8_channel_linear(p) for p in projections):
             return
@@ -644,7 +674,7 @@ class BeamAttention(Qwen3Attention):
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The QKV projection's and the output gate's outputs (column views of
-        one GEMM output where the FP8 weights were fused at load)."""
+        one GEMM output where the weights were fused at load)."""
         if self.qkv_gate_weight is not None:
             offered = self._input_fp8(hidden_states)
             if offered is not None:
@@ -660,6 +690,10 @@ class BeamAttention(Qwen3Attention):
                 out = fp8_dynamic_linear(
                     hidden_states, self.qkv_gate_weight, self.qkv_gate_scale
                 )
+            qkv, gate = out.split([self.q_size + 2 * self.kv_size, self.q_size], -1)
+            return qkv, gate
+        if self.qkv_gate_bf16 is not None:
+            out = kernel_mm(hidden_states, self.qkv_gate_bf16)
             qkv, gate = out.split([self.q_size + 2 * self.kv_size, self.q_size], -1)
             return qkv, gate
         qkv, _ = self.qkv_proj(hidden_states)
@@ -814,7 +848,7 @@ class BeamRouter(ReplicatedLinear):
         # Keep the exact parameter already referenced by TopK and MoELayer.
         self.e_score_correction_bias = correction_bias
         # BF16 pieces of the FP32 weight, made once after loading where a
-        # registered mv kernel takes them (SM100 to SM103).
+        # registered mv kernel takes them (SM90 and newer).
         self.register_buffer("weight_split", None, persistent=False)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
@@ -822,9 +856,10 @@ class BeamRouter(ReplicatedLinear):
 
     def forward(self, hidden_states: torch.Tensor):
         # BF16 rows times the FP32 weight, FP32 logits (gemm.mv): the
-        # FP32 row-CTA kernel up to 16 rows, the FP32 CUDA-core leaf from 17 to
-        # 96 rows, the BF16x3 tensor-core kernel on the weight split from 97
-        # rows, Torch's FP32 matmul where no kernel takes the call.
+        # FP32 row-CTA kernel up to 16 rows, the BF16x3 tensor-core kernel on
+        # the weight split from 17 rows, the FP32 CUDA-core kernel from 17 to
+        # 96 rows where no split is made, Torch's FP32 matmul
+        # where no kernel takes the call.
         return kernel_mv(hidden_states, self.weight, weight_split=self.weight_split)
 
 
@@ -920,6 +955,8 @@ class BeamVendorMoE(BeamMoE):
     precision policy and registry selection, with precomputed FP32 routes.
     Explicit backend selection is passed through to the registry. Routing
     applies the routed scale once; experts use their standard default arithmetic.
+    NVIDIA SM90 has no vendor kernel for these experts; its FP8 per-channel
+    experts take the same default-policy path (the Triton FP8 per-channel MoE).
     """
 
     def __init__(
@@ -935,10 +972,18 @@ class BeamVendorMoE(BeamMoE):
             raise NotImplementedError("Beam's vendor MoE requires normalized routes")
         fmt = None if quant_config is None else beam_checkpoint_format(quant_config)
         platform = current_platform()
-        amd_default = platform.is_cdna4
         if platform.is_amd and fmt == "nvfp4":
             raise ValueError("Beam NVFP4 experts require NVIDIA vendor MoE")
-        if amd_default:
+        if platform.is_hopper and fmt in (None, "nvfp4"):
+            raise ValueError(
+                f"Beam has no vendor MoE for {fmt or 'BF16'} experts on NVIDIA "
+                "SM90: BF16 experts run on BeamMoE (--moe-backend auto or "
+                "triton) and NVFP4 experts need NVIDIA SM100 to SM103"
+            )
+        default_policy = platform.is_cdna4 or (
+            platform.is_hopper and fmt == "fp8_channel"
+        )
+        if default_policy:
             policy = "default"
         elif fmt == "mxfp4":
             raise ValueError("Beam MXFP4 experts require AMD gfx950")
@@ -950,25 +995,25 @@ class BeamVendorMoE(BeamMoE):
             }[fmt]
         adapted = copy(config)
         adapted.moe_precision_policy = policy
-        if amd_default:
+        if default_policy:
             # Beam owns grouped selection and folds the routed scale into its
             # FP32 coefficients once, independent of the selected expert backend.
             adapted.moe_routing_mode = "precomputed_topk"
         adapted.moe_output_scale = 1.0
         self._init_moe(adapted, mapping, layer_id, prefix, quant_config)
         experts = self.experts
-        if amd_default:
+        if default_policy:
             # Beam consumes finalized output, even when the selected kernel
             # also supports separate routes for other models' combiners.
             experts.plan["supports_deferred_finalize"] = False
         self.kernel_routing = experts.support_routing
         if (
-            (not amd_default and experts.plan.get("precision_policy") != policy)
+            (not default_policy and experts.plan.get("precision_policy") != policy)
             or experts.plan.get("output_scale", 1.0) != adapted.moe_output_scale
             or experts.supports_deferred_finalize
             or self.kernel_routing != self.topk.topk_config.output_format.is_bypassed()
             or (
-                amd_default
+                default_policy
                 and (self.kernel_routing or not experts.supports_precomputed_topk)
             )
         ):
@@ -1061,19 +1106,21 @@ def beam_moe_class(quantized_experts: bool = False) -> type[BeamMoE]:
     ``--moe-backend flashinfer_trtllm`` (Beam's model default on NVIDIA SM100 to
     SM103 where the policy starts) selects :class:`BeamVendorMoE`; every other
     backend keeps BeamMoE. AMD gfx950 uses the finalized default-policy path
-    for BF16, FP8 and MXFP4 experts, with backend selection left to the registry.
+    for BF16, FP8 and MXFP4 experts, with backend selection left to the registry;
+    NVIDIA SM90 uses it for quantized (FP8 per-channel) experts.
     Unsupported quantized backends fail before loading.
     """
     if get_moe_backend().value == "flashinfer_trtllm":
         return BeamVendorMoE
     platform = current_platform()
-    if platform.is_cdna4:
+    if platform.is_cdna4 or (quantized_experts and platform.is_hopper):
         return BeamVendorMoE
     if quantized_experts:
         raise ValueError(
             "Beam runs FP8 experts on AMD gfx950 with --moe-backend auto, triton "
-            "or gluon (BF16 projection operands); "
-            "NVFP4 and NVIDIA FP8 experts use the vendor MoE, which needs "
+            "or gluon (BF16 projection operands) and on NVIDIA SM90 with "
+            "--moe-backend auto or triton; NVFP4 experts, and FP8 experts on "
+            "NVIDIA SM100 to SM103, use the vendor MoE, which needs "
             "--moe-backend flashinfer_trtllm (Beam's default on NVIDIA SM100 "
             f"to SM103 where it applies), not {get_moe_backend().value}"
         )
@@ -1097,23 +1144,26 @@ def beam_moe_agreement(mapping: Any, decision: tuple) -> None:
         raise RuntimeError(f"Beam's MoE differs across ranks: {decisions}")
 
 
-class BeamMLP(LlamaMLP):
+class BeamMLP(GatedMLP):
     """A dense MLP layer; FP8 W8A8 decode rows run gate/up unscaled.
 
     Where gate/up and down are compressed-tensors FP8 W8A8 linears with
     dynamic activations on the FP8 GEMMs, and a vendor per-tensor FP8 GEMM is
-    registered (``fp8_unscaled_gemm_available``), the rows the one-launch
-    per-token quantizer takes (up to 64) run: the
-    per-token quantization of the input, gate/up on that GEMM with unit
-    scales (``fp8_unscaled_linear``), one launch that applies its scales, the
-    SwiGLU and the down projection's per-token quantization
+    registered (``fp8_unscaled_gemm_available``), up to 64 rows run: the
+    per-token quantization of the input (or the codes and scales the
+    post-attention norm wrote in its own launch and offered), gate/up on that
+    GEMM with unit scales (``fp8_unscaled_linear``), one launch that applies
+    its scales, the SwiGLU and the down projection's per-token quantization
     (``silu_and_mul_quantize_fp8``), and the scaled FP8 down GEMM. Everything
-    else (BF16 checkpoints, other rows) runs ``LlamaMLP.forward``.
+    else (BF16 checkpoints, other rows) runs ``GatedMLP.forward``.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.register_buffer("fp8_unit_scale", None, persistent=False)
+        # The post-attention norm's per-token FP8 of the rows it returned
+        # last, offered for this MLP's gate/up GEMM: (rows, codes, scales).
+        self._token_fp8: tuple[torch.Tensor, ...] | None = None
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         # The loader visits this module before its projections, whose own
@@ -1137,16 +1187,37 @@ class BeamMLP(LlamaMLP):
             return
         self.fp8_unit_scale = torch.ones(1, dtype=torch.float32, device=weight.device)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not (
+    def _decode_unscaled(self, x: torch.Tensor) -> bool:
+        return (
             self.fp8_unit_scale is not None
             and x.ndim == 2
             and _token_fp8_rows(x.shape[0], x.dtype)
-        ):
-            return super().forward(x)
-        codes, token_scales = quantize_fp8(
-            x, granularity="token", enable_pdl=pdl_enabled()
         )
+
+    def takes_token_fp8(self, x: torch.Tensor) -> bool:
+        """Whether the post-attention norm can supply this gate/up GEMM's codes."""
+        return self._decode_unscaled(x) and x.dtype == torch.bfloat16
+
+    def offer_token_fp8(
+        self, rows: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor
+    ) -> None:
+        self._token_fp8 = (rows, codes, scales)
+
+    def _input_fp8(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The norm's codes and scales of exactly these rows, if it offered
+        them; consumed once."""
+        offered, self._token_fp8 = self._token_fp8, None
+        if offered is not None and offered[0] is x:
+            return offered[1], offered[2]
+        return None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        offered = self._input_fp8(x)
+        if not self._decode_unscaled(x):
+            return super().forward(x)
+        if offered is None:
+            offered = quantize_fp8(x, granularity="token", enable_pdl=pdl_enabled())
+        codes, token_scales = offered
         gate_up = fp8_unscaled_linear(
             codes, self.gate_up_proj.weight, self.fp8_unit_scale
         )
@@ -1233,11 +1304,16 @@ class BeamDecoderLayer(BaseDecoderLayer):
             query_sharded=False,
         )
         # The input norm writes its decode rows' per-token FP8 for the
-        # attention's fused FP8 GEMM where that runs (a plain attribute, not a
-        # submodule).
+        # attention's fused FP8 GEMM where that runs, and the post-attention
+        # norm for a dense MLP's FP8 gate/up GEMM (plain attributes, not
+        # submodules).
         if isinstance(self.self_attn, BeamAttention):
             object.__setattr__(
                 self.input_layernorm, "_token_fp8_consumer", self.self_attn
+            )
+        if isinstance(self.mlp, BeamMLP):
+            object.__setattr__(
+                self.post_attention_layernorm, "_token_fp8_consumer", self.mlp
             )
 
     @property
@@ -1273,11 +1349,15 @@ class BeamDecoderLayer(BaseDecoderLayer):
 
     def resolve_mlp(self, prefix: str):
         if not self.is_moe_layer:
-            return BeamMLP(
+            return BeamMLP.tensor_parallel(
                 hidden_size=self.config.hidden_size,
                 intermediate_size=self.config.intermediate_size,
-                hidden_act=self.config.hidden_act,
-                mapping=self.mapping,
+                activation=gated_activation(self.config.hidden_act, swiglu_limit=None),
+                tp_rank=self.mapping.dense.tp_rank,
+                tp_size=self.mapping.dense.tp_size,
+                tp_group=self.mapping.dense.tp_group,
+                reduce_results=False,
+                fusions=(),
                 quant_config=self.quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
@@ -1360,10 +1440,8 @@ class BeamModel(BaseTransformerModel):
         super().__init__(
             config=config, mapping=mapping, quant_config=quant_config, prefix=prefix
         )
-        # The final norm consumes the last layer's raw MLP pair; the shared
-        # constructor built a plain norm and its final-norm op, both re-resolved.
+        # The final norm consumes the last layer's raw MLP pair.
         self.norm = self.resolve_final_norm(config)
-        self._final_norm_op = self._build_final_norm_op()
         # Under --enable-allreduce-fusion every boundary runs through the
         # sandwich norm helper (fused where the MNNVL workspace serves it).
         from tokenspeed.runtime.models.beam_sandwich_fusion import (
@@ -1440,6 +1518,7 @@ class BeamLogitsProcessor(LogitsProcessor):
             tp_rank=tp.tp_rank,
             tp_size=tp.tp_size,
             tp_group=tp.tp_group,
+            attn_tp_size=tp.tp_size,
             dp_lm_head_tp=False,
         )
         self.beam_softcap = config.final_logit_softcapping
@@ -1451,7 +1530,19 @@ class BeamLogitsProcessor(LogitsProcessor):
             super().fuse_argmax()
 
     def _get_logits(self, *args, **kwargs):
-        logits = super()._get_logits(*args, **kwargs)
+        return self._capped(super()._get_logits(*args, **kwargs))
+
+    def sampled_shard_dtype(self, lm_head: Any) -> torch.dtype:
+        # The cap turns a shard fp32, as it turns whole rows.
+        if self.beam_softcap is None:
+            return super().sampled_shard_dtype(lm_head)
+        return torch.float32
+
+    def sampled_vocab_shard(self, logits: torch.Tensor, lm_head: Any):
+        # The cap acts per token: each rank caps its shard as the whole rows would be.
+        return super().sampled_vocab_shard(self._capped(logits), lm_head)
+
+    def _capped(self, logits: torch.Tensor) -> torch.Tensor:
         cap = self.beam_softcap
         if cap is None:
             return logits
@@ -1490,6 +1581,7 @@ class BeamDraftEmbedding:
 
 class BeamForCausalLM(BaseCausalLM):
     model_cls = BeamModel
+    supports_aux_capture = True
 
     def __init__(self, config: Any, mapping: Any, quant_config: Any) -> None:
         config.validate()

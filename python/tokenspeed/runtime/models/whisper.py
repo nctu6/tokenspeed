@@ -373,24 +373,24 @@ class CrossAttentionCache:
     ``k[:, slot, :encoder_len]`` then ``v[:, slot, :encoder_len]`` -- the
     padding rows are never written and stay out -- behind a prepared marker.
 
-    The cache is a request-keyed owner: the host-side ``owner`` of a slot is
-    the request whose encoder output its rows hold, recorded when the audio is
-    encoded (:meth:`claim_slot`). An extend for request ``r`` in slot ``s``
-    runs the encoder iff ``owner_of(s) != r`` (``_audio_features_to_encode``),
-    so a request that resumes into a slot another request encoded since --
+    The cache is an admission-keyed owner: the host-side ``owner`` of a slot is
+    the admission whose encoder output its rows hold, recorded when the audio
+    is encoded (:meth:`claim_slot`). An extend for admission ``a`` in slot ``s``
+    runs the encoder iff ``owner_of(s) != a`` (``_audio_features_to_encode``),
+    so a request that resumes into a slot another admission encoded since --
     whatever its prefix length -- encodes its own audio again.
 
-    Leaving a slot is detected the way the request-keyed sampling backends
+    Leaving a slot is detected the way the admission-keyed sampling backends
     detect it (``SamplingBackend.prepare_step``): the data plane receives no
     finish or abort event, so a finished request's claim stays until the next
-    occupant's extend sees a different request id and encodes over it. That
-    relies on request ids being unique over the server's lifetime, as the
-    sampling backends' per-slot state does. A victim whose slot it does not
-    own (retracted before its encoder ran, or a later occupant's rows) images
-    the marker as not-prepared and no rows, and the restore leaves the new
-    slot unowned (:meth:`release_slot`) so the request's next extend encodes
-    its own audio; a prepared image is restored and the new slot is claimed
-    for the request.
+    occupant's extend sees a different admission id and encodes over it. An
+    admission id is unique over the engine's lifetime, so a reused external
+    request id cannot match a previous occupant's claim. A victim whose slot it
+    does not own (retracted before its encoder ran, or a later occupant's
+    rows) images the marker as not-prepared and no rows, and the restore leaves
+    the new slot unowned (:meth:`release_slot`) so the request's next extend
+    encodes its own audio; a prepared image is restored and the new slot is
+    claimed for the admission.
 
     The image is large: ``2 x decoder_layers x encoder_len x d_model`` bytes
     of bf16 per slot (plus the 16-byte marker) -- 245.8 MB on large-v3
@@ -465,16 +465,16 @@ class CrossAttentionCache:
         self.cu_seqlens_q = torch.zeros(
             (num_slots + 1,), dtype=torch.int32, device=device
         )
-        # Host-side: which request's encoder output each slot's rows hold;
+        # Host-side: which admission's encoder output each slot's rows hold;
         # None while the slot holds nobody's (fresh, released, or restored
         # from a not-prepared image).
-        self.owner_per_slot: list[str | None] = [None] * num_slots
+        self.owner_per_slot: list[int | None] = [None] * num_slots
 
     def bytes_total(self) -> int:
         return self.k.numel() * self.k.element_size() * 2
 
     # ------------------------------------------------------------------
-    # Slot ownership (host-side, request-keyed)
+    # Slot ownership (host-side, admission-keyed)
     # ------------------------------------------------------------------
 
     def _check_slot(self, slot: int) -> None:
@@ -484,15 +484,15 @@ class CrossAttentionCache:
                 f"{self.num_slots}; the buffer is sized from max_num_seqs"
             )
 
-    def owner_of(self, slot: int) -> str | None:
-        """The request whose encoder output ``slot`` holds, or None."""
+    def owner_of(self, slot: int) -> int | None:
+        """The admission whose encoder output ``slot`` holds, or None."""
         self._check_slot(slot)
         return self.owner_per_slot[slot]
 
-    def claim_slot(self, slot: int, request_id: str) -> None:
-        """Record that ``slot`` now holds ``request_id``'s cross KV."""
+    def claim_slot(self, slot: int, admission_id: int) -> None:
+        """Record that ``slot`` now holds ``admission_id``'s cross KV."""
         self._check_slot(slot)
-        self.owner_per_slot[slot] = request_id
+        self.owner_per_slot[slot] = admission_id
 
     def release_slot(self, slot: int) -> None:
         """Forget ``slot``'s owner: its rows are nobody's from now on."""
@@ -520,12 +520,12 @@ class CrossAttentionCache:
         return PREPARED_MARKER_BYTES + slot_state_image_bytes(self.slot_state_rows(0))
 
     def export_slot_state(
-        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+        self, slot: int, out: torch.Tensor, stream, *, admission_id: int
     ) -> None:
-        # The rows are ``request_id``'s only once its audio was encoded into
+        # The rows are ``admission_id``'s only once its audio was encoded into
         # this slot; otherwise they are a previous occupant's (or zeros) and
         # the image carries the marker alone.
-        prepared = self.owner_of(slot) == request_id
+        prepared = self.owner_of(slot) == admission_id
         write_prepared_marker(out, prepared)
         if prepared:
             pack_slot_rows(
@@ -533,15 +533,15 @@ class CrossAttentionCache:
             )
 
     def import_slot_state(
-        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+        self, slot: int, src: torch.Tensor, stream, *, admission_id: int
     ) -> None:
         if read_prepared_marker(src):
             unpack_slot_rows(
                 self.slot_state_rows(slot), src[PREPARED_MARKER_BYTES:], stream
             )
-            # The restored rows are the request's own: its next extend must
+            # The restored rows are the admission's own: its next extend must
             # not re-encode over them.
-            self.claim_slot(slot, request_id)
+            self.claim_slot(slot, admission_id)
         else:
             # Nobody's: the request's next extend encodes its own audio, as
             # the unretracted request's first extend would have.
@@ -1354,6 +1354,7 @@ class WhisperForConditionalGeneration(nn.Module):
             tp_rank=mapping.lm_head.tp_rank,
             tp_size=mapping.lm_head.tp_size,
             tp_group=mapping.lm_head.tp_group,
+            attn_tp_size=mapping.attn.tp_size,
             dp_lm_head_tp=mapping.attn.has_dp and mapping.lm_head.has_tp,
         )
         # The prefill seam's encoder + cross-KV write. Eager until the
@@ -1431,21 +1432,21 @@ class WhisperForConditionalGeneration(nn.Module):
             or ctx.forward_mode.is_decode_or_idle()
         ):
             return None
-        features, slots, request_ids = _audio_features_to_encode(
+        features, slots, admission_ids = _audio_features_to_encode(
             multimodal_context, self.cross_cache
         )
         if features is not None:
-            self.encode_audio(features, slots, request_ids)
+            self.encode_audio(features, slots, admission_ids)
         return None
 
     def encode_audio(
         self,
         input_features: Sequence[torch.Tensor],
         slots: list[int],
-        request_ids: list[str],
+        admission_ids: list[int],
     ) -> None:
         """Encode each request's audio window into its slot's cross-attention
-        K/V, and record each slot as holding its request's encoder output.
+        K/V, and record each slot as holding its admission's encoder output.
 
         ``input_features[i]`` is request ``i``'s ``[mel, frames]`` window (a
         stacked ``[N, mel, frames]`` tensor works too). The work runs through
@@ -1453,17 +1454,17 @@ class WhisperForConditionalGeneration(nn.Module):
         graphs -- in passes batched over the requests (see
         :meth:`encode_into_cross_cache`); nothing reads the device.
         """
-        if len(slots) != len(request_ids):
+        if len(slots) != len(admission_ids):
             raise ValueError(
                 f"encode_audio got {len(slots)} slot(s) for "
-                f"{len(request_ids)} request id(s)"
+                f"{len(admission_ids)} admission id(s)"
             )
         self.audio_encode_runner(input_features, slots)
         # Host-side bookkeeping only. The writes above are queued on the
         # stream ahead of every later read, so a claim is never ahead of the
         # rows it vouches for from any reader's point of view.
-        for slot, request_id in zip(slots, request_ids):
-            self.cross_cache.claim_slot(slot, request_id)
+        for slot, admission_id in zip(slots, admission_ids):
+            self.cross_cache.claim_slot(slot, admission_id)
 
     def encode_into_cross_cache(
         self, features: torch.Tensor, slot_index: torch.Tensor
@@ -1771,14 +1772,14 @@ def _materialize_feature(item: Any) -> torch.Tensor:
 
 def _audio_features_to_encode(
     multimodal_context: MultimodalForwardContext, cross_cache: CrossAttentionCache
-) -> tuple[list[torch.Tensor] | None, list[int], list[str]]:
+) -> tuple[list[torch.Tensor] | None, list[int], list[int]]:
     """Collect the log-mel features of the extend requests whose slot does not
     hold their own encoder output.
 
-    ``mm_inputs``, ``request_ids`` and ``request_pool_indices`` are aligned
+    ``mm_inputs``, ``admission_ids`` and ``request_pool_indices`` are aligned
     with the batch, and the extend requests are its first
-    ``len(extend_seq_lens)`` rows. Request ``r`` in slot ``s`` is encoded iff
-    ``s`` is not owned by ``r``:
+    ``len(extend_seq_lens)`` rows. Admission ``a`` in slot ``s`` is encoded iff
+    ``s`` is not owned by ``a``:
 
       * a fresh prefill lands in a slot some earlier request encoded (or
         nobody did), so it encodes;
@@ -1794,7 +1795,7 @@ def _audio_features_to_encode(
     after a resume. Slots come from the host-side ``request_pool_indices``, so
     the decision reads no device tensor.
 
-    Returns ``(features, slots, request_ids)`` with ``features`` the
+    Returns ``(features, slots, admission_ids)`` with ``features`` the
     requests' ``[num_mel_bins, frames]`` windows as they arrived (host,
     pinned when they came through shared memory; :class:`AudioEncodeRunner`
     stages them), or ``(None, [], [])`` when no extend request needs
@@ -1802,28 +1803,33 @@ def _audio_features_to_encode(
     """
     features: list[torch.Tensor] = []
     slots: list[int] = []
-    request_ids: list[str] = []
+    admission_ids: list[int] = []
+    if multimodal_context.admission_ids is None:
+        raise ValueError(
+            "Whisper keys its cross-attention slots by admission id; the "
+            "multimodal context carries none"
+        )
     num_extends = len(multimodal_context.extend_seq_lens)
     for position, entry in enumerate(multimodal_context.mm_inputs[:num_extends]):
         if entry is None:
             continue
         slot = multimodal_context.request_pool_indices[position]
-        request_id = multimodal_context.request_ids[position]
-        if cross_cache.owner_of(slot) == request_id:
+        admission_id = multimodal_context.admission_ids[position]
+        if cross_cache.owner_of(slot) == admission_id:
             continue
         for item in entry.mm_items:
             if item is None or item.modality != Modality.AUDIO:
                 continue
             features.append(_materialize_feature(item))
             slots.append(slot)
-            request_ids.append(request_id)
+            admission_ids.append(admission_id)
             # One audio window per request: Whisper's encoder consumes a
             # fixed 30s window, and a second item would overwrite the first
             # request's cross KV rather than extend it.
             break
     if not features:
         return None, [], []
-    return features, slots, request_ids
+    return features, slots, admission_ids
 
 
 EntryClass = WhisperForConditionalGeneration

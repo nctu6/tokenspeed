@@ -49,7 +49,6 @@ from tokenspeed.runtime.layers.attention.backends.support import (
     CudaGraphSupport,
     TreeSupport,
 )
-from tokenspeed.runtime.layers.attention.chunk import prefix_chunk_len
 from tokenspeed.runtime.layers.attention.dcp.cache import PrefixHistoryGather
 from tokenspeed.runtime.utils.common import ceil_div
 
@@ -103,7 +102,13 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
     # Declared here as well as on AttentionBackend: the refactor made the two
     # separate roots, so a paged leaf inherits only this one.
     supports_layer_sliding_window: bool = False
+    # This leaf keeps each layer's ``sliding_window_sink`` leading tokens
+    # visible outside the window. Left False, a declared sink silently
+    # degrades to plain sliding-window attention: no error, only a quality
+    # loss. Declared alongside the window flag for the same reason.
+    supports_layer_window_sink: bool = False
     supports_mla_dcp: bool = False
+    prefill_needs_host_page_table: bool = False
 
     @classmethod
     def resolve_kernel_page_size(
@@ -190,15 +195,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         """The drafting lanes' cascade while a lane forward runs, else None."""
         if not self.tree_lane_step_active:
             return None
-        lanes = self.tree_draft
-        return TreeCascadeRows(
-            page_table=self.page_table_buf[:bs],
-            seq_lens=lanes.window_seq_lens[:bs],
-            prefix_lens=lanes.frontier[:bs],
-            mask=lanes.lane_mask[: bs * lanes.topk],
-            rows=lanes.topk,
-            window=lanes.num_slots,
-        )
+        return self.tree_draft.cascade_rows(self, bs)
 
     def _tree_verify_rows(
         self, bs: int, q_len: int, page_table: torch.Tensor, seq_lens: torch.Tensor
@@ -260,8 +257,9 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         buffers.
 
         ``spec_num_tokens`` under block decode: one entry per block position,
-        because the block is non-causal (all positions share the block-end
-        length) and the drafter rewrites those lengths in-graph
+        because each position carries its own length (the block-end length for
+        a non-causal block, backed off per position for a causal one) and the
+        drafter rewrites those lengths in-graph
         (:meth:`fill_block_decode_seq_lens`), so they must exist as storage.
         Otherwise 1: plain decode and a vanilla MTP draft have one position
         per request, and target verify derives its causal per-position
@@ -347,12 +345,13 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
                 :func:`reject_query_shard`.
             page_table_cpu: Host mirror of ``page_table``'s extend rows
                 (``[num_extends, cols]`` int32 kernel pages, unpadded) when the
-                forward is sharded, or when it extends a prefix and this leaf's
-                group is KVP page-sharded; else ``None``. The only host-side
-                table a leaf sees: the sharded extend arm and the KVP
-                prefix-chunk gather count how many history rows each page owner
-                holds from it, so the gather's per-rank split never waits on the
-                device.
+                forward is sharded, or when this leaf's group is KVP
+                page-sharded and the forward extends a prefix or is a pure
+                extend; else ``None``. The only host-side table a leaf sees:
+                the sharded extend arm and the KVP prefix-chunk gather count
+                how many history rows each page owner holds from it, so the
+                gather's per-rank split never waits on the device, and the DSA
+                leaf bounds the index pages each rank owns from it.
         """
 
     @abstractmethod
@@ -394,14 +393,22 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         """The ``(seq_lens, page_table)`` buffer views a decode refresh copies into.
 
         A leaf whose :meth:`refresh_decode_metadata` is exactly those two
-        copies followed by :meth:`publish_decode_metadata` returns them, so
-        the router can fill every such leaf with one batched copy; a leaf
-        with any other refresh returns None and refreshes itself.
+        copies (seq_lens clamped to :attr:`decode_seq_lens_floor`) followed
+        by :meth:`publish_decode_metadata` returns them, so the router can
+        fill every such leaf with one batched copy; a leaf with any other
+        refresh returns None and refreshes itself.
 
         Args:
             bs: Requests to prepare (the padded graph batch under replay).
         """
         return None
+
+    @property
+    def decode_seq_lens_floor(self) -> int:
+        """The minimum the router clamps ``seq_lens`` to before copying them
+        into :meth:`decode_buffer_targets`. Decode ``seq_lens`` are at least
+        1 (padding rows replay at 1), so 1 copies them unchanged."""
+        return 1
 
     def publish_decode_metadata(
         self, bs: int, seq_lens: torch.Tensor, *, num_extends: int
@@ -531,7 +538,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         chunk_kv_indices_list: Sequence[torch.Tensor],
         *,
         page_table_cpu: torch.Tensor | None,
-        prefix_lens_cpu: torch.Tensor,
+        chunk_bounds_cpu: torch.Tensor,
     ) -> None:
         """Record a prefill forward's prefix-chunk loops for
         :meth:`read_prefix_history`.
@@ -545,8 +552,8 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
             page_table_cpu: ``[requests, columns]`` host kernel-page table of
                 the extend requests; required when the cache is dealt over
                 owners and there are loops.
-            prefix_lens_cpu: ``[requests]`` host cached-prefix lengths of the
-                requests the loops were cut for.
+            chunk_bounds_cpu: ``[loops + 1, requests]`` host prefix positions
+                delimiting exactly the same loops as the slot indices.
         """
         if self._prefix_history is None:
             # A leaf deals every layer's pages the same way.
@@ -559,8 +566,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         self._prefix_history.prepare(
             chunk_kv_indices_list,
             page_table_cpu=page_table_cpu,
-            prefix_lens_cpu=prefix_lens_cpu,
-            chunk_len=prefix_chunk_len(len(prefix_lens_cpu)),
+            chunk_bounds_cpu=chunk_bounds_cpu,
         )
 
     def read_prefix_history(

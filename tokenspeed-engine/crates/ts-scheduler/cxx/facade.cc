@@ -1,0 +1,632 @@
+// Copyright (c) 2026 LightSeek Foundation
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+#include "ts-scheduler/cxx/facade.h"
+
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "core/profile_span.h"
+#include "scheduler/execution_event.h"
+#include "ts-scheduler/src/lib.rs.h"
+
+namespace ts_scheduler {
+
+namespace {
+
+template <typename T>
+rust::Vec<T> to_rust(const std::vector<T>& values) {
+    rust::Vec<T> out;
+    out.reserve(values.size());
+    for (const T& value : values) {
+        out.push_back(value);
+    }
+    return out;
+}
+
+std::vector<std::int32_t> to_std(rust::Slice<const std::int32_t> values) {
+    return {values.begin(), values.end()};
+}
+
+void record_profile_span(const char* name, std::int64_t begin_ns, std::int64_t end_ns) {
+    record_scheduler_span(rust::Str(name), begin_ns, end_ns);
+}
+
+}  // namespace
+
+void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs) {
+    std::vector<tokenspeed::RequestSpec> converted;
+    {
+        // Each prompt is copied across the bridge.
+        tokenspeed::ProfileSpan profile_span{"copyRequestSpecs"};
+        converted.reserve(specs.size());
+        for (const RequestSpec& spec : specs) {
+            converted.push_back(tokenspeed::RequestSpec{
+                .request_id = std::string(spec.request_id),
+                .session_id = std::string(spec.session_id),
+                .cache_group_id = std::string(spec.cache_group_id),
+                .shared_prefix_tokens = to_std({spec.shared_prefix_tokens.data(), spec.shared_prefix_tokens.size()}),
+                .tokens = to_std({spec.tokens.data(), spec.tokens.size()}),
+                .max_new_tokens = spec.max_new_tokens,
+                .max_cached_prefix_tokens = spec.max_cached_prefix_tokens,
+            });
+        }
+    }
+    scheduler.SubmitRequests(converted);
+}
+
+std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler, bool allow_prefill,
+                                                            bool apply_prefill_watermark) {
+    return std::make_unique<tokenspeed::ExecutionPlan>(
+        scheduler.NextExecutionPlan(tokenspeed::Scheduler::PlanOptions{
+            .allow_prefill = allow_prefill, .apply_prefill_watermark = apply_prefill_watermark}));
+}
+
+void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> events) {
+    tokenspeed::ExecutionEvent execution_event;
+    {
+        tokenspeed::ProfileSpan conversion{"SchedulerBridge::convertForwardEvents"};
+        for (const ForwardEvent& event : events) {
+            std::string request_id(event.request_id);
+            switch (event.kind) {
+                case ForwardEventKind::ExtendResult:
+                    execution_event.With(tokenspeed::forward::ExtendResult{
+                        .request_id = std::move(request_id),
+                        .tokens = to_std({event.tokens.data(), event.tokens.size()}),
+                        .spec_candidate_ids =
+                            to_std({event.spec_candidate_ids.data(), event.spec_candidate_ids.size()}),
+                    });
+                    break;
+                case ForwardEventKind::Finish:
+                    execution_event.With(tokenspeed::forward::Finish{.request_id = std::move(request_id)});
+                    break;
+                case ForwardEventKind::Abort:
+                    execution_event.With(tokenspeed::forward::Abort{.request_id = std::move(request_id)});
+                    break;
+                case ForwardEventKind::UpdateReserveNumTokens:
+                    execution_event.With(tokenspeed::forward::UpdateReserveNumTokens{
+                        .request_id = std::move(request_id),
+                        .reserve_num_tokens_in_next_schedule_event = event.reserve_num_tokens,
+                    });
+                    break;
+                case ForwardEventKind::PdBootstrapped:
+                    execution_event.With(tokenspeed::pd::BootstrappedEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdFailed:
+                    execution_event.With(tokenspeed::pd::FailedEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdTransferStopped:
+                    execution_event.With(tokenspeed::pd::TransferStoppedEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdSucceeded:
+                    execution_event.With(tokenspeed::pd::SucceededEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdRemotePrefillDone:
+                    execution_event.With(
+                        tokenspeed::pd::RemotePrefillDoneEvent(std::move(request_id), event.bootstrap_token));
+                    break;
+                default:
+                    throw std::invalid_argument("unknown forward event kind");
+            }
+        }
+    }
+    scheduler.Advance(execution_event);
+    {
+        tokenspeed::ProfileSpan destruction{"SchedulerBridge::destroyForwardEvents"};
+        execution_event = {};
+    }
+}
+
+void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
+                  rust::Slice<const StorageCancellationView> cancellations,
+                  rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events) {
+    // One batch, in the order the Python hooks built it: the storage clock,
+    // the cancellations, the storage completions, then the Host copies' ACKs.
+    tokenspeed::ExecutionEvent execution_event;
+    for (const StorageTickView& tick : ticks) {
+        execution_event.With(tokenspeed::cache::StorageTick{
+            .now_us = tick.now_us,
+            .allow_forward = tick.allow_forward,
+            .allow_storage = tick.allow_storage,
+            .pressure =
+                tokenspeed::StoragePressure{
+                    .queued_operations = tick.queued_operations,
+                    .queued_bytes = tick.queued_bytes,
+                    .oldest_operation_us = tick.oldest_operation_us,
+                },
+        });
+    }
+    for (const StorageCancellationView& cancellation : cancellations) {
+        std::string request_id(cancellation.request_id);
+        if (cancellation.abort) {
+            execution_event.With(tokenspeed::forward::Abort{.request_id = std::move(request_id)});
+        } else {
+            execution_event.With(tokenspeed::cache::StorageDetach{.request_id = std::move(request_id)});
+        }
+    }
+    for (const StorageDoneView& completion : done) {
+        execution_event.With(tokenspeed::cache::StorageDone{
+            .op_id = completion.op_id,
+            .success = std::vector<std::uint8_t>(completion.success.begin(), completion.success.end()),
+            .retired = completion.retired,
+            .object_failures = std::vector<std::uint8_t>(completion.object_failures.begin(),
+                                                         completion.object_failures.end()),
+        });
+    }
+    for (const CacheEvent& event : cache_events) {
+        switch (event.kind) {
+            case CacheEventKind::WriteBackDone:
+                execution_event.With(tokenspeed::cache::WriteBackDone{.op_id = event.op_id});
+                break;
+            case CacheEventKind::LoadBackDone:
+                execution_event.With(tokenspeed::cache::LoadBackDone{.op_id = event.op_id});
+                break;
+            case CacheEventKind::SnapshotDone:
+                execution_event.With(tokenspeed::cache::SnapshotDone{.op_id = event.op_id});
+                break;
+            case CacheEventKind::RestoreDone:
+                execution_event.With(tokenspeed::cache::RestoreDone{.op_id = event.op_id});
+                break;
+            default:
+                throw std::invalid_argument("unknown cache event kind");
+        }
+    }
+    scheduler.Advance(execution_event);
+}
+
+std::size_t demote_sessions(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended) {
+    std::vector<std::string> session_ids;
+    for (const auto& id : ids) session_ids.emplace_back(id);
+    return scheduler.DemoteSessions(session_ids, ended);
+}
+
+std::size_t demote_cache_groups(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended) {
+    std::vector<std::string> group_ids;
+    for (const auto& id : ids) group_ids.emplace_back(id);
+    return scheduler.DemoteCacheGroups(group_ids, ended);
+}
+
+std::size_t demote_session(tokenspeed::Scheduler& scheduler, rust::Str session_id, bool ended) {
+    return scheduler.DemoteSession(std::string(session_id), ended);
+}
+
+bool shared_prefix_storage_enabled(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.SharedPrefixStorageEnabled();
+}
+
+SharedPrefixPublication shared_prefix_publication(const tokenspeed::Scheduler& scheduler,
+                                                  rust::Slice<const std::int32_t> input_ids,
+                                                  std::int32_t max_prefix_tokens) {
+    const auto result = scheduler.GetSharedPrefixPublication({input_ids.data(), input_ids.size()}, max_prefix_tokens);
+    return SharedPrefixPublication{rust::String(result.status), result.confirmed_prefix_tokens, result.cache_epoch};
+}
+
+AdmissionSnapshot admission_snapshot(const tokenspeed::Scheduler& scheduler, std::int32_t token_step) {
+    AdmissionSnapshot snapshot;
+    snapshot.free_slots = scheduler.FreeRequestSlots();
+    snapshot.total_slots = scheduler.TotalRequestSlots();
+    snapshot.available_blocks = scheduler.AvailableLcmBlocks();
+    snapshot.total_blocks = scheduler.TotalLcmBlocks();
+    snapshot.host_free_blocks = scheduler.HostPoolFreeBlocks();
+    snapshot.host_total_blocks = scheduler.HostPoolTotalBlocks();
+    snapshot.retracted = scheduler.RetractedSize();
+    snapshot.waiting = scheduler.WaitingSize();
+    snapshot.max_tokens = scheduler.MaxSingleRequestTokens();
+    snapshot.capacity_token_step = token_step;
+    for (auto blocks : scheduler.AdmissionCapacityCurve(token_step)) snapshot.capacity_blocks.push_back(blocks);
+    return snapshot;
+}
+
+SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler) {
+    return SchedulerSizes{
+        .running = scheduler.RunningSize(),
+        .allocated_request_slots = static_cast<std::size_t>(scheduler.AllocatedRequestSlots()),
+        .active_decode_slots = static_cast<std::size_t>(scheduler.ActiveDecodeSlots()),
+        .ready_waiting = scheduler.ReadyWaitingSize(),
+        .waiting = scheduler.WaitingSize(),
+        .prefilling = scheduler.PrefillSize(),
+        .decoding = scheduler.DecodingSize(),
+        .retracted = scheduler.RetractedSize(),
+        .bootstrapping = scheduler.BootstrappingSize(),
+        .remote_prefilling = scheduler.RemotePrefillSize(),
+        .pd_transfer = scheduler.PdTransferSize(),
+        .empty_lcm_blocks = scheduler.EmptyLcmBlocks(),
+    };
+}
+
+std::int32_t active_lcm_blocks(const tokenspeed::Scheduler& scheduler) { return scheduler.ActiveLcmBlocks(); }
+
+PrefillGateProbe probe_prefill_gate(const tokenspeed::Scheduler& scheduler) {
+    const tokenspeed::Scheduler::PrefillGateProbe probe = scheduler.ProbePrefillGate();
+    return PrefillGateProbe{
+        .wants_prefill = probe.wants_prefill,
+        .has_decode_work = probe.has_decode_work,
+    };
+}
+
+CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id) {
+    const std::string id(group_id);
+    return CacheGroupPages{
+        .total = scheduler.CacheGroupTotalPages(id),
+        .available = scheduler.CacheGroupAvailablePages(id),
+    };
+}
+
+std::unique_ptr<tokenspeed::KvEventBatch> drain_kv_events(tokenspeed::Scheduler& scheduler) {
+    auto batch = scheduler.DrainKvEventBatch();
+    if (batch.Empty()) return nullptr;
+    return std::make_unique<tokenspeed::KvEventBatch>(std::move(batch));
+}
+
+std::unique_ptr<tokenspeed::KvEventBatch> make_kv_event_batch(rust::Slice<const KvEventView> events) {
+    if (events.empty()) return nullptr;
+    auto batch = std::make_unique<tokenspeed::KvEventBatch>();
+    for (const auto& event : events) {
+        const std::span<const std::uint64_t> hashes{event.block_hashes.data(), event.block_hashes.size()};
+        if (event.stored) {
+            batch->Store(hashes, event.has_parent ? std::optional{event.parent_block_hash} : std::nullopt,
+                         {event.token_ids.data(), event.token_ids.size()}, event.block_size);
+        } else {
+            batch->Remove(hashes);
+        }
+    }
+    return batch;
+}
+
+std::size_t kv_event_batch_size(const tokenspeed::KvEventBatch& batch) {
+    return batch.Size();
+}
+std::size_t kv_event_batch_bytes(const tokenspeed::KvEventBatch& batch) {
+    return batch.ByteSize();
+}
+rust::Slice<const std::uint8_t> kv_event_stored(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Stored();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::uint8_t> kv_event_has_parent(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.HasParent();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::uint64_t> kv_event_parents(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Parents();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::int32_t> kv_event_block_sizes(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.BlockSizes();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::size_t> kv_event_hash_offsets(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.HashOffsets();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::size_t> kv_event_token_offsets(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.TokenOffsets();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::uint64_t> kv_event_hashes(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Hashes();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::int32_t> kv_event_tokens(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Tokens();
+    return {values.data(), values.size()};
+}
+
+std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::Str request_id) {
+    return scheduler.RequestTokenSize(std::string(request_id));
+}
+
+bool can_abort_before_admission(const tokenspeed::Scheduler& scheduler, rust::Str request_id) {
+    return scheduler.CanAbortBeforeAdmission(std::string(request_id));
+}
+
+bool storage_pending(const tokenspeed::Scheduler& scheduler) { return scheduler.StoragePending(); }
+
+StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler) {
+    const tokenspeed::StorageStats stats = scheduler.GetStorageStats();
+    return StorageStatsView{
+        .operations = stats.operations,
+        .held_blocks = stats.held_blocks,
+        .quarantined = stats.quarantined,
+        .negative_keys = stats.negative_keys,
+        .backup_candidates = stats.backup_candidates,
+        .waiting_requests = stats.waiting_requests,
+        .ready_requests = stats.ready_requests,
+        .wait_timeouts = stats.wait_timeouts,
+        .ready_expirations = stats.ready_expirations,
+        .pressure_gate_closed = stats.pressure_gate_closed,
+        .pressure_bypasses = stats.pressure_bypasses,
+        .pressure_dropped_backup_keys = stats.pressure_dropped_backup_keys,
+        .overflow_dropped_backup_keys = stats.overflow_dropped_backup_keys,
+        .unavailable_dropped_backup_keys = stats.unavailable_dropped_backup_keys,
+        .disabled_dropped_backup_keys = stats.disabled_dropped_backup_keys,
+        .cleanup_dropped_backup_keys = stats.cleanup_dropped_backup_keys,
+    };
+}
+
+PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler) {
+    const tokenspeed::HostCacheStats stats = scheduler.GetHostCacheStats();
+    return PrefixHitView{
+        .prompt_tokens = stats.prefix_hits.prompt_tokens,
+        .device_hit_tokens = stats.prefix_hits.device_hit_tokens,
+        .host_hit_tokens = stats.prefix_hits.host_hit_tokens,
+        .l3_hit_tokens = stats.storage_query_hit_tokens,
+    };
+}
+
+bool clear_cache(tokenspeed::Scheduler& scheduler) { return scheduler.ClearCache(); }
+
+bool clear_l1_cache(tokenspeed::Scheduler& scheduler) { return scheduler.ClearL1Cache(); }
+
+bool can_clear_cache(const tokenspeed::Scheduler& scheduler) { return scheduler.CanClearCache(); }
+
+std::int32_t max_single_request_tokens(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.MaxSingleRequestTokens();
+}
+
+namespace {
+
+ForwardBatchView batch_view(const tokenspeed::ForwardBatch& batch) {
+    rust::Vec<rust::String> request_ids;
+    request_ids.reserve(batch.request_ids.size());
+    for (const std::string& id : batch.request_ids) {
+        request_ids.push_back(rust::String(id));
+    }
+    return ForwardBatchView{
+        .request_ids = std::move(request_ids),
+        .request_pool_indices = to_rust(batch.request_pool_indices),
+        .input_lengths = to_rust(batch.input_lengths),
+        .prefill_lengths = to_rust(batch.prefill_lengths),
+        .extend_prefix_lens = to_rust(batch.extend_prefix_lens),
+        .extend_replay_lens = to_rust(batch.extend_replay_lens),
+        .num_extends = batch.NumExtends(),
+    };
+}
+
+TransferBatchView transfer_view(const tokenspeed::ForwardBatch& batch) {
+    TransferBatchView view;
+    view.request_ids.reserve(batch.request_ids.size());
+    for (const std::string& id : batch.request_ids) {
+        view.request_ids.push_back(rust::String(id));
+    }
+    view.request_pool_indices = to_rust(batch.request_pool_indices);
+    view.input_lengths = to_rust(batch.input_lengths);
+    view.prefill_lengths = to_rust(batch.prefill_lengths);
+    view.extend_prefix_lens = to_rust(batch.extend_prefix_lens);
+    view.state_prefix_cached.reserve(batch.state_prefix_cached.size());
+    for (const bool cached : batch.state_prefix_cached) {
+        view.state_prefix_cached.push_back(cached);
+    }
+    view.decode_input_ids = to_rust(batch.decode_input_ids);
+    view.spec_candidate_offsets.push_back(0);
+    for (const std::vector<std::int32_t>& candidates : batch.spec_candidate_ids) {
+        for (const std::int32_t id : candidates) {
+            view.spec_candidate_ids.push_back(id);
+        }
+        view.spec_candidate_offsets.push_back(view.spec_candidate_ids.size());
+    }
+    view.num_extends = batch.NumExtends();
+    for (const auto& [group_id, table] : batch.block_tables) {
+        view.block_tables.push_back(BlockTableView{
+            .group_id = rust::String(group_id),
+            .columns = table.Columns(),
+            .blocks = to_rust(table.AbsoluteRows()),
+        });
+    }
+    return view;
+}
+
+rust::Vec<TransferBatchView> optional_transfer(const std::optional<tokenspeed::ForwardBatch>& batch) {
+    rust::Vec<TransferBatchView> out;
+    if (batch.has_value()) {
+        out.push_back(transfer_view(*batch));
+    }
+    return out;
+}
+
+rust::Vec<ForwardBatchView> optional_batch(const std::optional<tokenspeed::ForwardBatch>& batch) {
+    rust::Vec<ForwardBatchView> out;
+    if (batch.has_value()) {
+        out.push_back(batch_view(*batch));
+    }
+    return out;
+}
+
+}  // namespace
+
+rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<ForwardBatchView> out;
+    for (const tokenspeed::Operation& operation : plan.Operations()) {
+        const auto* batch = std::get_if<tokenspeed::ForwardBatch>(&operation);
+        if (batch != nullptr) {
+            out.push_back(batch_view(*batch));
+        }
+    }
+    return out;
+}
+
+bool plan_needs_device(const tokenspeed::ExecutionPlan& plan) {
+    if (plan.remote_decode.has_value() || plan.remote_prefill.has_value()) {
+        return true;
+    }
+    for (const auto& [group_id, pages] : plan.pages_to_zero) {
+        if (!pages.empty()) {
+            return true;
+        }
+    }
+    for (const auto& [group_id, pairs] : plan.pages_to_copy) {
+        if (!pairs.empty()) {
+            return true;
+        }
+    }
+    for (const tokenspeed::Operation& operation : plan.Operations()) {
+        if (const auto* batch = std::get_if<tokenspeed::ForwardBatch>(&operation)) {
+            if (!batch->request_ids.empty()) {
+                return true;
+            }
+            continue;
+        }
+        // Storage operations run on the host's L3 executor, not the device.
+        const auto* cache = std::get_if<tokenspeed::CacheOperation>(&operation);
+        if (cache == nullptr || !std::holds_alternative<tokenspeed::StorageOperation>(*cache)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+rust::Vec<ForwardBatchView> plan_remote_decode(const tokenspeed::ExecutionPlan& plan) {
+    return optional_batch(plan.remote_decode);
+}
+
+rust::Vec<ForwardBatchView> plan_remote_prefill(const tokenspeed::ExecutionPlan& plan) {
+    return optional_batch(plan.remote_prefill);
+}
+
+rust::Vec<TransferBatchView> plan_forward_transfer(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<TransferBatchView> out;
+    for (const tokenspeed::Operation& operation : plan.Operations()) {
+        if (const auto* batch = std::get_if<tokenspeed::ForwardBatch>(&operation)) {
+            out.push_back(transfer_view(*batch));
+            break;
+        }
+    }
+    return out;
+}
+
+rust::Vec<TransferBatchView> plan_remote_decode_transfer(const tokenspeed::ExecutionPlan& plan) {
+    return optional_transfer(plan.remote_decode);
+}
+
+rust::Vec<TransferBatchView> plan_remote_prefill_transfer(const tokenspeed::ExecutionPlan& plan) {
+    return optional_transfer(plan.remote_prefill);
+}
+
+rust::Vec<SchedulerAbortView> plan_aborts(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<SchedulerAbortView> out;
+    out.reserve(plan.aborts.size());
+    for (const tokenspeed::SchedulerAbort& abort : plan.aborts) {
+        out.push_back(SchedulerAbortView{
+            .request_id = rust::String(abort.request_id),
+            .detail = rust::String(abort.detail),
+        });
+    }
+    return out;
+}
+
+rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<CacheOpView> out;
+    // One acknowledgment per op id, whatever the batch kind: an L2 batch
+    // lists its ops, and a snapshot or restore batch has one op per request.
+    // Storage operations are the L3 executor's, completed through the
+    // storage agreement instead.
+    auto append = [&out](CacheOpKind kind, const std::vector<std::uint32_t>& op_ids) {
+        for (std::uint32_t op_id : op_ids) {
+            out.push_back(CacheOpView{.kind = kind, .op_id = op_id});
+        }
+    };
+    for (const tokenspeed::Operation& operation : plan.Operations()) {
+        const auto* cache = std::get_if<tokenspeed::CacheOperation>(&operation);
+        if (cache == nullptr) {
+            continue;
+        }
+        std::visit(
+            [&append](const auto& batch) {
+                using Batch = std::decay_t<decltype(batch)>;
+                if constexpr (std::is_same_v<Batch, tokenspeed::WriteBackBatch>) {
+                    append(CacheOpKind::WriteBack, batch.op_ids);
+                } else if constexpr (std::is_same_v<Batch, tokenspeed::LoadBackBatch>) {
+                    append(CacheOpKind::LoadBack, batch.op_ids);
+                } else if constexpr (std::is_same_v<Batch, tokenspeed::SnapshotStoreBatch>) {
+                    append(CacheOpKind::SnapshotStore, batch.op_ids);
+                } else if constexpr (std::is_same_v<Batch, tokenspeed::SnapshotRestoreBatch>) {
+                    append(CacheOpKind::SnapshotRestore, batch.op_ids);
+                } else {
+                    static_assert(std::is_same_v<Batch, tokenspeed::StorageOperation>, "a new cache batch kind");
+                }
+            },
+            *cache);
+    }
+    return out;
+}
+
+rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<StorageOpView> out;
+    const auto keys = [](const std::vector<tokenspeed::CacheKey>& cache_keys) {
+        rust::Vec<StorageKeyView> views;
+        views.reserve(cache_keys.size());
+        for (const tokenspeed::CacheKey& key : cache_keys) {
+            views.push_back(StorageKeyView{.group_id = key.group_id,
+                                           .content_hash = rust::String(key.content_hash.ToString()),
+                                           .page_offset = key.page_offset});
+        }
+        return views;
+    };
+    const auto blocks = [](const std::vector<std::int32_t>& host_blocks) {
+        rust::Vec<std::int32_t> out;
+        out.reserve(host_blocks.size());
+        for (const std::int32_t block : host_blocks) {
+            out.push_back(block);
+        }
+        return out;
+    };
+    for (const tokenspeed::Operation& operation : plan.Operations()) {
+        const auto* cache = std::get_if<tokenspeed::CacheOperation>(&operation);
+        if (cache == nullptr) {
+            continue;
+        }
+        const auto* storage = std::get_if<tokenspeed::StorageOperation>(cache);
+        if (storage == nullptr) {
+            continue;
+        }
+        std::visit(
+            [&](const auto& op) {
+                using Op = std::decay_t<decltype(op)>;
+                if constexpr (std::is_same_v<Op, tokenspeed::StorageCancelOperation>) {
+                    out.push_back(StorageOpView{
+                        .kind = StorageOpKind::Cancel, .op_id = op.op_id, .keys = {}, .host_blocks = {}});
+                } else if constexpr (std::is_same_v<Op, tokenspeed::StorageQueryOperation>) {
+                    out.push_back(StorageOpView{
+                        .kind = StorageOpKind::Query, .op_id = op.op_id, .keys = keys(op.keys), .host_blocks = {}});
+                } else {
+                    const StorageOpKind kind = std::is_same_v<Op, tokenspeed::StorageGetOperation>
+                                                   ? StorageOpKind::Get
+                                                   : StorageOpKind::Put;
+                    out.push_back(StorageOpView{.kind = kind,
+                                                .op_id = op.op_id,
+                                                .keys = keys(op.keys),
+                                                .host_blocks = blocks(op.host_blocks)});
+                }
+            },
+            *storage);
+    }
+    return out;
+}
+
+void set_profile_span_sink(bool installed) {
+    tokenspeed::SetProfileSpanSink(installed ? &record_profile_span : nullptr);
+}
+
+}  // namespace ts_scheduler

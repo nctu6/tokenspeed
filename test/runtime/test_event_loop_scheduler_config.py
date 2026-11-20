@@ -23,8 +23,9 @@
 CPU-only. ``scheduler_config_from_args`` is the one translation of the
 server arguments and ``DeviceSpecs`` into ``make_config``'s arguments; these
 tests run it with the arguments as an engine resolves them, so a knob that is
-unset on some engines (the L3 prefetch threshold without a store) is caught
-here rather than at the binding on startup.
+unset on some engines is caught here rather than at the binding on startup.
+The loop does not run the L3 storage executor, so a storage backend is refused
+(merge_main_1117.md, C2).
 """
 
 from __future__ import annotations
@@ -40,19 +41,12 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-pytest.importorskip("tokenspeed_scheduler")
+pytest.importorskip("tokenspeed_engine")
 
 from tokenspeed.runtime.engine.event_loop import (  # noqa: E402
     scheduler_config_from_args,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
-
-PREFETCH = dict(
-    kvstore_prefetch_min_pages=2,
-    kvstore_prefetch_timeout_base_s=1.0,
-    kvstore_prefetch_timeout_per_page_s=0.0,
-    kvstore_prefetch_batch_pages=128,
-)
 
 
 def _specs(*, num_host_pages: int, num_snapshot_pages: int, max_retracted: int):
@@ -60,6 +54,7 @@ def _specs(*, num_host_pages: int, num_snapshot_pages: int, max_retracted: int):
         cache_geometry=SimpleNamespace(num_device_pages=64, prefix_granularity=16),
         cache_groups=[],
         num_host_pages=num_host_pages,
+        host_group_packing=(),
         num_snapshot_pages=num_snapshot_pages,
         max_retracted_requests=max_retracted,
     )
@@ -71,6 +66,7 @@ def _config(args: ServerArgs, specs):
         specs,
         max_scheduled_tokens=args.chunked_prefill_size,
         max_batch_size=args.retraction_snapshot_max_requests or 8,
+        max_resident_requests=(args.retraction_snapshot_max_requests or 8) + 2,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
         enable_kv_cache_events=False,
@@ -78,28 +74,21 @@ def _config(args: ServerArgs, specs):
     )
 
 
-def test_an_engine_without_l3_passes_no_prefetch_threshold():
-    # The knob is unset (None) without a store; the binding takes 0.
+def test_an_engine_without_l3_maps_the_resolved_arguments():
     args = ServerArgs(model="x", max_num_seqs=8)
-    assert args.kvstore_prefetch_min_pages is None
     cfg = _config(
         args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
     )
     assert cfg.enable_l3_storage is False
-    assert cfg.l3_prefetch_min_pages == 0
     assert cfg.disable_l2_cache is False and cfg.num_host_pages == 17
     assert (cfg.num_snapshot_pages, cfg.max_retracted_requests) == (5, 8)
+    assert cfg.max_resident_requests == cfg.max_batch_size + 2
 
 
-def test_an_engine_with_l3_passes_its_prefetch_threshold():
-    args = ServerArgs(
-        model="x", max_num_seqs=8, kvstore_storage_backend="memory", **PREFETCH
-    )
-    cfg = _config(
-        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
-    )
-    assert cfg.enable_l3_storage is True
-    assert cfg.l3_prefetch_min_pages == 2
+def test_an_engine_with_a_storage_backend_is_refused():
+    args = ServerArgs(model="x", max_num_seqs=8, kvstore_storage_backend="memory")
+    with pytest.raises(NotImplementedError, match="L3 storage executor"):
+        _config(args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8))
 
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])

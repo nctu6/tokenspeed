@@ -163,6 +163,10 @@ def test_dispatch_native_multiq(page, rel_extent, window_left, kv_lens, k_new) -
             max_seqlen_q=k_new,
             window_left=window_left,
             softmax_scale=SCALE,
+            output_dtype=None,
+            return_lse=False,
+            gate=None,
+            sink=None,
         ).view(B * k_new, NUM_Q_HEADS, HEAD_DIM)
     finally:
         v2mod.rel_mha_decode_tsmha_v2 = orig
@@ -234,6 +238,10 @@ def test_v2_native_prediction_vs_reference(
         window_left,
         SCALE,
         prediction=k_new,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     ).view(B * k_new, NUM_Q_HEADS, HEAD_DIM)
 
     ref = _reference(q, ks, vs, rel, kv_lens, k_new, rel_extent, window_left)
@@ -323,6 +331,7 @@ def test_v1_native_prediction_tile_boundary() -> None:
     "flashinfer quantize_mxfp8 JIT also needs an nvcc whose version matches the "
     "CUDA runtime headers (else CCCL's CTK compat guard errors at build).",
     strict=False,
+    run=False,
 )
 def test_v1_native_prediction_mxfp8(window_left) -> None:
     """MXFP8 blockscaled v1 with native prediction matches the bf16 v1 run

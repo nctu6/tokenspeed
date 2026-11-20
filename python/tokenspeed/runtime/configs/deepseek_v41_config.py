@@ -46,6 +46,7 @@ class DeepseekV41TextConfig(PretrainedConfig):
         # run real weights on fewer GPUs; the router then picks among those).
         # None: the model has every checkpoint expert.
         self.num_checkpoint_experts: int | None = kwargs.get("num_checkpoint_experts")
+        self.expert_dtype: str | None = kwargs.get("expert_dtype")
         # These are architectural facts, not V4 defaults: V4.1 has learned,
         # ungrouped routing in every layer and no hash-routed MoE layers.
         self.num_hash_layers = 0

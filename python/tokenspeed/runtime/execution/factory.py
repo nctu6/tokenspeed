@@ -39,7 +39,7 @@ from tokenspeed.runtime.layers.logits_processor import (
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.sampling.registry import create_sampling_backend
 from tokenspeed.runtime.utils.nvtx import set_nvtx_enabled
-from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.server_args import AUX_CAPTURE_SPEC_ALGORITHMS, ServerArgs
 from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 if TYPE_CHECKING:
@@ -171,6 +171,7 @@ def _check_shared_head_layout(target_model, draft_model) -> None:
         target.tp_group == draft.tp_group
         and target.tp_size == draft.tp_size
         and target.dp_lm_head_tp == draft.dp_lm_head_tp
+        and (not target.dp_lm_head_tp or target.attn_tp_size == draft.attn_tp_size)
     ):
         return
     raise ValueError(
@@ -213,9 +214,7 @@ def configure_draft_target(
         )
     if DrafterImpl.shares_target_embed_head:
         _share_target_embed_and_head(model_runner, draft_model)
-    if server_args.speculative_algorithm == "EAGLE3" and hasattr(
-        model_runner.model, "set_eagle3_layers_to_capture"
-    ):
+    if server_args.speculative_algorithm in AUX_CAPTURE_SPEC_ALGORITHMS:
         # capture the layers the draft was trained on, not the default
         aux_layer_ids = server_args.eagle3_layers_to_capture or _eagle_aux_layer_ids(
             draft_model_runner.model_config.hf_config
@@ -313,6 +312,7 @@ def create_model_executor(
 
     sampling_backend = create_sampling_backend(
         server_args,
+        hf_config=model_runner.model_config.hf_text_config,
         max_bs=max_bs,
         max_draft_tokens_per_req=max_draft_tokens_per_req,
         device=config.device,

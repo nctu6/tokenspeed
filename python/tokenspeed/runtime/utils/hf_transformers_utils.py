@@ -31,6 +31,7 @@ import warnings
 from collections.abc import Callable
 from typing import Any
 
+import huggingface_hub
 import torch
 from huggingface_hub import snapshot_download
 from transformers import (
@@ -41,21 +42,23 @@ from transformers import (
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
 )
-from transformers.utils import cached_file
 
 from tokenspeed.runtime.configs import (
-    DeepseekV4Config,
     DeepseekV41Config,
     DeepseekV41TextConfig,
+    Inkling2MMConfig,
+    Inkling2ModelConfig,
+    Inkling2MTPConfig,
+    Inkling2VisionConfig,
     InklingMMConfig,
     InklingModelConfig,
     KimiK2Config,
     KimiK3Config,
     KimiK3DSparkConfig,
     KimiK25Config,
+    KimiK31Config,
     MiniMaxM3Config,
     MuseSparkConfig,
-    Qwen2Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
@@ -80,11 +83,9 @@ logger = logging.getLogger(__name__)
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     BeamConfig.model_type: BeamConfig,
     Dots3NoteConfig.model_type: Dots3NoteConfig,
-    Qwen2Config.model_type: Qwen2Config,
     Qwen3Config.model_type: Qwen3Config,
     Qwen3MoeConfig.model_type: Qwen3MoeConfig,
     Qwen3ASRConfig.model_type: Qwen3ASRConfig,
-    DeepseekV4Config.model_type: DeepseekV4Config,
     DeepseekV41Config.model_type: DeepseekV41Config,
     DeepseekV41TextConfig.model_type: DeepseekV41TextConfig,
     Qwen3_5Config.model_type: Qwen3_5Config,
@@ -96,9 +97,14 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     KimiK2Config.model_type: KimiK2Config,
     KimiK25Config.model_type: KimiK25Config,
     KimiK3Config.model_type: KimiK3Config,
+    KimiK31Config.model_type: KimiK31Config,
     KimiK3DSparkConfig.model_type: KimiK3DSparkConfig,
     InklingModelConfig.model_type: InklingModelConfig,
     InklingMMConfig.model_type: InklingMMConfig,
+    Inkling2ModelConfig.model_type: Inkling2ModelConfig,
+    Inkling2MMConfig.model_type: Inkling2MMConfig,
+    Inkling2MTPConfig.model_type: Inkling2MTPConfig,
+    Inkling2VisionConfig.model_type: Inkling2VisionConfig,
     Glm53FlashConfig.model_type: Glm53FlashConfig,
     NemotronHConfig.model_type: NemotronHConfig,
     NemotronHOmniConfig.model_type: NemotronHOmniConfig,
@@ -379,6 +385,7 @@ def get_config(
                 model,
                 revision=revision,
                 ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
 
         with get_lock(model):
@@ -462,6 +469,14 @@ def get_config(
             )
             del text_config.quantization_config["modules_to_not_convert"]
 
+    if is_draft_worker and isinstance(config, (Inkling2MMConfig, Inkling2MTPConfig)):
+        if speculative_algorithm != "DSPARK":
+            raise NotImplementedError("Inkling2 requires its separate DSpark MTP model")
+        if isinstance(config, Inkling2MMConfig):
+            config = Inkling2MTPConfig.from_target(config)
+        config._name_or_path = model
+        text_config = config
+
     # If the draft head ships in the same checkpoint as the base model,
     # rewrite the architecture in place so the model loader dispatches
     # to the *NextN / *Eagle3 entry class instead of the base one.
@@ -496,9 +511,9 @@ def get_config(
         and "DFlash" not in config.architectures[0]
         and "DSpark" not in config.architectures[0]
     ):
-        if speculative_algorithm == "DSPARK" and config.architectures[0] in (
-            "DeepseekV4ForCausalLM",
-            "DeepseekV41ForCausalLM",
+        if (
+            speculative_algorithm == "DSPARK"
+            and config.architectures[0] == "DeepseekV41ForCausalLM"
         ):
             config.architectures[0] += "DSpark"
         else:
@@ -520,7 +535,9 @@ def get_config(
         "KimiK25Config",
         "KimiK3ForConditionalGeneration",
         "KimiK3ForConditionalGenerationNextN",
+        "KimiK31ForConditionalGeneration",
         "KimiK3Config",
+        "KimiK31Config",
         "Glm53FlashForConditionalGeneration",
         "Glm53FlashForConditionalGenerationNextN",
         "Glm53FlashConfig",
@@ -535,6 +552,8 @@ def get_config(
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationNextN",
         "InklingMMConfig",
+        "Inkling2ForConditionalGeneration",
+        "Inkling2MMConfig",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3OmniMoeConfig",
         "Qwen3ASRForConditionalGeneration",
@@ -589,6 +608,7 @@ def get_generation_config(
                     model,
                     revision=revision,
                     ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
                 )
 
             with get_lock(model):
@@ -644,65 +664,6 @@ def get_context_length(config):
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 
-_DEEPSEEK_V4_TOKENIZER_ARCHITECTURES: frozenset = frozenset(
-    {
-        "DeepseekV4ForCausalLM",
-    }
-)
-
-
-def prefers_deepseek_v4_tokenizer(architectures: list[str] | None) -> bool:
-    if not architectures:
-        return False
-    return any(arch in _DEEPSEEK_V4_TOKENIZER_ARCHITECTURES for arch in architectures)
-
-
-def _find_deepseek_v4_encoding_file(
-    tokenizer_name: str,
-    tokenizer_revision: str | None,
-) -> str:
-    if os.path.isdir(tokenizer_name):
-        encoding_path = os.path.join(tokenizer_name, "encoding", "encoding_dsv4.py")
-        if os.path.exists(encoding_path):
-            return encoding_path
-        raise RuntimeError(
-            "DeepSeek V4 tokenizer mode requires "
-            f"`encoding/encoding_dsv4.py` in {tokenizer_name}."
-        )
-
-    try:
-        encoding_path = cached_file(
-            tokenizer_name,
-            "encoding/encoding_dsv4.py",
-            revision=tokenizer_revision,
-            _raise_exceptions_for_gated_repo=False,
-            _raise_exceptions_for_missing_entries=False,
-            _raise_exceptions_for_connection_errors=False,
-        )
-    except TypeError:
-        encoding_path = cached_file(
-            tokenizer_name,
-            "encoding/encoding_dsv4.py",
-            revision=tokenizer_revision,
-        )
-
-    if not encoding_path:
-        raise RuntimeError(
-            "DeepSeek V4 tokenizer mode requires "
-            "`encoding/encoding_dsv4.py` from the model repository."
-        )
-    return encoding_path
-
-
-def _load_deepseek_v4_encode_messages(
-    tokenizer_name: str,
-    tokenizer_revision: str | None,
-) -> Callable[..., str]:
-    return _load_deepseek_encode_messages(
-        _find_deepseek_v4_encoding_file(tokenizer_name, tokenizer_revision)
-    )
-
-
 def _load_deepseek_encode_messages(encoding_path: str) -> Callable[..., str]:
     """Load a standalone encoder from the already resolved checkpoint snapshot."""
     if not os.path.isfile(encoding_path):
@@ -718,14 +679,6 @@ def _load_deepseek_encode_messages(encoding_path: str) -> Callable[..., str]:
     if encode_messages is None:
         raise RuntimeError(f"{encoding_path} does not define encode_messages")
     return encode_messages
-
-
-def _wrap_deepseek_v4_tokenizer(
-    tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
-    encode_messages: Callable[..., str],
-) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
-    """Attach DeepSeek V4's model-provided chat encoder to a HF tokenizer."""
-    return _wrap_deepseek_tokenizer(tokenizer, encode_messages, is_v41=False)
 
 
 def _validate_deepseek_v41_text_content(content: Any) -> None:
@@ -753,22 +706,17 @@ def _validate_deepseek_v41_text_content(content: Any) -> None:
 def _wrap_deepseek_tokenizer(
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
     encode_messages: Callable[..., str],
-    *,
-    is_v41: bool,
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
     """Attach the checkpoint encoder without changing the backend vocabulary.
 
     V4.1 accepts text-only messages and passes numeric reasoning budgets and
-    low/high/max aliases unchanged to encoding/encoding.py. V4 retains its
-    high/max filtering and legacy vocabulary bookkeeping.
+    low/high/max aliases unchanged to encoding/encoding.py.
     """
     wrapped_tokenizer = copy.copy(tokenizer)
     added_vocab = tokenizer.get_added_vocab()
     # V4.1's added tokens overlap its base vocabulary. Double-counting them
     # changes Engram's compressed token map and therefore its n-gram hashes.
-    tokenizer_vocab_size = (
-        len(tokenizer) if is_v41 else tokenizer.vocab_size + len(added_vocab)
-    )
+    tokenizer_vocab_size = len(tokenizer)
 
     class _DeepseekTokenizer(tokenizer.__class__):  # type: ignore
         def apply_chat_template(
@@ -786,12 +734,9 @@ def _wrap_deepseek_tokenizer(
                 conversation.insert(0, {"role": "system", "tools": tools})
 
             reasoning_effort = kwargs.get("reasoning_effort")
-            if is_v41:
-                for message in conversation:
-                    for key in ("content", "content_blocks", "reasoning_content"):
-                        _validate_deepseek_v41_text_content(message.get(key))
-            elif reasoning_effort not in ("max", "high"):
-                reasoning_effort = None
+            for message in conversation:
+                for key in ("content", "content_blocks", "reasoning_content"):
+                    _validate_deepseek_v41_text_content(message.get(key))
 
             prompt = encode_messages(
                 conversation,
@@ -830,8 +775,7 @@ def _wrap_deepseek_tokenizer(
         def get_added_vocab(self) -> dict[str, int]:
             return added_vocab.copy()
 
-    version = "DSV41" if is_v41 else "DSV4"
-    _DeepseekTokenizer.__name__ = f"{version}{tokenizer.__class__.__name__}"
+    _DeepseekTokenizer.__name__ = f"DSV41{tokenizer.__class__.__name__}"
     wrapped_tokenizer.__class__ = _DeepseekTokenizer
     return wrapped_tokenizer
 
@@ -941,12 +885,6 @@ def get_tokenizer(
                 _load_deepseek_encode_messages(
                     os.path.join(tokenizer_path, "encoding", "encoding.py")
                 ),
-                is_v41=True,
-            )
-        elif tokenizer_mode == "auto" and prefers_deepseek_v4_tokenizer(architectures):
-            loaded_tokenizer = _wrap_deepseek_v4_tokenizer(
-                loaded_tokenizer,
-                _load_deepseek_v4_encode_messages(tokenizer_path, tokenizer_revision),
             )
         return loaded_tokenizer
 
@@ -958,6 +896,7 @@ def get_tokenizer(
                 tokenizer_name,
                 revision=tokenizer_revision,
                 ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
 
         with get_lock(tokenizer_name):

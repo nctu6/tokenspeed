@@ -20,7 +20,8 @@
 
 from __future__ import annotations
 
-import inspect
+import gc
+import weakref
 from dataclasses import replace
 from functools import partial
 
@@ -30,11 +31,17 @@ import torch
 from tokenspeed_kernel.numerics.torch.attention.qsa import (
     torch_qsa_selected_attention,
 )
-from tokenspeed_kernel.ops.attention.qsa import qsa_sparse_attention
+from tokenspeed_kernel.ops.attention.qsa import (
+    QSASparseMetadata,
+    QSAWorkspace,
+    qsa_sparse_attention,
+    select_qsa_sparse_attention_kernel,
+)
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import SelectedKernel, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.workspace import capture_session
 
 if current_platform().is_nvidia:
     from tokenspeed_kernel.ops.attention.qsa._flashinfer.runner import (
@@ -61,17 +68,950 @@ def _reference(
     )
 
 
-def test_qsa_sparse_attention_requires_dispatch_arguments() -> None:
-    parameters = inspect.signature(qsa_sparse_attention).parameters
-    for name in (
+def _prims_case(*, lengths, prefixes, kv_heads, shared_candidates, block_size, device):
+    from tokenspeed_kernel.ops.attention.qsa.triton import qwen4_exp_qsa_selected_slots
+
+    torch.manual_seed(91)
+    page_size, topk, head_dim = 64, 512, 256
+    max_pages = (
+        max(p + n for p, n in zip(prefixes, lengths)) + page_size - 1
+    ) // page_size
+    table = (
+        (torch.randperm(len(lengths) * max_pages, device=device) + 1)
+        .to(torch.int32)
+        .view(len(lengths), max_pages)
+    )
+    slots = (len(lengths) * max_pages + 1) * page_size
+    k = torch.randn(slots, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q = torch.randn(
+        sum(lengths), kv_heads * 6, head_dim, device=device, dtype=torch.bfloat16
+    )
+    positions = torch.cat(
+        [
+            torch.arange(prefix, prefix + length, device=device)
+            for prefix, length in zip(prefixes, lengths)
+        ]
+    )
+    requests = torch.repeat_interleave(
+        torch.arange(len(lengths), device=device, dtype=torch.int32),
+        torch.tensor(lengths, device=device),
+    )
+    blocks = torch.full((sum(lengths), topk), -1, dtype=torch.int32, device=device)
+    for row, position in enumerate(positions.tolist()):
+        complete = (position + 1) // block_size
+        chosen = (
+            torch.arange(min(complete, topk), device=device)
+            if shared_candidates
+            else torch.randperm(complete, device=device)[:topk]
+        )
+        blocks[row, : chosen.numel()] = chosen
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    metadata = QSASparseMetadata(
+        blocks,
+        table,
+        requests,
+        positions,
+        tuple(offsets),
+        page_size,
+        block_size,
+        QSAWorkspace(),
+        seq_lens=torch.tensor(
+            [prefix + length for prefix, length in zip(prefixes, lengths)],
+            dtype=torch.int32,
+            device=device,
+        ),
+    )
+    selected = qwen4_exp_qsa_selected_slots(
+        blocks,
+        ((positions + 1) // block_size).to(torch.int32),
+        positions,
+        requests,
+        table,
+        page_size,
+        block_size,
+        topk * block_size,
+        enable_pdl=False,
+    )
+    return q, k, v, selected, metadata
+
+
+@pytest.mark.parametrize("shared_candidates", [False, True])
+def test_prims_qsa_prefill_matches_causal_reference(shared_candidates, device):
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("PrimTS QSA requires SM100 or SM103")
+    q, k, v, slots, metadata = _prims_case(
+        lengths=(5, 3, 9),
+        prefixes=(32768, 29, 0),
+        kv_heads=2,
+        shared_candidates=shared_candidates,
+        block_size=4,
+        device=device,
+    )
+    kwargs = dict(
+        scale=1 / 16,
+        max_seqlen_q=None,
+        metadata_capacity_rows=None,
+        k_scale=0.75,
+        v_scale=1.25,
+        override="flashinfer_prims_qsa_sparse_attention",
+        solution=None,
+        sparse_metadata=metadata,
+    )
+    actual = qsa_sparse_attention(q, k, v, slots, **kwargs)
+    expected = _reference(q, k, v, slots, 1 / 16, 0.75, 1.25)
+    # PrimTS rounds the unnormalized probabilities to BF16 before PV. With
+    # only a few keys, cancellation can expose that rounding near zero.
+    torch.testing.assert_close(actual, expected, atol=4e-3, rtol=1e-2)
+    # Reuse the same plan with new candidate values and replacement Q storage.
+    metadata.selected_blocks[0].copy_(
+        torch.arange(512, 1024, device=device, dtype=torch.int32)
+    )
+    slots[0, :2048] = (
+        metadata.block_table[0, (torch.arange(2048, 4096, device=device) // 64)].long()
+        * 64
+        + torch.arange(2048, 4096, device=device) % 64
+    ).to(torch.int32)
+    new_q = q * 0.5
+    updated = qsa_sparse_attention(new_q, k, v, slots, **kwargs)
+    torch.testing.assert_close(
+        updated,
+        _reference(new_q, k, v, slots, 1 / 16, 0.75, 1.25),
+        atol=4e-3,
+        rtol=1e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("q_heads", "kv_heads", "max_rows"),
+    [(24, 2, 1), (24, 2, 3), (24, 2, 16), (128, 2, 16), (256, 2, 16)],
+)
+def test_prims_qsa_warmup_groups_follow_native_limits(q_heads, kv_heads, max_rows):
+    decode = pytest.importorskip("flashinfer.attention.prims_ts.decode")
+    from tokenspeed_kernel.thirdparty.flashinfer.qsa_prims import _warmup_group_sizes
+
+    offsets = torch.tensor([0, max_rows], dtype=torch.int32, device="cpu")
+    expected = []
+    for group in range(1, max_rows + 1):
+        try:
+            decode.validate_q_token_kv_block_sparse_group_size(
+                offsets, max_rows, q_heads, kv_heads, group_size=group
+            )
+        except ValueError:
+            continue
+        expected.append(group)
+    assert set(_warmup_group_sizes(q_heads, kv_heads, max_rows)) == set(expected)
+
+
+@pytest.mark.parametrize(("q_heads", "kv_heads", "max_rows"), [(3, 2, 16), (24, 2, 0)])
+def test_prims_qsa_warmup_rejects_invalid_group_geometry(q_heads, kv_heads, max_rows):
+    pytest.importorskip("flashinfer.attention.prims_ts.decode")
+    from tokenspeed_kernel.thirdparty.flashinfer.qsa_prims import _warmup_group_sizes
+
+    with pytest.raises(ValueError):
+        _warmup_group_sizes(q_heads, kv_heads, max_rows)
+
+
+def test_prims_qsa_startup_warms_query_groups_and_schedulers(device):
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("PrimTS QSA requires SM100 or SM103")
+    decode = pytest.importorskip("flashinfer.attention.prims_ts.decode")
+    pytest.importorskip("flashinfer.autotuner")
+    from tokenspeed_kernel.ops.attention.qsa.triton import qwen4_exp_qsa_selected_slots
+    from tokenspeed_kernel.ops.tuning import (
+        autotune,
+        get_autotune_max_num_tokens,
+        kernel_warmup,
+    )
+    from tokenspeed_kernel.thirdparty.flashinfer.qsa_prims import _get_runner
+
+    _, k, v, _, prototype = _prims_case(
+        lengths=(1024,),
+        prefixes=(4096,),
+        kv_heads=2,
+        shared_candidates=True,
+        block_size=4,
+        device=device,
+    )
+    k.mul_(0.25)
+    v.mul_(0.25)
+    workspace = QSAWorkspace()
+
+    def case(lengths):
+        rows = sum(lengths)
+        q = torch.randn(rows, 24, 256, device=device, dtype=torch.bfloat16)
+        positions = torch.cat(
+            [torch.arange(4096, 4096 + length, device=device) for length in lengths]
+        )
+        requests = torch.repeat_interleave(
+            torch.arange(len(lengths), device=device, dtype=torch.int32),
+            torch.tensor(lengths, device=device),
+        )
+        table = prototype.block_table.expand(len(lengths), -1).contiguous()
+        blocks = prototype.selected_blocks[:rows].clone()
+        offsets = [0]
+        for length in lengths:
+            offsets.append(offsets[-1] + length)
+        metadata = QSASparseMetadata(
+            blocks,
+            table,
+            requests,
+            positions,
+            tuple(offsets),
+            64,
+            4,
+            workspace,
+            seq_lens=torch.tensor(
+                [4096 + length for length in lengths], dtype=torch.int32, device=device
+            ),
+        )
+        selected = qwen4_exp_qsa_selected_slots(
+            blocks,
+            ((positions + 1) // 4).int(),
+            positions,
+            requests,
+            table,
+            64,
+            4,
+            2048,
+            enable_pdl=False,
+        )
+        return q, selected, metadata
+
+    def forward(q, selected, metadata):
+        return qsa_sparse_attention(
+            q,
+            k,
+            v,
+            selected,
+            scale=1 / 16,
+            max_seqlen_q=None,
+            metadata_capacity_rows=None,
+            k_scale=None,
+            v_scale=None,
+            override=None,
+            solution="flashinfer_prims",
+            sparse_metadata=metadata,
+        )
+
+    # Clear the compiler lookup cache; live plans retain their own binaries.
+    decode._get_compiled_decode.cache_clear()
+    original_k, original_v = k.clone(), v.clone()
+    with (
+        kernel_warmup(enabled=False),
+        autotune(tune_mode=True, tuning_buckets=None, round_up=None),
+    ):
+        forward(*case((1,)))
+    torch.testing.assert_close(k, original_k, atol=0, rtol=0)
+    torch.testing.assert_close(v, original_v, atol=0, rtol=0)
+    misses = decode._get_compiled_decode.cache_info().misses
+    # Check every native-legal group independently of the adapter's candidates,
+    # including short routes and both native scheduler choices.
+    max_rows = get_autotune_max_num_tokens()
+    boundaries = torch.tensor([0, max_rows], dtype=torch.int32, device="cpu")
+    groups = []
+    for group in range(1, max_rows + 1):
+        try:
+            decode.validate_q_token_kv_block_sparse_group_size(
+                boundaries, max_rows, 24, 2, group_size=group
+            )
+        except ValueError:
+            continue
+        groups.append(group)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    for routes in (1, min(max_rows, sm_count + 1)):
+        q, selected, metadata = case((1,) * routes)
+        runner = _get_runner(workspace, q.device)
+        row_ids = [0, q.shape[0] - 1]
+        expected = _reference(q[row_ids], k, v, selected[row_ids], 1 / 16)
+        for group in groups:
+            output = runner._run(
+                q, k, v, metadata, group_size=group, scale=1 / 16, v_scale=1.0
+            )
+            assert decode._get_compiled_decode.cache_info().misses == misses
+            torch.testing.assert_close(output[row_ids], expected, atol=4e-3, rtol=1e-2)
+    for lengths in ((7,), (128,), (1024,), (5, 3), (511, 513), (8,) + (1,) * 120):
+        q, selected, metadata = case(lengths)
+        eager = forward(q, selected, metadata)
+        assert decode._get_compiled_decode.cache_info().misses == misses
+        row_ids = [0, q.shape[0] - 1]
+        torch.testing.assert_close(
+            eager[row_ids],
+            _reference(q[row_ids], k, v, selected[row_ids], 1 / 16),
+            atol=4e-3,
+            rtol=1e-2,
+        )
+        graph = torch.cuda.CUDAGraph()
+        with capture_session(graph), torch.cuda.graph(graph):
+            captured = forward(q, selected, metadata)
+        q.mul_(0.75)
+        graph.replay()
+        expected = _reference(q[row_ids], k, v, selected[row_ids], 1 / 16)
+        torch.testing.assert_close(captured[row_ids], expected, atol=4e-3, rtol=1e-2)
+        assert decode._get_compiled_decode.cache_info().misses == misses
+
+
+def test_prims_qsa_kernel_warmup_does_not_enable_extra_compilation(device):
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("PrimTS QSA requires SM100 or SM103")
+    decode = pytest.importorskip("flashinfer.attention.prims_ts.decode")
+    from tokenspeed_kernel.ops.tuning import autotune, kernel_warmup
+
+    q, k, v, slots, metadata = _prims_case(
+        lengths=(1,),
+        prefixes=(17,),
+        kv_heads=1,
+        shared_candidates=True,
+        block_size=4,
+        device=device,
+    )
+    k.mul_(0.25)
+    v.mul_(0.25)
+
+    def forward():
+        return qsa_sparse_attention(
+            q,
+            k,
+            v,
+            slots,
+            scale=1 / 16,
+            max_seqlen_q=None,
+            metadata_capacity_rows=None,
+            k_scale=None,
+            v_scale=None,
+            override=None,
+            solution="flashinfer_prims",
+            sparse_metadata=metadata,
+        )
+
+    decode._get_compiled_decode.cache_clear()
+    with autotune(tune_mode=False, tuning_buckets=None, round_up=None):
+        with kernel_warmup(enabled=False):
+            forward()
+        misses = decode._get_compiled_decode.cache_info().misses
+        assert misses > 0
+        with kernel_warmup(enabled=True):
+            actual = forward()
+    assert decode._get_compiled_decode.cache_info().misses == misses
+    torch.testing.assert_close(
+        actual, _reference(q, k, v, slots, 1 / 16), atol=4e-3, rtol=1e-2
+    )
+
+
+def test_prims_qsa_new_batch_plans_reuse_cluster_occupancy(device):
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("PrimTS QSA requires SM100 or SM103")
+    from tokenspeed_kernel.compile_monitor import CompileMonitor
+    from tokenspeed_kernel.compile_monitor.cute_dsl import CuteDslHooks
+    from tokenspeed_kernel.thirdparty.flashinfer.qsa_prims import _get_runner
+
+    q, k, v, slots, prototype = _prims_case(
+        lengths=(1,) * 8,
+        prefixes=(17,) * 8,
+        kv_heads=2,
+        shared_candidates=True,
+        block_size=4,
+        device=device,
+    )
+    k.mul_(0.25)
+    v.mul_(0.25)
+
+    def forward(routes):
+        metadata = replace(
+            prototype,
+            selected_blocks=prototype.selected_blocks[:routes],
+            block_table=prototype.block_table[:routes],
+            token_to_request=prototype.token_to_request[:routes],
+            query_positions=prototype.query_positions[:routes],
+            query_start_loc=tuple(range(routes + 1)),
+            seq_lens=prototype.seq_lens[:routes],
+        )
+        return qsa_sparse_attention(
+            q[:routes],
+            k,
+            v,
+            slots[:routes],
+            scale=1 / 16,
+            max_seqlen_q=None,
+            metadata_capacity_rows=None,
+            k_scale=None,
+            v_scale=None,
+            override=None,
+            solution="flashinfer_prims",
+            sparse_metadata=metadata,
+        )
+
+    monitor = CompileMonitor("error", 4)
+    hooks = CuteDslHooks(monitor)
+    hooks.install()
+    try:
+        runner = _get_runner(prototype.workspace, q.device)
+        runner.warmup(q, k, v, prototype, max_rows=8)
+        forward(1)
+        monitor.serving = True
+        # Each intermediate route count builds a new eager plan while the
+        # native attention kernels are already warmed for this geometry.
+        for routes in range(2, 8):
+            previous_sync_debug = torch.cuda.get_sync_debug_mode()
+            try:
+                torch.cuda.set_sync_debug_mode("error")
+                actual = forward(routes)
+            finally:
+                torch.cuda.set_sync_debug_mode(previous_sync_debug)
+            expected = _reference(q[:routes], k, v, slots[:routes], 1 / 16)
+            torch.testing.assert_close(actual, expected, atol=4e-3, rtol=1e-2)
+        assert monitor.stats().serving_compiles == 0
+    finally:
+        hooks.uninstall()
+
+
+@pytest.mark.parametrize("query_width", [1, 4])
+@pytest.mark.parametrize("q_heads", [6, 8])
+@pytest.mark.parametrize("capture", [False, True])
+def test_prims_qsa_decode_matches_reference_and_refreshes_live_metadata(
+    query_width: int, q_heads: int, capture: bool, device: str
+) -> None:
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("PrimTS QSA requires SM100 or SM103")
+    from tokenspeed_kernel.ops.attention.qsa.triton import qwen4_exp_qsa_selected_slots
+
+    q, k, v, slots, metadata = _prims_case(
+        lengths=(query_width, query_width),
+        prefixes=(4096, 29),
+        kv_heads=1,
+        shared_candidates=True,
+        block_size=4,
+        device=device,
+    )
+    q = torch.randn(q.shape[0], q_heads, 256, device=device, dtype=q.dtype)
+    kwargs = dict(
+        scale=1 / 16,
+        max_seqlen_q=query_width,
+        metadata_capacity_rows=None,
+        k_scale=None,
+        v_scale=None,
+        override=None,
+        solution="flashinfer_prims",
+        sparse_metadata=metadata,
+    )
+    selected = select_qsa_sparse_attention_kernel(
+        q,
+        k,
+        v,
+        slots,
+        max_seqlen_q=query_width,
+        k_scale=None,
+        v_scale=None,
+        sparse_metadata=metadata,
+        override=None,
+        solution=None,
+    )
+    assert selected.name == (
+        "cute_dsl_blackwell_qsa_sparse_attention"
+        if q_heads == 6
+        else "flashinfer_prims_qsa_sparse_attention"
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        actual = qsa_sparse_attention(q, k, v, slots, **kwargs)
+    stream.synchronize()
+    torch.testing.assert_close(
+        actual, _reference(q, k, v, slots, 1 / 16), atol=4e-3, rtol=1e-2
+    )
+    graph = None
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with capture_session(graph), torch.cuda.graph(graph, stream=stream):
+            actual = qsa_sparse_attention(q, k, v, slots, **kwargs)
+    with torch.cuda.stream(stream):
+        metadata.selected_blocks[:query_width].copy_(
+            torch.arange(512, 1024, dtype=torch.int32, device=device).expand(
+                query_width, -1
+            )
+        )
+        metadata.query_positions.add_(1)
+        metadata.selected_blocks[query_width:].fill_(-1)
+        for row in range(query_width):
+            complete = (31 + row) // 4
+            metadata.selected_blocks[query_width + row, :complete] = torch.arange(
+                complete, dtype=torch.int32, device=device
+            )
+        metadata.block_table[:, :2] = metadata.block_table[:, :2].flip(1)
+        q.mul_(0.5)
+        updated_slots = qwen4_exp_qsa_selected_slots(
+            metadata.selected_blocks,
+            ((metadata.query_positions + 1) // 4).to(torch.int32),
+            metadata.query_positions,
+            metadata.token_to_request,
+            metadata.block_table,
+            64,
+            4,
+            2048,
+            enable_pdl=False,
+        )
+        if graph is None:
+            actual = qsa_sparse_attention(q, k, v, updated_slots, **kwargs)
+        else:
+            graph.replay()
+    stream.synchronize()
+    torch.testing.assert_close(
+        actual, _reference(q, k, v, updated_slots, 1 / 16), atol=4e-3, rtol=1e-2
+    )
+
+
+def test_qsa_sparse_attention_rejects_ragged_metadata_for_uniform_decode() -> None:
+    metadata = QSASparseMetadata(
+        torch.zeros((4, 512), dtype=torch.int32),
+        torch.ones((2, 1), dtype=torch.int32),
+        torch.tensor([0, 1, 1, 1], dtype=torch.int32),
+        torch.arange(4),
+        (0, 1, 4),
+        64,
+        4,
+        QSAWorkspace(),
+        seq_lens=torch.tensor([1, 4], dtype=torch.int32),
+    )
+    q = torch.empty((4, 8, 256), dtype=torch.bfloat16)
+    cache = torch.empty((64, 1, 256), dtype=q.dtype)
+    with pytest.raises(ValueError, match="uniform decode width"):
+        qsa_sparse_attention(
+            q,
+            cache,
+            cache,
+            torch.ones((4, 2051), dtype=torch.int32),
+            scale=1 / 16,
+            max_seqlen_q=2,
+            metadata_capacity_rows=None,
+            k_scale=None,
+            v_scale=None,
+            override=None,
+            solution="flashinfer_prims",
+            sparse_metadata=metadata,
+        )
+
+
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("rows", [1, 7])
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("block_size", [4, 8, 256])
+@pytest.mark.parametrize("tensor_scales", [False, True])
+def test_prims_qsa_prefill_dispatch(cache_dtype, rows, topk, block_size, tensor_scales):
+    platform = current_platform()
+    if not platform.is_nvidia or platform.arch_version < ArchVersion(9, 0):
+        pytest.skip("QSA BF16/FP8 fallback requires NVIDIA Hopper or newer")
+    q = torch.empty((rows, 6, 256), dtype=torch.bfloat16)
+    cache = torch.empty((64, 1, 256), dtype=cache_dtype)
+    slots = torch.ones((rows, topk * block_size + block_size - 1), dtype=torch.int32)
+    metadata = QSASparseMetadata(
+        torch.zeros((rows, topk), dtype=torch.int32),
+        torch.ones((1, 1), dtype=torch.int32),
+        torch.zeros(rows, dtype=torch.int32),
+        torch.arange(rows),
+        (0, rows),
+        64,
+        block_size,
+        QSAWorkspace(),
+        seq_lens=torch.tensor([rows], dtype=torch.int32),
+    )
+    expected = (
+        "flashinfer_prims_qsa_sparse_attention"
+        if platform.arch_version in (ArchVersion(10, 0), ArchVersion(10, 3))
+        and cache_dtype == torch.bfloat16
+        and topk <= 512
+        and block_size in (4, 8)
+        and not tensor_scales
+        else (
+            "flashinfer_fa2_qsa_sparse_attention"
+            if cache_dtype == torch.bfloat16
+            else "flashinfer_fa2_fp8_qsa_sparse_attention"
+        )
+    )
+    descale = torch.tensor(0.75) if tensor_scales else None
+    selected = select_qsa_sparse_attention_kernel(
+        q,
+        cache,
+        cache,
+        slots,
+        max_seqlen_q=None,
+        k_scale=descale,
+        v_scale=descale,
+        sparse_metadata=metadata,
+        override=None,
+        solution=None,
+    )
+    assert selected.name == expected
+
+
+@pytest.mark.parametrize(
+    ("cache_dtype", "block_size"),
+    [(torch.bfloat16, 256), (torch.float8_e4m3fn, 4)],
+)
+def test_prims_qsa_prefill_fa2_fallback_matches_reference(
+    cache_dtype: torch.dtype,
+    block_size: int,
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    platform = current_platform()
+    if not platform.is_nvidia or platform.arch_version < ArchVersion(9, 0):
+        pytest.skip("QSA BF16/FP8 fallback requires NVIDIA Hopper or newer")
+    import tokenspeed_kernel.ops.attention.qsa._flashinfer.runner as runner_module
+
+    # Other tests capture the process runner and pin its metadata shape.
+    # Give this fallback geometry a fresh cache of real FA2 runners.
+    monkeypatch.setattr(runner_module, "_runners", {})
+    q, k, v, slots, metadata = _prims_case(
+        lengths=(5, 3),
+        prefixes=(385, 29),
+        kv_heads=1,
+        shared_candidates=False,
+        block_size=block_size,
+        device=device,
+    )
+    k, v = (k * 0.25).to(cache_dtype), (v * 0.25).to(cache_dtype)
+    descale = 1.0 if cache_dtype == torch.float8_e4m3fn else None
+    actual = qsa_sparse_attention(
+        q,
+        k,
+        v,
+        slots,
+        scale=1 / 16,
+        max_seqlen_q=None,
+        metadata_capacity_rows=None,
+        k_scale=descale,
+        v_scale=descale,
+        override=None,
+        solution=None,
+        sparse_metadata=metadata,
+    )
+    torch.testing.assert_close(
+        actual, _reference(q, k, v, slots, 1 / 16), atol=2e-3, rtol=2e-3
+    )
+
+
+@pytest.mark.parametrize(
+    ("offsets", "group_size", "expected"),
+    [
+        ((0, 5, 5, 8, 17), 4, (0, 4, 5, 8, 12, 16, 17)),
+        ((0, 4, 8), 4, (0, 4, 8)),
+        ((0, 1, 3), 4, (0, 1, 3)),
+        ((0, 0, 0), 4, (0,)),
+        ((0, 2, 5), 1, (0, 1, 2, 3, 4, 5)),
+    ],
+)
+def test_prims_query_groups_stop_at_request_boundaries(offsets, group_size, expected):
+    # The adapter imports FlashInfer, which is only installed on NVIDIA runners.
+    if not current_platform().is_nvidia:
+        pytest.skip("FlashInfer PrimTS requires NVIDIA")
+    from tokenspeed_kernel.thirdparty.flashinfer.qsa_prims import _group_offsets
+
+    assert _group_offsets(offsets, group_size) == expected
+
+
+@pytest.mark.parametrize("block_size", [4, 8, 16, 32, 64, 128])
+def test_prims_qsa_prefill_supported_block_sizes(block_size, device):
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("PrimTS QSA requires SM100 or SM103")
+    q, k, v, slots, metadata = _prims_case(
+        lengths=(5, 3),
+        prefixes=(385, 29),
+        kv_heads=1,
+        shared_candidates=False,
+        block_size=block_size,
+        device=device,
+    )
+    actual = qsa_sparse_attention(
+        q,
+        k,
+        v,
+        slots,
+        scale=1 / 16,
+        max_seqlen_q=None,
+        metadata_capacity_rows=None,
+        k_scale=None,
+        v_scale=None,
+        override=None,
+        solution="flashinfer_prims",
+        sparse_metadata=metadata,
+    )
+    torch.testing.assert_close(
+        actual, _reference(q, k, v, slots, 1 / 16), atol=4e-3, rtol=1e-2
+    )
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("smaller_first", [False, True])
+def test_prims_qsa_interleaves_workspace_geometries(capture, smaller_first, device):
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("PrimTS QSA requires SM100 or SM103")
+    import tokenspeed_kernel.thirdparty.flashinfer.qsa_prims as prims
+
+    large = _prims_case(
+        lengths=(257, 3),
+        prefixes=(4096, 0),
+        kv_heads=1,
+        shared_candidates=False,
+        block_size=4,
+        device=device,
+    )
+    small = _prims_case(
+        lengths=(2, 1),
+        prefixes=(17, 0),
+        kv_heads=1,
+        shared_candidates=True,
+        block_size=4,
+        device=device,
+    )
+    first, second = (small, large) if smaller_first else (large, small)
+    q, k, v, slots, metadata = first
+    expected = _reference(q, k, v, slots, 1 / 16)
+    runner = prims._PrimTSQSARunner(q.device)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        runner.run(q, k, v, metadata, scale=1 / 16, v_scale=1.0)
+    stream.synchronize()
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with capture_session(graph), torch.cuda.graph(graph, stream=stream):
+            actual = runner.run(q, k, v, metadata, scale=1 / 16, v_scale=1.0)
+
+    # Growing scratch must preserve allocations already used by a graph.
+    # Poison the shared scratch too: nonsplit packed runs must regenerate all
+    # live workspace values before reading them, including on graph replay.
+    for _ in range(2):
+        bq, bk, bv, bslots, bmetadata = second
+        with torch.cuda.stream(stream):
+            other = runner.run(bq, bk, bv, bmetadata, scale=1 / 16, v_scale=1.0)
+            runner._workspace.fill_(255)
+            if capture:
+                graph.replay()
+            else:
+                actual = runner.run(q, k, v, metadata, scale=1 / 16, v_scale=1.0)
+        stream.synchronize()
+        torch.testing.assert_close(actual, expected, atol=4e-3, rtol=1e-2)
+        torch.testing.assert_close(
+            other, _reference(bq, bk, bv, bslots, 1 / 16), atol=4e-3, rtol=1e-2
+        )
+
+
+def test_prims_qsa_keeps_warmed_layer_cache_bindings(device):
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("PrimTS QSA requires SM100 or SM103")
+    import tokenspeed_kernel.thirdparty.flashinfer.qsa_prims as prims
+
+    q, k, v, slots, metadata = _prims_case(
+        lengths=(5, 3),
+        prefixes=(257, 0),
+        kv_heads=1,
+        shared_candidates=False,
+        block_size=4,
+        device=device,
+    )
+    other_k, other_v = k * 0.5, -v
+    runner = prims._PrimTSQSARunner(q.device)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for keys, values in ((k, v), (other_k, other_v)):
+            runner.run(q, keys, values, metadata, scale=1 / 16, v_scale=1.0)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with capture_session(graph), torch.cuda.graph(graph, stream=stream):
+        first = runner.run(q, k, v, metadata, scale=1 / 16, v_scale=1.0)
+        second = runner.run(q, other_k, other_v, metadata, scale=1 / 16, v_scale=1.0)
+    k.mul_(0.75)
+    v.mul_(1.25)
+    graph.replay()
+    for actual, keys, values in ((first, k, v), (second, other_k, other_v)):
+        torch.testing.assert_close(
+            actual, _reference(q, keys, values, slots, 1 / 16), atol=4e-3, rtol=1e-2
+        )
+
+
+def test_prims_qsa_replays_live_candidates(device):
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("PrimTS QSA requires SM100 or SM103")
+    q, k, v, slots, metadata = _prims_case(
+        lengths=(257, 3),
+        prefixes=(4096, 0),
+        kv_heads=1,
+        shared_candidates=True,
+        block_size=4,
+        device=device,
+    )
+    kwargs = dict(
+        scale=1 / 16,
+        max_seqlen_q=None,
+        metadata_capacity_rows=None,
+        k_scale=None,
+        v_scale=None,
+        override=None,
+        solution="flashinfer_prims",
+        sparse_metadata=metadata,
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        qsa_sparse_attention(q, k, v, slots, **kwargs)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with capture_session(graph), torch.cuda.graph(graph, stream=stream):
+        actual = qsa_sparse_attention(q, k, v, slots, **kwargs)
+    from tokenspeed_kernel.ops.attention.qsa.triton import qwen4_exp_qsa_selected_slots
+
+    metadata.selected_blocks[:5].add_(512)
+    updated_slots = qwen4_exp_qsa_selected_slots(
+        metadata.selected_blocks,
+        ((metadata.query_positions + 1) // 4).to(torch.int32),
+        metadata.query_positions,
+        metadata.token_to_request,
+        metadata.block_table,
+        64,
+        4,
+        2048,
+        enable_pdl=False,
+    )
+    graph.replay()
+    torch.testing.assert_close(
+        actual, _reference(q, k, v, updated_slots, 1 / 16), atol=4e-3, rtol=1e-2
+    )
+
+
+@pytest.mark.parametrize("query_width", [None, 1, 4])
+def test_prims_qsa_reuses_plan_across_ordered_streams(query_width, device):
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("PrimTS QSA requires SM100 or SM103")
+    q, k, v, slots, metadata = _prims_case(
+        lengths=(5, 3) if query_width is None else (query_width, query_width),
+        prefixes=(257, 29),
+        kv_heads=1,
+        shared_candidates=False,
+        block_size=4,
+        device=device,
+    )
+    kwargs = dict(
+        scale=1 / 16,
+        max_seqlen_q=query_width,
+        metadata_capacity_rows=None,
+        k_scale=None,
+        v_scale=None,
+        override=None,
+        solution="flashinfer_prims",
+        sparse_metadata=metadata,
+    )
+    warmup_stream = torch.cuda.Stream()
+    capture_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        qsa_sparse_attention(q, k, v, slots, **kwargs)
+    capture_stream.wait_stream(warmup_stream)
+    graph = torch.cuda.CUDAGraph()
+    # Capture on another stream without repeating warmup there.
+    with capture_session(graph), torch.cuda.graph(graph, stream=capture_stream):
+        captured = qsa_sparse_attention(q, k, v, slots, **kwargs)
+    warmup_stream.wait_stream(capture_stream)
+    with torch.cuda.stream(warmup_stream):
+        q.mul_(0.5)
+        eager = qsa_sparse_attention(q, k, v, slots, **kwargs)
+    capture_stream.wait_stream(warmup_stream)
+    with torch.cuda.stream(capture_stream):
+        graph.replay()
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    expected = _reference(q, k, v, slots, 1 / 16)
+    torch.testing.assert_close(eager, expected, atol=4e-3, rtol=1e-2)
+    torch.testing.assert_close(captured, expected, atol=4e-3, rtol=1e-2)
+
+
+def test_prims_qsa_captures_many_layers_and_releases_cache_storage(device):
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("PrimTS QSA requires SM100 or SM103")
+    q, k, v, slots, metadata = _prims_case(
+        lengths=(1,),
+        prefixes=(17,),
+        kv_heads=1,
+        shared_candidates=True,
+        block_size=4,
+        device=device,
+    )
+    q = torch.randn((1, 8, 256), device=device, dtype=q.dtype)
+    layers = [(k * (1 + i / 100), v * ((i + 1) / 65)) for i in range(65)]
+    cache_ref = weakref.ref(layers[0][0])
+    kwargs = dict(
+        scale=1 / 16,
+        max_seqlen_q=1,
+        metadata_capacity_rows=None,
+        k_scale=None,
+        v_scale=None,
+        override=None,
+        solution="flashinfer_prims",
+        sparse_metadata=metadata,
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for keys, values in layers:
+            qsa_sparse_attention(q, keys, values, slots, **kwargs)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with capture_session(graph), torch.cuda.graph(graph, stream=stream):
+        outputs = [
+            qsa_sparse_attention(q, keys, values, slots, **kwargs)
+            for keys, values in layers
+        ]
+    # Pool rebinding releases eager caches; a live graph still owns its inputs.
+    metadata.workspace.clear()
+    graph.replay()
+    torch.cuda.synchronize()
+    for output, (keys, values) in zip(outputs, layers):
+        torch.testing.assert_close(
+            output, _reference(q, keys, values, slots, 1 / 16), atol=4e-3, rtol=1e-2
+        )
+    del layers
+    gc.collect()
+    assert cache_ref() is not None
+    del graph
+    gc.collect()
+    assert cache_ref() is None
+
+
+@pytest.mark.parametrize(
+    "missing_argument",
+    [
         "max_seqlen_q",
         "metadata_capacity_rows",
         "k_scale",
         "v_scale",
         "override",
         "solution",
-    ):
-        assert parameters[name].default is inspect.Parameter.empty
+        "sparse_metadata",
+    ],
+)
+def test_qsa_sparse_attention_requires_dispatch_arguments(
+    missing_argument: str,
+) -> None:
+    q = torch.empty((0, 6, 256), dtype=torch.bfloat16)
+    cache = torch.zeros((2, 1, 256), dtype=q.dtype)
+    slots = torch.empty((0, 2051), dtype=torch.int32)
+    kwargs = dict(
+        scale=1 / 16,
+        max_seqlen_q=None,
+        metadata_capacity_rows=None,
+        k_scale=None,
+        v_scale=None,
+        override=None,
+        solution=None,
+        sparse_metadata=None,
+    )
+    output = qsa_sparse_attention(q, cache, cache, slots, **kwargs)
+    torch.testing.assert_close(output, q)
+
+    del kwargs[missing_argument]
+    with pytest.raises(TypeError, match=missing_argument):
+        qsa_sparse_attention(q, cache, cache, slots, **kwargs)
 
 
 def test_qsa_sparse_attention_selects_fa2_fallback(
@@ -85,6 +1025,7 @@ def test_qsa_sparse_attention_selects_fa2_fallback(
         "batch_size": 1,
         "q_len": 1,
         "is_decode": True,
+        "has_sparse_metadata": False,
         "head_dim": 256,
         "value_head_dim": 256,
         "num_q_heads": 6,
@@ -140,6 +1081,7 @@ def test_qsa_sparse_attention_selects_cute_on_b200_and_b300(
         "batch_size": 1,
         "q_len": q_len,
         "is_decode": True,
+        "has_sparse_metadata": False,
         "head_dim": 256,
         "value_head_dim": 256,
         "num_q_heads": 6,
@@ -223,6 +1165,7 @@ def test_qsa_sparse_attention_routes_prefill_and_uniform_decode(
         v_scale=None,
         override=None,
         solution=None,
+        sparse_metadata=None,
     )
 
 
@@ -244,6 +1187,7 @@ def test_qsa_sparse_attention_validates_uniform_query_length(device: str) -> Non
             v_scale=None,
             override=None,
             solution=None,
+            sparse_metadata=None,
         )
     with pytest.raises(ValueError, match="divisible"):
         qsa_sparse_attention(
@@ -258,6 +1202,7 @@ def test_qsa_sparse_attention_validates_uniform_query_length(device: str) -> Non
             v_scale=None,
             override=None,
             solution=None,
+            sparse_metadata=None,
         )
 
 
@@ -290,12 +1235,13 @@ def test_qsa_sparse_attention_ignores_nan_in_padding_write_slot(
     rows, live_rows = 4 * query_width, 3 * query_width
     q = torch.randn(rows, 6, 256, device=device, dtype=torch.bfloat16)
     q[live_rows:].fill_(float("nan"))
-    k_cache = (torch.randn(512, 1, 256, device=device, dtype=torch.bfloat16) * 0.25).to(
-        cache_dtype
-    )
-    v_cache = (torch.randn(512, 1, 256, device=device, dtype=torch.bfloat16) * 0.25).to(
-        cache_dtype
-    )
+    # Cache size is a compile key; 4096 slots reuse the cluster tests' kernels.
+    k_cache = (
+        torch.randn(4096, 1, 256, device=device, dtype=torch.bfloat16) * 0.25
+    ).to(cache_dtype)
+    v_cache = (
+        torch.randn(4096, 1, 256, device=device, dtype=torch.bfloat16) * 0.25
+    ).to(cache_dtype)
     # The reserved page starts at zero. Padding writes may poison slot 0,
     # while slot 1 remains a finite read target for invalid sparse entries.
     k_cache[:64].zero_()
@@ -312,6 +1258,7 @@ def test_qsa_sparse_attention_ignores_nan_in_padding_write_slot(
         v_scale=1.0 if cache_dtype is torch.float8_e4m3fn else None,
         override=None,
         solution=solution,
+        sparse_metadata=None,
     )
     qsa_sparse_attention(q, k_cache, v_cache, selected, **kwargs)
     torch.cuda.synchronize()
@@ -337,6 +1284,69 @@ def test_qsa_sparse_attention_ignores_nan_in_padding_write_slot(
     for output in (eager, captured):
         torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-2)
         assert torch.count_nonzero(output[live_rows:]) == 0
+
+
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_qsa_sparse_attention_blackwell_writes_a_caller_output(
+    device: str, cache_dtype: torch.dtype
+) -> None:
+    platform = current_platform()
+    if not platform.is_nvidia or platform.arch_version not in (
+        ArchVersion(10, 0),
+        ArchVersion(10, 3),
+    ):
+        pytest.skip("CuTe DSL QSA requires SM100 or SM103")
+    from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+        cute_dsl_blackwell_qsa_sparse_attention,
+    )
+
+    torch.manual_seed(127)
+    rows = 3
+    q = torch.randn(rows, 6, 256, device=device, dtype=torch.bfloat16)
+    # Cache size is a compile key; 4096 slots reuse the cluster tests' kernels.
+    k_cache = (
+        torch.randn(4096, 1, 256, device=device, dtype=torch.bfloat16) * 0.25
+    ).to(cache_dtype)
+    v_cache = (
+        torch.randn(4096, 1, 256, device=device, dtype=torch.bfloat16) * 0.25
+    ).to(cache_dtype)
+    selected = torch.full((rows, 2051), -1, device=device, dtype=torch.int32)
+    selected[:, :19] = torch.arange(64, 83, device=device)
+    selected[:, -3] = 128
+    unit = 1.0 if cache_dtype is torch.float8_e4m3fn else None
+    kwargs = dict(
+        scale=1 / 16,
+        max_seqlen_q=1,
+        metadata_capacity_rows=None,
+        k_scale=unit,
+        v_scale=unit,
+    )
+
+    out = torch.full_like(q, float("nan"))
+    result = cute_dsl_blackwell_qsa_sparse_attention(
+        q, k_cache, v_cache, selected, **kwargs, out=out
+    )
+    assert result is out
+    torch.testing.assert_close(
+        out, _reference(q, k_cache, v_cache, selected, 1 / 16), atol=1e-3, rtol=1e-2
+    )
+    for wrong in (
+        q.new_empty((rows + 1, 6, 256)),
+        torch.empty_like(q, dtype=torch.float16),
+        q.new_empty((rows, 6, 512))[..., ::2],
+        torch.empty_like(q, device="cpu"),
+    ):
+        with pytest.raises(ValueError, match="contiguous tensor like the query"):
+            cute_dsl_blackwell_qsa_sparse_attention(
+                q, k_cache, v_cache, selected, **kwargs, out=wrong
+            )
+    empty = q.new_empty((0, 6, 256))
+    assert (
+        cute_dsl_blackwell_qsa_sparse_attention(
+            q[:0], k_cache, v_cache, selected[:0], **kwargs, out=empty
+        )
+        is empty
+    )
 
 
 @pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
@@ -436,6 +1446,7 @@ def test_qsa_sparse_attention_blackwell_cluster_matches_reference(
         v_scale=v_scale,
         override=None,
         solution=None,
+        sparse_metadata=None,
     )
 
     assert torch.isfinite(actual).all()
@@ -455,9 +1466,217 @@ def test_qsa_sparse_attention_blackwell_cluster_matches_reference(
     )
 
 
+@pytest.mark.parametrize("logit_gain", [1.0, 4.0])
+@pytest.mark.parametrize("rows", [24, 39, 64, 115, 129])
+@pytest.mark.parametrize(("q_heads", "kv_heads"), [(24, 2), (12, 1)])
+def test_qsa_sparse_attention_blackwell_fp8_decode_grids_match_reference(
+    device: str, rows: int, q_heads: int, kv_heads: int, logit_gain: float
+) -> None:
+    """FP8 decode grids large enough to pick their rows/CTA and KV splits by
+    wave count match the reference over full selections with holes and a
+    padded request."""
+    platform = current_platform()
+    if platform.arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip(
+            "cluster QSA sparse attention is specialized for NVIDIA SM100 or SM103"
+        )
+
+    torch.manual_seed(131 + rows)
+    cache_slots, head_dim, width = 8192, 256, 2051
+    # A larger query gain peaks the softmax, where one KV split merges the
+    # whole prefix in a single online-softmax pass.
+    q = (
+        torch.randn(rows, q_heads, head_dim, device=device, dtype=torch.bfloat16)
+        * logit_gain
+    )
+    k_cache = (
+        torch.randn(
+            cache_slots, kv_heads, head_dim, device=device, dtype=torch.bfloat16
+        )
+        * 0.25
+    ).to(torch.float8_e4m3fn)
+    v_cache = (
+        torch.randn(
+            cache_slots, kv_heads, head_dim, device=device, dtype=torch.bfloat16
+        )
+        * 0.25
+    ).to(torch.float8_e4m3fn)
+    slots = torch.full((rows, width), -1, dtype=torch.int32, device=device)
+    slots[:, :2049] = torch.randint(
+        1, cache_slots, (rows, 2049), dtype=torch.int32, device=device
+    )
+    slots[:, 5::11] = -1
+    slots[:, 9::17] = 0
+    slots[-1].fill_(-1)
+
+    scale, k_scale, v_scale = head_dim**-0.5, 0.5, 0.25
+    actual = qsa_sparse_attention(
+        q,
+        k_cache,
+        v_cache,
+        slots,
+        scale=scale,
+        # MTP verify rows where they divide; the odd grids stay single-query.
+        max_seqlen_q=4 if rows % 4 == 0 else 1,
+        metadata_capacity_rows=None,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        override=None,
+        solution=None,
+        sparse_metadata=None,
+    )
+
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual[-1]) == 0
+    torch.testing.assert_close(
+        actual.float(),
+        _reference(
+            q, k_cache, v_cache, slots, scale, k_scale=k_scale, v_scale=v_scale
+        ).float(),
+        rtol=3.5e-2,
+        atol=3.5e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("q_heads", "kv_heads", "launch", "copies"),
+    [
+        # Decode grids: each FP8 rows/CTA x KV-split choice of the wave
+        # policy, and the eight splits of a small grid.
+        (24, 2, (1, 1), 1),
+        (24, 2, (2, 1), 1),
+        (24, 2, (1, 2), 1),
+        (24, 2, (1, 4), 1),
+        (24, 2, (1, 8), 1),
+        (12, 1, (1, 1), 1),
+        # A prefill-sized grid under the production launch policy.
+        (24, 2, None, 16),
+    ],
+)
+def test_qsa_sparse_attention_blackwell_fp8_prefix_ends_at_last_valid_tile(
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
+    q_heads: int,
+    kv_heads: int,
+    launch: tuple[int, int] | None,
+    copies: int,
+) -> None:
+    """FP8 rows end their prefix loop after the last tile with a positive id.
+
+    Rows ending in tile 0, mid-row or on a 128-entry tile edge, with padding
+    interleaved before the last valid id, match the reference and, bitwise, a
+    twin row whose extra candidates in tiles 8-15 force the full loop in every
+    KV split. Those candidates score so low that their softmax weight is
+    exactly zero, so the twin computes the full loop's result. Twins alternate
+    between the second and first row of their pair, so CTAs holding two rows
+    see both loop-length orders. All-padding prefixes run one tile and keep
+    their tail-only or zero output.
+    """
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("cluster QSA sparse attention requires NVIDIA SM100 or SM103")
+    import tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse as sparse_module
+
+    if launch is not None:
+
+        def select_config(
+            num_rows: int,
+            head_tiles_per_row: int,
+            bf16_kv: bool,
+            sm_count: int,
+            wide_cluster_capacity: int,
+            *,
+            fp8_wave_sizing: bool,
+        ) -> tuple[int, int, int, bool]:
+            del num_rows, head_tiles_per_row, bf16_kv, sm_count, wide_cluster_capacity
+            del fp8_wave_sizing
+            return launch[0], launch[1], 1, False
+
+        monkeypatch.setattr(sparse_module, "_select_launch_config", select_config)
+
+    torch.manual_seed(229)
+    cache_slots, width, far_slot = 4096, 2051, 4095
+    # Valid prefix positions. The rows end at tile 0's first entry, tile 0's
+    # last entry, tile 1's first entry, mid-row, tile 7's last entry after
+    # seven all-padding tiles, after a dense prefix with holes, and at the end.
+    patterns = (
+        [0],
+        [5, 127],
+        [64, 128],
+        [1, 300, 640, 1000],
+        [1023],
+        [p for p in range(700) if p % 11 != 5 and p % 17 != 9],
+        [1024, 2047],
+    )
+    paired = 2 * len(patterns)
+    # Each pattern fills one row of a pair, which ends early. Its twin repeats
+    # it, query included, plus one far candidate per tile 8-15, which ends
+    # every split's loop in its last tile. The twin comes second in even pairs
+    # and first in odd ones, so a two-row CTA runs a short row before a full one
+    # and the reverse. The last two rows have all-padding prefixes, and only
+    # the first of them has tail candidates.
+    slots = torch.full(
+        (copies, paired + 2, width), -1, dtype=torch.int32, device=device
+    )
+    slots[..., 0:2048:3] = 0  # Both padding encodings, before and after ids.
+    slots[..., 2048:] = torch.randint(
+        64, far_slot, (copies, paired + 2, 3), dtype=torch.int32, device=device
+    )
+    for index, positions in enumerate(patterns):
+        row, twin = 2 * index + index % 2, 2 * index + 1 - index % 2
+        columns = torch.tensor(positions, device=device)
+        slots[:, row, columns] = torch.randint(
+            64, far_slot, (copies, columns.numel()), dtype=torch.int32, device=device
+        )
+        slots[:, twin] = slots[:, row]
+        slots[:, twin, 8 * 128 + 120 : 2048 : 128] = far_slot
+    slots[:, -1, 2048:] = -1
+    q = torch.randn(
+        copies, paired + 2, q_heads, 256, device=device, dtype=torch.bfloat16
+    )
+    q[:, 1:paired:2] = q[:, 0:paired:2]
+    q[..., 0] = 4.0
+    k_cache = (
+        torch.randn(cache_slots, kv_heads, 256, device=device, dtype=torch.bfloat16)
+        * 0.25
+    )
+    # Raw score -1792 for every query: after the 1/16 * 1.75 scale it is ~196
+    # below the row maximum, so its softmax weight underflows to zero.
+    k_cache[far_slot] = 0
+    k_cache[far_slot, :, 0] = -448
+    k_cache = k_cache.to(torch.float8_e4m3fn)
+    v_cache = (
+        torch.randn(cache_slots, kv_heads, 256, device=device, dtype=torch.bfloat16)
+        * 0.25
+    ).to(torch.float8_e4m3fn)
+
+    q, slots = q.flatten(0, 1), slots.flatten(0, 1)
+
+    output = qsa_sparse_attention(
+        q,
+        k_cache,
+        v_cache,
+        slots,
+        scale=1 / 16,
+        max_seqlen_q=1 if launch is None else 4,
+        metadata_capacity_rows=None,
+        k_scale=1.75,
+        v_scale=0.25,
+        override="cute_dsl_blackwell_qsa_sparse_attention",
+        solution=None,
+        sparse_metadata=None,
+    )
+
+    assert torch.isfinite(output).all()
+    expected = _reference(q, k_cache, v_cache, slots, 1 / 16, 1.75, 0.25)
+    torch.testing.assert_close(output, expected, rtol=0.02, atol=0.002)
+    output = output.view(copies, paired + 2, q_heads, 256)
+    assert torch.equal(output[:, 0:paired:2], output[:, 1:paired:2])
+    assert torch.count_nonzero(output[:, -1]) == 0
+
+
 @pytest.mark.parametrize(("q_heads", "kv_heads"), [(1, 1), (8, 1), (16, 2), (24, 8)])
 @pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
-def test_qsa_sparse_attention_blackwell_preserves_other_head_dispatch(
+def test_qsa_sparse_attention_blackwell_preserves_other_decode_head_dispatch(
     q_heads: int,
     kv_heads: int,
     cache_dtype: torch.dtype,
@@ -477,6 +1696,8 @@ def test_qsa_sparse_attention_blackwell_preserves_other_head_dispatch(
         traits={
             "batch_size": 1,
             "q_len": 1,
+            "is_decode": True,
+            "has_sparse_metadata": False,
             "head_dim": 256,
             "value_head_dim": 256,
             "num_q_heads": q_heads,
@@ -558,6 +1779,7 @@ def test_qsa_sparse_attention_blackwell_cluster_supports_graph_replay(
         "metadata_capacity_rows": None,
         "override": "cute_dsl_blackwell_qsa_sparse_attention",
         "solution": None,
+        "sparse_metadata": None,
     }
 
     qsa_sparse_attention(q, k_cache, v_cache, selected, **kwargs)
@@ -648,7 +1870,8 @@ def test_qsa_sparse_attention_blackwell_long_context_tail_replay(
     if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
         pytest.skip("cluster QSA sparse attention requires NVIDIA SM100 or SM103")
     torch.manual_seed(83)
-    seq_len, page_size, num_pages = 65539, 256, 1024
+    # Cache size is a compile key; 4096 slots reuse the cluster tests' kernels.
+    seq_len, page_size, num_pages = 3839, 256, 15
     cache_slots = (num_pages + 1) * page_size
     q = torch.randn(rows, q_heads, 256, device=device, dtype=torch.bfloat16)
     k_cache = (
@@ -657,7 +1880,7 @@ def test_qsa_sparse_attention_blackwell_long_context_tail_replay(
     ).to(cache_dtype)
     v_cache = (torch.randn_like(k_cache, dtype=torch.bfloat16) * 0.25).to(cache_dtype)
     # Scatter 512 four-token groups and the three-token remainder over physical
-    # pages spanning the full 256K capacity, with page zero reserved.
+    # pages spanning the whole cache, with page zero reserved.
     pages = torch.randperm(num_pages, device=device, dtype=torch.int32) + 1
     slots = torch.empty((rows, 2051), device=device, dtype=torch.int32)
     offsets = torch.arange(4, device=device, dtype=torch.int32)
@@ -676,6 +1899,7 @@ def test_qsa_sparse_attention_blackwell_long_context_tail_replay(
         "v_scale": v_scale,
         "override": "cute_dsl_blackwell_qsa_sparse_attention",
         "solution": None,
+        "sparse_metadata": None,
     }
     # Make the tail dominate one head per KV group, forcing rescaling of the full-tile
     # partial rather than merely adding a negligible tail contribution.
@@ -733,6 +1957,9 @@ def test_qsa_sparse_attention_blackwell_long_context_tail_replay(
         (torch.float8_e4m3fn, 4, 1, 1, False),
         (torch.float8_e4m3fn, 8, 1, 1, False),
         (torch.float8_e4m3fn, 16, 1, 3, False),
+        (torch.float8_e4m3fn, 1, 1, 1, False),
+        (torch.float8_e4m3fn, 1, 2, 1, False),
+        (torch.float8_e4m3fn, 2, 1, 1, False),
         (torch.bfloat16, 1, 2, 3, True),
         (torch.bfloat16, 1, 4, 3, True),
         (torch.bfloat16, 2, 1, 3, True),
@@ -765,8 +1992,11 @@ def test_qsa_sparse_attention_blackwell_changed_kv_replay(
         bf16_kv: bool,
         sm_count: int,
         wide_cluster_capacity: int,
+        *,
+        fp8_wave_sizing: bool,
     ) -> tuple[int, int, int, bool]:
         del num_rows, head_tiles_per_row, bf16_kv, sm_count, wide_cluster_capacity
+        del fp8_wave_sizing
         return query_rows_per_cta, splits, bf16_smem_slots, bf16_async_ready
 
     monkeypatch.setattr(sparse_module, "_select_launch_config", select_config)
@@ -794,6 +2024,7 @@ def test_qsa_sparse_attention_blackwell_changed_kv_replay(
         "v_scale": 0.25,
         "override": "cute_dsl_blackwell_qsa_sparse_attention",
         "solution": None,
+        "sparse_metadata": None,
     }
     qsa_sparse_attention(q, k_cache, v_cache, selected, **kwargs)
     torch.cuda.synchronize()
@@ -864,8 +2095,11 @@ def test_qsa_sparse_attention_blackwell_large_kv_offsets(
         bf16_kv: bool,
         sm_count: int,
         wide_cluster_capacity: int,
+        *,
+        fp8_wave_sizing: bool,
     ) -> tuple[int, int, int, bool]:
         del num_rows, head_tiles_per_row, bf16_kv, sm_count, wide_cluster_capacity
+        del fp8_wave_sizing
         # Two BF16 buffers keep lookahead prefetch active at the large addresses.
         slots = 2 if cache_dtype is torch.bfloat16 else 3
         return 1, splits, slots, cache_dtype is torch.bfloat16
@@ -939,7 +2173,16 @@ def test_qsa_sparse_attention_blackwell_large_kv_offsets(
         (128, 4, True, 152, (1, 1, 3, True)),
         (416, 4, True, 152, (1, 1, 3, True)),
         (512, 1, True, 80, (1, 1, 3, True)),
-        (512, 1, False, 152, (1, 4, 1, False)),
+        # FP8 sizes rows/CTA and splits by wave-quantized per-CTA tile work.
+        (512, 1, False, 152, (1, 1, 1, False)),
+        (8, 1, False, 152, (1, 8, 1, False)),
+        (16, 2, False, 152, (1, 4, 1, False)),
+        (48, 1, False, 152, (1, 2, 1, False)),
+        (72, 2, False, 152, (1, 1, 1, False)),
+        (80, 2, False, 152, (1, 2, 1, False)),
+        (224, 2, False, 152, (1, 1, 1, False)),
+        (288, 2, False, 152, (1, 1, 1, False)),
+        (352, 2, False, 152, (1, 1, 1, False)),
     ],
 )
 def test_qsa_sparse_attention_blackwell_output_tiling(
@@ -953,7 +2196,46 @@ def test_qsa_sparse_attention_blackwell_output_tiling(
         pytest.skip("CTA tiling requires NVIDIA SM100 or SM103")
     from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import _select_launch_config
 
-    assert _select_launch_config(rows, head_tiles, bf16, sm_count, 7) == expected
+    assert (
+        _select_launch_config(rows, head_tiles, bf16, sm_count, 7, fp8_wave_sizing=True)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("sm107", "sm_count", "rows", "expected"),
+    [
+        # SM107 keeps tile8 below one tile per SM, and four KV splits.
+        (True, 212, 105, (8, 4, 1)),
+        (True, 212, 106, (16, 4, 1)),
+        # SM100/SM103 use tile16 at every size and size large grids by waves.
+        (False, 152, 8, (16, 4, 1)),
+        (False, 152, 72, (16, 1, 1)),
+        (False, 152, 288, (16, 1, 1)),
+    ],
+)
+def test_qsa_sparse_attention_blackwell_fp8_tile_and_grid_by_arch(
+    monkeypatch: pytest.MonkeyPatch,
+    sm107: bool,
+    sm_count: int,
+    rows: int,
+    expected: tuple[int, int, int],
+) -> None:
+    """24q/2kv FP8 decode picks its head tile, KV splits and rows/CTA per arch."""
+    if current_platform().arch_version not in (
+        ArchVersion(10, 0),
+        ArchVersion(10, 3),
+        ArchVersion(10, 7),
+    ):
+        pytest.skip("CTA tiling requires NVIDIA SM100, SM103 or SM107")
+    import tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse as sparse_module
+
+    # Stand in for the other architecture; the real selectors run unchanged.
+    monkeypatch.setattr(sparse_module, "_is_sm107", lambda device: sm107)
+    head_tile, _, kv_splits, query_rows_per_cta = sparse_module._configuration(
+        rows, 24, 2, 1, False, sm_count, torch.cuda.current_device()
+    )[:4]
+    assert (head_tile, kv_splits, query_rows_per_cta) == expected
 
 
 @pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
@@ -1020,6 +2302,7 @@ def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
         v_scale=v_scale,
         override=None,
         solution=None if is_prefill else "flashinfer",
+        sparse_metadata=None,
     )
     selected[:, :256] = torch.randint(
         1, cache_slots, (rows, 256), dtype=torch.int32, device=device
@@ -1038,6 +2321,7 @@ def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
         v_scale=v_scale,
         override=None,
         solution=None if is_prefill else "flashinfer",
+        sparse_metadata=None,
     )
 
     assert (
@@ -1170,6 +2454,7 @@ def test_qsa_sparse_attention_flashinfer_fa2_supports_graph_replay(
         "v_scale": v_scale,
         "override": None,
         "solution": "flashinfer",
+        "sparse_metadata": None,
     }
 
     qsa_sparse_attention(q, k_cache, v_cache, selected, **kwargs)

@@ -127,7 +127,8 @@ def _assert_unfused(calls, inputs, *, reduced: bool, pair=(None, None), post_eps
     assert (n_kw["x_scale"], n_kw["residual_scale"]) == pair
 
 
-@pytest.mark.parametrize("tokens", [1, 64])  # 64: --comm-fusion-max-num-tokens
+# 65: above --comm-fusion-max-num-tokens, which the fused op serves in row slices.
+@pytest.mark.parametrize("tokens", [1, 64, 65])
 def test_a_served_call_is_one_fused_launch(calls, tokens):
     calls.fused_result = ("out", "residual_out")
     out, (x, residual, post, norm) = _run(
@@ -145,19 +146,20 @@ def test_a_served_call_is_one_fused_launch(calls, tokens):
 @pytest.mark.parametrize(
     "pair", [(0.5, None), (None, 0.5)], ids=["x-scale-only", "residual-scale-only"]
 )
-@pytest.mark.parametrize("tokens", [1, 65])  # 65: above --comm-fusion-max-num-tokens
-def test_a_one_sided_pair_reaches_either_path(calls, pair, tokens):
+@pytest.mark.parametrize("served", [True, False])
+def test_a_one_sided_pair_reaches_either_path(calls, pair, served):
     """One multiplier alone is a valid call on both paths (the missing one is
-    1.0 in the fused wrapper and in rmsnorm): at T = 1 it goes to the fused
-    launch, and above the fusion limit to the unfused chain, unchanged."""
-    calls.fused_result = ("out", "residual_out") if tokens == 1 else ("never",)
-    out, inputs = _run(tokens=tokens, x_scale=pair[0], residual_scale=pair[1])
-    if tokens == 1:
+    1.0 in the fused wrapper and in rmsnorm): to the fused launch where it
+    serves the call, and unchanged to the unfused chain where it declines."""
+    calls.fused_result = ("out", "residual_out") if served else None
+    out, inputs = _run(tokens=1, x_scale=pair[0], residual_scale=pair[1])
+    if served:
         assert out == ("out", "residual_out")
         ((kind, _, kwargs),) = calls.log
         assert kind == "fused"
         assert (kwargs["x_scale"], kwargs["residual_scale"]) == pair
     else:
+        assert calls.log[0][0] == "fused"
         _assert_unfused(calls, inputs, reduced=True, pair=pair)
 
 
@@ -174,10 +176,9 @@ def test_without_the_launch_option_nothing_is_fused(calls, monkeypatch):
     _assert_unfused(calls, inputs, reduced=True)
 
 
-@pytest.mark.parametrize("tokens", [0, 65])
-def test_token_counts_outside_the_fusion_range_run_unfused(calls, tokens):
+def test_an_empty_call_runs_unfused(calls):
     calls.fused_result = ("never",)
-    _, inputs = _run(tokens=tokens)
+    _, inputs = _run(tokens=0)
     _assert_unfused(calls, inputs, reduced=True)
 
 
@@ -226,6 +227,54 @@ def test_sandwich_rmsnorm_is_the_two_triton_calls(calls):
     residual = torch.randn(4, HIDDEN).to(torch.bfloat16)
     post, norm = _norm(1e-6), _norm(1e-5)
     layernorm.sandwich_rmsnorm(x, residual, post, norm, x_scale=2.0, residual_scale=0.5)
+    _assert_unfused(
+        calls, (x, residual, post, norm), reduced=False, pair=(2.0, 0.5), post_eps=1e-6
+    )
+
+
+def _fp8_buffers(tokens=8):
+    return (
+        torch.empty(tokens, HIDDEN, dtype=torch.float8_e4m3fn),
+        torch.empty(tokens, 1, dtype=torch.float32),
+    )
+
+
+def test_token_fp8_out_reaches_the_fused_launch(calls):
+    """Per-token FP8 buffers go to the fused launch with the BF16 call's
+    arguments; nothing else runs."""
+    calls.fused_result = ("out", "residual_out")
+    buffers = _fp8_buffers()
+    out, _ = _run(x_scale=0.5, residual_scale=0.75, token_fp8_out=buffers)
+    assert out == ("out", "residual_out")
+    ((kind, _, kwargs),) = calls.log
+    assert kind == "fused"
+    assert kwargs.pop("token_fp8_out") is buffers
+    assert kwargs == dict(eps=1e-5, x_scale=0.5, residual_scale=0.75, max_token_num=64)
+
+
+@pytest.mark.parametrize("fusion", [True, False])
+def test_token_fp8_out_reaches_the_unfused_second_norm(calls, monkeypatch, fusion):
+    """A declined (or unfused) call writes the codes in the second Triton
+    norm, the one whose output they quantize; the first norm and the rest of
+    the chain keep the BF16 call's arguments."""
+    monkeypatch.setitem(global_server_args_dict, "enable_allreduce_fusion", fusion)
+    buffers = _fp8_buffers()
+    _, inputs = _run(x_scale=0.5, residual_scale=0.75, token_fp8_out=buffers)
+    if fusion:
+        assert calls.log[0][2]["token_fp8_out"] is buffers
+    assert calls.log[-1][4].pop("token_fp8_out") is buffers
+    _assert_unfused(calls, inputs, reduced=True, pair=(0.5, 0.75))
+
+
+def test_sandwich_rmsnorm_passes_token_fp8_out_to_the_second_norm(calls):
+    x = torch.randn(4, HIDDEN).to(torch.bfloat16)
+    residual = torch.randn(4, HIDDEN).to(torch.bfloat16)
+    post, norm = _norm(1e-6), _norm(1e-5)
+    buffers = _fp8_buffers(4)
+    layernorm.sandwich_rmsnorm(
+        x, residual, post, norm, x_scale=2.0, residual_scale=0.5, token_fp8_out=buffers
+    )
+    assert calls.log[-1][4].pop("token_fp8_out") is buffers
     _assert_unfused(
         calls, (x, residual, post, norm), reduced=False, pair=(2.0, 0.5), post_eps=1e-6
     )

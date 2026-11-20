@@ -68,6 +68,7 @@ from test.runtime.models.whisper_fixtures import (  # noqa: E402
     VOCAB,
     Request,
     WhisperRuntime,
+    admission_id_for,
     audio_features,
     build_whisper,
     cuda_kernels,
@@ -189,7 +190,7 @@ def test_extend_encodes_iff_the_slot_is_not_the_requests_own():
         return all(bool(torch.all(rows == 3.0)) for rows in cross.slot_state_rows(slot))
 
     runtime.extend([Request(2, 0, PROMPT, audio_a, rid="a")], [0])()
-    assert cross.owner_of(2) == "a"
+    assert cross.owner_of(2) == admission_id_for("a")
     own_rows = [rows.clone() for rows in cross.slot_state_rows(2)]
 
     # The owner's continuation does not run the encoder over its slot.
@@ -199,20 +200,20 @@ def test_extend_encodes_iff_the_slot_is_not_the_requests_own():
 
     # "a" finished; "b" lands in slot 2 with a prefix hit and encodes its own.
     runtime.extend([Request(2, 1, tokens, audio_b, rid="b")], [len(PROMPT)])()
-    assert cross.owner_of(2) == "b" and not scribbled(2)
+    assert cross.owner_of(2) == admission_id_for("b") and not scribbled(2)
     # "a" resumed by recompute into slot 2 encodes again: its own rows return.
     runtime.extend([Request(2, 0, tokens, audio_a, rid="a")], [len(PROMPT)])()
-    assert cross.owner_of(2) == "a"
+    assert cross.owner_of(2) == admission_id_for("a")
     for rows, expected in zip(cross.slot_state_rows(2), own_rows):
         torch.testing.assert_close(rows, expected, atol=1e-2, rtol=1e-2)
 
     # A snapshot restored into slot 6 claims it: the next extend skips the encoder.
     image = torch.empty((cross.slot_state_bytes(),), dtype=torch.uint8, pin_memory=True)
-    cross.export_slot_state(2, image, None, request_id="a")
+    cross.export_slot_state(2, image, None, admission_id=admission_id_for("a"))
     torch.cuda.synchronize()
-    cross.import_slot_state(6, image, None, request_id="a")
+    cross.import_slot_state(6, image, None, admission_id=admission_id_for("a"))
     torch.cuda.synchronize()
-    assert cross.owner_of(6) == "a"
+    assert cross.owner_of(6) == admission_id_for("a")
     scribble(6)
     runtime.extend([Request(6, 0, tokens, audio_a, rid="a")], [len(PROMPT)])()
     assert scribbled(6)
@@ -385,13 +386,17 @@ def test_every_request_reads_its_own_cross_kv_through_admit_decode_finish(seed):
             image = torch.empty(
                 (cross.slot_state_bytes(),), dtype=torch.uint8, pin_memory=True
             )
-            cross.export_slot_state(src, image, None, request_id=life.rid)
+            cross.export_slot_state(
+                src, image, None, admission_id=admission_id_for(life.rid)
+            )
             torch.cuda.synchronize()
             assert read_prepared_marker(image), "a running request owns its slot"
             for rows in cross.slot_state_rows(src):
                 rows.normal_()
-            cross.import_slot_state(dst, image, None, request_id=life.rid)
-            assert cross.owner_of(dst) == life.rid
+            cross.import_slot_state(
+                dst, image, None, admission_id=admission_id_for(life.rid)
+            )
+            assert cross.owner_of(dst) == admission_id_for(life.rid)
             life.slot = dst
             life.moves.append(f"snapshot({src}->{dst})")
             active[dst] = life

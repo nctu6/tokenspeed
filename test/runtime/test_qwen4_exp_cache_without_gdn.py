@@ -90,10 +90,10 @@ def _recipe(
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
         kv_cache_mxfp8=False,
-        prefix_granularity=256,
         kernel_page_size=64,
         context_len=1024,
         max_bs=2,
+        max_resident_requests=2,
         pd_disaggregation_enabled=False,
         speculative_num_steps=2 if speculative else 0,
         speculative_num_draft_tokens=width,
@@ -117,7 +117,10 @@ def _recipe(
             max_total_tokens=None,
             speculative_num_draft_tokens=width,
             speculative_eagle_topk=1,
+            speculative_draft_tree=False,
             enable_replay_ssm=True,
+            mamba_ssm_dtype="float32",
+            enable_qsa_prefill_bf16_scratch=False,
         ),
         model_config=model_config,
         attn_config=config,
@@ -269,14 +272,14 @@ def test_qwen4_state_layer_still_requires_linear_geometry() -> None:
 @pytest.mark.parametrize("has_gdn", [False, True])
 @pytest.mark.parametrize("ssm_dtype", ["float32", "bfloat16"])
 def test_qwen4_side_caches_preserve_kv_capacity(
-    speculative: bool, has_gdn: bool, ssm_dtype: str, monkeypatch
+    speculative: bool, has_gdn: bool, ssm_dtype: str
 ) -> None:
-    monkeypatch.setenv("TOKENSPEED_MAMBA_SSM_DTYPE", ssm_dtype)
     recipe = _recipe(
         layer_types=(FULL_ATTENTION, FULL_ATTENTION),
         speculative=speculative,
         width=1,
     )
+    recipe.server_args.mamba_ssm_dtype = ssm_dtype
     if has_gdn:
         layer_types = (LINEAR_ATTENTION, FULL_ATTENTION) * 2
         recipe.model_config.num_attention_layers = len(layer_types)

@@ -21,31 +21,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Online expert rebalancing: the slot move plan and the control-plane state machine.
+"""Online expert rebalancing's data-plane values: the slot move plan and specs.
 
-A rebalance is a sequence of *internal control ops* the scheduler completes
-through the same attention-DP same-round gate as the RL weight ops
-(``RequestHandler._rendezvous_replica_flush``), so every rank runs each step
-in the same round and the device call may block the control thread:
-
-1. ``EplbSnapshot``: read the route counters since the previous snapshot
-   (``DeviceHandle.snapshot_expert_load``), reduce them over the EP group when
-   each rank counted only its own tokens, and hand the logical load to the
-   controller. EP rank 0 derives the new placement in a spawned CPU worker
-   process (``compute_placement_maps``), so the Python greedy loop never
-   contends for this process's GIL with the forward thread.
-2. ``EplbCommit``, ``COMMIT_DELAY_FORWARDS`` forwards later: rank 0 waits for
-   its result, the map is broadcast over the EP group, and every rank plans
-   the same slot moves (``plan_slot_moves``) from the old and new rows.
-3. ``EplbApplyChunk(layer_ids)``, one per round: the weights move
-   (``DeviceHandle.apply_expert_placement``) and the layer's routing tables
-   switch in place after its slots landed.
-
-``ExpertRebalanceController`` owns the phase machine
-(IDLE -> COMPUTING -> APPLYING -> IDLE), the forward counter that triggers a
-snapshot, the background future and the chunk cursor. It is self-contained:
-no loop reference, no collective, no device access; ``engine/eplb_hooks.py``
-glues it to the request handler and the device handle.
+The control plane (``ts-control``'s ``eplb`` module) decides when a rebalance
+runs and derives the placement; the device moves the weights with the
+``SlotMoves`` it hands over and reports the ``ExpertRebalanceSpecs`` the
+control plane rebalances with.
 
 The move plan is a pure function of ``(old_row, new_row)`` and the rank
 topology, so it is identical on every rank: sends mirror receives by
@@ -68,84 +49,10 @@ from tokenspeed.runtime.moe.expert_location import load_balancedness, logical_co
 from tokenspeed.runtime.moe.placement_maps import compute_placement_maps
 
 __all__ = [
-    "COMMIT_DELAY_FORWARDS",
-    "EplbApplyChunk",
-    "EplbCommit",
-    "EplbSnapshot",
-    "ExpertRebalanceController",
     "ExpertRebalanceSpecs",
-    "PlacementComputeWorker",
-    "RebalancePhase",
     "SlotMoves",
-    "chunk_layer_ids",
-    "expected_balancedness",
     "plan_slot_moves",
 ]
-
-logger = logging.getLogger(__name__)
-
-# Forwards between the snapshot and the commit: the placement computation (a
-# Python greedy loop of a few seconds on EP rank 0) overlaps these forwards
-# instead of stalling the commit round. A slow computation is still waited
-# for at the commit (the reference engine's 200-step overlap).
-COMMIT_DELAY_FORWARDS = 200
-
-
-def _worker_ready() -> bool:
-    """Warm-up task: forces the compute worker to spawn and import at startup."""
-    return True
-
-
-class PlacementComputeWorker:
-    """One spawned CPU process that derives placements off the serving process.
-
-    A Python-bound thread would contend for the GIL with the forward thread
-    (eager launches, metadata refresh) for the seconds the greedy packing
-    takes; a spawned process does not, and it never inherits the CUDA
-    context. The worker is started here, at construction, so the first
-    rebalance does not pay the child's torch import inside the snapshot
-    round; inputs and results cross as small CPU tensors.
-    """
-
-    def __init__(self) -> None:
-        self._pool = ProcessPoolExecutor(
-            max_workers=1, mp_context=multiprocessing.get_context("spawn")
-        )
-        self._ready: Future = self._pool.submit(_worker_ready)
-
-    def submit(self, logical_count: torch.Tensor, **kwargs) -> Future:
-        """Schedule ``compute_placement_maps(logical_count, **kwargs)`` in the worker."""
-        if logical_count.device.type != "cpu":
-            raise ValueError("the placement worker takes host tensors only")
-        return self._pool.submit(compute_placement_maps, logical_count, **kwargs)
-
-    def wait_ready(self, timeout: float | None = None) -> None:
-        """Block until the worker process is up (tests and startup checks)."""
-        self._ready.result(timeout=timeout)
-
-    def shutdown(self) -> None:
-        self._pool.shutdown(wait=False, cancel_futures=True)
-
-
-# -------------------------------- internal op kinds ---------------------------------
-
-
-@dataclass(frozen=True)
-class EplbSnapshot:
-    """Read and reset the route counters; start the placement computation."""
-
-
-@dataclass(frozen=True)
-class EplbCommit:
-    """Agree on the new placement and plan every layer's slot moves."""
-
-
-@dataclass(frozen=True)
-class EplbApplyChunk:
-    """Move the weights of ``layer_ids`` and switch their routing tables."""
-
-    layer_ids: tuple[int, ...]
-
 
 # -------------------------------- the move plan -------------------------------------
 
@@ -325,47 +232,6 @@ def plan_slot_moves(
     )
 
 
-def chunk_layer_ids(num_layers: int, layers_per_chunk: int) -> list[tuple[int, ...]]:
-    """Split ``range(num_layers)`` into ``ceil(num_layers / layers_per_chunk)`` runs."""
-    if not 1 <= layers_per_chunk <= num_layers:
-        raise ValueError(
-            f"layers_per_chunk={layers_per_chunk} must be in [1, {num_layers}]"
-        )
-    return [
-        tuple(range(start, min(start + layers_per_chunk, num_layers)))
-        for start in range(0, num_layers, layers_per_chunk)
-    ]
-
-
-def expected_balancedness(
-    logical_count: torch.Tensor, physical_to_logical_map: torch.Tensor, ep_size: int
-) -> torch.Tensor:
-    """Per-layer balancedness a placement would reach for ``logical_count``.
-
-    Each expert's load is split evenly over its replicas, the static
-    assumption the EPLB algorithm balances under.
-    """
-    map_long = physical_to_logical_map.to(torch.int64)
-    replicas = torch.zeros_like(logical_count, dtype=torch.int64).scatter_add_(
-        1, map_long, torch.ones_like(map_long)
-    )
-    per_slot = logical_count.double().gather(1, map_long) / replicas.gather(
-        1, map_long
-    ).double().clamp_min(1)
-    return load_balancedness(per_slot, ep_size)
-
-
-# -------------------------------- the controller ------------------------------------
-
-
-class RebalancePhase(Enum):
-    IDLE = "idle"
-    # A snapshot op is queued or taken; the placement is being derived.
-    COMPUTING = "computing"
-    # The commit and chunk ops are queued; chunks complete one per round.
-    APPLYING = "applying"
-
-
 @dataclass(frozen=True)
 class ExpertRebalanceSpecs:
     """Plain values the control plane rebalances with (``DeviceSpecs`` carries them).
@@ -397,6 +263,109 @@ class ExpertRebalanceSpecs:
     @property
     def num_local_physical_experts(self) -> int:
         return self.num_physical_experts // self.ep_size
+
+
+# --- definitions restored from the pre-merge branch (D3-3) ---
+
+logger = logging.getLogger(__name__)
+
+
+# Forwards between the snapshot and the commit: the placement computation (a
+# Python greedy loop of a few seconds on EP rank 0) overlaps these forwards
+# instead of stalling the commit round. A slow computation is still waited
+# for at the commit (the reference engine's 200-step overlap).
+COMMIT_DELAY_FORWARDS = 200
+
+
+def _worker_ready() -> bool:
+    """Warm-up task: forces the compute worker to spawn and import at startup."""
+    return True
+
+
+class PlacementComputeWorker:
+    """One spawned CPU process that derives placements off the serving process.
+
+    A Python-bound thread would contend for the GIL with the forward thread
+    (eager launches, metadata refresh) for the seconds the greedy packing
+    takes; a spawned process does not, and it never inherits the CUDA
+    context. The worker is started here, at construction, so the first
+    rebalance does not pay the child's torch import inside the snapshot
+    round; inputs and results cross as small CPU tensors.
+    """
+
+    def __init__(self) -> None:
+        self._pool = ProcessPoolExecutor(
+            max_workers=1, mp_context=multiprocessing.get_context("spawn")
+        )
+        self._ready: Future = self._pool.submit(_worker_ready)
+
+    def submit(self, logical_count: torch.Tensor, **kwargs) -> Future:
+        """Schedule ``compute_placement_maps(logical_count, **kwargs)`` in the worker."""
+        if logical_count.device.type != "cpu":
+            raise ValueError("the placement worker takes host tensors only")
+        return self._pool.submit(compute_placement_maps, logical_count, **kwargs)
+
+    def wait_ready(self, timeout: float | None = None) -> None:
+        """Block until the worker process is up (tests and startup checks)."""
+        self._ready.result(timeout=timeout)
+
+    def shutdown(self) -> None:
+        self._pool.shutdown(wait=False, cancel_futures=True)
+
+
+@dataclass(frozen=True)
+class EplbSnapshot:
+    """Read and reset the route counters; start the placement computation."""
+
+
+@dataclass(frozen=True)
+class EplbCommit:
+    """Agree on the new placement and plan every layer's slot moves."""
+
+
+@dataclass(frozen=True)
+class EplbApplyChunk:
+    """Move the weights of ``layer_ids`` and switch their routing tables."""
+
+    layer_ids: tuple[int, ...]
+
+
+def chunk_layer_ids(num_layers: int, layers_per_chunk: int) -> list[tuple[int, ...]]:
+    """Split ``range(num_layers)`` into ``ceil(num_layers / layers_per_chunk)`` runs."""
+    if not 1 <= layers_per_chunk <= num_layers:
+        raise ValueError(
+            f"layers_per_chunk={layers_per_chunk} must be in [1, {num_layers}]"
+        )
+    return [
+        tuple(range(start, min(start + layers_per_chunk, num_layers)))
+        for start in range(0, num_layers, layers_per_chunk)
+    ]
+
+
+def expected_balancedness(
+    logical_count: torch.Tensor, physical_to_logical_map: torch.Tensor, ep_size: int
+) -> torch.Tensor:
+    """Per-layer balancedness a placement would reach for ``logical_count``.
+
+    Each expert's load is split evenly over its replicas, the static
+    assumption the EPLB algorithm balances under.
+    """
+    map_long = physical_to_logical_map.to(torch.int64)
+    replicas = torch.zeros_like(logical_count, dtype=torch.int64).scatter_add_(
+        1, map_long, torch.ones_like(map_long)
+    )
+    per_slot = logical_count.double().gather(1, map_long) / replicas.gather(
+        1, map_long
+    ).double().clamp_min(1)
+    return load_balancedness(per_slot, ep_size)
+
+
+class RebalancePhase(Enum):
+    IDLE = "idle"
+    # A snapshot op is queued or taken; the placement is being derived.
+    COMPUTING = "computing"
+    # The commit and chunk ops are queued; chunks complete one per round.
+    APPLYING = "applying"
 
 
 class ExpertRebalanceController:

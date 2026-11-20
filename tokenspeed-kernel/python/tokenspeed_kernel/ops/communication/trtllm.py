@@ -114,6 +114,10 @@ ensure_workspace_initialized = error_fn
 group_spans_nodes = error_fn
 allreduce_residual_attnres_combine = error_fn
 allreduce_lane_latent_norm = error_fn
+allreduce_mhc_post_norm = error_fn
+supports_allreduce_mhc_post_norm = error_fn
+allreduce_sconv = error_fn
+supports_allreduce_sconv = error_fn
 reducescatter_residual_rmsnorm = error_fn
 trtllm_allreduce_fusion = error_fn
 trtllm_create_ipc_workspace_for_all_reduce_fusion = error_fn
@@ -225,6 +229,54 @@ if current_platform().is_nvidia:
         )
         return workspace
 
+    def _try_create_plain_all_reduce(max_token_num: int, hidden_dim: int, group):
+        """Collectively build the BT plain all-reduce; None on every rank otherwise.
+
+        Votes on the local support probe before the collective creation and
+        on its result after it, as the mnnvl workspace does.
+        """
+        from tokenspeed_kernel.ops.communication.allreduce_fusion import (
+            all_reduce_supported,
+            create_all_reduce_workspace,
+        )
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        ok = torch.tensor(
+            [
+                int(
+                    all_reduce_supported(
+                        group=group,
+                        hidden_size=hidden_dim,
+                        max_num_tokens=max_token_num,
+                        dtype=torch.bfloat16,
+                    )
+                )
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
+        if ok.item() == 0:
+            return None
+        workspace = None
+        try:
+            workspace = create_all_reduce_workspace(
+                group=group, hidden_size=hidden_dim, max_num_tokens=max_token_num
+            )
+        except Exception as exc:  # noqa: BLE001 - voted on below
+            logger.warning(f"plain BT all-reduce creation failed: {exc!s}")
+        ok = torch.tensor(
+            [int(workspace is not None)], dtype=torch.int32, device=device
+        )
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
+        if ok.item() == 0:
+            return None
+        logger.info(
+            f"Plain BT all-reduce armed: world_size={group.size()!s} "
+            f"max_token_num={max_token_num!s} hidden_dim={hidden_dim!s}"
+        )
+        return workspace
+
     def _group_spans_nodes(group) -> bool:
         """True when the process group spans hosts.
 
@@ -274,6 +326,8 @@ if current_platform().is_nvidia:
             self.workspace_tensor = None
             self.ipc_handles = None
             self.mnnvl_workspace = None
+            # FlashInfer's BT kernels for large plain reductions, beside mnnvl.
+            self.plain_all_reduce = None
             self.world_size = None
             self.rank = None
             self.max_token_num = None
@@ -353,6 +407,11 @@ if current_platform().is_nvidia:
             self.mnnvl_workspace = _try_create_mnnvl_workspace(
                 rank, world_size, max_token_num, hidden_dim, group
             )
+            # Rank-agreed, and its rendezvous proved the group's multicast.
+            if self.mnnvl_workspace is not None:
+                self.plain_all_reduce = _try_create_plain_all_reduce(
+                    self.mnnvl_workspace.max_token_num, hidden_dim, group
+                )
 
             # With IPC skipped, mnnvl is the only workspace; if it failed to
             # arm there is nothing to fuse with -- stay uninitialized so
@@ -403,6 +462,7 @@ if current_platform().is_nvidia:
                     # symm_mem allocations are process-lifetime; dropping the
                     # reference is all we can (and need to) do here.
                     self.mnnvl_workspace = None
+                    self.plain_all_reduce = None
                     self.initialized = False
                     self.world_size = None
                     self.rank = None
@@ -675,9 +735,248 @@ if current_platform().is_nvidia:
         manager = _manager_for_group(group)
         return int(manager.hidden_dim) if manager.initialized else 0
 
+    def supports_allreduce_mhc_post_norm(
+        x: torch.Tensor, norm_weight: torch.Tensor, group: dist.ProcessGroup
+    ) -> bool:
+        """Admit an anticipated producer output and target norm storage for fusion.
+
+        x describes the output's final shape/dtype/device/layout. norm_weight
+        supplies the target norm's storage metadata and may be another norm
+        with the same layout. Neither tensor's values are read or retained.
+        HC residual/coefficient formats are a fixed producer contract,
+        validated at execution. The group's configuration and workspace must
+        remain fixed between admission and execution.
+        """
+        if (
+            not x.is_cuda
+            or x.dtype != torch.bfloat16
+            or norm_weight.dtype != torch.bfloat16
+            or not x.is_contiguous()
+            or norm_weight.device != x.device
+            or norm_weight.shape != (5120,)
+            or not norm_weight.is_contiguous()
+            or x.ndim != 2
+            or x.shape[1] != 5120
+            or not 0 < x.shape[0] <= MNNVL_TWOSHOT_MAX_TOKEN
+        ):
+            return False
+        manager = _manager_for_group(group)
+        ws = manager.mnnvl_workspace
+        if (
+            not manager.initialized
+            or manager.world_size not in _MNNVL_SUPPORTED_WORLD_SIZES
+            or manager.use_fp32_lamport
+            or ws is None
+            or not ws.supports(
+                x.shape[0],
+                x.shape[1],
+                x.dtype,
+                manager.world_size,
+                AllReduceFusionPattern.kAllReduce,
+                use_oneshot=ws.resolve_use_oneshot(x.shape[0], None, x.shape[1]),
+            )
+        ):
+            return False
+        return True
+
+    def allreduce_mhc_post_norm(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        pre: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        group: dist.ProcessGroup,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce x, update four residual streams, then collapse and RMS-normalize.
+
+        x is [T, H], residual is [T, 4, H], post/pre are FP32 [T, 4],
+        comb is FP32 [T, 4, 4], and weight is BF16 [H]. All tensors must be
+        contiguous and on the same CUDA device, with positive eps. Returns the
+        updated residual and normalized [T, H] input. The caller must select
+        this operation through supports_allreduce_mhc_post_norm before deferring
+        communication. Invalid inputs raise; this operation never declines.
+        Reuses the group's armed MNNVL workspace without allocating communication
+        storage and uses its ordinary one-shot/two-shot selection. Supports
+        groups of 2, 4, 8 or 16 ranks with H=5120 and up to the MNNVL token
+        limit, subject to workspace capacity; the four HC streams are
+        independent of the collective's rank count.
+        """
+        if (
+            x.ndim != 2
+            or not x.is_cuda
+            or not 0 < x.shape[0] <= MNNVL_TWOSHOT_MAX_TOKEN
+        ):
+            raise ValueError(
+                f"mHC fusion requires CUDA x [T,5120] with 0<T<={MNNVL_TWOSHOT_MAX_TOKEN}"
+            )
+        expected = (
+            ("x", x, (x.shape[0], 5120), torch.bfloat16),
+            ("residual", residual, (x.shape[0], 4, 5120), torch.bfloat16),
+            ("post", post, (x.shape[0], 4), torch.float32),
+            ("comb", comb, (x.shape[0], 4, 4), torch.float32),
+            ("pre", pre, (x.shape[0], 4), torch.float32),
+            ("weight", weight, (5120,), torch.bfloat16),
+        )
+        for name, tensor, shape, dtype in expected:
+            if (
+                tensor.shape != shape
+                or tensor.dtype != dtype
+                or tensor.device != x.device
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"mHC fusion requires {name} to be contiguous {dtype} "
+                    f"{shape} on {x.device}"
+                )
+        if not eps > 0:
+            raise ValueError("mHC fusion requires positive eps")
+        manager = _manager_for_group(group)
+        ws = manager.mnnvl_workspace
+        if ws is None:
+            raise RuntimeError("mHC fusion requires a prepared MNNVL workspace")
+        from tokenspeed_kernel.platform import pdl_enabled
+        from tokenspeed_kernel.thirdparty.cuda.trtllm import _load_trtllm_mhc_module
+
+        residual_out, norm_out = torch.empty_like(residual), torch.empty_like(x)
+        _mark_captured(manager, ws)
+        _load_trtllm_mhc_module().trtllm_mnnvl_mhc(
+            x,
+            residual,
+            post,
+            comb,
+            pre,
+            weight,
+            residual_out,
+            norm_out,
+            eps,
+            manager.rank,
+            ws.multicast_ptr,
+            ws.local_ptr,
+            ws.peer_ptrs,
+            ws.buffer_flags,
+            ws.buffer_size_bytes,
+            ws.resolve_use_oneshot(x.shape[0], None, x.shape[1]),
+            pdl_enabled(),
+        )
+        return residual_out, norm_out
+
+    def supports_allreduce_sconv(
+        x: torch.Tensor, weight: torch.Tensor, group: dist.ProcessGroup
+    ) -> bool:
+        """Admit an anticipated all-reduce input and the taps of a decode ring
+        convolution of its sum for ``allreduce_sconv``.
+
+        x describes the producer's ``[T, H]`` partial, weight the
+        convolution's ``[H, W]`` taps; no values are read or retained. The
+        group's workspace must stay fixed between admission and execution
+        and serve ``T`` rows in one shot.
+        """
+        if (
+            not x.is_cuda
+            or x.ndim != 2
+            or x.dtype not in (torch.bfloat16, torch.float16)
+            or not x.is_contiguous()
+            or not 0 < x.shape[0] <= MNNVL_TWOSHOT_MAX_TOKEN
+            or weight.ndim != 2
+            or weight.shape[0] != x.shape[1]
+            or weight.device != x.device
+        ):
+            return False
+        manager = _manager_for_group(group)
+        ws = manager.mnnvl_workspace
+        if (
+            not manager.initialized
+            or manager.world_size not in _MNNVL_SUPPORTED_WORLD_SIZES
+            or manager.use_fp32_lamport
+            or ws is None
+        ):
+            return False
+        use_oneshot = ws.resolve_use_oneshot(x.shape[0], None, x.shape[1])
+        return use_oneshot and ws.supports(
+            x.shape[0],
+            x.shape[1],
+            x.dtype,
+            manager.world_size,
+            AllReduceFusionPattern.kAllReduce,
+            use_oneshot=use_oneshot,
+        )
+
+    def allreduce_sconv(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        ring: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        seq_idx: torch.Tensor,
+        cache_indices: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        checkpoint: torch.Tensor,
+        *,
+        output_scale: float,
+        fp32_acc: bool,
+        group: dist.ProcessGroup,
+    ) -> torch.Tensor:
+        """All-reduce ``x`` and run ``inkling_ring_sconv``'s decode
+        convolution (static taps, residual, no activation, no live publish)
+        on the sum.
+
+        The all-reduce releases the convolution once it has waited for its
+        input, not at its end: the convolution reads only its taps, ring and
+        routing, all older than the all-reduce, before its own wait, so those
+        cold loads run under the reduction. The rows are the all-reduce
+        followed by the convolution, bit for bit.
+
+        Args:
+            x: This rank's contiguous ``[T, H]`` partial.
+            weight, ring, cu_seqlens, seq_idx, cache_indices,
+                has_initial_state, seq_lens, block_table, checkpoint: The
+                decode convolution's operands, as ``inkling_ring_sconv``
+                takes them (``checkpoint`` its ``ckpt_a``).
+            output_scale: Multiplier applied in FP32 after the residual.
+            fp32_acc: Sum the ranks as ``trtllm_workspace_allreduce`` does
+                with this flag.
+            group: A group admitted by ``supports_allreduce_sconv``.
+
+        Returns:
+            The ``[T, H]`` convolution of the all-reduced rows.
+        """
+        from tokenspeed_kernel.ops.conv import inkling_ring_sconv
+
+        summed = _workspace_allreduce(
+            x, group, fp32_acc=fp32_acc, out=None, trigger_completion_at_end=False
+        )
+        if summed is None:
+            raise RuntimeError(
+                "the all-reduce convolution needs its admitted workspace"
+            )
+        return inkling_ring_sconv(
+            summed,
+            weight,
+            ring,
+            cu_seqlens,
+            seq_idx,
+            cache_indices,
+            has_initial_state,
+            seq_lens,
+            block_table,
+            checkpoint,
+            None,
+            num_extends=0,
+            publish_live=False,
+            dynamic_weights=None,
+            output_scale=output_scale,
+            token_range=None,
+        )
+
     def trtllm_workspace_allreduce(
         input_tensor: torch.Tensor,
         group: dist.ProcessGroup,
+        *,
+        fp32_acc: bool,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Plain SUM all-reduce through the group's armed fusion workspace.
 
@@ -691,12 +990,44 @@ if current_platform().is_nvidia:
                 is treated as the hidden lane. A non-contiguous tensor is
                 served through a contiguous copy and is never mutated.
             group: process group to reduce over.
+            fp32_acc: Sum 16-bit partials in fp32. Every strategy then adds
+                ranks 0..n-1 left to right from rank 0's value and rounds
+                once (lamport sends -0.0 as +0.0), the rank-ordered fold;
+                these calls take mnnvl where it serves, and the IPC
+                two-shot, which keeps -0.0 sums, never.
+            out: Contiguous, 16-byte aligned destination of the input's
+                shape and dtype; None allocates one.
 
         Returns:
-            The reduced tensor (new allocation, same shape), or ``None`` when
+            The reduced tensor (``out`` or a new allocation), or ``None`` when
             no workspace is armed for *group* or the shape is not served --
             the caller keeps its own (NCCL) fallback.
+
+        Raises:
+            ValueError: ``out`` is not contiguous with the input's shape and
+                dtype, or a payload the BT kernels serve is not 16-byte
+                aligned (every rank routes alike, so this is never a split).
         """
+        return _workspace_allreduce(
+            input_tensor,
+            group,
+            fp32_acc=fp32_acc,
+            out=out,
+            trigger_completion_at_end=True,
+        )
+
+    def _workspace_allreduce(
+        input_tensor: torch.Tensor,
+        group: dist.ProcessGroup,
+        *,
+        fp32_acc: bool,
+        out: torch.Tensor | None,
+        trigger_completion_at_end: bool,
+    ) -> torch.Tensor | None:
+        """``trtllm_workspace_allreduce`` at a chosen release point: without
+        ``trigger_completion_at_end`` its PDL dependents launch once it has
+        waited for its input, so they must read only data older than it
+        before their own wait."""
         if input_tensor.ndim == 0 or input_tensor.numel() == 0:
             return None
         if not input_tensor.is_cuda:
@@ -734,27 +1065,68 @@ if current_platform().is_nvidia:
             resolved_oneshot = manager.mnnvl_workspace.resolve_use_oneshot(
                 token_num, None, hidden_dim
             )
-        workspace = _ar_fusion_workspace(
-            manager,
-            token_num,
-            hidden_dim,
-            tensor_2d.dtype,
-            AllReduceFusionPattern.kAllReduce,
-            resolved_oneshot,
-            ipc_oneshot=requested_oneshot,
-        )
+        mnnvl = manager.mnnvl_workspace
+        if (
+            fp32_acc
+            and mnnvl is not None
+            and mnnvl.supports(
+                token_num,
+                hidden_dim,
+                tensor_2d.dtype,
+                world_size,
+                AllReduceFusionPattern.kAllReduce,
+                use_oneshot=resolved_oneshot,
+            )
+        ):
+            # The IPC two-shot keeps -0.0 sums, so the fold stays on mnnvl.
+            workspace = _mark_captured(manager, mnnvl)
+        else:
+            workspace = _ar_fusion_workspace(
+                manager,
+                token_num,
+                hidden_dim,
+                tensor_2d.dtype,
+                AllReduceFusionPattern.kAllReduce,
+                resolved_oneshot,
+                ipc_oneshot=requested_oneshot,
+            )
         if workspace is None:
             return None
         # IPC has its own heuristic; only MNNVL uses the workspace's frozen cap.
         if workspace is not manager.mnnvl_workspace:
             resolved_oneshot = requested_oneshot
-            # The IPC two-shot kernel asserts token_num > world_size.
-            if not resolved_oneshot and token_num <= world_size:
+            # IPC two-shot needs token_num > world_size and keeps -0.0 sums.
+            if not resolved_oneshot and (token_num <= world_size or fp32_acc):
                 return None
         if not tensor_2d.is_contiguous():
             tensor_2d = tensor_2d.contiguous()
 
-        allreduce_out = torch.empty_like(tensor_2d)
+        if out is None:
+            allreduce_out = torch.empty_like(tensor_2d)
+        elif (
+            out.shape != input_tensor.shape
+            or out.dtype != input_tensor.dtype
+            or not out.is_contiguous()
+        ):
+            raise ValueError("out must be contiguous with the input's shape and dtype")
+        else:
+            allreduce_out = out.view(tensor_2d.shape)
+        plain = manager.plain_all_reduce
+        # Rank-agreed terms only; early-release callers keep the Lamport kernels.
+        if (
+            not fp32_acc
+            and trigger_completion_at_end
+            and plain is not None
+            and plain.serves(token_num, hidden_dim, tensor_2d.dtype)
+        ):
+            from tokenspeed_kernel.ops.communication.allreduce_fusion import (
+                all_reduce,
+            )
+
+            # Large payloads: owner reduction in rank order, fp32 accumulate.
+            _mark_captured(manager, None)
+            all_reduce(tensor_2d, plain, allreduce_out)
+            return allreduce_out.view(input_tensor.shape)
         trtllm_allreduce_fusion(
             allreduce_in=tensor_2d,
             world_size=world_size,
@@ -763,8 +1135,8 @@ if current_platform().is_nvidia:
             hidden_dim=hidden_dim,
             workspace_ptrs=workspace,
             use_oneshot=resolved_oneshot,
-            trigger_completion_at_end=True,
-            fp32_acc=False,
+            trigger_completion_at_end=trigger_completion_at_end,
+            fp32_acc=fp32_acc,
             pattern_code=AllReduceFusionPattern.kAllReduce,
             allreduce_out=allreduce_out,
         )
@@ -986,9 +1358,11 @@ if current_platform().is_nvidia:
         max_token_num: int = 2048,
         trigger_completion_at_end: bool = True,
         launch_with_pdl: bool | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        token_fp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+        norm_out_bf16: bool,
+    ) -> tuple[torch.Tensor | None, torch.Tensor] | None:
         """All-reduce a sublayer partial and run the pre/post norm boundary on
-        the sum in one MNNVL launch.
+        the sum in one MNNVL launch per slice of at most the workspace's rows.
 
         The result is the unfused chain's::
 
@@ -1001,7 +1375,7 @@ if current_platform().is_nvidia:
         (``ops/layernorm/triton.py``) with the same operations and BF16
         rounding points; only the order of the two sum-of-squares reductions
         differs. That order does not depend on the token count, the strategy
-        or the launch geometry.
+        or the launch geometry, so a row's result does not depend on its slice.
 
         Args:
             input_tensor: This rank's contiguous BF16 ``[T, H]`` partial.
@@ -1014,18 +1388,27 @@ if current_platform().is_nvidia:
             x_scale, residual_scale: Optional multipliers of the normalized sum
                 and the residual (a missing one is 1.0); each product is
                 rounded to BF16 before the add.
-            max_token_num: Token capacity to arm the group's workspace for.
+            max_token_num: Token capacity to arm the group's workspace for, and
+                the most rows one launch takes.
             trigger_completion_at_end: Release PDL dependents after the last
                 store (otherwise after the inputs are loaded).
             launch_with_pdl: Programmatic dependent launch; None follows
                 ``pdl_enabled()``.
+            token_fp8_out: Optional ``(codes, scales)`` buffers, contiguous FP8
+                E4M3 ``[T, H]`` and FP32 ``[T, 1]``: the launch also writes
+                ``norm_out`` quantized per token, the codes and scales
+                ``ops/quantization/triton.py``'s ``fp8_quantize_per_token``
+                gives for that BF16 ``norm_out`` (as ``rmsnorm``'s
+                ``token_fp8_out``).
+            norm_out_bf16: With ``token_fp8_out``, False skips the BF16
+                ``norm_out`` store (``norm_out`` is returned as None).
 
         Returns:
             ``(norm_out, residual_out)``, or None when no fused kernel serves
-            the call (one rank, a token count outside ``[1, max_token_num]``,
-            no MNNVL workspace for the group, or a shape its partition cannot
-            split). Nothing is launched then and the caller runs the unfused
-            chain; the answer depends only on state every rank shares.
+            the call (one rank, no tokens, no token capacity, no MNNVL workspace
+            for the group, or a shape its partition cannot split). Nothing is
+            launched then and the caller runs the unfused chain; the answer
+            depends only on state every rank shares.
 
         Raises:
             ValueError: the tensors or the scale pair do not form a valid call.
@@ -1051,8 +1434,28 @@ if current_platform().is_nvidia:
                     f"{tuple(tensor.shape)} on {tensor.device}"
                 )
         x_scale, residual_scale = _sandwich_scale_pair(x_scale, residual_scale)
+        if token_fp8_out is not None:
+            codes, scales = token_fp8_out
+            if (
+                codes.dtype != torch.float8_e4m3fn
+                or tuple(codes.shape) != (tokens, hidden)
+                or not codes.is_contiguous()
+                or codes.device != input_tensor.device
+                or scales.dtype != torch.float32
+                or scales.numel() != tokens
+                or not scales.is_contiguous()
+                or scales.device != input_tensor.device
+            ):
+                raise ValueError(
+                    "token_fp8_out takes contiguous FP8 E4M3 codes shaped "
+                    f"{(tokens, hidden)} and FP32 [{tokens}, 1] scales on "
+                    f"{input_tensor.device}, got {codes.dtype} "
+                    f"{tuple(codes.shape)} and {scales.dtype} {tuple(scales.shape)}"
+                )
+        elif not norm_out_bf16:
+            raise ValueError("norm_out_bf16=False needs token_fp8_out")
         world_size = group.size()
-        if world_size <= 1 or not 1 <= tokens <= max_token_num:
+        if world_size <= 1 or tokens < 1 or max_token_num < 1:
             return None
         if not ensure_workspace_initialized(
             rank=rank,
@@ -1066,35 +1469,58 @@ if current_platform().is_nvidia:
         mnnvl = manager.mnnvl_workspace
         if mnnvl is None:
             return None
-        use_oneshot = mnnvl.resolve_use_oneshot(tokens, None, hidden)
-        if not mnnvl.supports(
-            tokens,
-            hidden,
-            torch.bfloat16,
-            world_size,
-            AllReduceFusionPattern.kARSandwichResidualRMSNorm,
-            use_oneshot=use_oneshot,
+        step = min(max_token_num, mnnvl.max_token_num)
+        slices = [
+            (start, min(tokens, start + step)) for start in range(0, tokens, step)
+        ]
+        strategies = [
+            mnnvl.resolve_use_oneshot(stop - start, None, hidden)
+            for start, stop in slices
+        ]
+        if not all(
+            mnnvl.supports(
+                stop - start,
+                hidden,
+                torch.bfloat16,
+                world_size,
+                AllReduceFusionPattern.kARSandwichResidualRMSNorm,
+                use_oneshot=use_oneshot,
+            )
+            for (start, stop), use_oneshot in zip(slices, strategies)
         ):
             return None
         _mark_captured(manager, mnnvl)
-        norm_out = torch.empty_like(input_tensor)
+        norm_out = torch.empty_like(input_tensor) if norm_out_bf16 else None
         residual_out = torch.empty_like(residual)
-        trtllm_mnnvl_sandwich_norm_allreduce(
-            mnnvl,
-            input_tensor,
-            residual,
-            post_weight,
-            weight,
-            norm_out,
-            residual_out,
-            world_rank=rank,
-            use_oneshot=use_oneshot,
-            rms_eps=eps,
-            x_scale=x_scale,
-            residual_scale=residual_scale,
-            trigger_completion_at_end=trigger_completion_at_end,
-            launch_with_pdl=launch_with_pdl,
-        )
+        # Rows are independent: a call above the workspace launches per row slice.
+        for (start, stop), use_oneshot in zip(slices, strategies):
+            fp8_kwargs = (
+                {}
+                if token_fp8_out is None
+                else {
+                    "token_fp8_out": (
+                        token_fp8_out[0][start:stop],
+                        token_fp8_out[1][start:stop],
+                    )
+                }
+            )
+            trtllm_mnnvl_sandwich_norm_allreduce(
+                mnnvl,
+                input_tensor[start:stop],
+                residual[start:stop],
+                post_weight,
+                weight,
+                None if norm_out is None else norm_out[start:stop],
+                residual_out[start:stop],
+                world_rank=rank,
+                use_oneshot=use_oneshot,
+                rms_eps=eps,
+                x_scale=x_scale,
+                residual_scale=residual_scale,
+                trigger_completion_at_end=trigger_completion_at_end,
+                launch_with_pdl=launch_with_pdl,
+                **fp8_kwargs,
+            )
         return norm_out, residual_out
 
     def allreduce_residual_attnres_combine(
@@ -1537,7 +1963,7 @@ if current_platform().is_nvidia:
     # Their registry modes are separate from stateless/auto-dispatched ops.
 
     class TrtllmAllGatherState:
-        """Own BF16 AllGather IPC scratch for serialized auxiliary-stream calls."""
+        """Own BF16 AllGather peer scratch for serialized auxiliary-stream calls."""
 
         def __init__(self, group, max_rows, hidden, device, oneshot):
             from tokenspeed_kernel.thirdparty.cuda.trtllm import (
@@ -1545,9 +1971,9 @@ if current_platform().is_nvidia:
             )
 
             self.tp_size = group.size()
-            if self.tp_size not in (2, 4, 8, 16) or not 0 < max_rows <= 128:
+            if self.tp_size not in (2, 4, 8, 16) or max_rows <= 0:
                 raise ValueError(
-                    "TRT-LLM one-shot gather requires TP2/4/8/16 and 1..128 rows"
+                    "TRT-LLM one-shot gather requires TP2/4/8/16 and positive rows"
                 )
             if hidden <= 0 or hidden % 128:
                 raise ValueError(
@@ -1663,6 +2089,8 @@ if current_platform().is_nvidia:
                 <= torch.cuda.get_device_properties(device).multi_processor_count
             ):
                 raise ValueError("Fused gather requires a positive, SM-bounded grid")
+            if max_rows > 128:
+                raise ValueError("Fused gather quantization supports 1..128 rows")
             self.module = load_allgather_quant_module()
             self.num_blocks = num_blocks
             super().__init__(group, max_rows, hidden, device, True)
@@ -1733,11 +2161,11 @@ if current_platform().is_nvidia:
         return state.gather(inputs)
 
     class TrtllmReduceScatterState:
-        """Own IPC scratch shared by sequential layers, not by concurrent streams.
+        """Own peer scratch shared by sequential layers, not by concurrent streams.
 
         Args:
-            group: 2/4/8/16-rank process group on a CUDA-IPC-accessible topology.
-            max_rows: Prepared physical rows per rank, at most 128.
+            group: 2/4/8/16-rank group reachable through CUDA IPC or NVLink fabric.
+            max_rows: Prepared physical rows per rank.
             hidden: Output width, a positive multiple of eight BF16 elements.
             device: Current rank's CUDA device, already selected by the caller.
         """
@@ -1748,13 +2176,9 @@ if current_platform().is_nvidia:
             )
 
             self.tp_size = group.size()
-            if (
-                self.tp_size not in (2, 4, 8, 16)
-                or not 0 < max_rows <= 128
-                or hidden <= 0
-            ):
+            if self.tp_size not in (2, 4, 8, 16) or max_rows <= 0 or hidden <= 0:
                 raise ValueError(
-                    "Lamport TRT-LLM reduction requires TP2/4/8/16, positive width and 1..128 rows"
+                    "Lamport TRT-LLM reduction requires TP2/4/8/16, positive width and rows"
                 )
             if hidden % 8:
                 raise ValueError(

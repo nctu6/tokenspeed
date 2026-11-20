@@ -518,7 +518,14 @@ def prepare_dsv41_index_topk(
         + column[None, :],
         -1,
     )
-    page_table = request_tables[requests].contiguous()
+    if parameters.get("shared_table", False):
+        # Canonical prefill windows score one request: the runtime broadcasts
+        # that request's page table row over the window's queries.
+        if batch != 1:
+            raise _invalid("DSV4.1 shared_table requires a single request")
+        page_table = request_tables[:1].expand(tokens, -1)
+    else:
+        page_table = request_tables[requests].contiguous()
     visible = ((positions + 1) // ratio).to(torch.int32)
 
     candidate_blocks = None
@@ -541,6 +548,14 @@ def prepare_dsv41_index_topk(
     )
 
     def invoke() -> object:
+        from tokenspeed_kernel.ops.attention.dsv41 import new_index_metadata
+
+        # Shared tables are one prefill request (dense); others score paged.
+        metadata = (
+            new_index_metadata(page_table, visible, None, history_rows=(tokens,))
+            if parameters.get("shared_table", False)
+            else None
+        )
         return kernel(
             index_q,
             weights,
@@ -555,7 +570,7 @@ def prepare_dsv41_index_topk(
             _SCORE_CHUNK_SIZE,
             None,
             out,
-            index_metadata=None,
+            index_metadata=metadata,
         )
 
     return PreparedBenchmark(

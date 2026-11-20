@@ -99,6 +99,9 @@ BUILDERS = {"gemma3": _gemma3, "gemma4": _gemma4}
 
 def _graph(model):
     from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
 
     return PrefillGraph(
         model_runner=_ModelRunner(
@@ -111,6 +114,7 @@ def _graph(model):
         token_to_kv_pool=None,
         input_buffers=None,
         config=_executor_config(),
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
     )
 
 
@@ -168,7 +172,7 @@ def test_prefill_graph_decisions_for_gemma_are_unchanged(name):
     assert graph.inner_model is model.model
 
     ids = torch.tensor([0, 1, 5, 7, VOCAB - 1], dtype=torch.int64)
-    fed = graph._embed_tokens(ids)
+    fed = graph._compute_input_embeddings(ids, None, request_token_history=None)
     torch.testing.assert_close(fed, model.get_input_embeddings(ids), atol=0.0, rtol=0.0)
     hidden = model.model.embed_tokens.weight.shape[1]
     torch.testing.assert_close(

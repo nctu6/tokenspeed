@@ -38,8 +38,10 @@ def _stage(hidden, ids, weights, begin, count):
     sf = torch.empty(num_tokens, HIDDEN // 128, dtype=torch.int32, device="cuda")
     idx = torch.empty(num_tokens, TOP_K, dtype=torch.int64, device="cuda")
     out_weights = torch.empty(num_tokens, TOP_K, dtype=torch.float32, device="cuda")
+    # No shared-expert scale view, no live-request count (the arguments main
+    # added between the outputs and the expert range).
     stage_mxfp4_mega_moe_inputs(
-        hidden, weights, ids, x, sf, idx, out_weights, begin, count
+        hidden, weights, ids, x, sf, idx, out_weights, None, None, None, begin, count
     )
     return x, sf, idx, out_weights
 

@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from typing import Any
 from unittest.mock import patch
@@ -109,6 +109,74 @@ def assert_no_triton_compile(*kernels: Any) -> Iterator[None]:
             f"{kernel.fn.__name__} compiled {compile_calls.call_count} new "
             "specialization(s); a per-batch value is likely passed as tl.constexpr"
         )
+
+
+def assert_warmup_covers(
+    kernels: Iterable[Any],
+    warm: Callable[[], Any],
+    run: Callable[[Any], Any],
+    sweep: Iterable[Any],
+) -> None:
+    """Fail if ``run`` compiles any of ``kernels`` for a ``sweep`` value after
+    ``warm`` prepared them from empty JIT caches.
+
+    Clearing first keeps binaries an earlier test compiled from standing in
+    for the ones ``warm`` must prepare.
+    """
+    kernels = tuple(kernels)
+    for kernel in kernels:
+        kernel.device_caches.clear()
+    warm()
+    with assert_no_triton_compile(*kernels):
+        for value in sweep:
+            run(value)
+
+
+@contextmanager
+def assert_no_cute_compile() -> Iterator[None]:
+    """Fail if any CuTe DSL kernel is traced or compiled in the block.
+
+    ``cute.compile`` traces and compiles on every call, and calling a
+    ``@cute.jit`` function directly traces it on every call, so launches must
+    reuse the compiled functions their caller cached. Warm the caller's cache
+    before entering, then launch with shapes that vary the way serving does; a
+    trace means the cache keys on a per-batch value or the launch bypasses it.
+    """
+    from cutlass.base_dsl.dsl import BaseDSL
+
+    with patch.object(
+        BaseDSL, "generate_mlir", autospec=True, side_effect=BaseDSL.generate_mlir
+    ) as traces:
+        yield
+    # generate_mlir(dsl, funcBody, ...): the traced @cute.jit function.
+    kernels = sorted({call.args[1].__qualname__ for call in traces.call_args_list})
+    assert not kernels, (
+        f"traced CuTe DSL kernel(s) {', '.join(kernels)} {traces.call_count} "
+        "time(s); a per-batch value likely keys the compile cache"
+    )
+
+
+def move_pages_past_int32(
+    caches: tuple[torch.Tensor, ...], page_table: torch.Tensor
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """Copy paged caches to the far end of pools larger than 2**31 elements.
+
+    Every cache is ``[pages, ...]`` with the same page count. Each returned
+    pool places those pages after more than ``2**31`` elements of unwritten
+    pages, sized by the smallest page so it holds for every cache, and the
+    returned page table points at them, so every page base a kernel computes
+    exceeds the int32 range while only the used pages are written.
+    """
+    pages = caches[0].shape[0]
+    first = 2**31 // min(cache[0].numel() for cache in caches) + 1
+    pools = []
+    for cache in caches:
+        pool = torch.empty(
+            (first + pages, *cache.shape[1:]), dtype=cache.dtype, device=cache.device
+        )
+        pool[first:].copy_(cache)
+        pools.append(pool)
+    return tuple(pools), page_table + first
 
 
 def compiled_kernels(kernel: Any) -> list[Any]:

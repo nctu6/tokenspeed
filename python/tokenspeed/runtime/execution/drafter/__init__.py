@@ -48,7 +48,9 @@ __all__ = [
 ]
 
 #: Algorithms the in-tree resolution below serves.
-_IN_TREE_ALGORITHMS = frozenset({"EAGLE3", "MTP", "DFLASH", "DSPARK", "DUMMY"})
+_IN_TREE_ALGORITHMS = frozenset(
+    {"EAGLE3", "EAGLE4", "MTP", "DFLASH", "DSPARK", "DUMMY"}
+)
 
 
 @dataclass
@@ -209,6 +211,18 @@ def get_drafter_impl(
     Returns:
         The ``BaseDrafter`` subclass to instantiate (not an instance).
     """
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    if global_server_args_dict.get("enable_dsv41_adaptive_dspark", False):
+        from tokenspeed.runtime.models.deepseek_v41_dspark import (
+            DeepseekV41ForCausalLMDSpark,
+        )
+
+        if spec_algo != "DSPARK" or not isinstance(model, DeepseekV41ForCausalLMDSpark):
+            raise ValueError(
+                "adaptive V4.1 confidence verification requires the native V4.1 DSpark model"
+            )
+
     plugin = _PLUGIN_DRAFTERS.get(spec_algo)
     if plugin is not None:
         for model_cls, drafter_cls in plugin.scoped:
@@ -225,12 +239,14 @@ def get_drafter_impl(
     from tokenspeed.runtime.execution.drafter.dspark import DSpark
     from tokenspeed.runtime.execution.drafter.dummy import DummyDrafter
     from tokenspeed.runtime.execution.drafter.eagle import Eagle
+    from tokenspeed.runtime.execution.drafter.eagle_harness.drafter import Eagle4
     from tokenspeed.runtime.models.inkling_nextn import (
         InklingForConditionalGenerationNextN,
     )
 
     DRAFTER_MAPPING = {
         "EAGLE3": Eagle,
+        "EAGLE4": Eagle4,
         "MTP": Eagle,
         "DFLASH": DFlash,
         "DSPARK": DSpark,
@@ -248,6 +264,14 @@ def get_drafter_impl(
     # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
     # (2) Vanilla MTP (e.g. Inkling) with multi-layer weights stays on Mtp in mtp.py.
     if spec_algo == "DSPARK":
+        from tokenspeed.runtime.execution.drafter.inkling2 import Inkling2DSpark
+        from tokenspeed.runtime.models.inkling2_mtp import (
+            Inkling2ForConditionalGenerationMTP,
+        )
+
+        if isinstance(model, Inkling2ForConditionalGenerationMTP):
+            return Inkling2DSpark
+
         from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
             DeepseekV41DSpark,
         )

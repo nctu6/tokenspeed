@@ -27,7 +27,10 @@ from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     verify_chain_greedy as _verify_chain_greedy_cuda,
 )
-from tokenspeed_kernel.ops.sampling.triton import verify_tree
+from tokenspeed_kernel.ops.sampling.triton import (
+    verify_chain_target_sampled,
+    verify_tree,
+)
 from tokenspeed_kernel.registry import error_fn
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -47,7 +50,7 @@ if TYPE_CHECKING:
 
 def _verify_chain_greedy_torch(
     predicts: torch.Tensor,  # [bs * N] int32, in/out
-    accept_index: torch.Tensor,  # [bs, N] int32, in/out (-1-filled on entry)
+    accept_index: torch.Tensor,  # [bs, N] int32, out
     accept_token_num: torch.Tensor,  # [bs] int32, out
     candidates: torch.Tensor,  # [bs, N] int32
     target_predict: torch.Tensor,  # [bs, N] int64 (argmax output)
@@ -56,7 +59,7 @@ def _verify_chain_greedy_torch(
 ) -> None:
     """Pure-torch equivalent of tokenspeed_kernel.verify_chain_greedy.
 
-    Used on non-CUDA devices and when the CUDA kernel is unavailable.
+    Used on non-CUDA devices; CUDA/ROCm fallbacks share the fused verifier.
     """
 
     bs = batch_size
@@ -94,10 +97,11 @@ def _verify_chain_greedy(
     batch_size: int,
     num_draft_tokens: int,
 ) -> None:
-
     # Prefer the CUDA kernel when available AND the tensors are on CUDA.
     if _verify_chain_greedy_cuda is not error_fn and candidates.is_cuda:
-
+        # The CUDA kernel writes only accepted indices; other implementations
+        # write their complete output window, including the rejected suffix.
+        accept_index.fill_(-1)
         _verify_chain_greedy_cuda(
             predicts=predicts,
             accept_index=accept_index,
@@ -106,6 +110,26 @@ def _verify_chain_greedy(
             target_predict=target_predict,
             batch_size=batch_size,
             num_draft_tokens=num_draft_tokens,
+        )
+        return
+
+    if candidates.is_cuda:
+        if (
+            candidates.shape != (batch_size, num_draft_tokens)
+            or target_predict.shape != candidates.shape
+        ):
+            raise ValueError(
+                f"Greedy verification expects candidates and target_predict shapes "
+                f"{(batch_size, num_draft_tokens)}, got candidates "
+                f"{tuple(candidates.shape)} and target_predict {tuple(target_predict.shape)}"
+            )
+        verify_chain_target_sampled(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            target_sampled=target_predict,
+            write_rejected_targets=True,
         )
         return
 
@@ -120,11 +144,84 @@ def _verify_chain_greedy(
     )
 
 
+def verify_packed_chain_greedy(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_length: torch.Tensor,
+    candidates: torch.Tensor,
+    target_predict: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> None:
+    """Verify packed target predictions into ordinary fixed-width output buffers.
+
+    ``candidates`` and ``accept_index`` are [requests, proposal_width],
+    ``predicts`` is flat storage of the same size, and ``accept_length`` is
+    [requests]. ``target_predict`` contains packed argmax IDs (possibly with
+    trailing graph padding); ``query_start_loc`` is their [requests + 1] CSR.
+    Live intervals contain 1..proposal_width rows; an empty interval is an
+    inactive request. Returned lengths include the target bonus token.
+
+    Reuses the ordinary chain verifier. Only the small token-ID matrix is
+    expanded, never the logits or target activations. Acceptance is capped at
+    the number of computed query rows; a match at the last computed prediction
+    is emitted as the bonus and must not advance beyond its input KV row.
+    The caller retains ownership of TP output agreement and stop conditions.
+    """
+    if candidates.ndim != 2:
+        raise ValueError("packed greedy candidates must be a matrix")
+    bs, width = candidates.shape
+    if (
+        width < 1
+        or target_predict.ndim != 1
+        or query_start_loc.shape != (bs + 1,)
+        or query_start_loc.dtype not in (torch.int32, torch.int64)
+        or predicts.shape != (bs * width,)
+        or accept_index.shape != (bs, width)
+        or accept_length.shape != (bs,)
+    ):
+        raise ValueError("packed greedy verification buffers disagree")
+    tensors = (predicts, accept_index, accept_length, target_predict, query_start_loc)
+    if any(t.device != candidates.device for t in tensors):
+        raise ValueError("packed verification tensors must share a device")
+    lengths = query_start_loc.diff()
+    if not candidates.is_cuda and (
+        query_start_loc[0] != 0
+        or query_start_loc[-1] > target_predict.numel()
+        or (lengths < 0).any()
+        or (lengths > width).any()
+    ):
+        raise ValueError("packed target intervals must fit proposal storage")
+    if bs == 0 or target_predict.numel() == 0:
+        predicts.zero_()
+        accept_index.fill_(-1)
+        accept_length.zero_()
+        return
+    columns = torch.arange(width, device=candidates.device)[None, :]
+    rows = query_start_loc[:-1, None].to(torch.int64) + columns
+    expanded = target_predict[rows.clamp(0, target_predict.numel() - 1)]
+    expanded = torch.where(columns < lengths[:, None], expanded, -1)
+    _verify_chain_greedy(
+        predicts,
+        accept_index,
+        accept_length,
+        candidates,
+        expanded,
+        bs,
+        width,
+    )
+    accept_length.copy_(torch.minimum(accept_length + 1, lengths))
+    accept_index.masked_fill_(columns >= accept_length[:, None], -1)
+    # The OOV guard audits the whole fixed output window, including unused
+    # columns. Keep those IDs valid; acceptance indices still mark them absent.
+    predicts.view(bs, width).masked_fill_(columns >= lengths[:, None], 0)
+
+
 class GreedySamplingBackend(SamplingBackend):
     """Greedy-only backend: argmax for single-step, chain-greedy verify for
     multi-step verification. No flashinfer / min_p / penalty machinery, no
     coin buffers. Verify uses the fused CUDA kernel when available; falls
-    back to a pure-torch implementation otherwise (CPU, ROCm, etc.).
+    back to the shared Triton target-token verifier on CUDA/ROCm and a
+    pure-torch implementation on other devices.
 
     sampling_info is ignored for single-step (always argmax). verify() also
     treats every request as greedy — stochastic verification is not
@@ -132,10 +229,10 @@ class GreedySamplingBackend(SamplingBackend):
     flashinfer is unavailable."""
 
     _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
+    _SUPPORTS_OUTPUT_CUMULATIVE_PROBS = True
     supports_tree_verify = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
-
         super().__init__(config)
 
         self._ones_buf = torch.ones(
@@ -159,7 +256,6 @@ class GreedySamplingBackend(SamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
         logits = logits_output.next_token_logits
         # Grammar bitmask apply — captured inside the CUDA graph. Buffer is
         # pre-bound by bind_grammar_mask_buf; non-grammar rows stay all-ones
@@ -195,16 +291,22 @@ class GreedySamplingBackend(SamplingBackend):
         candidates: torch.Tensor,
         *,
         tree: TreeVerifyBatch | None,
+        query_start_loc: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
+        if query_start_loc is not None and (
+            tree is not None
+            or sampling_info.vocab_mask is not None
+            or self.config.synthetic_acceptance_length is not None
+            or self.config.enable_output_logprobs
+            or self.config.enable_output_cumulative_probs
+        ):
+            raise ValueError("packed greedy verification requires plain chain sampling")
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
 
         predict = self._predict_buf[: bs * num_tokens_per_req]
-        accept_index = (
-            self._accept_index_buf[: bs * num_tokens_per_req]
-            .view(bs, num_tokens_per_req)
-            .fill_(-1)
+        accept_index = self._accept_index_buf[: bs * num_tokens_per_req].view(
+            bs, num_tokens_per_req
         )
         accept_length = self._accept_length_buf[:bs]
 
@@ -221,9 +323,20 @@ class GreedySamplingBackend(SamplingBackend):
             logits_output.next_token_ids
             if logits_output.next_token_ids is not None
             else sampling_argmax(logits)
-        ).reshape(bs, num_tokens_per_req)
+        )
+        if query_start_loc is None:
+            target_predict = target_predict.reshape(bs, num_tokens_per_req)
 
-        if tree is not None:
+        if query_start_loc is not None:
+            verify_packed_chain_greedy(
+                predict,
+                accept_index,
+                accept_length,
+                candidates.to(torch.int32),
+                target_predict,
+                query_start_loc,
+            )
+        elif tree is not None:
             # The accepted path rides in accept_index so the TP broadcast below carries it.
             verify_tree(
                 predict,
@@ -245,16 +358,11 @@ class GreedySamplingBackend(SamplingBackend):
             )
             # Retain normal verification cost before forcing benchmark acceptance.
             if self.config.synthetic_acceptance_length is not None:
-                lengths = self.synthetic_lengths(
-                    candidates, sampling_info.batch_row_offset
-                )
-                target_tokens = target_predict.gather(
-                    1, (lengths - 1).long()[:, None]
-                ).squeeze(1)
+                row_offset = sampling_info.batch_row_offset
                 self.write_synthetic_outputs(
                     candidates,
-                    target_tokens,
-                    lengths,
+                    target_predict,
+                    self._synthetic_lengths[row_offset : row_offset + bs],
                     predict,
                     accept_index,
                     accept_length,

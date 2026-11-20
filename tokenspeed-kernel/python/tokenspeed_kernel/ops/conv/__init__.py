@@ -23,7 +23,7 @@
 :func:`causal_conv1d_fn` (prefill) and :func:`causal_conv1d_update` (decode,
 chain verify and draft trees) select the depthwise causal conv in front of
 the Mamba / GDN recurrences, over a slot-indexed conv-window pool; the
-selected leaves are registered in ``conv/triton.py``.
+selected leaves are registered in ``conv/triton.py`` and ``conv/cute_dsl.py``.
 
 :func:`dflash2_grouped_conv` is independent of everything below it: a
 block-local grouped depthwise convolution for DFlash2's draft layers, with no
@@ -46,21 +46,36 @@ speculative rows are overwritten when their positions recur.
 The ring may be a channel-sliced view of a wider buffer
 (``ring[:, :, off:off + D]``): all kernels receive explicit strides, so only
 ``conv_cache.stride(-1) == 1`` is required.
+
+A target verify's decode kernel publishes nothing: the window to keep ends
+at the accepted frontier, known only after acceptance.
+:func:`inkling_ring_commit` then publishes it from the ring for every
+layer's streams at once, through the tables :func:`inkling_commit_tables`
+builds once.
 """
 
 from __future__ import annotations
+
+import math
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 import torch
 
 # Aliased because importing the conv.triton and conv._triton submodules below
 # rebinds the names ``triton`` and ``_triton`` in this package.
+from tokenspeed_kernel._triton import tl as _tl
 from tokenspeed_kernel._triton import triton as _triton_lang
 from tokenspeed_kernel.ops.attention.gdn.triton import CausalConv1dPrefillMetadata
+from tokenspeed_kernel.ops.conv import cute_dsl as _cute_dsl_solutions  # noqa: F401
 from tokenspeed_kernel.ops.conv.triton import (
     PAD_SLOT_ID,
+    PREFILL_QKV_CHANNEL_MULTIPLE,
+    _inkling_ring_commit_kernel,
     _inkling_ring_sconv_decode_kernel,
     _inkling_ring_sconv_prefill_kernel,
     dflash2_grouped_conv,
+    select_decode_config,
     select_prefill_config,
 )
 from tokenspeed_kernel.platform import pdl_enabled
@@ -69,9 +84,14 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "PAD_SLOT_ID",
+    "PREFILL_QKV_CHANNEL_MULTIPLE",
+    "InklingCommitTable",
     "causal_conv1d_fn",
+    "causal_conv1d_qkv_fn",
     "causal_conv1d_update",
     "dflash2_grouped_conv",
+    "inkling_commit_tables",
+    "inkling_ring_commit",
     "inkling_ring_sconv",
     "seq_idx_from_cu_seqlens",
 ]
@@ -117,6 +137,9 @@ def inkling_ring_sconv(
     *,
     num_extends: int,
     publish_live: bool,
+    dynamic_weights: torch.Tensor | None,
+    output_scale: float,
+    token_range: tuple[int, int] | None,
     activation: str | None = None,
     use_residual: bool = True,
 ) -> torch.Tensor:
@@ -142,9 +165,13 @@ def inkling_ring_sconv(
 
     Args:
         x: Varlen-packed input ``[T, D]`` (e.g. bf16). May be a strided
-            slice of a wider buffer.
+            slice of a wider buffer. A ``[T, S, D]`` input holds ``S`` slot
+            rows per token (MoE route rows): they add in FP32 slot order
+            from +0.0 and round once, and the sum is the input everywhere,
+            the ring included.
         weight: Per-channel FIR taps ``[D, W]``; tap ``W - 1`` multiplies
             the current token.
+            With ``dynamic_weights``, tap 0 multiplies the current token instead.
         conv_cache: Conv state ring ``[num_slots, R, D]`` with
             ``stride(-1) == 1`` and ``R >= W``. May be a channel-sliced
             view of a wider buffer. Updated in place.
@@ -166,14 +193,98 @@ def inkling_ring_sconv(
         num_extends: Extend requests in the batch; 0 selects the decode
             kernel, anything else the prefill kernel.
         publish_live: Write each request's chunk-end window to its live slot.
+        dynamic_weights: Optional floating ``[T, heads, W]`` coefficients,
+            ``heads`` dividing ``D``, rounded to ``x``'s dtype as they load (an
+            FP32 projection needs no separate cast). With these coefficients,
+            weight tap zero denotes the current token and each coefficient
+            adds to the static taps of its head's ``D / heads`` channels in FP32.
+            Without them, static taps retain oldest-to-current order.
+        output_scale: Finite multiplier applied in FP32 after the residual,
+            before the output dtype store. The ring always stores raw inputs.
         activation: Optional activation before the residual: ``None``,
             ``"silu"`` or ``"swish"``.
         use_residual: Add the residual connection ``y = x + conv(...)``.
+        token_range: Prefill only: ``(first, count)`` to compute only those
+            output rows, as a sequence-parallel rank does with its share; the
+            ring and checkpoint writes still cover every request. Rows of
+            ``x`` must then hold real values from ``first - (W - 1)`` through
+            the range and in each request's last ``R`` rows; other output rows
+            are unspecified. None computes every row.
     Returns:
         Output tensor ``[T, D]`` with the same dtype as ``x``.
     """
-    T, D = x.shape
+    return _ring_sconv(
+        x,
+        weight,
+        conv_cache,
+        cu_seqlens,
+        seq_idx,
+        cache_indices,
+        has_initial_state,
+        seq_lens,
+        block_table,
+        ckpt_a,
+        ckpt_b,
+        num_extends=num_extends,
+        publish_live=publish_live,
+        dynamic_weights=dynamic_weights,
+        output_scale=output_scale,
+        activation=activation,
+        use_residual=use_residual,
+        mailbox=False,
+        token_range=token_range,
+    )
+
+
+def _ring_sconv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    conv_cache: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seq_idx: torch.Tensor,
+    cache_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    ckpt_a: torch.Tensor,
+    ckpt_b: torch.Tensor | None,
+    *,
+    num_extends: int,
+    publish_live: bool,
+    dynamic_weights: torch.Tensor | None,
+    output_scale: float,
+    activation: str | None,
+    use_residual: bool,
+    mailbox: bool,
+    token_range: tuple[int, int] | None,
+) -> torch.Tensor:
+    if x.ndim == 3:
+        T, slots, D = x.shape
+        stride_x_s = x.stride(1)
+    elif x.ndim == 2:
+        (T, D), slots, stride_x_s = x.shape, 1, 0
+    else:
+        raise ValueError("sconv input must be [T, D] rows or [T, S, D] slot rows")
     W = weight.shape[1]
+    if not math.isfinite(output_scale):
+        raise ValueError("sconv needs a finite output scale")
+    # Static kernels never read HEAD_DIM: one value keeps one compilation.
+    head_dim = 1
+    if dynamic_weights is not None:
+        heads = dynamic_weights.shape[1] if dynamic_weights.ndim == 3 else 0
+        if (
+            dynamic_weights.shape != (T, heads, W)
+            or heads == 0
+            or D % heads
+            or dynamic_weights.device != x.device
+            or dynamic_weights.dtype
+            not in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            raise ValueError(
+                "dynamic sconv coefficients must be colocated floating [T, heads, W] "
+                "with heads dividing D"
+            )
+        head_dim = D // heads
     R = conv_cache.shape[1]
     assert R >= W, f"conv ring holds {R} rows per slot, needs at least W={W}"
     assert conv_cache.stride(-1) == 1, "conv_cache must be D-contiguous"
@@ -181,7 +292,7 @@ def inkling_ring_sconv(
         block_table.dim() == 2 and block_table.shape[1] >= 2
     ), "the conv group's block table holds an input and a live slot per request"
 
-    y = torch.empty_like(x)
+    y = x.new_empty((T, D))
     if T == 0:
         return y
 
@@ -209,8 +320,31 @@ def inkling_ring_sconv(
 
     enable_pdl = pdl_enabled()
     use_silu = activation in ("silu", "swish")
-    block_t, block_d, num_warps, num_stages = select_prefill_config(T, D)
-    grid = (_triton_lang.cdiv(T, block_t), _triton_lang.cdiv(D, block_d))
+    block_t, block_d, num_warps, num_stages = (
+        select_prefill_config(T, D)
+        if num_extends > 0
+        else select_decode_config(T, D, dynamic_weights is not None)
+    )
+    if mailbox:
+        # One program holds every token of its channels, so it alone reads
+        # (and re-arms) their mailbox slots.
+        assert num_extends == 0 and dynamic_weights is None and not publish_live
+        block_t = _triton_lang.next_power_of_2(T)
+    t_tiles = _triton_lang.cdiv(T, block_t)
+    tile_lo, n_tiles, n_tail_programs = 0, t_tiles, 0
+    if token_range is not None:
+        first, count = token_range
+        if num_extends == 0 or not 0 <= first <= first + count <= T:
+            raise ValueError("an sconv token range takes prefill rows within the batch")
+        tile_lo = first // block_t
+        n_tiles = _triton_lang.cdiv(first + count, block_t) - tile_lo
+        # Each request's last R rows span at most this many tiles.
+        n_tail_programs = cache_indices.shape[0] * (_triton_lang.cdiv(R, block_t) + 1)
+    # Prefill adds one program row per request for its checkpoint edge.
+    grid = (
+        n_tiles + n_tail_programs + (cache_indices.shape[0] if num_extends > 0 else 0),
+        _triton_lang.cdiv(D, block_d),
+    )
     kernel[grid](
         x,
         weight,
@@ -224,8 +358,12 @@ def inkling_ring_sconv(
         block_table,
         ckpt_a,
         ckpt_b,
+        dynamic_weights,
+        *(dynamic_weights.stride() if dynamic_weights is not None else (0, 0, 0)),
+        output_scale,
         x.stride(0),
-        x.stride(1),
+        stride_x_s,
+        x.stride(-1),
         y.stride(0),
         y.stride(1),
         weight.stride(0),
@@ -252,12 +390,268 @@ def inkling_ring_sconv(
         BLOCK_T=block_t,
         BLOCK_D=block_d,
         W=W,
+        HAS_DYNAMIC=dynamic_weights is not None,
+        HEAD_DIM=head_dim,
+        SLOTS=slots,
+        **(
+            {
+                "tile_lo": tile_lo,
+                "n_tiles": n_tiles,
+                "n_tail_programs": n_tail_programs,
+            }
+            if num_extends > 0
+            else {"MAILBOX": mailbox}
+        ),
         W_POW2=_triton_lang.next_power_of_2(W),
         num_warps=num_warps,
         num_stages=num_stages,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
     return y
+
+
+def inkling_ring_sconv_mailbox(
+    slots: torch.Tensor,
+    tokens: int,
+    weight: torch.Tensor,
+    conv_cache: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seq_idx: torch.Tensor,
+    cache_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    ckpt_a: torch.Tensor,
+    *,
+    output_scale: float,
+) -> torch.Tensor:
+    """The decode/verify ``inkling_ring_sconv`` (static taps, the residual, no
+    live publish) of a TP sum carried by a Lamport mailbox
+    (``ops.communication.mailbox``): the input row of token ``t`` is the FP32
+    rank-order sum of ``slots[:, t]``, rounded once, as the ranks' producers
+    publish it. The kernel polls the slots, re-arms them after use and waits
+    on its PDL predecessor only before its stores.
+
+    Args:
+        slots: This rank's ``[tp, rows, D]`` BF16 slots of the mailbox parity
+            the producers published into, ``tokens <= rows``.
+        tokens: Rows of the batch, at most 64.
+        weight, conv_cache, cu_seqlens, seq_idx, cache_indices,
+            has_initial_state, seq_lens, block_table, ckpt_a: As for
+            :func:`inkling_ring_sconv`.
+        output_scale: As for :func:`inkling_ring_sconv`.
+
+    Returns:
+        BF16 ``[tokens, D]`` output.
+    """
+    if (
+        slots.dtype != torch.bfloat16
+        or slots.dim() != 3
+        or not 0 < tokens <= min(64, slots.shape[1])
+    ):
+        raise ValueError("mailbox sconv takes BF16 [tp, rows, D] slots and 1-64 tokens")
+    return _ring_sconv(
+        slots[:, :tokens].transpose(0, 1),
+        weight,
+        conv_cache,
+        cu_seqlens,
+        seq_idx,
+        cache_indices,
+        has_initial_state,
+        seq_lens,
+        block_table,
+        ckpt_a,
+        None,
+        num_extends=0,
+        publish_live=False,
+        dynamic_weights=None,
+        output_scale=output_scale,
+        activation=None,
+        use_residual=True,
+        mailbox=True,
+        token_range=None,
+    )
+
+
+_COMMIT_DTYPES = {
+    torch.bfloat16: _tl.bfloat16,
+    torch.float16: _tl.float16,
+    torch.float32: _tl.float32,
+    torch.float8_e5m2: _tl.float8e5,
+    torch.float8_e4m3fn: _tl.float8e4nv,
+}
+
+
+@dataclass(frozen=True)
+class InklingCommitTable:
+    """The checkpoint fields one :func:`inkling_ring_commit` launch writes.
+
+    Each entry is one field of one layer's stream; every field is of
+    ``dtype``. Device tensors, one element per entry.
+
+    Attributes:
+        src_offsets: Int64 ring offset of the entry's first channel
+            (``layer * ring.stride(0) + channel``).
+        widths: Int32 channels the field holds.
+        addresses: Uint64 address of the field's page 0.
+        page_strides: Int64 field page stride, in elements.
+        row_strides: Int64 field row stride, in elements.
+        groups: Int32 row of the entry's group in ``live_pages``.
+        dtype: The fields' dtype.
+        state_rows: Rows per checkpoint (``W - 1``).
+        max_width: The widest entry.
+    """
+
+    src_offsets: torch.Tensor
+    widths: torch.Tensor
+    addresses: torch.Tensor
+    page_strides: torch.Tensor
+    row_strides: torch.Tensor
+    groups: torch.Tensor
+    dtype: torch.dtype
+    state_rows: int
+    max_width: int
+
+
+def inkling_commit_tables(
+    ring: torch.Tensor,
+    streams: Sequence[tuple[int, int, int, Sequence[torch.Tensor]]],
+) -> list[InklingCommitTable]:
+    """Describe the checkpoint fields :func:`inkling_ring_commit` writes.
+
+    Args:
+        ring: Conv rings of every layer ``[L, num_slots, R, C]``,
+            channel-contiguous.
+        streams: ``(layer, channel_offset, group, fields)`` per stream. The
+            stream's channels start at ``channel_offset`` of the layer's ring
+            and its fields (``[pages, W - 1, width]``, width-contiguous) split
+            them in order; ``group`` is the stream's row of ``live_pages``.
+
+    Returns:
+        One table per field dtype.
+    """
+    if ring.dim() != 4 or ring.stride(-1) != 1:
+        raise ValueError("the rings must be [L, num_slots, R, C], C-contiguous")
+    entries: dict[torch.dtype, list[tuple[int, ...]]] = {}
+    state_rows: int | None = None
+    for layer, channel_offset, group, fields in streams:
+        channel = channel_offset
+        for field in fields:
+            if field.dim() != 3 or field.stride(-1) != 1:
+                raise ValueError("a checkpoint field must be [pages, W - 1, width]")
+            if state_rows not in (None, field.shape[1]):
+                raise ValueError("every checkpoint field must hold W - 1 rows")
+            state_rows = field.shape[1]
+            entries.setdefault(field.dtype, []).append(
+                (
+                    layer * ring.stride(0) + channel,
+                    field.shape[-1],
+                    field.data_ptr(),
+                    field.stride(0),
+                    field.stride(1),
+                    group,
+                )
+            )
+            channel += field.shape[-1]
+        if channel > ring.shape[-1]:
+            raise ValueError(f"layer {layer}'s stream runs past the ring channels")
+
+    def device(values: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        # The caller may build the tables on the first verify round, while
+        # serving: stage through pinned memory so the upload does not wait
+        # for the step in flight (a pageable copy would).
+        host = torch.tensor(values, dtype=dtype, pin_memory=True)
+        return host.to(ring.device, non_blocking=True)
+
+    tables = []
+    for dtype, rows in entries.items():
+        offsets, widths, addresses, page_strides, row_strides, groups = zip(*rows)
+        tables.append(
+            InklingCommitTable(
+                src_offsets=device(offsets, torch.int64),
+                widths=device(widths, torch.int32),
+                addresses=device(addresses, torch.uint64),
+                page_strides=device(page_strides, torch.int64),
+                row_strides=device(row_strides, torch.int64),
+                groups=device(groups, torch.int32),
+                dtype=dtype,
+                state_rows=state_rows,
+                max_width=max(widths),
+            )
+        )
+    return tables
+
+
+def inkling_ring_commit(
+    ring: torch.Tensor,
+    tables: Sequence[InklingCommitTable],
+    live_pages: torch.Tensor,
+    cache_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    accepted_lengths: torch.Tensor,
+    *,
+    verify_width: int,
+) -> None:
+    """Publish each request's accepted conv window to its live block.
+
+    After a target verify the ring holds all ``verify_width`` speculative
+    rows of every request; the live block must hold the ``W - 1`` rows ending
+    at the committed frontier ``seq_lens - verify_width + clamp(accepted, 1,
+    verify_width)``, zeros before position 0. One launch per table covers
+    every layer's streams.
+
+    Args:
+        ring: The rings the tables were built over.
+        tables: :func:`inkling_commit_tables` of ``ring``.
+        live_pages: Int32 ``[G, >= B]`` live block per group and request, any
+            strides (such as the live column of ``[G, B, slots]`` tables);
+            entries ``<= 0`` are holes and store nothing.
+        cache_indices: Contiguous int32 ``[B]`` ring slot per request;
+            ``PAD_SLOT_ID`` rows store nothing.
+        seq_lens: Contiguous integer ``[B]`` lengths through the verify chunk.
+        accepted_lengths: Contiguous integer ``[B]`` accepted tokens per
+            request.
+        verify_width: Tokens per request in the verify chunk.
+    """
+    num_reqs = accepted_lengths.shape[0]
+    if num_reqs == 0:
+        return
+    if not all(v.is_contiguous() for v in (cache_indices, seq_lens, accepted_lengths)):
+        raise ValueError(
+            "cache_indices, seq_lens and accepted_lengths must be contiguous"
+        )
+    enable_pdl = pdl_enabled()
+    for table in tables:
+        block_c = min(1024, _triton_lang.next_power_of_2(table.max_width))
+        grid = (
+            table.widths.shape[0],
+            num_reqs,
+            _triton_lang.cdiv(table.max_width, block_c),
+        )
+        _inkling_ring_commit_kernel[grid](
+            ring,
+            table.src_offsets,
+            table.widths,
+            table.addresses,
+            table.page_strides,
+            table.row_strides,
+            table.groups,
+            live_pages,
+            cache_indices,
+            seq_lens,
+            accepted_lengths,
+            ring.stride(1),
+            ring.stride(2),
+            live_pages.stride(0),
+            live_pages.stride(1),
+            CKPT_DTYPE=_COMMIT_DTYPES[table.dtype],
+            STATE_ROWS=table.state_rows,
+            R=ring.shape[2],
+            VERIFY_WIDTH=verify_width,
+            BLOCK_C=block_c,
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
+        )
 
 
 def _state_layout(state: torch.Tensor, weight: torch.Tensor) -> str:
@@ -292,6 +686,16 @@ def causal_conv1d_fn(
         traits={
             "width": weight.shape[1],
             "state_layout": _state_layout(conv_states, weight),
+            "channels": x.shape[0],
+            "channel_contiguous": x.stride(0) == 1,
+            "token_stride": x.stride(1),
+            "weight_dtype": weight.dtype,
+            "bias_dtype": bias.dtype if bias is not None else None,
+            "state_dtype": conv_states.dtype,
+            "indexed_state": cache_indices is not None
+            and has_initial_state is not None,
+            "pad_slot_id": pad_slot_id,
+            "block_m": prefill_metadata.block_m,
         },
     )
     return kernel(
@@ -306,6 +710,49 @@ def causal_conv1d_fn(
         pad_slot_id=pad_slot_id,
         validate_data=validate_data,
         prefill_metadata=prefill_metadata,
+    )
+
+
+def causal_conv1d_qkv_fn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+    *,
+    prefill_metadata: CausalConv1dPrefillMetadata,
+    key_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``causal_conv1d_fn`` whose packed ``[q | k | v]`` output leaves as
+    contiguous ``[tokens, width]`` q, k and v, with the same values."""
+    kernel = select_kernel(
+        "conv",
+        "causal_conv1d_prefill_qkv",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={
+            "width": weight.shape[1],
+            "state_layout": _state_layout(conv_states, weight),
+            "channels": x.shape[0],
+            "channel_contiguous": x.stride(0) == 1,
+            "block_m": prefill_metadata.block_m,
+        },
+    )
+    return kernel(
+        x=x,
+        weight=weight,
+        bias=bias,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation=activation,
+        pad_slot_id=pad_slot_id,
+        prefill_metadata=prefill_metadata,
+        key_dim=key_dim,
     )
 
 
@@ -324,6 +771,8 @@ def causal_conv1d_update(
     validate_data=False,
     *,
     parent_indices: torch.Tensor | None,
+    out: torch.Tensor | None = None,
+    replay_payload: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ):
     """Select a decode/tree convolution leaf for the supplied state indices."""
     kernel = select_kernel(
@@ -350,4 +799,6 @@ def causal_conv1d_update(
         pad_slot_id=pad_slot_id,
         validate_data=validate_data,
         parent_indices=parent_indices,
+        out=out,
+        replay_payload=replay_payload,
     )

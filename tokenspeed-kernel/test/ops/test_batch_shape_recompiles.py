@@ -34,6 +34,7 @@ from tokenspeed_kernel.numerics.torch.attention.dsa import (
     torch_dsa_compact_index_pages,
 )
 from utils import (
+    assert_fp8_same_or_adjacent_at_midpoint,
     assert_no_triton_compile,
     int_specialization_class,
     warm_specialization_classes,
@@ -232,6 +233,71 @@ def test_mxfp4_mm_row_count():
             torch.testing.assert_close(run(rows), full[:rows], rtol=0, atol=0)
 
 
+def test_fp8_token_group_quantize_row_count(monkeypatch):
+    from tokenspeed_kernel import compile_monitor
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
+    from tokenspeed_kernel.ops.quantization import triton as quantization
+
+    # Kimi K3's KDA projection quantizes 7168-wide tokens in groups of 128,
+    # whose general launch tile changes above 2 and above 255 tokens. The
+    # gfx950 specialization has its own 1/16-group boundary. One startup call
+    # compiles every tile for the selected policy.
+    x = torch.randn(4096, 7168, device=DEVICE, dtype=torch.bfloat16)
+    monkeypatch.setattr(compile_monitor, "_serving", False)
+    full_codes, full_scales = quantize_fp8(
+        x,
+        granularity="token_group",
+        group_size=128,
+        override="triton_quantize_fp8_with_scale",
+    )
+    full_reciprocal = (
+        quantization._fp8_token_group_groups_per_cta(x, 128, x.numel() // 128) == 16
+    )
+    compile_monitor.mark_serving()
+    with assert_no_triton_compile(quantization._fp8_token_group_quantize_kernel):
+        for rows, columns in (
+            (1, 128),
+            (1, 7168),
+            (2, 7168),
+            (3, 7168),
+            (4, 7168),
+            (255, 7168),
+            (256, 7168),
+            (4095, 7168),
+        ):
+            # Groups are independent: a smaller input is a slice of the full one.
+            codes, scales = quantize_fp8(
+                x[:rows, :columns],
+                granularity="token_group",
+                group_size=128,
+                override="triton_quantize_fp8_with_scale",
+            )
+            values = x[:rows, :columns]
+            reciprocal = (
+                quantization._fp8_token_group_groups_per_cta(
+                    values, 128, values.numel() // 128
+                )
+                == 16
+            )
+            expected_codes = full_codes[:rows, :columns]
+            if reciprocal == full_reciprocal:
+                torch.testing.assert_close(
+                    codes.view(torch.uint8),
+                    expected_codes.view(torch.uint8),
+                    rtol=0,
+                    atol=0,
+                )
+            else:
+                # Crossing the AMD normalization boundary can move only an
+                # FP8 midpoint to its adjacent code; scales remain exact.
+                assert_fp8_same_or_adjacent_at_midpoint(
+                    values, codes, expected_codes, scales, 128
+                )
+            torch.testing.assert_close(
+                scales, full_scales[:rows, : columns // 128], rtol=0, atol=0
+            )
+
+
 def test_dsa_index_candidates_table_width():
     from tokenspeed_kernel.ops.attention.dsa._triton import index_candidates as ic
 
@@ -260,7 +326,9 @@ def test_dsa_index_candidates_table_width():
         logits = torch.randn(requests.numel(), width, device=DEVICE)
         logits[0, 5] = float("nan")
         expected = logits.clone()
-        ic.mask_index_scores(logits, positions, lengths, causal, page, 3, 5)
+        ic.mask_index_scores(
+            logits, positions, lengths, causal, page, 3, 5, mask_tail=True
+        )
         col = torch.arange(width, device=DEVICE)
         valid = col[None] < lengths
         logical = positions.gather(
@@ -481,11 +549,102 @@ def test_mhc_hc4_pre_mix_token_count():
                 torch.testing.assert_close(got, want[:tokens], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("with_candidates", [False, True])
+@pytest.mark.parametrize("sort_positions", [False, True])
+def test_dsv41_finish_selection_width(with_candidates, sort_positions):
+    from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
+
+    scores = torch.ones((2, 128), device=DEVICE)
+    scores[:, 3] = -torch.inf
+    lengths = torch.tensor([64, 128], dtype=torch.int32, device=DEVICE)
+    candidates = torch.arange(15, -1, -1, dtype=torch.int32, device=DEVICE)
+    candidates = candidates.repeat(2, 1)
+    candidates[:, 2] = -1
+
+    def run(k):
+        indices = torch.arange(k - 1, -1, -1, dtype=torch.int32, device=DEVICE)
+        indices = indices.repeat(2, 1)
+        valid = (indices < lengths[:, None]) & (indices != 3)
+        positions = indices
+        if with_candidates:
+            blocks = candidates.gather(1, (indices // 8).long())
+            positions = blocks * 8 + indices % 8
+            valid &= (blocks >= 0) & (positions < 121)
+        expected = torch.where(valid, positions, torch.iinfo(torch.int32).max)
+        if sort_positions:
+            expected = expected.sort(dim=1).values
+        expected = torch.where(expected == torch.iinfo(torch.int32).max, -1, expected)
+        actual = implementation.finish_selection(
+            indices,
+            scores,
+            lengths,
+            candidates if with_candidates else None,
+            121,
+            8,
+            sort_positions,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    run(65)
+    with assert_no_triton_compile(implementation._finish_selection):
+        for k in (72, 80, 96, 104, 112, 127):
+            run(k)
+
+
+@pytest.mark.parametrize("with_candidates", [False, True])
+def test_dsv41_write_selection_width(with_candidates):
+    from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
+
+    def run(k, c):
+        selected = torch.arange(k, dtype=torch.int32, device=DEVICE).repeat(2, 1)
+        selected[0, ::2] = -1
+        selected[1, 1::3] = -1
+        candidates = None
+        if with_candidates:
+            candidates = torch.arange(c, dtype=torch.int32, device=DEVICE)
+            candidates = candidates.repeat(2, 1)
+            candidates[0, ::3] = -1
+            candidates[1, 1::4] = -1
+        rows = torch.full((2, k), -2, dtype=torch.int32, device=DEVICE)
+        lengths = torch.full((2,), -2, dtype=torch.int32, device=DEVICE)
+        blocks = torch.full((2, c), -2, dtype=torch.int32, device=DEVICE)
+        block_lengths = torch.full((2,), -2, dtype=torch.int32, device=DEVICE)
+        implementation.write_selection(
+            selected, candidates, (rows, lengths, blocks, block_lengths)
+        )
+        torch.testing.assert_close(rows, selected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            lengths, (selected >= 0).sum(1).to(torch.int32), rtol=0, atol=0
+        )
+        if with_candidates:
+            sentinel = torch.iinfo(torch.int32).max
+            expected = torch.where(candidates >= 0, candidates, sentinel)
+            expected = expected.sort(dim=1).values
+            expected = torch.where(expected == sentinel, -1, expected)
+            torch.testing.assert_close(blocks, expected, rtol=0, atol=0)
+            torch.testing.assert_close(
+                block_lengths,
+                (candidates >= 0).sum(1).to(torch.int32),
+                rtol=0,
+                atol=0,
+            )
+        else:
+            torch.testing.assert_close(
+                block_lengths, torch.zeros_like(block_lengths), rtol=0, atol=0
+            )
+
+    run(65, 65 if with_candidates else 0)
+    with assert_no_triton_compile(implementation._write_selection):
+        for k in (72, 80, 96, 104, 112, 127):
+            run(k, k if with_candidates else 0)
+
+
 def test_dsv41_page_table_geometry():
-    """The dsv41 address kernels take the page table's rows, columns and
-    strides as runtime scalars. Rows follow the batch and columns the longest
-    request, so a lone request (one row, which Triton otherwise folds into a
-    constant) or a width crossing a multiple of 16 must not recompile."""
+    """The dsv41 address kernels take the page table's rows, columns,
+    strides and pool capacity as runtime scalars. Rows follow the batch and
+    columns the longest request, so a lone request (one row, which Triton
+    otherwise folds into a constant) or a width crossing a multiple of 16
+    must not recompile."""
     from tokenspeed_kernel.ops.attention.dsv41 import triton as dsv41
     from tokenspeed_kernel.ops.attention.mla._triton import page_table
 
@@ -496,7 +655,7 @@ def test_dsv41_page_table_geometry():
     selected = (torch.arange(48, device=DEVICE, dtype=torch.int32) * 7 % 70).view(8, 6)
     n = positions.numel()
 
-    def run(rows, cols, col_stride):
+    def run(rows, cols, col_stride, pages):
         table = torch.full(
             (rows, cols * col_stride), -1, dtype=torch.int32, device=DEVICE
         )
@@ -507,7 +666,7 @@ def test_dsv41_page_table_geometry():
             torch.empty((n, 128), dtype=torch.int32, device=DEVICE),
             torch.empty(n, dtype=torch.int32, device=DEVICE),
         )
-        dsv41.decode_window(positions, requests, *window, table, 8)
+        dsv41.decode_window(positions, requests, *window, table, pages)
         compressor = tuple(
             torch.empty(n, dtype=dtype, device=DEVICE)
             for dtype in (
@@ -519,19 +678,21 @@ def test_dsv41_page_table_geometry():
                 torch.int64,
             )
         )
-        dsv41.compressor_metadata(positions, requests, table, 8, *compressor, rows=2)
+        dsv41.compressor_metadata(
+            positions, requests, table, pages, *compressor, rows=2
+        )
         selection, lengths = dsv41.selection_table(positions, requests, table, 4)
         assert (selection[:, 4:] == -1).all()
         return (
-            page_table.bounded_group_slots(positions, requests, table, 64, 1, 1, 8),
-            dsv41.global_slots(selected, positions, requests, table, 4, 8),
+            page_table.bounded_group_slots(positions, requests, table, 64, 1, 1, pages),
+            dsv41.global_slots(selected, positions, requests, table, 4, pages),
             selection[:, :4],
             lengths,
             *window,
             *compressor,
         )
 
-    expected = run(3, 8, 1)
+    expected = run(3, 8, 1, 8)
     # Pages 3, 1, 7 hold columns 0-2; column 4 is padding and resolves to -1.
     assert expected[0][[1, 3, 4, 6]].tolist() == [197, 64, 450, -1]
     with assert_no_triton_compile(
@@ -541,15 +702,17 @@ def test_dsv41_page_table_geometry():
         dsv41._decode_window_kernel,
         dsv41._compressor_metadata,
     ):
-        for rows, cols, col_stride in (
-            (1, 4, 1),
-            (1, 16, 1),
-            (2, 33, 1),
-            (16, 1024, 1),
-            (17, 129, 2),
-            (1, 6, 2),
+        for rows, cols, col_stride, pages in (
+            (1, 4, 1, 9),
+            (1, 16, 1, 16),
+            (2, 33, 1, 17),
+            (16, 1024, 1, 32),
+            (17, 129, 2, 33),
+            (1, 6, 2, 1024),
         ):
-            for got, want in zip(run(rows, cols, col_stride), expected, strict=True):
+            for got, want in zip(
+                run(rows, cols, col_stride, pages), expected, strict=True
+            ):
                 torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
@@ -575,12 +738,25 @@ def test_dsv41_cache_pack_row_count():
             run(rows)
 
 
+def _capacity_sweep(max_sequences):
+    """Live lengths and capacities across every batch-shaped scalar class."""
+    cases = []
+    for sequences in (*range(1, 18), 31, 32, 33, 47, 48, 63, 64, max_sequences):
+        lengths = [1 + (7 * s) % 37 for s in range(sequences)]
+        live = sum(lengths)
+        # Exact fit, a multiple of 16 and an odd tail exercise all count classes.
+        for capacity in (live, -(-live // 16) * 16, -(-live // 16) * 16 + 33):
+            cases.append((tuple(lengths), capacity))
+    cases.append(((1,), 1))
+    return cases
+
+
 def test_kda_prepare_capacity_scan_token_and_sequence_counts():
     from tokenspeed_kernel.ops.attention.kda._triton import prefill_scan_inputs as scan
 
     heads, dim = 2, 128
 
-    def run(case):
+    def run(case, boundary_dtype=torch.int64):
         lengths, capacity = case
         live, sequences = sum(lengths), len(lengths)
 
@@ -589,47 +765,31 @@ def test_kda_prepare_capacity_scan_token_and_sequence_counts():
 
         q, k, v, gate = (randn(heads, dim) for _ in range(4))
         beta = randn(heads)
-        bounds = F.pad(torch.tensor(lengths).cumsum(0), (1, 0)).int().to(DEVICE)
+        bounds = F.pad(torch.tensor(lengths).cumsum(0), (1, 0)).to(DEVICE)
+        bounds = bounds.to(boundary_dtype)
         oq, ok, ov, og, ob, chunks, chunk_rows = scan.prepare_capacity_scan(
             q, k, v, gate, beta, bounds
         )
         rows = torch.arange(capacity, device=DEVICE) < live
         for got, x in ((oq, q), (ok, k), (ov, v), (og, gate.float())):
-            torch.testing.assert_close(got, x * rows[None, :, None, None])
-        torch.testing.assert_close(ob, beta * rows[None, :, None])
+            assert torch.equal(got, x * rows[None, :, None, None])
+        assert torch.equal(ob, beta * rows[None, :, None])
         counts = [triton_cdiv(n, 16) for n in lengths]
         expected = [s for s, c in enumerate(counts) for _ in range(c)]
         expected += [sequences - 1] * (chunk_rows.numel() - len(expected))
         assert chunks.tolist() == [0, *torch.tensor(counts).cumsum(0).tolist()]
         assert chunk_rows.tolist() == expected
 
-    def key(case):
-        lengths, capacity = case
-        chunk_count = triton_cdiv(capacity, 16) + len(lengths) - 1
-        counts = (capacity, len(lengths), chunk_count)
-        return (
-            *map(int_specialization_class, counts),
-            1 << (len(lengths) - 1).bit_length(),
-        )
-
-    # Token capacity and live sequences both follow the batch.
-    sweep = (
-        ((20, 7, 33), 64),
-        ((1, 2, 3, 4), 130),
-        ((50, 60, 70, 5, 9, 11), 300),
-        ((100, 3, 3, 3, 3), 381),
-        ((8, 8, 8, 8, 8, 8, 8), 264),
-        ((500, 17), 590),
-    )
-    pool = [
-        ((max(1, capacity // (2 * n)),) * n, capacity)
-        for n in range(1, 9)
-        for capacity in (48, 49, 96, 97, 160, 161, 400, 401)
-    ]
-    warm_specialization_classes(run, key, sweep, pool)
+    # One launch compiles the kernel; token, sequence and chunk counts then
+    # sweep every integer class and several fixed-width sequence tiles.
+    sweep = _capacity_sweep(130)
+    run(sweep[-1])
     with assert_no_triton_compile(scan._prepare_capacity_scan_kernel):
         for case in sweep:
             run(case)
+    # Serving passes int64 boundaries; int32 ones compile their own binary.
+    for case in sweep[::5]:
+        run(case, torch.int32)
 
 
 def test_causal_conv1d_capacity_metadata_counts():
@@ -652,34 +812,81 @@ def test_causal_conv1d_capacity_metadata_counts():
         assert metadata.batch_indices.tolist() == requests + [-1] * pad
         assert metadata.chunk_offsets.tolist() == offsets + [0] * pad
 
-    def key(case):
-        lengths, capacity = case
-        chunks = triton_cdiv(capacity, block_m) + len(lengths) - 1
-        # The offsets map starts ``chunks`` int32s into one allocation, so its
-        # 16-byte pointer alignment is a specialization class too.
-        return (
-            int_specialization_class(chunks),
-            int_specialization_class(len(lengths)),
-            chunks % 4 == 0,
-        )
-
-    # Token capacity and live sequences both follow the batch.
-    sweep = (
-        ((20, 7, 33), 64),
-        ((1, 2, 3, 4), 130),
-        ((50, 60, 70, 5, 9, 11), 300),
-        ((100, 3, 3, 3, 3), 381),
-        ((500, 17), 590),
-    )
-    pool = [
-        ((max(1, capacity // (2 * n)),) * n, capacity)
-        for n in range(1, 9)
-        for capacity in (48, 49, 96, 97, 160, 161, 400, 401)
-    ]
-    warm_specialization_classes(run, key, sweep, pool)
+    # The offsets map starts ``chunks`` int32s into one allocation, so the sweep
+    # also crosses its 16-byte pointer alignment.
+    sweep = _capacity_sweep(70)
+    run(sweep[-1])
     with assert_no_triton_compile(causal_conv1d_metadata._refresh_conv_capacity_kernel):
         for case in sweep:
             run(case)
+
+
+def test_kda_commit_conv_window_batch_size():
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
+        batched_kda_commit_conv_window_kernel,
+    )
+
+    layers, steps, conv_dim, pages = 2, 4, 3 * 2 * 128, 160
+    generator = torch.Generator(device="cpu").manual_seed(0)
+    qkv = torch.randn(layers, 64 * steps, conv_dim, generator=generator).bfloat16()
+    pools = torch.randn(layers, pages, conv_dim, 3, generator=generator).bfloat16()
+    qkv, pools = qkv.to(DEVICE), pools.to(DEVICE)
+
+    def run(batch):
+        conv = pools.clone()
+        # Per-layer descriptors: raw QKV at slot 0, convolution history at slot 2.
+        addresses = torch.tensor(
+            [
+                [qkv[i].data_ptr(), 0, conv[i].data_ptr()] + [0] * 7
+                for i in range(layers)
+            ],
+            dtype=torch.uint64,
+            device=DEVICE,
+        )
+        # Reads come from the first 80 pages and writes go to the rest; -1 skips.
+        reads = torch.randint(-1, 80, (layers, batch), generator=generator)
+        writes = 80 + torch.randperm(80, generator=generator)[:batch].repeat(layers, 1)
+        writes[:, 1::5] = -1
+        accepted = torch.randint(-1, steps + 2, (batch,), generator=generator)
+        batched_kda_commit_conv_window_kernel[
+            (layers, batch, triton_cdiv(conv_dim, 128))
+        ](
+            addresses,
+            qkv,
+            conv,
+            torch.arange(layers, dtype=torch.int32, device=DEVICE),
+            reads.int().to(DEVICE),
+            writes.int().to(DEVICE),
+            accepted.int().to(DEVICE),
+            batch,
+            T=steps,
+            STRIDE_QKV=conv_dim,
+            STRIDE_CONV=3 * conv_dim,
+            CONV_DIM=conv_dim,
+            BLOCK=128,
+            num_warps=1,
+        )
+        expected = pools.clone()
+        for layer in range(layers):
+            for request in range(batch):
+                read, write = int(reads[layer, request]), int(writes[layer, request])
+                if write < 0:
+                    continue
+                window = (
+                    pools[layer, read]
+                    if read >= 0
+                    else torch.zeros_like(pools[layer, 0])
+                )
+                taken = min(max(int(accepted[request]), 0), steps)
+                rows = qkv[layer, request * steps : request * steps + taken]
+                history = torch.cat((window, rows.transpose(0, 1)), dim=1)
+                expected[layer, write] = history[:, -3:]
+        assert torch.equal(conv, expected)
+
+    run(3)
+    with assert_no_triton_compile(batched_kda_commit_conv_window_kernel):
+        for batch in (1, 2, 16, 17, 32, 48, 63, 64):
+            run(batch)
 
 
 def test_dp_sampling_kernels_bucket_size():
@@ -906,6 +1113,10 @@ def test_rel_mha_decode_table_width_and_split_count():
                 max_seqlen_q=1,
                 softmax_scale=1.0 / HEAD_DIM,
                 solution="triton",
+                output_dtype=None,
+                return_lse=False,
+                gate=None,
+                sink=None,
             )
             for heads in (NUM_Q_HEADS, NUM_KV_HEADS)
         ]
@@ -952,6 +1163,7 @@ def test_rel_mha_extend_table_width():
             rel_logits=rel_logits,
             softmax_scale=1.0 / HEAD_DIM,
             solution="triton",
+            output_dtype=None,
         )
 
     expected = run(table.shape[1])
@@ -1068,6 +1280,26 @@ def test_compact_kvp_pages_table_width():
     with assert_no_triton_compile(placement._compact_owned_pages):
         for cols in (10, 11, 13, 15):
             run(cols)
+
+
+def test_virtual_slots_to_local_slot_count():
+    from tokenspeed_kernel.ops.kvcache import triton_cache_placement as placement
+
+    geometry = dict(rows_per_page=128, virtual_block_count=40, degree=4, rank=1)
+
+    def run(count):
+        # Null and foreign blocks, a block past the capacity, and -1 holes.
+        slots = torch.randint(-1, 41 * 128, (count,), dtype=torch.int32)
+        want = placement.virtual_slots_to_local(slots, **geometry)
+        got = placement.virtual_slots_to_local(slots.to(DEVICE), **geometry)
+        for value, expected in zip(got, want, strict=True):
+            torch.testing.assert_close(value.cpu(), expected, rtol=0, atol=0)
+
+    # The count is unspecialized: one count warms 1 and multiples of 16 too.
+    run(33)
+    with assert_no_triton_compile(placement._translate_virtual_slots):
+        for count in (1, 7, 16, 255, 256, 257, 4096, 70001):
+            run(count)
 
 
 def test_mhc_mixes_split_count():
@@ -1254,6 +1486,53 @@ def test_qrita_top_k_top_p_row_count():
     with assert_no_triton_compile(topk_topp._top_k_top_p_qrita_gumbel_kernel):
         for rows in (5, 6, 7, 9, 12, 130, 131):
             run(rows)
+
+
+def test_top_k_top_p_gumbel_request_count_and_top_k():
+    from tokenspeed_kernel.ops.sampling.triton import topk_topp
+
+    # The serving verify layout: four rows per request, 1024-token blocks and
+    # the CUDA-graph pad of 128. Each row's top_k is read from the pool.
+    vocab, n, block_size, top_k_pad, pools = 5000, 4, 1024, 128, 8
+    num_candidates = -(-vocab // block_size) * top_k_pad
+    greedy = torch.ones(pools, dtype=torch.int32, device=DEVICE)
+    mixed = torch.tensor([1, 20, 128, 1, 7, 1, 64, 1], dtype=torch.int32, device=DEVICE)
+
+    def run(requests, top_k_pool):
+        rows = requests * n
+        logits = torch.randn(rows, vocab, device=DEVICE) * 2.0
+        req_pool_indices = torch.arange(requests, dtype=torch.int32, device=DEVICE)
+        req_pool_indices %= pools
+        got = topk_topp.gumbel_sample_top_k_top_p_from_pools(
+            logits,
+            req_pool_indices,
+            torch.ones(pools, device=DEVICE),
+            top_k_pool,
+            torch.ones(pools, device=DEVICE),
+            torch.arange(pools, dtype=torch.int64, device=DEVICE),
+            torch.zeros(pools, dtype=torch.int64, device=DEVICE),
+            torch.empty(rows, num_candidates, dtype=torch.int32, device=DEVICE),
+            torch.empty(rows, num_candidates, dtype=torch.float32, device=DEVICE),
+            torch.empty(rows, dtype=torch.int32, device=DEVICE),
+            block_size=block_size,
+            top_k_pad=top_k_pad,
+            num_tokens_per_req=n,
+        )
+        # Top-k of one leaves only the argmax to sample.
+        greedy_rows = (top_k_pool[req_pool_indices.long()] == 1).repeat_interleave(n)
+        torch.testing.assert_close(
+            got[greedy_rows], logits.argmax(-1).int()[greedy_rows], rtol=0, atol=0
+        )
+
+    for requests in (1, 16, 3):
+        run(requests, greedy)
+    with assert_no_triton_compile(
+        topk_topp._top_k_top_p_candidates_stage1_kernel,
+        topk_topp._top_k_top_p_gumbel_stage2_kernel,
+    ):
+        for requests in (2, 5, 8, 9, 16, 33):
+            for top_k_pool in (greedy, mixed):
+                run(requests, top_k_pool)
 
 
 def test_marlin_deepep_pack_global_token_count():

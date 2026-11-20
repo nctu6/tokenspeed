@@ -90,6 +90,7 @@ if platform.is_nvidia:
         ep_size: int,
         ep_rank: int,
         device: torch.device,
+        use_fused_finalize: bool,
     ) -> torch.Tensor:
         """The device's persistent workspace, grown (and re-zeroed) on demand.
 
@@ -107,6 +108,8 @@ if platform.is_nvidia:
             ep_size: Expert-parallel width.
             ep_rank: This rank's expert-parallel coordinate.
             device: CUDA device the call runs on.
+            use_fused_finalize: Whether GEMM2 atomically reduces expert outputs
+                in its epilogue. Must match the actual MoE call.
 
         Returns:
             A 1-D ``uint8`` CUDA tensor of at least the bytes
@@ -128,6 +131,7 @@ if platform.is_nvidia:
             ep_size=ep_size,
             ep_rank=ep_rank,
             device=device,
+            use_fused_finalize=use_fused_finalize,
         )
         workspace = _workspaces.get(device)
         if workspace is None or workspace.numel() < needed:
@@ -190,6 +194,7 @@ if platform.is_nvidia:
         ep_rank = getattr(w, "ep_rank", 0)
         tp_size = getattr(w, "tp_size", 1)
         tp_rank = getattr(w, "tp_rank", 0)
+        use_fused_finalize = plan["cutlass_fused_finalize"]
         workspace = cutlass_unquant_moe_workspace(
             num_tokens=x.shape[0],
             hidden_size=w.w2_weight.shape[1],
@@ -203,6 +208,7 @@ if platform.is_nvidia:
             ep_size=ep_size,
             ep_rank=ep_rank,
             device=x.device,
+            use_fused_finalize=use_fused_finalize,
         )
         return cutlass_fused_moe(
             input=x,
@@ -223,6 +229,9 @@ if platform.is_nvidia:
             # identical call is clean). Keep the chain fully serialized until
             # the flashinfer kernels are fixed.
             enable_pdl=False,
+            # Fused GEMM2 finalize uses floating-point atomics; changing their
+            # arrival order changes the reduction's rounding across calls.
+            use_fused_finalize=use_fused_finalize,
             workspace_buffer=workspace,
         )[0]
 
@@ -1970,7 +1979,6 @@ if platform.is_nvidia:
         trtllm_fp4_block_scale_moe,
     )
     from flashinfer.cute_dsl import is_cute_dsl_available
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
     )
@@ -1978,6 +1986,9 @@ if platform.is_nvidia:
         get_w2_permute_indices_with_cache,
     )
     from flashinfer.tllm_enums import ActivationType
+    from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
+        trtllm_fp4_block_scale_routed_moe as tokenspeed_trtllm_fp4_block_scale_routed_moe,
+    )
 
     def _get_device_permute_indices(
         x: torch.Tensor,
@@ -2082,9 +2093,9 @@ if platform.is_nvidia:
             )
             limit = None
         elif (swiglu_arg := getattr(w, "swiglu_arg", None)) is None:
-            alpha = 1.702
-            limit = 7.0
-            beta = 1.0
+            alpha = 1.0
+            limit = None
+            beta = 0.0
         else:
             alpha = swiglu_arg.alpha
             limit = swiglu_arg.limit
@@ -2304,7 +2315,7 @@ if platform.is_nvidia:
             topk_ids.to(torch.int32).contiguous(),
             topk_weights.to(torch.bfloat16).contiguous(),
         )
-        result = trtllm_fp4_block_scale_routed_moe(
+        result = tokenspeed_trtllm_fp4_block_scale_routed_moe(
             topk_ids=topk,
             routing_bias=None,
             hidden_states=x,
@@ -3260,11 +3271,9 @@ if platform.is_nvidia:
     )
     from flashinfer.fused_moe.da_moe import DABody
     from flashinfer.tllm_enums import ActivationType
+    from flashinfer.utils import device_support_pdl
     from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
         trtllm_fp4_block_scale_moe as tokenspeed_trtllm_fp4_block_scale_moe,
-    )
-    from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
-        trtllm_fp4_block_scale_routed_moe as tokenspeed_trtllm_fp4_block_scale_routed_moe,
     )
 
     def _flashinfer_trtllm_nvfp4_moe_weights(
@@ -3522,6 +3531,35 @@ if platform.is_nvidia:
         if _correction_bias is not None:
             _correction_bias = _correction_bias.to(_routing_logits_dtype)
 
+        from tokenspeed_kernel.ops.communication.peer_weights import (
+            ExpertWeightShard,
+            PreparedExpertWeights,
+        )
+
+        streamed = (
+            "gemm1_weights_fp4_shuffled",
+            "gemm1_scales_fp4_shuffled",
+            "gemm2_weights_fp4_shuffled",
+            "gemm2_scales_fp4_shuffled",
+        )
+        replicated = (
+            "g1_alphas",
+            "g2_alphas",
+            "g1_scale_c",
+            "gemm1_alpha",
+            "gemm1_beta",
+            "gemm1_clamp_limit",
+        )
+        parameters = dict(w.named_parameters(recurse=False))
+        return PreparedExpertWeights(
+            layout=f"flashinfer-trtllm-nvfp4-{activation}-v1",
+            shards=tuple(
+                ExpertWeightShard(name, parameters[name], name in replicated)
+                for name in (*streamed, *replicated)
+                if name in parameters
+            ),
+        )
+
     _FP4_TILES = (8, 16, 32, 64, 128)
 
     def _default_tile(num_tokens: int, top_k: int, num_local_experts: int) -> int:
@@ -3566,8 +3604,7 @@ if platform.is_nvidia:
             local_expert_offset=spec.ep_rank * spec.num_local_experts,
             routed_scaling_factor=None,
             routing_method_type=0,
-            enable_pdl=enable_pdl
-            and _fi_core._device_support_moe_pdl(w.g1_alphas.device),
+            enable_pdl=enable_pdl and device_support_pdl(w.g1_alphas.device),
             do_finalize=False,
             activation_type=activation_type,
             num_fused_shared_experts=0,

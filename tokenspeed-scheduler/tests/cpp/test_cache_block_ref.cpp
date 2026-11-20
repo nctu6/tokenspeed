@@ -192,5 +192,124 @@ TEST(CacheBlockRefTest, LastOwnerDestroysDynamicBlockAndReleasesExactSlot) {
     EXPECT_EQ(pool.BoundGroup(location.lcm_block_id), std::nullopt);
 }
 
+TEST(CacheBlockRefTest, UniqueObserverFiresOnceAfterAllOtherOwnersRelease) {
+    BlockPool pool(1, {1});
+    CacheBlockRef owner = pool.AcquireBlock(0);
+    CacheBlockRef second = owner;
+    CacheBlockRef third = owner;
+    CacheBlockUniqueObserver observer;
+    int notifications = 0;
+    observer.Observe(owner, [](void* context) noexcept { ++*static_cast<int*>(context); }, &notifications);
+    second.reset();
+    EXPECT_EQ(notifications, 0);
+    third.reset();
+    EXPECT_TRUE(owner.unique());
+    EXPECT_EQ(notifications, 1);
+    second = owner;
+    second.reset();
+    EXPECT_EQ(notifications, 1);
+}
+
+TEST(CacheBlockRefTest, UniqueObserverCanCancelAnotherPendingObserverAndDestroyBlock) {
+    BlockPool pool(1, {1});
+    CacheBlockRef owner = pool.AcquireBlock(0);
+    CacheBlockRef second = owner;
+    CacheBlockUniqueObserver cancelled;
+    CacheBlockUniqueObserver active;
+    int cancelled_notifications = 0;
+    cancelled.Observe(owner, [](void* context) noexcept { ++*static_cast<int*>(context); }, &cancelled_notifications);
+    struct Context {
+        CacheBlockRef& owner;
+        CacheBlockUniqueObserver& cancelled;
+        int notifications{0};
+    } context{owner, cancelled};
+    active.Observe(
+        owner,
+        [](void* data) noexcept {
+            auto& context = *static_cast<Context*>(data);
+            context.cancelled.Reset();
+            context.owner.reset();
+            ++context.notifications;
+        },
+        &context);
+
+    second.reset();
+
+    EXPECT_EQ(context.notifications, 1);
+    EXPECT_EQ(cancelled_notifications, 0);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
+}
+
+TEST(CacheBlockRefTest, UniqueObserverCanBeCancelledOrRebound) {
+    BlockPool pool(2, {1});
+    CacheBlockRef first = pool.AcquireBlock(0);
+    CacheBlockRef second = pool.AcquireBlock(0);
+    CacheBlockRef first_pin = first;
+    CacheBlockRef second_pin = second;
+    CacheBlockUniqueObserver observer;
+    int notifications = 0;
+    const auto notify = [](void* context) noexcept { ++*static_cast<int*>(context); };
+    observer.Observe(first, notify, &notifications);
+    observer.Observe(second, notify, &notifications);
+    first_pin.reset();
+    EXPECT_EQ(notifications, 0);
+    observer.Reset();
+    second_pin.reset();
+    EXPECT_EQ(notifications, 0);
+    observer.Observe(first, notify, &notifications);
+    EXPECT_EQ(notifications, 1);
+}
+
+TEST(CacheBlockRefTest, ObserverCanReleaseAndImmediatelyReuseItsControlStorage) {
+    BlockPool pool(1, {1});
+    CacheBlockRef owner = pool.AcquireBlock(0);
+    const auto location = owner->Location();
+    CacheBlockRef second = owner;
+    CacheBlockUniqueObserver observer;
+    struct Context {
+        BlockPool& pool;
+        CacheBlockRef& owner;
+        int notifications{0};
+    } context{pool, owner};
+    observer.Observe(
+        owner,
+        [](void* data) noexcept {
+            auto& context = *static_cast<Context*>(data);
+            context.owner.reset();
+            context.owner = context.pool.AcquireBlock(0);
+            ++context.notifications;
+        },
+        &context);
+    second.reset();
+    ASSERT_TRUE(owner);
+    EXPECT_EQ(owner->Location(), location);
+    EXPECT_TRUE(owner.unique());
+    EXPECT_EQ(context.notifications, 1);
+    second = owner;
+    second.reset();
+    EXPECT_EQ(context.notifications, 1);
+    owner.reset();
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
+}
+
+TEST(CacheBlockRefTest, LiveControlsStayStableWhileOtherControlsGrowAndRecycle) {
+    BlockPool pool(2000, {2});
+    auto anchor = pool.AcquireBlock(0);
+    const CacheBlock* address = &*anchor;
+    const auto location = anchor->Location();
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        std::vector<CacheBlockRef> blocks;
+        for (int i = 0; i < 3999; ++i) blocks.push_back(pool.AcquireBlock(0));
+        EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
+        EXPECT_EQ(&*anchor, address);
+        EXPECT_EQ(anchor->Location(), location);
+        EXPECT_TRUE(anchor.unique());
+        blocks.clear();
+        EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1999);
+    }
+    anchor.reset();
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2000);
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

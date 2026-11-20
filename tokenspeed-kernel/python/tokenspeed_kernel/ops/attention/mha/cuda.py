@@ -20,6 +20,7 @@
 import math
 
 import torch
+from tokenspeed_kernel._optional import has_fa4_cute, has_optional_package
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -48,13 +49,13 @@ platform = current_platform()
 # ------------------------------------------------------------------------------
 
 
-if platform.is_blackwell_plus:
+if platform.is_blackwell_plus and has_fa4_cute():
     from flash_attn.cute import (
         flash_attn_func,
         flash_attn_varlen_func,
     )
 
-if platform.is_nvidia and platform.is_blackwell:
+if platform.is_nvidia and platform.is_blackwell and has_fa4_cute():
     # FA4 on Blackwell supports prefill head_dim in [8, 256] divisible by 8,
     # but the 256-wide MHA path mishandles non-contiguous V split views, so we
     # restrict it to <256 for now until that is resolved.
@@ -214,6 +215,8 @@ if platform.is_nvidia and platform.is_blackwell:
             "return_lse": frozenset({False}),
             "sinks": frozenset({False}),
             "sliding_window": frozenset({False, True}),
+            # FA3/FA4/flashinfer take no token sink; the Triton leaf does.
+            "window_sink": frozenset({False}),
         },
     )
     def fa4_mha_decode_with_kvcache(
@@ -324,6 +327,8 @@ if platform.is_nvidia and platform.is_blackwell:
             "return_lse": frozenset({False}),
             "sinks": frozenset({False}),
             "sliding_window": frozenset({False, True}),
+            # FA3/FA4/flashinfer take no token sink; the Triton leaf does.
+            "window_sink": frozenset({False}),
         },
     )
     def fa4_mha_decode_with_kvcache_fp8(
@@ -403,6 +408,8 @@ if platform.is_nvidia and platform.is_blackwell:
                 "return_lse": frozenset({False}),
                 "sinks": frozenset({False}),
                 "sliding_window": frozenset({False, True}),
+                # FA3/FA4/flashinfer take no token sink; the Triton leaf does.
+                "window_sink": frozenset({False}),
             },
         )
         def fa4_mha_decode_with_kvcache_mxfp8(
@@ -515,13 +522,57 @@ if platform.is_nvidia and platform.is_blackwell:
             )
             return out.to(torch.bfloat16)
 
-elif platform.is_nvidia and platform.is_hopper:
+elif (
+    platform.is_nvidia
+    and platform.is_hopper
+    and has_optional_package("flash_attn_interface")
+):
+    import inspect
+
     from flash_attn_interface import (
         flash_attn_func,
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
         get_scheduler_metadata,
     )
+
+    # FA3 on Hopper supports head_dim at most 256 (flash_attn_3 fwd guard).
+    # Gemma-4 full-attention layers use global_head_dim=512; without this trait
+    # the registry selects fa3 for those layers and crashes at kernel launch.
+    # Keep the set aligned with FA4's dense MHA dims up through 256.
+    _FA3_HOPPER_HEAD_DIMS = frozenset(range(8, 257, 8))
+
+    def _fa3_sinks(sinks: torch.Tensor | None) -> torch.Tensor | None:
+        # The FA3 Hopper API requires bf16 sinks regardless of the q/kv dtype
+        # (fp16, bf16 or fp8). Sinks are per-head softmax logits, so bf16
+        # precision is sufficient; cast instead of failing at kernel launch.
+        if sinks is None or sinks.dtype == torch.bfloat16:
+            return sinks
+        return sinks.to(torch.bfloat16).contiguous()
+
+    # Older FA3 builds take no `sinks` argument. Declare the capability from the
+    # installed signature (as _FA4_HAS_BLOCKSCALED does) so the registry refuses a
+    # sink-bearing graph here and selects a leaf that serves it, instead of the
+    # call failing on an unexpected keyword. All three entry points gained the
+    # argument together, so one probe covers them.
+    _FA3_HAS_SINKS = "sinks" in inspect.signature(flash_attn_with_kvcache).parameters
+    _FA3_SINKS = frozenset({False, True}) if _FA3_HAS_SINKS else frozenset({False})
+
+    def _fa3_sink_kwargs(sinks: torch.Tensor | None) -> dict:
+        """Pass `sinks` through, or refuse one this build cannot apply.
+
+        Reaching here with sinks on an older build means a caller bypassed
+        selection; dropping them silently would return plausible wrong numbers.
+        """
+        if _FA3_HAS_SINKS:
+            return {"sinks": _fa3_sinks(sinks)}
+        if sinks is not None:
+            raise ValueError(
+                "The installed FlashAttention 3 takes no attention sinks; "
+                "its kernels declare sinks=False, so this call bypassed "
+                "kernel selection"
+            )
+        return {}
 
     @register_kernel(
         "attention",
@@ -542,7 +593,7 @@ elif platform.is_nvidia and platform.is_hopper:
         traits={
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
-            "sinks": frozenset({False, True}),
+            "sinks": _FA3_SINKS,
             "skip_softmax": frozenset({False}),
             "sliding_window": frozenset({False, True}),
         },
@@ -577,7 +628,7 @@ elif platform.is_nvidia and platform.is_hopper:
             causal=True,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
-            sinks=sinks,
+            **_fa3_sink_kwargs(sinks),
         )
 
     @register_kernel(
@@ -600,7 +651,7 @@ elif platform.is_nvidia and platform.is_hopper:
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
-            "sinks": frozenset({False, True}),
+            "sinks": _FA3_SINKS,
             "sliding_window": frozenset({False, True}),
         },
     )
@@ -640,7 +691,7 @@ elif platform.is_nvidia and platform.is_hopper:
             causal=is_causal,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
-            sinks=sinks,
+            **_fa3_sink_kwargs(sinks),
         )
 
     @register_kernel(
@@ -662,8 +713,10 @@ elif platform.is_nvidia and platform.is_hopper:
         traits={
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
-            "sinks": frozenset({False, True}),
+            "sinks": _FA3_SINKS,
             "sliding_window": frozenset({False, True}),
+            # FA3/FA4/flashinfer take no token sink; the Triton leaf does.
+            "window_sink": frozenset({False}),
         },
     )
     def fa3_mha_decode_with_kvcache(
@@ -697,6 +750,6 @@ elif platform.is_nvidia and platform.is_hopper:
             causal=max_seqlen_q > 1,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
-            sinks=sinks,
+            **_fa3_sink_kwargs(sinks),
         )
         return out.view_as(q)

@@ -220,6 +220,9 @@ def producer_schedule(
     )
 
 
+# --- definitions restored from the pre-merge branch (D3-3) ---
+
+
 def block_manifest(
     *groups: tuple[str, tuple[int, ...]],
     prefix: int = 0,

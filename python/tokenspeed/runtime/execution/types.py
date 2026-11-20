@@ -51,6 +51,51 @@ class DpForwardMetadata:
     all_extend: bool
     need_idle_forward: bool
 
+    @classmethod
+    def from_ranks(
+        cls,
+        *,
+        global_num_tokens: list[int],
+        global_batch_size: list[int],
+        global_num_extends: list[int],
+        need_idle_forward: bool,
+    ) -> DpForwardMetadata:
+        """The metadata from every rank's batch, in rank order.
+
+        Args:
+            global_num_tokens: Tokens each rank forwards.
+            global_batch_size: Requests in each rank's batch; 0 for a rank
+                without model work.
+            global_num_extends: Prefill rows in each rank's batch.
+            need_idle_forward: This rank has no batch while another has one.
+        """
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+        global_forward_mode = [
+            int(ForwardMode.from_num_extends(num_extends, batch_size))
+            for num_extends, batch_size in zip(global_num_extends, global_batch_size)
+        ]
+        return cls(
+            global_num_tokens=list(global_num_tokens),
+            global_batch_size=list(global_batch_size),
+            global_num_decodes=[
+                batch_size - num_extends
+                for batch_size, num_extends in zip(
+                    global_batch_size, global_num_extends
+                )
+            ],
+            global_forward_mode=global_forward_mode,
+            all_decode_or_idle=all(
+                mode in (int(ForwardMode.DECODE), int(ForwardMode.IDLE))
+                for mode in global_forward_mode
+            ),
+            # Replicated prefill-graph gate (see PrefillGraph._select_bucket).
+            all_extend=all(
+                mode == int(ForwardMode.EXTEND) for mode in global_forward_mode
+            ),
+            need_idle_forward=need_idle_forward,
+        )
+
 
 @dataclass(frozen=True)
 class NGramInputs:
@@ -70,11 +115,13 @@ class NGramInputs:
 class RequestHistorySeeds:
     """Immutable committed prefixes that rebuild request-token history rows.
 
-    Row ``i`` restores the first ``prefix_lengths[i]`` tokens of request-pool
-    slot ``slots[i]`` from ``tokens[i]``: an extend that resumes a prefix it
-    did not compute on this slot (a prefix-cache hit, a later chunk, a PD
-    landing) must see that prefix before its own inputs are appended. No
-    request objects or device tensors cross this boundary.
+    Row ``i`` restores the committed prefix of request-pool slot ``slots[i]``,
+    ``prefix_lengths[i]`` tokens long, from ``tokens[i]``: an extend that
+    resumes a prefix it did not compute on this slot (a prefix-cache hit, a
+    later chunk, a PD landing) must see that prefix before its own inputs are
+    appended. For a model with a bounded history lookback ``tokens[i]`` is
+    only the prefix's tail, ending at ``prefix_lengths[i]``. No request
+    objects or device tensors cross this boundary.
     """
 
     slots: tuple[int, ...]
@@ -85,7 +132,7 @@ class RequestHistorySeeds:
         if not len(self.slots) == len(self.prefix_lengths) == len(self.tokens):
             raise ValueError("request history seed fields must have equal lengths")
         for prefix_length, tokens in zip(self.prefix_lengths, self.tokens):
-            if len(tokens) != prefix_length:
+            if len(tokens) > prefix_length:
                 raise ValueError(
                     f"request history seed has {len(tokens)} tokens for a "
                     f"{prefix_length}-token prefix"
@@ -174,11 +221,11 @@ class StopCriteria:
 class PlannedForward:
     """One round's planned work, as the device side needs to see it.
 
-    Everything the data plane learns about a round arrives through here and
-    is captured into the submitted closure, so every field must be something
-    the control plane will not touch again once the round is dispatched (the
-    capture contract in ``forward_thread.py``). A new field either satisfies
-    that, or it is a new registered exception — not a comment.
+    Everything the forward learns about a round arrives through here, so
+    every field must be something nothing edits again once the forward is
+    launched (the capture contract in ``execution/device.py``). A new field
+    either satisfies that, or it is a new registered exception — not a
+    comment.
 
     Attributes:
         forward_op: The scheduler's op for this round. A per-round value copy
@@ -186,6 +233,8 @@ class PlannedForward:
             no later scheduler activity can reach it.
         sampling_params_list: Per-slot sampling params, gathered by the loop.
             Read-only for the request's lifetime.
+        admission_ids: Immutable identities aligned with the forward's requests.
+            A new admission gets a new identity even when its rid is reused.
         dp_metadata: CPU-gathered DP metadata, None outside DP. A frozen
             dataclass of plain lists.
         grammar_inputs: Per-batch grammar state, None when no request in the
@@ -209,6 +258,7 @@ class PlannedForward:
     """
 
     forward_op: Any
+    admission_ids: tuple[int, ...]
     sampling_params_list: list
     dp_metadata: "DpForwardMetadata | None"
     grammar_inputs: Any
@@ -277,7 +327,11 @@ class ModelExecutionResult:
     """
     Result of model execution returned to scheduler.
 
-    This is the output from the Python executor back to the C++ scheduler.
+    The Rust host reads these tensors after their CPU copies have landed.
+    Producers emit fp32 logprob values and cumulative probabilities, and int64
+    top-k IDs, independently of the model's weight or activation dtype. The host
+    buffer reader also accepts fp64 values and int32 IDs; fp16/bfloat16 values
+    are not part of this result contract.
 
     Attributes:
         output_tokens: Sampled token IDs
@@ -288,10 +342,13 @@ class ModelExecutionResult:
     copy_event: torch.cuda.Event | None = None
     output_lengths: torch.Tensor | None = None
     grammar_completion: GrammarStepCompletion | None = None
-    # Per-position logprob of the sampled token, same layout as output_tokens.
+    # Per-position fp32 logprob of the sampled token, same layout as output_tokens.
     # Populated unconditionally by the sampling backend so it's always
     # available if any request asks for it.
     output_logprobs: torch.Tensor | None = None
+    # fp32 probability mass preceding each sampled token in probability-descending,
+    # token-ID-ascending order; aligned with output_tokens and output_logprobs.
+    output_token_cumulative_probs: torch.Tensor | None = None
     # P role, final chunk only: the sampled rows the commit path folds into
     # the ExtendResult as the bootstrap payload the peer's decode needs.
     next_input_ids: torch.Tensor | None = None
@@ -322,21 +379,24 @@ class ModelExecutionResult:
     def sync(self) -> None:
         """Block until this result's D2H copy has landed.
 
-        Called exactly once, by ``PendingExecution.result()`` — the single
-        gate between the forward thread and the control plane. Consumers
-        receive an already-synced result and must not call this again; a
-        second call means a redundant sync path was reintroduced, so it
-        raises instead of silently costing a no-op event join.
+        Called exactly once, by the commit (``HostDataPlane.complete``) — the
+        single gate between the forward thread and the control plane.
+        Consumers receive an already-synced result and must not call this
+        again; a second call means a redundant sync path was reintroduced, so
+        it raises instead of silently costing a no-op event join.
         """
         if self._synced:
             raise RuntimeError(
-                "ModelExecutionResult is synced exactly once, by "
-                "PendingExecution.result(); consumers get a synced result."
+                "ModelExecutionResult is synced exactly once, by the commit; "
+                "consumers get a synced result."
             )
         if self.copy_event is None:
             raise RuntimeError("copy_event is required before synchronizing results.")
         self.copy_event.synchronize()
         self._synced = True
+
+
+# --- definitions restored from the pre-merge branch (D3-3) ---
 
 
 @dataclass

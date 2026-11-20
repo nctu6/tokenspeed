@@ -22,8 +22,14 @@ Supported task types:
 Task types that start a server (`server_smoke`, `eval`, `perf`) run with
 `TOKENSPEED_JIT_COMPILE_CHECK=error` unless the task's `env` sets it: a
 compile-time kernel parameter that keeps taking new values after startup
-(a per-batch `tl.constexpr`) fails the run. The server log names the kernel,
-the parameter, and the launching call site.
+(a per-batch `tl.constexpr` or static CuTe DSL dimension), a call site that
+keeps recompiling specializations a kernel already has, or a direct
+`@cute.jit` call after startup fails the run. The server log names the kernel,
+the cause, and the launching call site. They also run with
+`TOKENSPEED_DATA_PLANE_SYNC_DEBUG=error`, which no task may change
+(validation rejects a task or `runner.env` that sets it): a host
+synchronization on the forward thread's per-round path after startup fails
+the run, and the server log names its Python location.
 
 Currently configured task directories:
 
@@ -33,9 +39,14 @@ Currently configured task directories:
 
 Every task declares one `workflow_stage`:
 
+- `import-check` for MI350 adapter import and dispatch checks after gfx1250
+  implementation changes, and MI450 checks after gfx950 implementation changes
 - `unit-test` for kernel and runtime tests
 - `kernel-benchmark` for registration-level kernel performance tests
 - `model-test` for model evaluation and performance tests
+
+Only AMD workflows run the `import-check` stage, so its tasks must use AMD
+runner labels. Validation rejects other runner labels for that stage.
 
 The NVIDIA Tests and AMD Tests workflows run unit tests before model
 tests. AMD kernel benchmarks run in the separate AMD Kernel Benchmark workflow,
@@ -44,22 +55,22 @@ each stage run in parallel. The workflow treats a stage with no matching tasks
 as satisfied.
 
 On NVIDIA runners, `ut-tokenspeed-kernel-part-i` runs tests outside
-`tokenspeed-kernel/test/ops/`, keeping the numerics, TRT-LLM communication, and
-CUDA suites in separate processes. `ut-tokenspeed-kernel-part-ii` runs
-`tokenspeed-kernel/test/ops/`. Together the two tasks cover the kernel suite
-once. AMD runners run the same commands in the single `ut-tokenspeed-kernel`
-task.
+`tokenspeed-kernel/test/ops/` and `tokenspeed-kernel/test/nvidia/thirdparty/`,
+keeping the numerics suite in a separate process. `ut-tokenspeed-kernel-part-ii`
+runs those two directories, keeping the TRT-LLM communication and CUDA suites in
+separate processes. `ut-tokenspeed-kernel-post-submit` runs the slow files that
+`ut-tokenspeed-kernel-part-i` ignores (the non-FP8 GEMM autotune capacity test)
+on pushes to `main` only. Together the three tasks cover the kernel suite once.
+On AMD runners, `ut-tokenspeed-kernel-part-amd-gfx950` runs
+`tokenspeed-kernel/test/amd/gfx950/` and `ut-tokenspeed-kernel-part-amd-ops`
+runs `tokenspeed-kernel/test/ops/`; `ut-tokenspeed-kernel` runs the rest, with
+the numerics, TRT-LLM communication, and CUDA suites in separate processes.
 
-Conversely, AMD runners split the `runtime-1gpu` suite across
-`ut-runtime-1gpu-part-i` and `ut-runtime-1gpu-part-ii`, which balance test files
-by their registered `est_time` (`run_ci_suite.py --auto-partition-*`). Other
-runners run the whole suite in `ut-runtime-1gpu`.
-
-PRs labeled `high priority` start `unit-test` and `model-test` concurrently.
-Applying the label starts a new CI run immediately and cancels the older run
-through the workflow's concurrency policy. A unit-test failure does not cancel
-model tests that are already running in this mode. The label does not restart
-AMD kernel benchmarks.
+All runners split the `runtime-1gpu` suite across `ut-runtime-1gpu-part-i` and
+`ut-runtime-1gpu-part-ii`, which balance test files by their registered
+`est_time` (`run_ci_suite.py --auto-partition-*`). The suite starts one `pytest`
+process per file, so per-file startup is a large share of its time, and
+running it in one job takes longer than the kernel unit tests.
 
 The Qwen3.5 FP8 DeepEP correctness task runs GSM8K on four GB200 GPUs with
 attention TP2, attention DP2, and MoE EP4. DeepEP `auto` mode exercises its
@@ -78,6 +89,21 @@ of at least 0.96.
 The AMD variant runs the AMD Quark MXFP4 checkpoint the same way on two MI35x
 GPUs. Its MTP layer is BF16 in the checkpoint, so the draft model runs
 unquantized.
+
+The Qwen3.8 Flash Next MXFP4 monokernel task serves the same checkpoint on
+one GPU with `--decode-monokernel` and three-step MTP. It uses the same 2-GPU
+MI35x runners, whose Hugging Face cache already holds the checkpoint. It sends the first
+128 GSM8K test questions one at a time
+(`test/single_request_benchmark/gsm8k_decode.py`). Every decode step then has
+one request, so the decode monokernel serves every step. The batched GSM8K
+eval runs more than four token rows per step, so it keeps the regular path.
+One server start gates two things. The benchmark exits with status 1 when
+accuracy is below 0.88. `perf_reference` gates the per-request decode rate,
+which leaves out time to first token. The reference is the median of three
+runs on that runner, rounded down. The task stays optional until later runs
+confirm it. The benchmark
+writes per-request records under
+`.ci-artifacts/published/gsm8k-single-request`.
 
 The long-context performance report accepts both current EvalScope metrics
 (`Avg TPOT (ms)`, `Avg Decoded Tok/Iter`) and their older names. Missing or
@@ -160,6 +186,73 @@ optional:
   amd-mi355-1gpu: true
 ```
 
+`ignore_changes` lists directories whose changes cannot affect a task. On
+pull requests the scan drops the task when every changed file is Markdown or
+lies under one of them. Pushes to `main` and manual runs keep every task. The
+per-commit kernel unit-test tasks list the runtime sources and runtime tests,
+so a pull request that changes only the runtime skips them. That holds because
+the kernel tests never import the runtime: the `kernel-tests-without-runtime`
+pre-commit hook rejects such an import under `tokenspeed-kernel/test`.
+
+```yaml
+ignore_changes:
+  - python/tokenspeed
+  - test/runtime
+```
+
+`model_sources` lists the model modules (directly under
+`python/tokenspeed/runtime/models/`) that a model-test task serves, including
+those its model and draft model import. On pull requests the scan drops the
+task when every changed file is Markdown, another model's module, or a test
+under `test/runtime/` or `tokenspeed-kernel/test/`; a unit-test task keeps the
+tests its definition names, as files or directories, and every test helper. A
+module there belongs to one model when it defines `EntryClass` or a task lists
+it; any other module, such as `utils.py`, is shared, and a change to it runs
+every task. Speculative-decoding draft modules (file names with `nextn`,
+`eagle`, `dflash` or `dspark`) are shared too, and `model_sources` may not list
+them. The scan fails when a listed module does not exist, or imports a
+module that belongs to one model without the task listing it too.
+
+```yaml
+model_sources:
+  - python/tokenspeed/runtime/models/llama.py
+  - python/tokenspeed/runtime/models/minimax_m3.py
+```
+
+`changed_paths: true` hands a pull request's changed paths to the task's
+commands as `TOKENSPEED_CI_CHANGED_PATHS`, one path per line, so the suite can
+pick its own tests. The scan sets it only where it narrows tasks: pull
+requests with fewer than 300 changed files. The kernel unit-test tasks use it:
+`tokenspeed-kernel/test/kernel_test_selection.py` runs the test files whose
+op families a change names (`ops/<family>/`, an attention variant such as
+`ops/attention/mla/`, `thirdparty/<package>/`, and the AMD
+`ops/<arch>/<family>/`), the changed test files, and the tests that load every
+kernel. A change to a core module, `conftest.py`, packaging, or anything else
+that names no family runs every test. Dependencies between families are not
+followed; pushes to `main` run every test.
+
+The runtime unit-test tasks use it too: `test/runtime/run_ci_suite.py` keeps
+only the test files the changes reach before it partitions the suite
+(`test/ci_system/runtime_test_selection.py`). The suite narrows only when every
+change is Markdown, a test file, or a model module: a module directly under
+`python/tokenspeed/runtime/models/` that defines `EntryClass`. It then runs these
+test files:
+
+- The changed runtime test files.
+- The tests that import a changed model module or a module built on it, or that
+  name one of them, so `gpt_oss` matches a test serving `openai/gpt-oss-20b`.
+- The tests that import any of these, directly or through other test files.
+
+Any other change runs every test.
+
+A reviewer can widen a pull request's tests. The `ci-full-tests` label turns
+off every changed-path narrowing (vendor path filtering, `ignore_changes`,
+and `changed_paths`), and each `CI-Extra-Changes: <path>` line in the description
+counts as a changed path, such as a kernel family directory whose tests should
+also run. The scan job reads both from the pull request
+(`test/ci_system/pr_test_scope.py`), so re-run the workflows after adding the
+label or editing the description.
+
 The NVIDIA PR workflow routes `b200-<Ngpu>` task labels to
 `b200v2-<Ngpu>` by default. Set the `TOKENSPEED_B200_RUNNER_LABEL` repository
 variable in GitHub Actions (`Settings` -> `Secrets and variables` -> `Actions`
@@ -173,6 +266,22 @@ the jobs create the two directories beside that cache instead. This survives
 runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
+
+The engine installer reuses `tokenspeed-engine` wheels under
+`CI_WHEEL_CACHE_DIR/tokenspeed-engine` on these runners and on Slurm's mounted
+package cache. The key covers the engine and scheduler sources, Python ABI and
+configuration, resolved Python build dependencies, Rust/C++ toolchains, native
+system packages, and compiler settings. A source change invalidates the wheel
+even without a version bump. Concurrent jobs build a missing wheel once under
+a lock, then publish it atomically after an import check. Fork PRs and local
+xgrammar source overrides bypass this cache. The installer logs cache hits and
+build/install elapsed time. Each run prunes wheel directories, orphaned build
+directories, and stale lock files untouched for 14 days; a hit refreshes the
+wheel's timestamp.
+
+The dedicated Rust workflow caches Cargo dependencies and workspace build
+artifacts, with Python/native build inputs included in the key. GPU jobs share
+only the final wheel: CMake build trees contain checkout-specific paths.
 
 B200v2 CI stores FlashInfer tactics under `tokenspeed/flashinfer-autotune`
 in the same persistent root as the package cache: an explicit `CI_CACHE_ROOT`,
@@ -202,20 +311,6 @@ the task's server restarts, and the same job cleanup removes it. Compiler
 options and test workloads are unchanged. Performance jobs retain the runner's
 Triton cache policy so cold compilation is not newly introduced into measured
 requests.
-
-The AMD Kimi-K3 EAGLE3 performance task publishes its EvalScope outputs and
-tokenizer under
-`.ci-artifacts/published/kimi-k3-eagle3-tp8ep1-50k-500-perf`, including the
-request/response database. These artifacts support investigating input,
-output, and speculative acceptance differences alongside timing changes. The
-task measures 16 concurrent 50K-input/500-output requests with TP8/EP1 and
-zero benchmark warmup requests.
-
-The corresponding AMD Kimi-K3 EAGLE3 AIME26 gate publishes its per-question
-predictions and scoring records under
-`.ci-artifacts/published/kimi-k3-eagle3-aime26`. This retains evidence for accuracy
-misses without changing the full 30-question workload, generation settings, or
-score threshold.
 
 Model jobs load weights from the runner's shared Hugging Face cache
 (`HF_HOME`) and must not pass `--download-dir` into the job's work directory.
@@ -281,6 +376,13 @@ its GPU matrix jobs when nothing requires that runner group. The first
 matching rule decides (`ci_path_filter.py` holds the full lists):
 
 - Markdown files require no runner group.
+- AMD sources under `tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/`
+  select MI350; `ops/gfx1250/` selects MI450. Tests under
+  `tokenspeed-kernel/test/amd/gfx950/` or `amd/gfx1250/`, and
+  benchmark suites under `tokenspeed-kernel/benchmarks/amd/gfx950/` or
+  `gfx1250/` (including the corresponding `.json` files), each select their
+  matching family: MI350 for gfx950 and MI450 for gfx1250.
+  MI450 simulator scripts select only MI450.
 - Vendor-owned paths (`tokenspeed-kernel-amd/`, `tokenspeed-mla/`, the
   `tokenspeed-kernel/test/<vendor>/` subtrees, and vendor-specific requirements
   and CI scripts) require only that vendor's runner groups.
@@ -289,11 +391,39 @@ matching rule decides (`ci_path_filter.py` holds the full lists):
   `gluon` is AMD. A vendor-named file whose content mentions another vendor
   stays shared.
 - `test/ci` task YAMLs require only the runner groups matching their
-  `runner.labels`.
+  `runner.labels`. Their `workflow_stage` selects full coverage or import
+  checks; adding or renaming an import-check task needs no filename registry.
+  Missing or invalid task definitions retain conservative coverage, and
+  invalid definitions in the checkout fail matrix validation.
 - Other paths under `python/`, `test/`, `tokenspeed-kernel/`, and
   `tokenspeed-scheduler/` require every runner group.
 - Each workflow's own YAML requires only its runner group; `workflow_dispatch`
   always runs.
+
+Shared AMD adapters, helpers, dependencies, packaging, and unrecognized AMD
+paths still select both families. Mixed changes take the union. Architecture
+rules use both the current and previous filenames supplied by the workflows,
+so moves between architectures retain coverage on both.
+
+AMD adapters import implementations for both architectures. A change confined
+to one architecture's Python sources therefore runs the other family's
+`import-check` tasks in place of its full unit/model suites and benchmarks.
+These reuse the existing API selection tests, which import the real adapters
+and intercept kernel execution. Test-only and benchmark-only changes need no
+cross-architecture import check. Full suites already exercise these imports.
+The MI450 tasks use the existing CPU functional simulator; they do not measure
+GPU performance. Manual runs keep full coverage, and potentially truncated
+changed-path lists (300+ files) conservatively select full coverage.
+
+MI450 simulator tasks share their ROCm and PyTorch pins through
+`test/ci_system/mi450_sim_env.sh`. Each task sources it before running the
+simulator and dependency installers in the same shell; standalone simulator
+setup loads it as well. Update that file to change the stack: its pins override
+inherited environment values. Changes to it select both MI450 tasks.
+The simulator tasks use `install_kernel_deps_rocm.sh` to install kernel
+dependencies without building the scheduler or Rust engine or installing the
+serving runtime. Full ROCm serving installs reuse that script through
+`install_deps_rocm.sh` before installing the runtime components.
 
 PR and push diffs containing only `test/ci/**/*.yaml` run only the changed tasks,
 with existing validation and runner/trigger rules. Diffs that also, or only,
@@ -305,7 +435,13 @@ retain their existing task selection.
 `tokenspeed-kernel/test/` is laid out to feed the vendor rules. Tests whose
 module-level gate (`is_cdna4()`, `is_cdna5()`, `is_amd()`, or an import from
 `tokenspeed_kernel_amd`) skips them off AMD hardware live under
-`tokenspeed-kernel/test/amd/`. Tests that require CUDA, CuTe DSL, FlashInfer,
+`tokenspeed-kernel/test/amd/`. Tests for one AMD architecture live under its
+`gfx950/` or `gfx1250/` subdirectory; shared AMD tests stay outside those
+directories. Keep fixtures and helpers with their tests so directory-based
+coverage also applies to them. Benchmark infrastructure tests live under
+`tokenspeed-kernel/test/benchmark/`; benchmark tests specific to a vendor or
+architecture keep a `benchmark/` directory under that vendor or architecture.
+Tests that require CUDA, CuTe DSL, FlashInfer,
 DeepEP, DeepGEMM, TRT-LLM, FlashAttention 3/4, FlashMLA, Marlin, MNNVL, or
 `tokenspeed-mla` live under `tokenspeed-kernel/test/nvidia/`. Everything else
 (portable Triton kernels, registry and selection logic, tests that
@@ -441,6 +577,9 @@ requested pull request. The generated `srun` steps name that variable in
 `tokenspeed-kernel/python/requirements/cuda-thirdparty.txt`. That pin and the
 in-tree package carry the same version, so pip keeps the wheel and an unreleased
 in-tree kernel change never runs.
+Tests of unreleased MLA implementation behavior, such as KV packing compilation
+reuse, import the in-tree package in a subprocess with an explicit `PYTHONPATH`.
+This keeps those checks independent of the installed wheel used by API tests.
 
 The job gets the node exclusively by default so another job cannot contend for
 its GPU or fixed service ports. Runtime cleanup is
@@ -547,8 +686,8 @@ and per-commit submissions.
 
 The `NVIDIA GB200 Tests` workflow runs single-node `slurm-gb200-*`
 tasks through the `slurm-dispatch` coordinator. Qwen four-GPU tasks migrated
-from B200 use `slurm-gb200-4gpu`: the 397B NVFP4 AIME25 evaluation, 35B FP8
-DeepEP GSM8K evaluation, and 122B EPD OCRBench evaluation and unit test.
+from B200 use `slurm-gb200-4gpu`: the 397B NVFP4 AIME25 evaluation and the
+35B FP8 DeepEP GSM8K evaluation.
 The migration preserves their existing commands, triggers, and score
 thresholds.
 
@@ -560,8 +699,7 @@ Slurm scan clears `TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS`, so the Kubernetes
 The approved-PR and latest-main retry workflows also cover this workflow.
 
 `Slurm Dispatch` includes `slurm-gb200-4gpu` in its default bulk runners.
-Its default `eval,perf` selection covers the three migrated evaluations.
-Select `ut` explicitly to include the EPD unit test.
+Its default `eval,perf` selection covers the two migrated evaluations.
 
 The `NVIDIA GB300 Tests` workflow selects only multi-node model tasks with
 the `per-commit` trigger and submits them through the same
@@ -571,8 +709,8 @@ this repository. Pull-request runs execute the merge commit's dispatcher, so
 the run covers dispatcher changes before merge. The workflow skips fork pull
 requests until the coordinator pool uses ephemeral runners with a protected
 approval environment. Use the manual `Slurm Dispatch` workflow after review.
-New commits cancel the older run for the same pull request or the `main`
-branch.
+New commits cancel the older run for the same pull request. A push to `main`
+does not cancel a running run; only the newest waiting run is kept.
 
 Submission is fail-closed and requires the repository variable
 `TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED` to equal `true`. The dedicated
@@ -611,15 +749,15 @@ GB200 examples:
 ```bash
 # One existing YAML:
 test/ci/run_slurm.sh \
-  test/ci/eval/qwen3.5-122b-a10b-nvfp4-evalscope-ocr-bench.yaml \
+  test/ci/eval/qwen3.5-397b-a17b-nvfp4-evalscope-aime25.yaml \
   --follow
 
 # Every existing YAML for one exact runner label:
 test/ci/run_slurm.sh --all --runner gb200-4gpu --trigger manual
 
-# Migrated Qwen four-GPU evaluations and EPD unit test:
+# Migrated Qwen four-GPU evaluations:
 test/ci/run_slurm.sh --all --runner slurm-gb200-4gpu \
-  --type eval --type ut --trigger manual
+  --type eval --trigger manual
 
 # List Kimi eval/perf tasks from PR 795 for two runner labels:
 test/ci/run_slurm.sh \
@@ -647,10 +785,10 @@ This is a manual launcher, not a GitHub Actions runner. Override its defaults
 with `TS_CI_ARTIFACT_ROOT`, `TS_CI_CACHE_DIR`, or
 `TS_CI_CONTAINER_IMAGE`.
 
-The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.2 by image digest.
+The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.4 by image digest.
 When upgrading, keep the FlashInfer Python requirement, release cubin checksum,
-and runner JIT-cache version aligned. FlashInfer 0.7.2 also requires
-cuDNN frontend 1.31.0 or newer and splits its JIT cache into provider packages.
+and runner JIT-cache version aligned. FlashInfer 0.7.4 also requires
+cuDNN frontend 1.32.0 or newer and splits its JIT cache into provider packages.
 GB200/B200 setup resolves those providers from the matching FlashInfer CUDA
 index and checks their installed versions again after dependency installation.
 

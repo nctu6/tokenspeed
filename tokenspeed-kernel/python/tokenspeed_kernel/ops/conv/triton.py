@@ -34,6 +34,8 @@ both are registered leaves of the ``conv`` family's
 kernels are re-exported for the conv package entry points.
 """
 
+import functools
+
 import torch
 from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.ops.attention.gdn.triton import (
@@ -47,8 +49,10 @@ from tokenspeed_kernel.ops.conv._triton.causal_conv1d import (
 )
 from tokenspeed_kernel.ops.conv._triton.grouped import dflash2_grouped_conv
 from tokenspeed_kernel.ops.conv._triton.sconv import (
+    _inkling_ring_commit_kernel,
     _inkling_ring_sconv_decode_kernel,
     _inkling_ring_sconv_prefill_kernel,
+    select_decode_config,
     select_prefill_config,
 )
 from tokenspeed_kernel.platform import pdl_enabled
@@ -57,15 +61,31 @@ from tokenspeed_kernel.signature import format_signatures
 
 __all__ = [
     "PAD_SLOT_ID",
+    "PREFILL_QKV_CHANNEL_MULTIPLE",
+    "_inkling_ring_commit_kernel",
     "_inkling_ring_sconv_decode_kernel",
     "_inkling_ring_sconv_prefill_kernel",
     "dflash2_grouped_conv",
+    "select_decode_config",
     "select_prefill_config",
     "triton_causal_conv1d_prefill",
+    "triton_causal_conv1d_prefill_qkv",
     "triton_causal_conv1d_update",
 ]
 
 _CONV_DTYPES = {torch.bfloat16, torch.float16, torch.float32}
+# Channels per program of the sequential update, one per thread.
+_UPDATE_BLOCK_CHANNELS = 128
+# Channels per program of the varlen prefill.
+_PREFILL_BLOCK_CHANNELS = 256
+PREFILL_QKV_CHANNEL_MULTIPLE = _PREFILL_BLOCK_CHANNELS
+
+
+@functools.cache
+def _update_num_warps() -> int:
+    """Warps holding one channel per thread (32- or 64-lane warps)."""
+    warp_size = triton.runtime.driver.active.get_current_target().warp_size
+    return max(_UPDATE_BLOCK_CHANNELS // warp_size, 1)
 
 
 @register_kernel(
@@ -133,19 +153,56 @@ def triton_causal_conv1d_prefill(
         Read-only program mapping built once with this forward's sequence
         boundaries and shared by all recurrent-attention layers.
 
-    out: same shape as `x`
+    out: same shape as `x`, with contiguous channels in each token row
     """
+    out = torch.empty((x.shape[1], x.shape[0]), dtype=x.dtype, device=x.device).T
+    _launch_causal_conv1d_prefill(
+        x,
+        weight,
+        bias,
+        conv_states,
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        activation,
+        pad_slot_id,
+        validate_data,
+        prefill_metadata,
+        out,
+    )
+    return out
+
+
+def _launch_causal_conv1d_prefill(
+    x,
+    weight,
+    bias,
+    conv_states,
+    query_start_loc,
+    cache_indices,
+    has_initial_state,
+    activation,
+    pad_slot_id,
+    validate_data,
+    prefill_metadata,
+    out,
+    split_out=None,
+):
     enable_pdl = pdl_enabled()
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
-    out = torch.empty_like(x)
     batch_ptr = prefill_metadata.batch_indices
     token_chunk_offset_ptr = prefill_metadata.chunk_offsets
     if batch_ptr.device != x.device or token_chunk_offset_ptr.device != x.device:
         raise ValueError("convolution metadata must be on the input device")
     if batch_ptr.numel() == 0:
-        return out
+        return
+
+    split_args = {}
+    if split_out is not None:
+        o_k, o_v, key_dim = split_out
+        split_args = {"o_k_ptr": o_k, "o_v_ptr": o_v, "SPLIT_KEY_DIM": key_dim}
 
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
@@ -206,7 +263,7 @@ def triton_causal_conv1d_prefill(
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
 
-    grid = (batch_ptr.numel(), triton.cdiv(dim, 256))
+    grid = (batch_ptr.numel(), triton.cdiv(dim, _PREFILL_BLOCK_CHANNELS))
     _causal_conv1d_fwd_kernel[grid](
         # Pointers to matrices
         x,
@@ -247,12 +304,75 @@ def triton_causal_conv1d_prefill(
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
         BLOCK_M=prefill_metadata.block_m,
-        BLOCK_N=256,
+        BLOCK_N=_PREFILL_BLOCK_CHANNELS,
         num_stages=2,
         ENABLE_PDL=enable_pdl,
+        **split_args,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
-    return out
+
+
+@register_kernel(
+    "conv",
+    "causal_conv1d_prefill_qkv",
+    name="triton_causal_conv1d_prefill_qkv",
+    solution="triton",
+    signatures=format_signatures("x", "dense", _CONV_DTYPES),
+    priority=Priority.PORTABLE,
+)
+def triton_causal_conv1d_prefill_qkv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+    *,
+    prefill_metadata: CausalConv1dPrefillMetadata,
+    key_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``triton_causal_conv1d_prefill`` written straight to contiguous q, k, v rows.
+
+    The packed ``[q | k | v]`` channels of ``x`` (``(dim, cu_seqlen)``, channel
+    last) leave as ``[cu_seqlen, key_dim]``, ``[cu_seqlen, key_dim]`` and
+    ``[cu_seqlen, dim - 2 * key_dim]`` tensors with the values the packed
+    output followed by a q/k/v split would hold. ``key_dim`` and the value
+    width must be multiples of ``PREFILL_QKV_CHANNEL_MULTIPLE``.
+    """
+    dim, cu_seqlen = x.shape
+    value_dim = dim - 2 * key_dim
+    if (
+        key_dim <= 0
+        or value_dim <= 0
+        or key_dim % _PREFILL_BLOCK_CHANNELS
+        or value_dim % _PREFILL_BLOCK_CHANNELS
+    ):
+        raise ValueError(
+            f"q/k/v widths {key_dim}, {key_dim}, {value_dim} must be positive "
+            f"multiples of {_PREFILL_BLOCK_CHANNELS}"
+        )
+    q = x.new_empty((cu_seqlen, key_dim))
+    k = x.new_empty((cu_seqlen, key_dim))
+    v = x.new_empty((cu_seqlen, value_dim))
+    _launch_causal_conv1d_prefill(
+        x,
+        weight,
+        bias,
+        conv_states,
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        activation,
+        pad_slot_id,
+        False,
+        prefill_metadata,
+        q,
+        split_out=(k, v, key_dim),
+    )
+    return q, k, v
 
 
 @register_kernel(
@@ -278,6 +398,8 @@ def triton_causal_conv1d_update(
     validate_data=False,
     *,
     parent_indices: torch.Tensor | None,
+    out: torch.Tensor | None = None,
+    replay_payload: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)
@@ -305,7 +427,9 @@ def triton_causal_conv1d_update(
         conv_state_indices and int32 output_state_indices. Draft trees: token t's
         window ends at token parent_indices[b, t] (the initial window when
         negative) instead of token t - 1.
-    out: (batch, dim) or (batch, dim, seqlen)
+    out: destination shaped and typed like x, not overlapping it; None writes over x.
+    replay_payload: (payload, a, b) to fill, or None; row i * seqlen + t: [k/v channels | a | b].
+    returns: the output, (batch, dim) or (batch, dim, seqlen)
     """
     enable_pdl = pdl_enabled()
     if parent_indices is not None:
@@ -343,6 +467,8 @@ def triton_causal_conv1d_update(
     elif activation is not None:
         assert activation in ["silu", "swish"]
     if parent_indices is not None:
+        if out is not None or replay_payload is not None:
+            raise ValueError("the tree conv writes its own output, without payload")
         return _causal_conv1d_tree_update(
             x,
             conv_state,
@@ -379,7 +505,14 @@ def triton_causal_conv1d_update(
         assert weight.stride(1) == 1  # Need this
         assert cache_seqlens is None
 
-    out = x
+    if out is None:
+        out = x
+    elif out.dim() == 2:
+        out = out.unsqueeze(-1)
+    if out.shape != x.shape or out.dtype != x.dtype:
+        raise ValueError(
+            f"out {out.dtype} {tuple(out.shape)} must match x {x.dtype} {x.shape}"
+        )
     stride_w_dim, stride_w_width = weight.stride()
 
     stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # X (batch, dim, seqlen)
@@ -418,6 +551,36 @@ def triton_causal_conv1d_update(
         )
     else:
         stride_output_state_indices_seq = stride_output_state_indices_step = 0
+    # One channel per thread for multi-token windows, two for single-token decode (faster each).
+    block_n, num_warps = (
+        (_UPDATE_BLOCK_CHANNELS, _update_num_warps()) if seqlen > 1 else (256, 4)
+    )
+    if replay_payload is not None:
+        payload, replay_a, replay_b = replay_payload
+        gate_heads = replay_a.shape[-1]
+        rows = batch * seqlen
+        # The payload saves the channels from this one on.
+        replay_first_channel = dim + 2 * gate_heads - payload.shape[-1]
+        if (
+            payload.shape[0] != rows
+            or payload.stride(-1) != 1
+            or replay_a.shape != (rows, gate_heads)
+            or replay_b.shape != (rows, gate_heads)
+            or replay_a.stride(-1) != 1
+            or replay_b.stride(-1) != 1
+            or not 0 <= replay_first_channel < dim
+            or any(t.dtype != x.dtype for t in replay_payload)
+        ):
+            raise ValueError(
+                "replay_payload needs a [batch * seqlen, width] payload saving "
+                "1 to dim channels plus two [batch * seqlen, heads] gates, all of "
+                "x's dtype with unit inner strides"
+            )
+        replay_strides = (payload.stride(0), replay_a.stride(0), replay_b.stride(0))
+    else:
+        payload = replay_a = replay_b = out
+        gate_heads = replay_first_channel = 0
+        replay_strides = (0, 0, 0)
 
     _causal_conv1d_update_kernel[grid](
         # Pointers to matrices
@@ -431,6 +594,9 @@ def triton_causal_conv1d_update(
         intermediate_conv_window if intermediate_conv_window is not None else x,
         output_state_indices if output_state_indices is not None else x,
         out,
+        payload,
+        replay_a,
+        replay_b,
         # Matrix dimensions
         batch,
         dim,
@@ -456,6 +622,7 @@ def triton_causal_conv1d_update(
         stride_o_seq,
         stride_o_dim,
         stride_o_token,
+        *replay_strides,
         # others
         pad_slot_id,
         # META
@@ -466,9 +633,15 @@ def triton_causal_conv1d_update(
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=block_n,
+        num_warps=num_warps,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
+        HAS_REPLAY_PAYLOAD=replay_payload is not None,
+        REPLAY_FIRST_CHANNEL=replay_first_channel,
+        GATE_HEADS=gate_heads,
+        GATE_BLOCK=triton.next_power_of_2(max(gate_heads, 1)),
+        NP2_SEQLEN=triton.next_power_of_2(seqlen),
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )

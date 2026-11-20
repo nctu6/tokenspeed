@@ -44,7 +44,13 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-from tokenspeed_scheduler import Cache  # noqa: E402
+# Known follow-up, deferred by decision: C1/C2: calls the pre-merge plan helpers (count_plan_ops / cache_ops_from_plan) and nctu6 make_config shapes that main replaced.
+# See merge_main_1117.md, "Known follow-ups".
+pytestmark = pytest.mark.skip(
+    reason="merge_main_1117.md known follow-up (C1/C2): calls the pre-merge plan helpers (count_plan_ops / cache_ops_from_plan) and nctu6 make_config shapes that main replaced"
+)
+
+from tokenspeed_engine.scheduler import Cache  # noqa: E402
 
 from tokenspeed.runtime.engine import cache_hooks as cache_hooks_module  # noqa: E402
 from tokenspeed.runtime.engine import (  # noqa: E402

@@ -36,6 +36,9 @@ The contract, which every caller must hold to:
   kernels in order on one stream, so an earlier op is done with its scratch
   before a later op's kernels run. Work on a side stream runs concurrently and
   must bring its own buffer.
+  One hand-off: a pending draft round resumes on the drafter's stream
+  (``docs/design/event-loop.md``), which owns the block until the main stream
+  joins it.
 
 * **The block must reach its peak before the first CUDA-graph capture.** A
   graph records the raw address of any view captured into it, so the executor
@@ -56,7 +59,8 @@ import os
 import torch
 
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
 
@@ -89,8 +93,17 @@ class WorkspacePool:
         if initial_nbytes is None:
             initial_nbytes = envs.TOKENSPEED_WORKSPACE_INITIAL_MB.get() * (1 << 20)
         self.device = torch.device(device)
-        self._block = torch.empty(initial_nbytes, dtype=torch.uint8, device=self.device)
+        self._memory_saver = TorchMemorySaverAdapter.create(
+            enable=self.device.type == "cuda"
+            and global_server_args_dict["enable_memory_saver"]
+        )
+        self._block = self._new_block(initial_nbytes)
         self._frozen = False
+
+    def _new_block(self, nbytes: int) -> torch.Tensor:
+        """Tag the initial or grown scratch allocation without changing existing views."""
+        with self._memory_saver.named_region("workspace"):
+            return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
 
     def allocate(
         self, *specs: tuple[tuple[int, ...], torch.dtype]
@@ -126,7 +139,7 @@ class WorkspacePool:
             # request from those bytes.
             self._block = torch.empty(0, dtype=torch.uint8, device=self.device)
             del block
-            self._block = torch.empty(total, dtype=torch.uint8, device=self.device)
+            self._block = self._new_block(total)
             block = self._block
 
         views = []
@@ -150,6 +163,11 @@ class WorkspacePool:
     def frozen(self) -> bool:
         return self._frozen
 
+    @property
+    def capacity_bytes(self) -> int:
+        """Current backing allocation size, including unused capacity."""
+        return self._block.numel() * self._block.element_size()
+
 
 _pools: dict[torch.device, WorkspacePool] = {}
 
@@ -157,6 +175,10 @@ _pools: dict[torch.device, WorkspacePool] = {}
 def workspace_pool(device: torch.device | str) -> WorkspacePool:
     """The pool for ``device``, created on first use."""
     key = torch.device(device)
+    # Executor configs name "npu", while tensors report "npu:<index>". Both
+    # must reach the same allocation and the same graph-freeze state.
+    if key.type == "npu" and key.index is None:
+        key = torch.device("npu", torch.get_device_module(key).current_device())
     pool = _pools.get(key)
     if pool is None:
         pool = WorkspacePool(key)

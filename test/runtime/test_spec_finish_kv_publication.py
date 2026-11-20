@@ -43,7 +43,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
-ts = pytest.importorskip("tokenspeed_scheduler")
+ts = pytest.importorskip("tokenspeed_engine.scheduler")
 
 from tokenspeed_kernel.ops.metadata import advance_accepted_frontier  # noqa: E402
 
@@ -116,9 +116,14 @@ class _Engine:
                 disable_l2_cache=True,
                 enable_l3_storage=False,
                 role="fused",
+                max_resident_requests=4,
                 num_snapshot_pages=1,
+                host_group_packing=(),
                 max_retracted_requests=0,
-                l3_prefetch_min_pages=0,
+                storage_config=None,
+                host_write_policy="write_through",
+                prefill_decode_interval=0,
+                prefill_decode_min_interval=0,
                 decode_input_tokens=width,
                 overlap_schedule_depth=int(overlap),
                 cache_groups=[
@@ -132,7 +137,10 @@ class _Engine:
             )
         )
         self.states = RuntimeStates(
-            req_pool_size=_POOL, vocab_size=_VOCAB, output_length=width
+            req_pool_size=_POOL,
+            input_vocab_size=_VOCAB,
+            vocab_size=_VOCAB,
+            output_length=width,
         )
         self.buffers = InputBuffers(
             max_bs=_POOL, max_num_tokens=256, state_write_padding_pool_index=_POOL
@@ -148,6 +156,9 @@ class _Engine:
         self.kv = [-1] * ((_PAGES + 1) * _PAGE)
         # Gathered at dispatch, as the event loop does.
         self.stop_criteria = {}
+        # The runtime's admission id per request (the event loop numbers
+        # admissions; slot state is keyed by them).
+        self.admission_ids = {}
 
     def submit(self, request_id: str, tokens: list[int]) -> None:
         self.processor.rid_to_state[request_id] = RequestState(
@@ -162,6 +173,7 @@ class _Engine:
         self.stop_criteria[request_id] = self.processor.rid_to_state[
             request_id
         ].stop_criteria
+        self.admission_ids[request_id] = len(self.admission_ids) + 1
         spec = ts.RequestSpec()
         spec.request_id = request_id
         spec.tokens = list(tokens)
@@ -187,11 +199,16 @@ class _Engine:
                 rows, torch.tensor(batch.extend_prefix_lens, dtype=torch.int32).cuda()
             )
         self.states.bind_stop_criteria(
-            batch.request_ids,
+            [self.admission_ids[rid] for rid in batch.request_ids],
             batch.request_pool_indices,
             [self.stop_criteria[rid] for rid in batch.request_ids],
         )
-        self.buffers.fill_input_buffers(batch, self.states, total, ngram_inputs=None)
+        self.buffers.fill_input_buffers(batch, self.states, total)
+        # The previous round's outputs (future_input_map) are this forward's
+        # decode inputs; the executor loads them once that round completes.
+        self.buffers.load_round_inputs(
+            batch, self.states, total, None, ngram_inputs=None
+        )
         input_ids = self.buffers.input_ids_buf[:total].tolist()
         positions = self.buffers.positions_buf[:total].tolist()
         pages = batch.block_tables_arrays()["history"][0]

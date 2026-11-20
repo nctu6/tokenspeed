@@ -24,8 +24,10 @@ import math
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
+from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention.kda._prefill_capacity import KdaPrefillCapacity
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
     NoKernelFoundError,
@@ -107,6 +109,111 @@ class KdaPrefillResult:
     final_state: torch.Tensor
 
 
+@dataclass(frozen=True)
+class KdaOutputNorm:
+    """The gated RMSNorm a KDA layer applies to its attention output.
+
+    ``out = rmsnorm(core) * weight * sigmoid(gate)`` per head over ``head_dim``,
+    in FP32 on the BF16 core output, rounded once to the output dtype.
+
+    Attributes:
+        gate: ``[tokens, heads * head_dim]`` raw output-gate logits with unit
+            inner stride; a column view of the input projection is fine.
+        weight: ``[head_dim]`` RMSNorm weight.
+        eps: RMSNorm epsilon.
+    """
+
+    gate: torch.Tensor
+    weight: torch.Tensor
+    eps: float
+
+    def rows(self, begin: int, end: int) -> KdaOutputNorm:
+        """The norm of token rows ``[begin, end)``."""
+        return KdaOutputNorm(self.gate[begin:end], self.weight, self.eps)
+
+
+def apply_kda_output_norm(
+    out: torch.Tensor, output_norm: KdaOutputNorm | None
+) -> torch.Tensor:
+    """``out`` gated-RMSNormed as a ``[tokens, heads * head_dim]`` tensor, or as is.
+
+    Args:
+        out: KDA attention output whose leading dimensions flatten to the
+            gate's token rows and whose last dimension is ``head_dim`` or
+            ``heads * head_dim``.
+        output_norm: The layer's output norm, or None to return ``out``.
+
+    Returns:
+        ``out`` when ``output_norm`` is None, else the normed output.
+    """
+    if output_norm is None:
+        return out
+    tokens, width = output_norm.gate.shape
+    head_dim = output_norm.weight.shape[0]
+    return rmsnorm_gated_sigmoid(
+        out.reshape(tokens, width).contiguous(),
+        output_norm.gate,
+        output_norm.weight,
+        output_norm.eps,
+        width // head_dim,
+        head_dim,
+        enable_pdl=pdl_enabled(),
+    )
+
+
+@dataclass(frozen=True)
+class KdaReplayRecords:
+    """Current-round recovery destinations and record metadata.
+
+    correction and key_gate use slot/head/ring-position/channel order.
+    key_gate holds activation-dtype unnormalized K and raw gate.
+    Correction is always FP32.
+    metadata is INT64 [batch, 3]: physical slot, generation, absolute start.
+    stamps is INT64 [slots, capacity, 2]: absolute position and generation.
+    Position i maps to i % capacity. PR1 allocates one slot per batch row
+    and assigns a new generation on each metadata refresh.
+    query_start_loc maps packed tokens to request rows.
+    original_qkv is an optional destination for live pre-convolution rows in
+    packed input order. None leaves retention to the caller. A destination
+    must use separate storage from the projection inputs.
+    """
+
+    original_qkv: torch.Tensor | None
+    correction: torch.Tensor
+    metadata: torch.Tensor
+    stamps: torch.Tensor
+    key_gate: torch.Tensor
+    query_start_loc: torch.Tensor
+
+
+def kda_replay_payload_specs(
+    dtype: torch.dtype,
+    *,
+    conv_channels: int,
+    num_heads: int,
+    head_dim: int,
+) -> tuple[tuple[int, torch.dtype], ...]:
+    """Describe the common per-token records workspace for both vendors.
+
+    Args:
+        dtype: Activation storage type for original QKV, K, and raw gate.
+        conv_channels: Width of the original QKV input to convolution.
+        num_heads: Local recurrent head count.
+        head_dim: Recurrent key/value dimension.
+
+    Returns:
+        Four (channels, dtype) entries: original QKV, FP32 U, activation-dtype
+        K/raw-g, and an empty reserved buffer. Callers prepend layer/token
+        capacities; the same specification drives allocation and budgeting.
+    """
+    return (
+        (conv_channels, dtype),
+        (num_heads * head_dim, torch.float32),
+        (2 * num_heads * head_dim, dtype),
+        (0, dtype),
+    )
+
+
 def kda_recurrent_layout() -> str:
     """Return the recurrent state layout this platform's KDA kernels consume.
 
@@ -145,15 +252,14 @@ def kda_paged_prefill(
         v: Values ``[1, total_tokens, heads, value_dim]``.
         beta_logits: Raw beta logits ``[1, total_tokens, heads]``.
         A_log/dt_bias: FP32 gate parameters.
-        initial_state: One backend-owned recurrent state per sequence.
+        initial_state: One backend-owned recurrent state per sequence, FP32
+            or BF16.
         cu_seqlens: Device sequence boundaries ``[num_sequences + 1]``.
         cu_seqlens_cpu: REQUIRED host int64 copy of ``cu_seqlens`` with equal
-            contents. Every solution plans its chunk indices from it on the
-            host; reading the device boundaries instead would issue a
-            stream-synchronizing D2H per KDA layer per chunk, which stalls
-            the launch thread behind all queued work (and serializes the
-            chunk pipeline's stages).
-        capacity: Explicit CuTeDSL graph planning bounds, or None for exact
+            contents. Used for capacity admission and backends that require
+            host planning, without a synchronizing D2H per layer. Backends
+            with device planning consume cu_seqlens directly.
+        capacity: Explicit graph planning bounds, or None for exact
             live-length planning. Live boundaries retain their normal meaning.
         lower_bound: Optional safe lower bound for log decay.
         override: Optional exact kernel name.
@@ -162,11 +268,15 @@ def kda_paged_prefill(
             platform default when omitted.
 
     Returns:
-        Packed output and final state, in the caller's ``recurrent_layout``.
+        Packed output and FP32 final state, in the caller's
+        ``recurrent_layout``.
     """
     recurrent_layout = recurrent_layout or kda_recurrent_layout()
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("KDA q must be [1, total_tokens, heads, key_dim]")
+    # Prefill scans take and return FP32 state. A BF16 state pool is widened
+    # here, and the caller narrows the final state when writing it back.
+    initial_state = initial_state.float()
     if k.shape != q.shape or g_raw.shape != q.shape:
         raise ValueError("KDA q, k, and g_raw must have identical shapes")
     if v.ndim != 4 or v.shape[:3] != q.shape[:3]:
@@ -190,10 +300,7 @@ def kda_paged_prefill(
         solution = "triton"
     capacity_kwargs = {}
     if capacity is not None:
-        if solution != "cutedsl_kda":
-            raise ValueError("KDA capacity planning requires explicit cutedsl_kda")
         capacity.validate(cu_seqlens_cpu, q.shape[1])
-        capacity_kwargs["capacity"] = capacity
     kernel = select_kernel(
         "attention",
         "kda_paged_prefill",
@@ -202,10 +309,13 @@ def kda_paged_prefill(
         override=override,
     )
     spec = KernelRegistry.get().get_by_name(kernel.name)
-    if capacity is not None and (
-        spec is None or True not in spec.traits.get("prefill_capacity", ())
-    ):
+    supports_capacity = spec is not None and True in spec.traits.get(
+        "prefill_capacity", ()
+    )
+    if capacity is not None and not supports_capacity:
         raise ValueError("Selected KDA kernel does not support planning capacity")
+    if supports_capacity:
+        capacity_kwargs["capacity"] = capacity
     supported = None if spec is None else spec.traits.get("recurrent_layout")
     # Kernels that declare no layout consume the caller's state as it is.
     relayout = supported is not None and recurrent_layout not in supported
@@ -406,9 +516,8 @@ def try_kda_fused_paged_verify(
     override: str | None = None,
     solution: str | None = None,
     store_states: bool = True,
-    replay_mixed_qkv: torch.Tensor | None = None,
-    replay_gate: torch.Tensor | None = None,
-    replay_beta: torch.Tensor | None = None,
+    replay_records: KdaReplayRecords | None,
+    output_norm: KdaOutputNorm | None,
     g_raw: torch.Tensor | None = None,
     conv_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
@@ -419,13 +528,20 @@ def try_kda_fused_paged_verify(
     scratches for partial-accept commit. ``store_states`` selects the
     rollback-tape variant and ``recurrent_layout`` defaults to the
     platform's state layout; which producer arrangement runs is the
-    registry's choice. Returns ``None`` only when no implementation
+    registry's choice. ``replay_records`` holds FP32 corrections,
+    activation-dtype unnormalized keys and raw gates, and query boundaries
+    for same-round recovery. Commit recomputes key normalization and gate decay.
+    A raw gate may be supplied to fused-convolution verification; supplying
+    ``conv_qkv`` additionally selects split producers. With ``output_norm``
+    the result is the layer's gated-RMSNormed ``[tokens, heads * head_dim]``
+    output; kernels apply it in their epilogue where they can.
+    Returns ``None`` only when no implementation
     supports the current platform.
     """
     recurrent_layout = recurrent_layout or kda_recurrent_layout()
-    if (g_raw is None) != (conv_qkv is None):
-        raise ValueError("g_raw and conv_qkv must be provided together")
-    split_producers = g_raw is not None
+    if conv_qkv is not None and g_raw is None:
+        raise ValueError("precomputed convolution requires a projected raw gate")
+    split_producers = conv_qkv is not None
     signature = _attention_format_signature(
         q=mixed_qkv,
         k=mixed_qkv,
@@ -441,6 +557,9 @@ def try_kda_fused_paged_verify(
                 "head_dim": head_dim,
                 "paged_state": True,
                 "recurrent_layout": recurrent_layout,
+                "replay_records": replay_records is not None,
+                "spec_query_len": draft_token_num,
+                "batch_size": read_indices.shape[0],
                 "split_producers": split_producers,
                 "store_states": store_states,
             },
@@ -450,16 +569,12 @@ def try_kda_fused_paged_verify(
     except NoKernelFoundError:
         return None
     kwargs = {}
-    if replay_mixed_qkv is not None:
-        kwargs.update(
-            {
-                "replay_mixed_qkv": replay_mixed_qkv,
-                "replay_gate": replay_gate,
-                "replay_beta": replay_beta,
-            }
-        )
+    if g_raw is not None:
+        kwargs["g_raw"] = g_raw
     if split_producers:
-        kwargs.update({"g_raw": g_raw, "conv_qkv": conv_qkv})
+        kwargs["conv_qkv"] = conv_qkv
+    if split_producers or replay_records is not None:
+        kwargs["replay_records"] = replay_records
     return kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
@@ -478,6 +593,7 @@ def try_kda_fused_paged_verify(
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
+        output_norm=output_norm,
         **kwargs,
     )
 
@@ -490,7 +606,7 @@ def kda_fused_paged_verify_uses_split_producers(
     num_heads: int,
     head_dim: int,
 ) -> bool:
-    """Whether the selected verify implementation accepts split producers.
+    """Whether serving can pair split-producer verify with batched recovery.
 
     Args:
         dtype: Activation dtype used to resolve the registered kernel.
@@ -501,13 +617,15 @@ def kda_fused_paged_verify_uses_split_producers(
 
     Returns:
         True when the selected implementation accepts precomputed convolution
-        and gate tensors.
+        and gate tensors and its dtype has a batched recovery kernel. Direct
+        kernel callers can exercise verify before serving recovery is available.
     """
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
     traits = {
         "paged_state": True,
         "recurrent_layout": recurrent_layout,
+        "split_producers": True,
         "store_states": store_states,
         "num_heads": num_heads,
         "head_dim": head_dim,
@@ -519,9 +637,65 @@ def kda_fused_paged_verify_uses_split_producers(
     except NoKernelFoundError:
         return False
     registered = KernelRegistry.get().get_by_name(kernel.name)
-    return bool(
+    if registered is None or registered.traits.get("split_producers") != frozenset(
+        {True}
+    ):
+        return False
+    # The backend and workspace recipe must make the same records decision.
+    # Otherwise verify can produce records that commit cannot consume.
+    return (
+        resolve_kda_batched_replay_commit(dtype, num_heads=num_heads, head_dim=head_dim)
+        is not None
+    )
+
+
+def kda_fused_paged_verify_fuses_producers(
+    dtype: torch.dtype,
+    *,
+    recurrent_layout: str,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    batch_size: int,
+) -> bool:
+    """Whether record verify runs its gate and convolution producers inline.
+
+    Args:
+        dtype: Activation dtype used to resolve the registered kernel.
+        recurrent_layout: Committed recurrent-state layout.
+        num_heads: Per-rank KDA head count.
+        head_dim: KDA head width.
+        draft_token_num: Tokens per request window.
+        batch_size: Requests in the batch (padding included).
+
+    Returns:
+        True when the selected record verify for these windows computes the gate
+        projection and convolution itself, so the caller passes neither
+        ``g_raw`` nor ``conv_qkv``. Records and commit are the same either way.
+    """
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    traits = {
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "paged_state": True,
+        "recurrent_layout": recurrent_layout,
+        "replay_records": True,
+        "spec_query_len": draft_token_num,
+        "batch_size": batch_size,
+        "store_states": False,
+    }
+    try:
+        kernel = select_kernel(
+            "attention", "kda_fused_paged_verify", signature, traits=traits
+        )
+    except NoKernelFoundError:
+        return False
+    registered = KernelRegistry.get().get_by_name(kernel.name)
+    return (
         registered is not None
-        and registered.traits.get("split_producers") == frozenset({True})
+        and registered.traits.get("split_producers") == frozenset({False})
+        and registered.traits.get("replay_records") == frozenset({True})
     )
 
 
@@ -534,6 +708,8 @@ def kda_verify_conv_update(
     num_heads: int,
     head_dim: int,
     draft_token_num: int,
+    bias: torch.Tensor | None = None,
+    original_qkv: torch.Tensor | None = None,
     recurrent_layout: str,
 ) -> torch.Tensor:
     """Materialize the convolution producer used by split KDA verification.
@@ -543,6 +719,10 @@ def kda_verify_conv_update(
         conv_weights: Fused four-tap QKV convolution weights.
         conv_states: Committed convolution-state pool.
         read_indices: Committed page index for each request.
+        bias: Optional per-channel bias before SiLU; None adds zero.
+        original_qkv: Optional separate destination for pre-convolution QKV.
+            The producer retains each input row for accepted-history commit.
+            None leaves retention to the caller.
         num_heads: Per-rank KDA head count.
         head_dim: KDA head width.
         draft_token_num: Verify positions per request.
@@ -574,95 +754,9 @@ def kda_verify_conv_update(
         num_heads=num_heads,
         head_dim=head_dim,
         draft_token_num=draft_token_num,
+        bias=bias,
+        original_qkv=original_qkv,
     )
-
-
-def try_kda_replay_commit(
-    mixed_qkv: torch.Tensor,
-    conv_weights: torch.Tensor,
-    conv_states: torch.Tensor,
-    conv_out: torch.Tensor,
-    f_a_out: torch.Tensor,
-    f_b_weight: torch.Tensor,
-    beta_logits: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    *,
-    state_pool: torch.Tensor,
-    state_out: torch.Tensor,
-    read_indices: torch.Tensor,
-    write_indices: torch.Tensor,
-    accepted_length: torch.Tensor,
-    num_heads: int,
-    head_dim: int,
-    draft_token_num: int,
-    lower_bound: float | None = -5.0,
-    override: str | None = None,
-    solution: str | None = None,
-    gate_scratch: torch.Tensor | None = None,
-    replay_gate: torch.Tensor | None = None,
-    recurrent_layout: str | None = None,
-) -> bool:
-    """Run a registered KDA speculative replay-commit when available.
-
-    Replays the accepted prefix of a verified draft window from the committed
-    page, so the caller never has to keep a recurrent state per draft
-    position. Pass the SAME projections the verify pass consumed.
-    ``gate_scratch`` is transient fp32 scratch for the hoisted gate
-    (``[>= N*T, num_heads*head_dim]``); ``None`` falls back to a
-    kernel-module buffer. ``recurrent_layout`` defaults to the platform's
-    state layout.
-
-    Returns:
-        ``True`` when a kernel ran, ``False`` when none supports the current
-        platform (the caller must then fall back to a scratch-based commit).
-    """
-    recurrent_layout = recurrent_layout or kda_recurrent_layout()
-    signature = _attention_format_signature(
-        q=mixed_qkv,
-        k=mixed_qkv,
-        v=mixed_qkv,
-    )
-    try:
-        kernel = select_kernel(
-            "attention",
-            "kda_replay_commit",
-            signature,
-            traits={
-                "num_heads": num_heads,
-                "head_dim": head_dim,
-                "flat_state": True,
-                "recurrent_layout": recurrent_layout,
-            },
-            solution=solution,
-            override=override,
-        )
-    except NoKernelFoundError:
-        return False
-    kwargs = {"replay_gate": replay_gate} if replay_gate is not None else {}
-    kernel(
-        mixed_qkv=mixed_qkv,
-        conv_weights=conv_weights,
-        conv_states=conv_states,
-        conv_out=conv_out,
-        f_a_out=f_a_out,
-        f_b_weight=f_b_weight,
-        beta_logits=beta_logits,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        state_pool=state_pool,
-        state_out=state_out,
-        read_indices=read_indices,
-        write_indices=write_indices,
-        accepted_length=accepted_length,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        draft_token_num=draft_token_num,
-        lower_bound=lower_bound,
-        gate_scratch=gate_scratch,
-        **kwargs,
-    )
-    return True
 
 
 def resolve_kda_batched_replay_commit(
@@ -670,18 +764,24 @@ def resolve_kda_batched_replay_commit(
     *,
     num_heads: int | None = None,
     head_dim: int | None = None,
+    spec_query_len: int | None = None,
+    state_dtype: torch.dtype | None = None,
 ):
     """Resolve the all-layer replay kernel once, or return ``None``.
 
-    Batched kernels dereference descriptor addresses as BF16, so other dtypes
-    use the per-layer commit.
+    NVIDIA records recovery accepts BF16 and FP16 activations, with history
+    stored in the bound pool dtype. Other vendors use their registered dtypes.
+    Kernels bounded to a window or a state dtype are selected only when the
+    caller states them. Otherwise the commit every caller can take is selected.
 
     Args:
         dtype: Activation dtype used by the replay payload.
         num_heads: Local KDA head count, when known.
         head_dim: KDA head dimension, when known.
+        spec_query_len: The verify window the commit replays, when known.
+        state_dtype: Element type of the recurrent-state pools, when known.
     """
-    if dtype is not torch.bfloat16:
+    if dtype not in (torch.bfloat16, torch.float16):
         return None
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
@@ -690,44 +790,14 @@ def resolve_kda_batched_replay_commit(
         traits["num_heads"] = num_heads
     if head_dim is not None:
         traits["head_dim"] = head_dim
+    if spec_query_len is not None:
+        traits["spec_query_len"] = spec_query_len
+    if state_dtype is not None:
+        traits["state_dtype"] = state_dtype
     try:
-        return select_kernel(
-            "attention",
-            "kda_replay_commit",
-            signature,
-            traits=traits,
-            override=(
-                "triton_nvidia_kda_batched_replay_commit"
-                if current_platform().is_nvidia
-                else None
-            ),
-        )
+        return select_kernel("attention", "kda_replay_commit", signature, traits=traits)
     except NoKernelFoundError:
         return None
-
-
-def kda_batched_replay_uses_raw_gate(
-    dtype: torch.dtype = torch.bfloat16,
-    *,
-    num_heads: int | None = None,
-    head_dim: int | None = None,
-) -> bool:
-    """Whether the selected batched replay consumes persistent BF16 raw-g.
-
-    Args:
-        dtype: Activation dtype used by the replay payload.
-        num_heads: Local KDA head count, when known.
-        head_dim: KDA head dimension, when known.
-    """
-    kernel = resolve_kda_batched_replay_commit(
-        dtype, num_heads=num_heads, head_dim=head_dim
-    )
-    if kernel is None:
-        return False
-    registered = KernelRegistry.get().get_by_name(kernel.name)
-    if registered is None:
-        return False
-    return registered.traits.get("replay_raw_gate") == frozenset({True})
 
 
 def kda_replay_commit_supported(
@@ -742,8 +812,8 @@ def kda_replay_commit_supported(
 
     Lets a caller decide up front whether it can skip allocating a
     per-draft-position state scratch, before any verify batch has run. The
-    eager replay path has no decomposed fallback, so it needs both the
-    standalone commit kernel and the no-store fused verify it rides on.
+    deferred commit path needs a batched commit kernel and its matching
+    no-store verify producer. NVIDIA and AMD both consume correction records.
 
     Args:
         dtype: activation dtype the verify batch will use.
@@ -773,6 +843,7 @@ def kda_replay_commit_supported(
             traits={
                 **shape_traits,
                 "flat_state": True,
+                "batched_layers": True,
                 "recurrent_layout": recurrent_layout,
             },
             solution=solution,
@@ -797,23 +868,29 @@ def kda_replay_commit_supported(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.kda.triton  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.kda.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.kda.vllm_recoverssm  # noqa: E402,F401
+
+if has_optional_package("flash_kda"):
+    import tokenspeed_kernel.ops.attention.kda.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.cute_dsl  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.kda.cudnn  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401
 
 # isort: on
 
 __all__ = [
+    "KdaOutputNorm",
     "KdaPrefillResult",
+    "apply_kda_output_norm",
+    "kda_replay_payload_specs",
     "kda_recurrent_layout",
     "kda_paged_prefill",
     "kda_paged_decode",
     "try_kda_fused_paged_decode",
     "try_kda_fused_paged_verify",
+    "kda_fused_paged_verify_fuses_producers",
     "kda_fused_paged_verify_uses_split_producers",
     "kda_verify_conv_update",
-    "try_kda_replay_commit",
     "resolve_kda_batched_replay_commit",
-    "kda_batched_replay_uses_raw_gate",
     "kda_replay_commit_supported",
 ]

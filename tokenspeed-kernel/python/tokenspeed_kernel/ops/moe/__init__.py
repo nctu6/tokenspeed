@@ -29,8 +29,13 @@ from typing import Any, Literal
 import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
+from tokenspeed_kernel.registry import KernelRegistry, Priority
+from tokenspeed_kernel.selection import (
+    KernelPlan,
+    NoKernelFoundError,
+    resolve_kernel_override,
+    select_kernel,
+)
 from tokenspeed_kernel.signature import (
     dense_format_signature,
     dense_tensor_format,
@@ -39,6 +44,8 @@ from tokenspeed_kernel.signature import (
 
 __all__ = [
     "bf16_moe_routes",
+    "bf16_moe_routes_warmup",
+    "gather_moe_routes",
     "COMBINE_ORDERS",
     "ExpertDispatch",
     "dispatch_topk_ids",
@@ -48,6 +55,7 @@ __all__ = [
     "latent_moe_input_projections",
     "MEGA_MOE_AUTO_FEATURE",
     "mega_moe_auto_available",
+    "try_latent_moe_input_projections",
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
@@ -58,12 +66,22 @@ __all__ = [
     "torch_softmax_bias_topk",
     "packed_projection_weight_view",
     "moe_sigmoid_bias_topk_routing",
+    "kimi3_sigmoid_bias_topk_sorted",
+    "kimi3_sorted_routing_accepts",
+    "kimi3_sorted_routing_fuses_shared_down",
+    "kimi3_sorted_routing_scratch",
+    "kimi3_sorted_routing_supported",
     "FUSED_ROUTING_MAX_TOKENS",
     "PreparedNvfp4Routing",
     "prepare_nvfp4_routing",
     "routed_input_scale_rmsnorm_sum",
     "routed_input_scale_rmsnorm_sum_gathered",
+    "routed_sum_reduces_mailbox",
     "prepare_sm90_fp8_moe",
+    "moe_sorted_down",
+    "moe_sorted_gate_up",
+    "prepare_moe_sorted_down_weight",
+    "warmup_moe_sorted_prefill",
 ]
 
 
@@ -156,7 +174,7 @@ def prepare_sm90_fp8_moe(
         returning its output list. Private modes additionally accept a positive
         uint32 ``expected_m`` or None. Callers compute that hint from their own
         routing layout. Initialize before warmup and CUDA graph capture;
-        private modes require FlashInfer 0.7.2, Hopper, and a working JIT compiler.
+        private modes require FlashInfer 0.7.4, Hopper, and a working JIT compiler.
     """
     from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_fused_moe
 
@@ -360,6 +378,53 @@ def latent_moe_input_projections(
     Returns:
         ``(router_logits, routed_input, shared_input)``.
     """
+    result = try_latent_moe_input_projections(
+        hidden_states,
+        router_weight,
+        routed_weight,
+        shared_gate_up_weight,
+        gate_clamp=gate_clamp,
+        up_clamp=up_clamp,
+        override=override,
+        solution=solution,
+    )
+    if result is not None:
+        return result
+
+    router_logits = torch.nn.functional.linear(
+        hidden_states.float(), router_weight.float()
+    )
+    routed_input = torch.nn.functional.linear(hidden_states, routed_weight)
+    shared_raw = torch.nn.functional.linear(hidden_states, shared_gate_up_weight)
+    gate, up = shared_raw.chunk(2, dim=-1)
+    gate_fp32 = gate.float()
+    up_fp32 = up.float()
+    gate_fp32 = gate_clamp * torch.tanh(gate_fp32 / gate_clamp)
+    gate_fp32 *= torch.sigmoid(gate.float())
+    if up_clamp is not None:
+        up_fp32 = up_clamp * torch.tanh(up_fp32 / up_clamp)
+    shared_input = (gate_fp32 * up_fp32).to(hidden_states.dtype)
+    return router_logits, routed_input, shared_input
+
+
+def try_latent_moe_input_projections(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    routed_weight: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    *,
+    gate_clamp: float,
+    up_clamp: float | None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Run a fused input projection, or return None without projecting.
+
+    Arguments and outputs match :func:`latent_moe_input_projections`. A caller
+    that schedules separate projections can retain that scheduling when no
+    fused implementation supports the inputs. Automatic selection declines
+    correctness references; explicit backend requests are preserved.
+    """
     if hidden_states.ndim != 2 or hidden_states.shape[0] < 1:
         raise ValueError("hidden_states must have shape [tokens, hidden_size]")
     tokens, hidden_size = hidden_states.shape
@@ -396,7 +461,10 @@ def latent_moe_input_projections(
         ),
         "weights_packed": _weights_packed(weights),
         "hidden_size_multiple_64": hidden_size % 64 == 0,
+        "gate_clamp": gate_clamp,
+        "up_clamp": up_clamp,
     }
+    override = resolve_kernel_override("moe", "latent_input", override)
     try:
         kernel = select_kernel(
             "moe",
@@ -410,6 +478,12 @@ def latent_moe_input_projections(
         if override is not None or solution is not None:
             raise
         kernel = None
+
+    if kernel is not None and override is None and solution is None:
+        spec = KernelRegistry.get().get_by_name(kernel.name)
+        assert spec is not None
+        if spec.priority == Priority.REFERENCE:
+            return None
 
     if kernel is not None:
         ShapeCapture.get().record(
@@ -435,20 +509,7 @@ def latent_moe_input_projections(
                 up_clamp=up_clamp,
             )
 
-    router_logits = torch.nn.functional.linear(
-        hidden_states.float(), router_weight.float()
-    )
-    routed_input = torch.nn.functional.linear(hidden_states, routed_weight)
-    shared_raw = torch.nn.functional.linear(hidden_states, shared_gate_up_weight)
-    gate, up = shared_raw.chunk(2, dim=-1)
-    gate_fp32 = gate.float()
-    up_fp32 = up.float()
-    gate_fp32 = gate_clamp * torch.tanh(gate_fp32 / gate_clamp)
-    gate_fp32 *= torch.sigmoid(gate.float())
-    if up_clamp is not None:
-        up_fp32 = up_clamp * torch.tanh(up_fp32 / up_clamp)
-    shared_input = (gate_fp32 * up_fp32).to(hidden_states.dtype)
-    return router_logits, routed_input, shared_input
+    return None
 
 
 # ===-----------------------------------------------------------------------===#
@@ -840,6 +901,7 @@ def _moe_sigmoid_bias_topk(
     weights_dtype: torch.dtype = torch.float32,
     override: str | None = None,
     solution: str | None = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select experts using ``sigmoid(logits) + correction_bias``.
 
@@ -852,15 +914,19 @@ def _moe_sigmoid_bias_topk(
         logical_to_physical_map: Optional ``[experts]`` integer map applying
             static expert-location dispatch to the selected ids (fused into
             the specialized decode kernel; a gather elsewhere).
-        weights_dtype: Output dtype for the route weights (selection always
-            runs in FP32).
+        weights_dtype: Dtype for allocated route weights (selection always
+            runs in FP32). Supplied output buffers select their own precision.
         override: Optional exact registered kernel name.
         solution: Optional implementation solution.
+        out: Optional contiguous weight and expert-ID output buffers. FP32
+            weight storage retains FP32 precision, including when
+            ``weights_dtype`` is BF16. IDs can use INT32 or INT64. The selected
+            kernel must support these buffers.
 
     Returns:
-        ``(topk_weights, topk_ids)`` with shapes ``[tokens, topk]``. Weights
-        are ``weights_dtype`` and ids are INT32 (physical ids when a dispatch
-        map is given).
+        ``(topk_weights, topk_ids)`` with shapes ``[tokens, topk]``. Supplied
+        output buffers are returned in place. Without buffers, weights use
+        ``weights_dtype`` and IDs use INT32. A dispatch map produces physical IDs.
     """
     if router_logits.dim() != 2:
         raise ValueError("router_logits must have shape [tokens, experts]")
@@ -881,11 +947,33 @@ def _moe_sigmoid_bias_topk(
         )
     if not 0 < topk <= experts:
         raise ValueError(f"topk must be in [1, {experts}], got {topk}")
+    if out is not None:
+        weights, ids = out
+        shape = (tokens, topk)
+        for tensor in out:
+            if (
+                tensor.shape != shape
+                or tensor.device != router_logits.device
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"Routing output must be contiguous {shape} on {router_logits.device}"
+                )
+        if weights.dtype != weights_dtype and not (
+            weights_dtype == torch.bfloat16 and weights.dtype == torch.float32
+        ):
+            raise ValueError(
+                "Routing weights must use the requested dtype or FP32 storage "
+                "for BF16 requests"
+            )
+        if ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Routing expert IDs must use INT32 or INT64")
     if tokens == 0:
-        shape = (0, topk)
+        if out is not None:
+            return out
         return (
-            torch.empty(shape, device=router_logits.device, dtype=weights_dtype),
-            torch.empty(shape, device=router_logits.device, dtype=torch.int32),
+            torch.empty((0, topk), dtype=weights_dtype, device=router_logits.device),
+            torch.empty((0, topk), dtype=torch.int32, device=router_logits.device),
         )
     if (
         override is None
@@ -895,7 +983,18 @@ def _moe_sigmoid_bias_topk(
         solution = "torch"
 
     signature = format_signature(router_logits=dense_tensor_format(router_logits.dtype))
-    traits = {"tokens": tokens, "experts": experts, "topk": topk}
+    traits = {
+        "tokens": tokens,
+        "experts": experts,
+        "topk": topk,
+        "bias_dtype": correction_bias.dtype,
+        "inputs_contiguous": router_logits.is_contiguous()
+        and correction_bias.is_contiguous(),
+        "normalize_topk_weights": normalize_topk_weights,
+        "routed_scaling_factor": routed_scaling_factor,
+        "weights_dtype": out[0].dtype if out is not None else weights_dtype,
+        "ids_dtype": out[1].dtype if out is not None else torch.int32,
+    }
     if logical_to_physical_map is not None and (
         (override is not None and override.endswith("_mapped"))
         or (
@@ -915,7 +1014,15 @@ def _moe_sigmoid_bias_topk(
         except NoKernelFoundError:
             mapped_kernel = None
         if mapped_kernel is not None:
-            topk_weights, topk_ids = mapped_kernel(
+            spec = KernelRegistry.get().get_by_name(mapped_kernel.name)
+            supports_output_buffers = spec is not None and True in spec.traits.get(
+                "supports_output_buffers", frozenset({False})
+            )
+            if out is not None and not supports_output_buffers:
+                raise ValueError(
+                    f"{mapped_kernel.name} does not accept routing output buffers"
+                )
+            kwargs = dict(
                 router_logits=router_logits,
                 correction_bias=correction_bias,
                 topk=topk,
@@ -924,6 +1031,10 @@ def _moe_sigmoid_bias_topk(
                 logical_to_physical_map=logical_to_physical_map,
                 weights_dtype=weights_dtype,
             )
+            if supports_output_buffers:
+                topk_weights, topk_ids = mapped_kernel(**kwargs, out=out)
+            else:
+                topk_weights, topk_ids = mapped_kernel(**kwargs)
             return topk_weights, topk_ids
 
     kernel = select_kernel(
@@ -934,7 +1045,13 @@ def _moe_sigmoid_bias_topk(
         override=override,
         solution=solution,
     )
-    topk_weights, topk_ids = kernel(
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    supports_output_buffers = spec is not None and True in spec.traits.get(
+        "supports_output_buffers", frozenset({False})
+    )
+    if out is not None and not supports_output_buffers:
+        raise ValueError(f"{kernel.name} does not accept routing output buffers")
+    kwargs = dict(
         router_logits=router_logits,
         correction_bias=correction_bias,
         topk=topk,
@@ -942,8 +1059,15 @@ def _moe_sigmoid_bias_topk(
         normalize_topk_weights=normalize_topk_weights,
         weights_dtype=weights_dtype,
     )
+    if supports_output_buffers:
+        topk_weights, topk_ids = kernel(**kwargs, out=out)
+    else:
+        topk_weights, topk_ids = kernel(**kwargs)
     if logical_to_physical_map is not None:
         topk_ids = logical_to_physical_map[topk_ids.long()].to(torch.int32)
+        if out is not None:
+            out[1].copy_(topk_ids)
+            topk_ids = out[1]
     return topk_weights, topk_ids
 
 
@@ -951,6 +1075,16 @@ def _moe_sigmoid_bias_topk(
 # Routing and expert APIs
 # ===-----------------------------------------------------------------------===#
 
+from tokenspeed_kernel.ops.moe._triton.bf16 import (  # noqa: E402
+    _check_route_tensors as _check_bf16_route_tensors,
+)
+from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (  # noqa: E402
+    kimi3_sigmoid_bias_topk_sorted,
+    kimi3_sorted_routing_accepts,
+    kimi3_sorted_routing_fuses_shared_down,
+    kimi3_sorted_routing_scratch,
+    kimi3_sorted_routing_supported,
+)
 from tokenspeed_kernel.ops.moe._triton.sigmoid_topk_routing import (  # noqa: E402
     MAX_TOKENS as FUSED_ROUTING_MAX_TOKENS,
 )
@@ -959,8 +1093,16 @@ from tokenspeed_kernel.ops.moe.flashinfer import (  # noqa: E402
     prepare_nvfp4_routing,
 )
 from tokenspeed_kernel.ops.moe.routed_norm import (  # noqa: E402
+    gather_moe_routes,
     routed_input_scale_rmsnorm_sum,
     routed_input_scale_rmsnorm_sum_gathered,
+    routed_sum_reduces_mailbox,
+)
+from tokenspeed_kernel.ops.moe.sorted_prefill import (  # noqa: E402
+    moe_sorted_down,
+    moe_sorted_gate_up,
+    prepare_moe_sorted_down_weight,
+    warmup_moe_sorted_prefill,
 )
 
 
@@ -1031,7 +1173,7 @@ def _routing_kind(
 
 
 def moe_topk(
-    router_logits: torch.Tensor,
+    router_logits: torch.Tensor | None,
     top_k: int,
     score_function: Literal["softmax", "sigmoid", "sqrt_softplus"],
     selection_method: Literal["topk", "hash"],
@@ -1045,14 +1187,22 @@ def moe_topk(
     topk_weights_dtype: torch.dtype = torch.float32,
     override: str | None = None,
     solution: str | None = None,
+    hidden_states: torch.Tensor | None = None,
+    gate_weight: torch.Tensor | None = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Produce expert weights and ids using a registered MoE TopK kernel.
+
+    Sqrt-softplus routing may pass `hidden_states` and `gate_weight` instead of
+    `router_logits`. A fused router GEMM and top-k kernel is then selected, and
+    NoKernelFoundError is raised when none serves the inputs.
 
     Correction bias affects selection only; returned weights are gathered from
     the unbiased scores. Hash routing uses the checkpoint table for expert ids.
 
     Args:
-        router_logits: Router logits shaped [tokens, experts].
+        router_logits: Router logits shaped [tokens, experts], or None when
+            `hidden_states` and `gate_weight` are given.
         top_k: Number of experts selected for each token.
         score_function: Transformation from router logits to routing scores.
         selection_method: Select experts by score or token hash.
@@ -1069,9 +1219,15 @@ def moe_topk(
             and Triton can write BF16 directly after scaling.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
+        hidden_states: Optional activations shaped [tokens, hidden].
+        gate_weight: Optional router weight shaped [experts, hidden].
+        out: Optional (weights, ids) output buffers for biased sigmoid routing.
+            IDs must use topk_indices_dtype. Weights use the supplied buffer's
+            precision; FP32 storage is also accepted for BF16 requests.
+            Omission allocates the outputs in the selected kernel.
     Returns:
         Weights and expert ids shaped [tokens, top_k], using the requested
-        output dtypes (FP32 weights and INT32 ids by default).
+        output dtypes, or the supplied out buffers.
     """
     if selection_method not in {"topk", "hash"}:
         raise ValueError(f"unsupported MoE selection method: {selection_method!r}")
@@ -1086,7 +1242,23 @@ def moe_topk(
         raise ValueError("topk_indices_dtype must be torch.int32 or torch.int64")
     if not topk_weights_dtype.is_floating_point:
         raise ValueError("topk_weights_dtype must be a floating-point dtype")
+    if out is not None:
+        if score_function != "sigmoid":
+            raise ValueError(
+                "Routing output buffers currently support biased sigmoid top-k"
+            )
+        if out[1].dtype != topk_indices_dtype:
+            raise ValueError("Routing expert-ID output must match topk_indices_dtype")
 
+    if router_logits is None and (
+        hidden_states is None
+        or gate_weight is None
+        or score_function != "sqrt_softplus"
+    ):
+        raise ValueError(
+            "router_logits may only be omitted for sqrt_softplus routing "
+            "with hidden_states and gate_weight"
+        )
     scaling_factor = 1.0 if routed_scaling_factor is None else routed_scaling_factor
     if score_function == "softmax":
         if selection_method != "topk":
@@ -1121,6 +1293,7 @@ def moe_topk(
             weights_dtype=topk_weights_dtype,
             override=override,
             solution=solution,
+            out=out,
         )
         return topk_weights, topk_ids.to(topk_indices_dtype)
 
@@ -1128,11 +1301,17 @@ def moe_topk(
         raise ValueError(f"unsupported MoE score function: {score_function!r}")
     if logical_to_physical_map is not None:
         raise ValueError("sqrt_softplus routing does not accept an expert-id map")
-    if router_logits.ndim != 2:
-        raise ValueError("router_logits must have shape [tokens, experts]")
-    if not router_logits.is_floating_point():
+    fused = router_logits is None
+    if fused:
+        router_like = hidden_states
+        tokens, experts = hidden_states.shape[0], gate_weight.shape[0]
+    else:
+        router_like = router_logits
+        if router_logits.ndim != 2:
+            raise ValueError("router_logits must have shape [tokens, experts]")
+        tokens, experts = router_logits.shape
+    if not router_like.is_floating_point():
         raise ValueError("router_logits must be a floating-point tensor")
-    tokens, experts = router_logits.shape
     if not 0 < top_k <= experts:
         raise ValueError(f"top_k must be in [1, {experts}], got {top_k}")
     valid_bias_shapes = {(experts,), (tokens, experts)}
@@ -1156,11 +1335,11 @@ def moe_topk(
             raise ValueError("input_ids must have dtype int32 or int64")
         if input_ids.numel() != tokens:
             raise ValueError(f"input_ids must contain {tokens} token ids")
-        if hash_indices_table.device != router_logits.device:
+        if hash_indices_table.device != router_like.device:
             raise ValueError(
                 "hash_indices_table must be on the same device as router_logits"
             )
-        if input_ids.device != router_logits.device:
+        if input_ids.device != router_like.device:
             raise ValueError("input_ids must be on the same device as router_logits")
         _assert_indices_in_range(input_ids, hash_indices_table.shape[0], "input_ids")
         safe_input_ids = input_ids.clamp(0, hash_indices_table.shape[0] - 1)
@@ -1169,6 +1348,34 @@ def moe_topk(
         input_ids = safe_input_ids
 
     routing_kind = _routing_kind(correction_bias, hash_indices_table)
+    per_token_bias = correction_bias is not None and correction_bias.ndim == 2
+    if fused:
+        if per_token_bias:
+            raise ValueError("fused router top-k does not accept per-token bias")
+        kernel, fused_traits = _router_topk_kernel(
+            hidden_states, gate_weight, top_k, routing_kind, override, solution
+        )
+        ShapeCapture.get().record(
+            "moe", "router_topk", kernel.name, hidden_states.dtype, fused_traits
+        )
+        with kernel_scope(
+            "moe",
+            "router_topk",
+            hidden_states.dtype,
+            kernel_name=kernel.name,
+            **fused_traits,
+        ):
+            topk_weights, topk_ids = kernel(
+                hidden_states,
+                gate_weight,
+                top_k,
+                renormalize,
+                correction_bias,
+                hash_indices_table,
+                input_ids,
+                scaling_factor,
+            )
+            return topk_weights.to(topk_weights_dtype), topk_ids.to(topk_indices_dtype)
     traits = {
         "tokens": int(tokens),
         "experts": experts,
@@ -1178,7 +1385,6 @@ def moe_topk(
         "score_function": score_function,
     }
     signature = format_signature(router_logits=dense_tensor_format(router_logits.dtype))
-    per_token_bias = correction_bias is not None and correction_bias.ndim == 2
     if per_token_bias and solution not in {None, "torch"}:
         raise ValueError(
             f"per-token correction bias does not support solution {solution!r}"
@@ -1247,6 +1453,35 @@ def moe_topk(
             ),
         )
         return topk_weights.to(topk_weights_dtype), topk_ids.to(topk_indices_dtype)
+
+
+def _router_topk_kernel(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    top_k: int,
+    routing_kind: str,
+    override: str | None = None,
+    solution: str | None = None,
+):
+    traits = {
+        "tokens": int(hidden_states.shape[0]),
+        "experts": int(gate_weight.shape[0]),
+        "hidden": int(hidden_states.shape[1]),
+        "top_k": int(top_k),
+        "routing_kind": routing_kind,
+    }
+    kernel = select_kernel(
+        "moe",
+        "router_topk",
+        format_signature(
+            hidden_states=dense_tensor_format(hidden_states.dtype),
+            gate_weight=dense_tensor_format(gate_weight.dtype),
+        ),
+        traits=traits,
+        override=override,
+        solution=solution,
+    )
+    return kernel, traits
 
 
 def _normalize_weight_dtype(weight_dtype: str) -> str:
@@ -1390,6 +1625,9 @@ def _build_traits(
         traits["activation"] = activation
     if requires_deferred_finalize:
         traits["supports_deferred_finalize"] = True
+    else:
+        # Excludes the kernels that only return per-route outputs.
+        traits["supports_finalize"] = True
     if routing_mode is not None:
         traits["routing_mode"] = routing_mode
 
@@ -1479,8 +1717,14 @@ def bf16_moe_routes(
     w2: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_start: int,
+    output: torch.Tensor | None = None,
+    *,
+    batch_invariant: bool,
 ) -> torch.Tensor:
-    """Return unweighted BF16 SwiGLU outputs for every selected local expert.
+    """Return the unweighted BF16 output of every selected local expert.
+
+    Each route row is the expert's down projection of its SwiGLU intermediate,
+    before the routing weight is applied.
 
     Args:
         x: Contiguous BF16 hidden states ``[tokens, hidden]``.
@@ -1488,12 +1732,238 @@ def bf16_moe_routes(
         w2: Local down weights ``[experts, hidden, I]``.
         topk_ids: Global selected expert ids ``[tokens, topk]``.
         expert_start: First global expert represented by ``w13`` and ``w2``.
+        output: Optional caller-owned contiguous destination of
+            ``tokens * topk * hidden`` elements with ``x``'s dtype that overlaps
+            no input; every route row is overwritten.
+        batch_invariant: Require a provider declaring the ``batch_invariant``
+            feature, as bitwise numerics envelopes do.
 
     Returns:
-        Route outputs ``[tokens, topk, hidden]``; routes to other ranks' experts are zero.
+        Route outputs ``[tokens, topk, hidden]`` (a view of ``output`` when
+        given); routes to other ranks' experts are zero.
     """
-    kernel = select_kernel("moe", "routes", dense_format_signature(("x",), (x.dtype,)))
-    return kernel(x, w13, w2, topk_ids, expert_start)
+    _check_bf16_route_tensors(x, w13, w2, topk_ids)
+    if expert_start < 0:
+        raise ValueError("expert_start must be non-negative")
+    if output is not None:
+        _check_bf16_route_destination(x, w13, w2, topk_ids, output)
+        output = output.view(topk_ids.numel(), x.shape[1])
+    num_tokens, hidden = x.shape
+    top_k = topk_ids.shape[1]
+    intermediate_size = w2.shape[2]
+    kernel = _select_bf16_routes_kernel(
+        x.dtype,
+        hidden,
+        intermediate_size,
+        top_k,
+        buffer_offsets_fit_int32=_bf16_route_offsets_fit_int32(
+            num_tokens, top_k, hidden, intermediate_size, x.element_size()
+        ),
+        batch_invariant=batch_invariant,
+    )
+    return kernel(x, w13, w2, topk_ids, expert_start, output=output)
+
+
+def _select_bf16_routes_kernel(
+    dtype: torch.dtype,
+    hidden: int,
+    intermediate_size: int,
+    top_k: int,
+    *,
+    buffer_offsets_fit_int32: bool,
+    batch_invariant: bool,
+) -> Callable[..., torch.Tensor]:
+    return select_kernel(
+        "moe",
+        "routes",
+        dense_format_signature(("x",), (dtype,)),
+        features=frozenset({"batch_invariant"}) if batch_invariant else frozenset(),
+        traits={
+            "buffer_offsets_fit_int32": buffer_offsets_fit_int32,
+            "hidden": hidden,
+            "ispp": intermediate_size,
+            "topk": top_k,
+        },
+    )
+
+
+def _bf16_route_offsets_fit_int32(
+    num_tokens: int,
+    top_k: int,
+    hidden: int,
+    intermediate_size: int,
+    element_size: int,
+) -> bool:
+    """Return whether every route buffer and expert weight stays under 2 GiB.
+
+    Buffer loads and stores take 32-bit byte offsets. The largest route buffer
+    is the output or the intermediate (``x`` is smaller than the output);
+    weights are addressed from each expert's base, so one expert's gate/up
+    projection bounds them.
+    """
+    route_elements = num_tokens * top_k * max(hidden, intermediate_size)
+    expert_elements = 2 * intermediate_size * hidden
+    return max(route_elements, expert_elements) * element_size < 2**31
+
+
+def _check_bf16_route_destination(
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Reject a route destination that is ill-shaped or overlaps a route input."""
+    if (
+        output.dtype != x.dtype
+        or output.device != x.device
+        or not output.is_contiguous()
+    ):
+        raise ValueError("route destination must be contiguous and match x")
+    if output.numel() != topk_ids.numel() * x.shape[1]:
+        raise ValueError("route destination must hold tokens * topk * hidden values")
+    start = output.data_ptr()
+    end = start + output.numel() * output.element_size()
+    for tensor in (x, w13, w2, topk_ids):
+        # Each kernel streams these inputs while it writes routes.
+        first = tensor.data_ptr()
+        if (
+            output.numel()
+            and tensor.numel()
+            and first < end
+            and start < first + tensor.numel() * tensor.element_size()
+        ):
+            raise ValueError("route destination must not overlap the route inputs")
+
+
+# Token counts that compile the binaries a layer launches. The Gluon kernels
+# take every batch-varying integer at runtime, so one count on each side of
+# their 16-token decode/prefill switch would do. The rest is for the Triton
+# fallback (unsupported widths or top-k), whose integer arguments do
+# specialize: 1, multiples of 16 and other values on both sides of its own
+# 16-token tile switch, with odd and even route counts. Its program count is
+# also a constexpr, so small decode batches that do not fill the GPU may
+# still compile once. On NVIDIA the deep-pipeline tile switch sits at 32
+# routes per local expert instead, past these counts, so the first larger
+# prefill batch there compiles once too.
+_BF16_ROUTES_WARMUP_TOKENS = (1, 2, 16, 17, 18, 32)
+
+
+def bf16_moe_routes_warmup(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    top_k: int,
+    expert_start: int,
+    *,
+    max_num_tokens: int,
+    batch_invariant: bool,
+) -> None:
+    """Compile the route kernels a layer can launch, before graph capture.
+
+    Args:
+        w13: Local gate/up weights ``[experts, 2I, hidden]``.
+        w2: Local down weights ``[experts, hidden, I]``.
+        top_k: Routes per token.
+        expert_start: First global expert represented by the weights.
+        max_num_tokens: Largest token count the layer routes.
+        batch_invariant: Passed to :func:`bf16_moe_routes`.
+    """
+    num_experts, _, hidden = w13.shape
+    intermediate_size = w2.shape[2]
+    # Batches past the 2 GiB offset bound select another kernel. Its binaries
+    # depend only on token classes the counts below already cover above 16
+    # tokens, so compile it on those counts too.
+    large_batch_kernel = None
+    if not _bf16_route_offsets_fit_int32(
+        max_num_tokens, top_k, hidden, intermediate_size, w13.element_size()
+    ):
+        large_batch_kernel = _select_bf16_routes_kernel(
+            w13.dtype,
+            hidden,
+            intermediate_size,
+            top_k,
+            buffer_offsets_fit_int32=False,
+            batch_invariant=batch_invariant,
+        )
+        small_batch_kernel = _select_bf16_routes_kernel(
+            w13.dtype,
+            hidden,
+            intermediate_size,
+            top_k,
+            buffer_offsets_fit_int32=True,
+            batch_invariant=batch_invariant,
+        )
+        if large_batch_kernel.name == small_batch_kernel.name:
+            large_batch_kernel = None
+    for num_tokens in _BF16_ROUTES_WARMUP_TOKENS:
+        if num_tokens > max_num_tokens:
+            break
+        topk_ids = (
+            torch.arange(num_tokens * top_k, dtype=torch.int32, device=w13.device)
+            % num_experts
+            + expert_start
+        ).view(num_tokens, top_k)
+        x = torch.zeros((num_tokens, hidden), dtype=w13.dtype, device=w13.device)
+        bf16_moe_routes(
+            x, w13, w2, topk_ids, expert_start, batch_invariant=batch_invariant
+        )
+        if large_batch_kernel is not None:
+            large_batch_kernel(x, w13, w2, topk_ids, expert_start, output=None)
+
+
+def _bf16_routes_moe_apply(
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    topk_ids: torch.Tensor | None,
+    do_finalize: bool,
+    deferred_out: torch.Tensor | None,
+) -> tuple[torch.Tensor, None, None]:
+    """Run a ``MoELayer``'s BF16 experts through :func:`bf16_moe_routes`.
+
+    The shared body of the route-backed ``moe.apply`` kernels, which declare
+    ``supports_finalize={False}``: they only return unfinalized routes.
+
+    Args:
+        x: Contiguous BF16 hidden states ``[tokens, hidden]``.
+        w: The layer, holding local ``w13_weight`` ``[experts, 2I, hidden]``
+            and ``w2_weight`` ``[experts, hidden, I]`` and its ``ep_rank`` and
+            ``num_local_experts``.
+        topk_ids: Global selected expert ids ``[tokens, topk]``.
+        do_finalize: Must be false.
+        deferred_out: Optional caller-owned destination, as ``output`` of
+            :func:`bf16_moe_routes`.
+
+    Returns:
+        ``(route_outputs, None, None)``: unweighted routes ``[tokens * topk,
+        hidden]`` in token order, rows of other ranks' experts zero, so no
+        route map is needed.
+    """
+    if do_finalize:
+        raise ValueError("BF16 route kernels return unfinalized routes only")
+    if topk_ids is None:
+        raise ValueError("BF16 route kernels require precomputed top-k ids")
+    routes = bf16_moe_routes(
+        x,
+        w.w13_weight,
+        w.w2_weight,
+        topk_ids.contiguous(),
+        w.ep_rank * w.num_local_experts,
+        output=deferred_out,
+        batch_invariant=False,
+    )
+    return routes.view(-1, x.shape[1]), None, None
+
+
+def _bf16_routes_moe_warmup(plan: dict, w: torch.nn.Module) -> None:
+    """Compile the route kernels behind :func:`_bf16_routes_moe_apply`."""
+    bf16_moe_routes_warmup(
+        w.w13_weight,
+        w.w2_weight,
+        w.top_k,
+        w.ep_rank * w.num_local_experts,
+        max_num_tokens=plan["warmup_max_num_tokens"],
+        batch_invariant=False,
+    )
 
 
 def moe_plan(
@@ -1535,6 +2005,8 @@ def moe_plan(
         input_dtype: Hidden-state dtype used for the apply-kernel signature.
         activation: Optional activation name required by the layer.
         requires_deferred_finalize: Require a kernel that can defer finalize.
+            Otherwise the kernel must finalize, which excludes kernels
+            declaring ``supports_finalize={False}``.
         routing_mode: Optional routing-mode requirement. "precomputed_topk"
             requires a kernel that consumes externally computed top-k ids and
             weights (for models whose routing function the fused kernels
@@ -1624,6 +2096,9 @@ def moe_plan(
     the selected apply kernel, then pinned by callable in the returned plan so load
     time does not rerun selection or conflict resolution. The plan carries
     ``combine_order`` and ``process_group`` for the apply kernel to read.
+    Unquantized CUTLASS plans use fused expert reduction by default.
+    Set ``plan["cutlass_fused_finalize"] = False`` before warmup to use
+    a separate reduction instead of floating-point atomics.
     """
     weight_dtype = _normalize_weight_dtype(weight_dtype)
     _validate_a2a_backend(a2a_backend)
@@ -1715,6 +2190,12 @@ def moe_plan(
     supports_deferred_finalize = True in apply_spec.traits.get(
         "supports_deferred_finalize", frozenset({False})
     )
+    deferred_output_is_token_order = True in apply_spec.traits.get(
+        "deferred_output_is_token_order", frozenset({False})
+    )
+    supports_deferred_out = True in apply_spec.traits.get(
+        "supports_deferred_out", frozenset({False})
+    )
     topk_weights_dtypes = apply_spec.traits.get(
         "topk_weights_dtype", frozenset({torch.float32})
     )
@@ -1735,6 +2216,15 @@ def moe_plan(
     supports_prequantized_input = True in apply_spec.traits.get(
         "supports_prequantized_input", frozenset({False})
     )
+    sorted_route_rows = apply_spec.traits.get("sorted_route_rows", frozenset())
+    sorted_route_block_sizes = apply_spec.traits.get(
+        "sorted_route_block_size", frozenset()
+    )
+    if len(sorted_route_block_sizes) != (1 if sorted_route_rows else 0):
+        raise ValueError(
+            f"MoE kernel {apply_spec.name!r} must declare one "
+            "sorted_route_block_size exactly when it declares sorted_route_rows"
+        )
     return {
         "weight_dtype": weight_dtype,
         "activation": activation,
@@ -1742,8 +2232,12 @@ def moe_plan(
         "apply_kernel": kernel,
         "input_dtype": input_dtype,
         "features": features,
+        "supports_valid_token_mask": "valid_token_mask" in apply_spec.features,
         "weight_preprocessor": apply_spec.weight_preprocessor,
         "warmup": getattr(kernel.impl, "_tokenspeed_warmup", None),
+        "fuse_shared_expert": getattr(
+            kernel.impl, "_tokenspeed_fuse_shared_expert", None
+        ),
         "a2a_backend": a2a_backend,
         "process_group": process_group,
         "deepep_mode": deepep_mode or "auto",
@@ -1754,11 +2248,16 @@ def moe_plan(
         "fast_math": fast_math,
         "combine_order": combine_order,
         "ep_token_layout": ep_token_layout,
+        "cutlass_fused_finalize": True,
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
+        "deferred_output_is_token_order": deferred_output_is_token_order,
+        "supports_deferred_out": supports_deferred_out,
         "topk_weights_dtype": topk_weights_dtype,
         "supports_prequantized_input": supports_prequantized_input,
+        "sorted_route_rows": sorted_route_rows,
+        "sorted_route_block_size": next(iter(sorted_route_block_sizes), None),
         # All-to-all EP (DeepEP, Petit): each rank runs its own tokens'
         # routes, so routing may pick per-rank replicas. Otherwise every
         # rank routes every token and must agree on one replica per route.
@@ -1844,7 +2343,9 @@ def mega_moe_auto_available(
     return True
 
 
-def moe_process_weights(plan: dict, w: torch.nn.Module):
+def moe_process_weights(
+    plan: dict, w: torch.nn.Module, *, communication_initializer=None
+):
     """Process loaded MoE weights and prepare persistent communication storage.
 
     Args:
@@ -1853,6 +2354,9 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
             place to prepare solution-specific layouts and scales. DeepEP
             modules must declare hidden_size (the unquantized input width)
             and num_experts (the global expert count).
+        communication_initializer: Optional callback scheduler accepting a
+            zero-argument initializer. A managed allocator may defer it until
+            its weight region exits. None initializes immediately.
 
     Returns:
         The selected weight preprocessor's result, or None without one.
@@ -1873,7 +2377,8 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
         from tokenspeed_kernel.ops.communication.deep_ep import prepare_deepep_buffer
 
         hidden_size, num_experts = deepep_geometry
-        prepare_deepep_buffer(
+        initialize = functools.partial(
+            prepare_deepep_buffer,
             group=plan["process_group"],
             hidden_size=hidden_size,
             num_experts=num_experts,
@@ -1882,6 +2387,10 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
                 "deepep_low_latency_max_num_tokens_per_gpu"
             ],
         )
+        if communication_initializer is None:
+            initialize()
+        else:
+            communication_initializer(initialize)
     return result
 
 
@@ -1917,6 +2426,8 @@ def moe_apply(
     shared_out: torch.Tensor | None = None,
     x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
     routing_prepared: object | None = None,
+    deferred_out: torch.Tensor | None = None,
+    valid_token_mask: torch.Tensor | None = None,
 ):
     """Apply a planned MoE kernel.
 
@@ -1957,16 +2468,31 @@ def moe_apply(
         shared_out: Optional destination for the shared-expert down projection
             with shape [tokens, output_size]. Must be provided together with
             ``shared_input`` and ``shared_weight``.
+        valid_token_mask: Optional boolean live-row mask. The selected kernel
+            must declare this feature; shape/device mismatches are rejected.
         x_quantized: Optional ``x`` already quantized in the kernel's
             activation format, so the kernel skips its own quantize. Only
             forwarded when given; kernels that cannot consume it reject it.
         routing_prepared: Routing metadata the top-k kernel filled ahead of
             this call, so the kernel skips its routing launch. Only forwarded
             when given; kernels that cannot consume it reject it.
+        deferred_out: Optional caller-owned route destination for
+            ``do_finalize=False``; requires ``supports_deferred_out``.
 
     Solutions may use precomputed top-k tensors or route from logits directly.
     """
+    if deferred_out is not None and (do_finalize or not plan["supports_deferred_out"]):
+        raise ValueError("selected MoE plan cannot write the supplied deferred output")
     data = x[0] if isinstance(x, tuple) else x
+    if valid_token_mask is not None:
+        if not plan["supports_valid_token_mask"]:
+            raise ValueError("Selected MoE kernel cannot consume a live-row mask")
+        if (
+            valid_token_mask.dtype != torch.bool
+            or valid_token_mask.shape != data.shape[:1]
+            or valid_token_mask.device != data.device
+        ):
+            raise ValueError("MoE live-row mask must match its input rows")
     kernel = plan["apply_kernel"]
     if "batch_invariant" in plan["features"] and data.dtype != plan["input_dtype"]:
         raise ValueError(
@@ -1997,6 +2523,9 @@ def moe_apply(
     quantized_kwargs = {"x_quantized": x_quantized} if x_quantized is not None else {}
     if routing_prepared is not None:
         quantized_kwargs["routing_prepared"] = routing_prepared
+    output_kwargs = {"deferred_out": deferred_out} if deferred_out is not None else {}
+    if valid_token_mask is not None:
+        output_kwargs["valid_token_mask"] = valid_token_mask
     return kernel(
         plan=plan,
         x=x,
@@ -2011,6 +2540,7 @@ def moe_apply(
         **a2a_kwargs,
         **shared_kwargs,
         **quantized_kwargs,
+        **output_kwargs,
     )
 
 

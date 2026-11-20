@@ -37,8 +37,10 @@ protected:
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 32;
         cfg.host_allocator.total_pages = 32;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
@@ -77,18 +79,18 @@ TEST_F(KvCacheLifecycleTestSuite, SingleRequest_PrefillDecodeFinish) {
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
     const ForwardBatch* prefill = FindForwardBatch(prefill_plan);
     ASSERT_NE(prefill, nullptr);
-    ASSERT_EQ(prefill->block_tables.count("full"), 1u);
-    ASSERT_EQ(prefill->block_tables.count("swa"), 1u);
-    EXPECT_EQ(prefill->block_tables.at("full").size(), 1u);
-    EXPECT_EQ(prefill->block_tables.at("swa").size(), 1u);
-    const auto& full_prefill_row = prefill->block_tables.at("full").at(0);
+    ASSERT_EQ(prefill->BlockTables().count("full"), 1u);
+    ASSERT_EQ(prefill->BlockTables().count("swa"), 1u);
+    EXPECT_EQ(prefill->BlockTables().at("full").size(), 1u);
+    EXPECT_EQ(prefill->BlockTables().at("swa").size(), 1u);
+    const auto full_prefill_row = prefill->BlockTables().at("full").at(0);
     ASSERT_GE(full_prefill_row.size(), 2u);
     EXPECT_NE(full_prefill_row[0], full_prefill_row[1])
         << "two child slots in one LCM block need distinct kernel page ids";
     ASSERT_EQ(prefill_plan.pages_to_zero.count("full"), 1u);
     ASSERT_EQ(prefill_plan.pages_to_zero.count("swa"), 1u);
     EXPECT_EQ(prefill_plan.pages_to_zero.at("full"), full_prefill_row);
-    EXPECT_EQ(prefill_plan.pages_to_zero.at("swa"), prefill->block_tables.at("swa").at(0));
+    EXPECT_EQ(prefill_plan.pages_to_zero.at("swa"), prefill->BlockTables().at("swa").at(0));
 
     SendForwardDone("r1", {42});
     EXPECT_EQ(scheduler_->PrefillSize(), 1u);
@@ -106,11 +108,11 @@ TEST_F(KvCacheLifecycleTestSuite, SingleRequest_PrefillDecodeFinish) {
     const ForwardBatch* last_decode = FindForwardBatch(*last_plan);
     ASSERT_NE(last_decode, nullptr);
 
-    const auto& full_row = last_decode->block_tables.at("full").at(0);
+    const auto full_row = last_decode->BlockTables().at("full").at(0);
     for (std::int32_t id : full_row) {
         EXPECT_GT(id, 0) << "full row should keep history with no null/padding hole";
     }
-    const auto& swa_row = last_decode->block_tables.at("swa").at(0);
+    const auto swa_row = last_decode->BlockTables().at("swa").at(0);
     EXPECT_NE(std::find(swa_row.begin(), swa_row.end(), 0), swa_row.end())
         << "swa row should contain a null hole after the sliding window slides";
 
@@ -138,8 +140,12 @@ TEST_F(KvCacheLifecycleTestSuite, AvailableLcmBlocksReportsSharedPool) {
 }
 
 // The per-step gauge splits the pool into empty, active and cache-only
-// parents without asking who holds each child.
+// parents without asking who holds each child. Only prefix caching keeps a
+// finished request's pages as cache-only parents, and the suite disables it.
 TEST_F(KvCacheLifecycleTestSuite, EmptyAndActiveLcmBlocksPartitionThePool) {
+    config_.disable_prefix_cache = false;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+
     const std::int32_t total = scheduler_->EmptyLcmBlocks();
     EXPECT_EQ(total, scheduler_->AvailableLcmBlocks());
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
@@ -158,6 +164,102 @@ TEST_F(KvCacheLifecycleTestSuite, EmptyAndActiveLcmBlocksPartitionThePool) {
     EXPECT_LT(scheduler_->EmptyLcmBlocks(), total) << "but they stay resident as cache-only parents";
 }
 
+// With prefix caching disabled no admission can hit a published page, in
+// either tier: a running request's completed pages and its finish publish
+// nothing, so its pages return straight to the free pool instead of staying
+// resident as cache-only parents (SchedulerConfig::PublishesCompletedPages).
+TEST_F(KvCacheLifecycleTestSuite, FinishedPagesReturnToThePoolWithoutPrefixCaching) {
+    for (const bool host_cache : {false, true}) {
+        SCOPED_TRACE(host_cache ? "with a Host cache" : "without a Host cache");
+        config_.disable_l2_cache = !host_cache;
+        scheduler_ = std::make_unique<Scheduler>(config_);
+        const std::int32_t total = scheduler_->EmptyLcmBlocks();
+        EXPECT_EQ(total, scheduler_->AvailableLcmBlocks());
+        EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+
+        // More than one page so a page actually completes mid-request.
+        Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+        PlanOnce();
+        SendForwardDone("r1", {42});
+        EXPECT_GT(scheduler_->ActiveLcmBlocks(), 0);
+        EXPECT_EQ(scheduler_->EmptyLcmBlocks() + scheduler_->ActiveLcmBlocks(), total)
+            << "a live request's pages are active; none are cache-only";
+
+        int tok = 43;
+        for (int step = 0; step < 4; ++step) {
+            PlanOnce();
+            EXPECT_EQ(scheduler_->EmptyLcmBlocks() + scheduler_->ActiveLcmBlocks(), total)
+                << "still no cache-only parents mid-decode";
+            SendForwardDone("r1", {tok++});
+        }
+
+        SendFinish("r1");
+        PlanOnce();
+        EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+        EXPECT_EQ(scheduler_->EmptyLcmBlocks(), total)
+            << "with prefix caching disabled the finished request leaves no cache-only parents";
+        EXPECT_EQ(scheduler_->AvailableLcmBlocks(), total);
+    }
+}
+
+// One full-attention group with 8-token pages and no Host cache: a decode
+// step needs a new block once every 8 tokens.
+class DecodeInPlaceReserveTestSuite : public SchedulerTestSuite {
+protected:
+    static constexpr std::int32_t kPageTokens = 8;
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = kPageTokens;
+        cfg.device_allocator.total_pages = 32;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = true;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full_attention",
+            .block_granularity = cfg.prefix_granularity,
+            .total_pages = cfg.device_allocator.total_pages,
+            .attn_kind = AttnKind::kFull,
+        });
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+// Without prefix caching a decode step publishes nothing, so one that needs no
+// new block consumes its reserve in place: only a step whose block row grows
+// runs an admission (SchedulerConfig::PublishesCompletedPages).
+TEST_F(DecodeInPlaceReserveTestSuite, DecodeAdmitsOnlyWhenItOpensABlock) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+    ExecutionPlan prefill_plan = PlanOnce();
+    const ForwardBatch* prefill = FindForwardBatch(prefill_plan);
+    ASSERT_NE(prefill, nullptr);
+    std::size_t row_blocks = prefill->BlockTables().at("full_attention").at(0).size();
+    SendForwardDone("r1", {42});
+
+    const std::uint64_t admissions_before = SchedulerTestAccess::DecodeAdmissions(*scheduler_);
+    constexpr std::int32_t kSteps = 2 * kPageTokens;
+    std::uint64_t steps_opening_a_block = 0;
+    int tok = 43;
+    for (std::int32_t step = 0; step < kSteps; ++step) {
+        ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* decode = FindForwardBatch(plan);
+        ASSERT_NE(decode, nullptr);
+        const std::size_t blocks = decode->BlockTables().at("full_attention").at(0).size();
+        if (blocks > row_blocks) {
+            ++steps_opening_a_block;
+        }
+        row_blocks = blocks;
+        SendForwardDone("r1", {tok++});
+    }
+    ASSERT_GT(steps_opening_a_block, 0u);
+    ASSERT_LT(steps_opening_a_block, static_cast<std::uint64_t>(kSteps));
+    EXPECT_EQ(SchedulerTestAccess::DecodeAdmissions(*scheduler_) - admissions_before, steps_opening_a_block)
+        << "a decode step that opens no block consumes its reserve in place";
+}
+
 TEST_F(KvCacheLifecycleTestSuite, TwoRequestsBatchBlockTables) {
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
@@ -170,10 +272,10 @@ TEST_F(KvCacheLifecycleTestSuite, TwoRequestsBatchBlockTables) {
     ASSERT_NE(prefill, nullptr);
     ASSERT_EQ(prefill->request_ids.size(), 2u);
 
-    ASSERT_EQ(prefill->block_tables.count("full"), 1u);
-    ASSERT_EQ(prefill->block_tables.count("swa"), 1u);
-    const auto& full = prefill->block_tables.at("full");
-    const auto& swa = prefill->block_tables.at("swa");
+    ASSERT_EQ(prefill->BlockTables().count("full"), 1u);
+    ASSERT_EQ(prefill->BlockTables().count("swa"), 1u);
+    const auto full = prefill->BlockTables().at("full");
+    const auto swa = prefill->BlockTables().at("swa");
     ASSERT_EQ(full.size(), 2u);
     ASSERT_EQ(swa.size(), 2u);
 
@@ -208,15 +310,16 @@ TEST_F(KimiFourGroupSuite, FourTablesUseDisjointGlobalPages) {
     ExecutionPlan plan = PlanOnce();
     const ForwardBatch* op = FindForwardBatch(plan);
     ASSERT_NE(op, nullptr);
-    ASSERT_EQ(op->block_tables.size(), GroupIds().size());
+    ASSERT_EQ(op->BlockTables().size(), GroupIds().size());
 
     std::set<std::int32_t> all_real;
     std::size_t fresh_positive_entries = 0;
     for (const auto& group_id : GroupIds()) {
-        ASSERT_EQ(op->block_tables.count(group_id), 1u) << group_id;
-        ASSERT_EQ(op->block_tables.at(group_id).size(), 1u) << group_id;
+        ASSERT_EQ(op->BlockTables().count(group_id), 1u) << group_id;
+        ASSERT_EQ(op->BlockTables().at(group_id).size(), 1u) << group_id;
         std::set<std::int32_t> group_real;
-        const std::size_t group_entries = CollectDisjointRealPages(op->block_tables.at(group_id), group_real, group_id);
+        const std::size_t group_entries =
+            CollectDisjointRealPages(op->BlockTables().at(group_id), group_real, group_id);
         EXPECT_GT(group_entries, 0u) << group_id;
         fresh_positive_entries += group_entries;
         for (std::int32_t page_id : group_real) {
@@ -231,6 +334,7 @@ TEST_F(KimiFourGroupSuite, FourTablesUseDisjointGlobalPages) {
     EXPECT_EQ(all_real.size(), fresh_positive_entries);
 
     AbortRequest("r1");
+    DrainForwardResults("r1");
     PlanOnce();
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), before);
 }
@@ -249,6 +353,7 @@ TEST_F(KimiFourGroupSuite, FinishAndAbortRestoreAllUsablePages) {
     Submit(MakeRequestSpec("aborted", /*num_pages=*/2, /*start=*/101));
     ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
     AbortRequest("aborted");
+    DrainForwardResults("aborted");
     PlanOnce();
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), before);
 }

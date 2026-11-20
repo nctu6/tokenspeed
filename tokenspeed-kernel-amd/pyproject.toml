@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
     "torch",
-    "tokenspeed-triton>=3.9.10.post20261008",
+    "tokenspeed-triton>=3.9.10.post20261028",
 ]
 
 [project.urls]
@@ -25,4 +25,4 @@ license-files = ["LICENSE", "THIRDPARTYNOTICES"]
 where = ["python"]
 
 [tool.setuptools.package-data]
-"tokenspeed_kernel_amd" = ["sched_barrier.ll"]
+"tokenspeed_kernel_amd" = ["_intrinsics/*.ll"]

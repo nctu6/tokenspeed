@@ -85,6 +85,10 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    o_k_ptr=None,
+    o_v_ptr=None,
+    # K > 0: split channels at K, 2K into o_ptr, o_k_ptr, o_v_ptr (BLOCK_N multiples).
+    SPLIT_KEY_DIM: tl.constexpr = 0,
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -353,6 +357,19 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         w_ptrs = w_base + (3 * stride_w_width)  # [BLOCK_N] tensor
         w_col3 = tl.load(w_ptrs, mask_w, other=0.0)
     mask_x_1d = idx_feats < dim
+    if SPLIT_KEY_DIM > 0:
+        # Each program's channel block lies inside one of q, k and v.
+        block_start = tl.program_id(1) * BLOCK_N
+        if block_start < SPLIT_KEY_DIM:
+            o_cols = o_ptr + idx_feats
+        elif block_start < 2 * SPLIT_KEY_DIM:
+            o_cols = o_k_ptr + (idx_feats - SPLIT_KEY_DIM)
+        else:
+            o_cols = o_v_ptr + (idx_feats - 2 * SPLIT_KEY_DIM)
+        if block_start < 2 * SPLIT_KEY_DIM:
+            o_row_stride = SPLIT_KEY_DIM
+        else:
+            o_row_stride = dim - 2 * SPLIT_KEY_DIM
     for idx_token in range(segment_len):
         acc = acc_preload
 
@@ -402,11 +419,17 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         mask_1d = (idx_token < segment_len) & (
             idx_feats < dim
         )  # token-index  # feature-index
-        o_ptrs = (
-            o_ptr
-            + (sequence_start_index + token_offset + idx_token) * stride_o_token
-            + (idx_feats * stride_o_dim)
-        )
+        if SPLIT_KEY_DIM > 0:
+            o_ptrs = (
+                o_cols
+                + (sequence_start_index + token_offset + idx_token) * o_row_stride
+            )
+        else:
+            o_ptrs = (
+                o_ptr
+                + (sequence_start_index + token_offset + idx_token) * stride_o_token
+                + (idx_feats * stride_o_dim)
+            )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
 
@@ -424,6 +447,9 @@ def _causal_conv1d_update_kernel(
     intermediate_conv_window_ptr,
     output_state_indices_ptr,
     o_ptr,  # (batch, dim, seqlen)
+    replay_ptr,  # (batch * seqlen, replay width)
+    replay_a_ptr,  # (batch * seqlen, gate heads)
+    replay_b_ptr,  # (batch * seqlen, gate heads)
     # Matrix dimensions
     batch: int,
     dim: tl.constexpr,
@@ -449,6 +475,9 @@ def _causal_conv1d_update_kernel(
     stride_o_seq: tl.constexpr,
     stride_o_dim: tl.constexpr,
     stride_o_token: tl.constexpr,
+    stride_replay_row: tl.constexpr,
+    stride_replay_a_row: tl.constexpr,
+    stride_replay_b_row: tl.constexpr,
     # others
     pad_slot_id: tl.constexpr,
     # Meta-parameters
@@ -462,6 +491,11 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_OUTPUT_STATE_INDICES: tl.constexpr,
+    HAS_REPLAY_PAYLOAD: tl.constexpr,
+    REPLAY_FIRST_CHANNEL: tl.constexpr,
+    GATE_HEADS: tl.constexpr,
+    GATE_BLOCK: tl.constexpr,
+    NP2_SEQLEN: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     # ruff: noqa: E501
@@ -472,6 +506,36 @@ def _causal_conv1d_update_kernel(
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return
+
+    if HAS_REPLAY_PAYLOAD:
+        # Channel block 0 copies the gates: payload row = [REPLAY_FIRST_CHANNEL on | a | b].
+        if tl.program_id(1) == 0:
+            gate_tokens = tl.arange(0, NP2_SEQLEN)
+            gate_heads = tl.arange(0, GATE_BLOCK)
+            gate_rows = (idx_seq * seqlen + gate_tokens).to(tl.int64)
+            gate_mask = (gate_tokens < seqlen)[:, None] & (gate_heads < GATE_HEADS)[
+                None, :
+            ]
+            gate_dst = (
+                replay_ptr
+                + gate_rows[:, None] * stride_replay_row
+                + (dim - REPLAY_FIRST_CHANNEL)
+                + gate_heads[None, :]
+            )
+            gate_a = tl.load(
+                replay_a_ptr
+                + gate_rows[:, None] * stride_replay_a_row
+                + gate_heads[None, :],
+                mask=gate_mask,
+            )
+            gate_b = tl.load(
+                replay_b_ptr
+                + gate_rows[:, None] * stride_replay_b_row
+                + gate_heads[None, :],
+                mask=gate_mask,
+            )
+            tl.store(gate_dst, gate_a, mask=gate_mask)
+            tl.store(gate_dst + GATE_HEADS, gate_b, mask=gate_mask)
 
     # [BLOCK_N,] elements along the feature-dimension (channel)
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -608,6 +672,11 @@ def _causal_conv1d_update_kernel(
 
     x_base_1d = x_base  # starting of chunk [BLOCK_N]
     mask_x_1d = idx_feats < dim
+    # Load every token's input before any output store, which may alias x and so pins later loads.
+    x_tokens = ()
+    for idx_token in tl.static_range(seqlen):
+        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+        x_tokens = x_tokens + (tl.load(x_ptrs_1d, mask=mask_x_1d),)
 
     # STEP 5: compute each token
     for idx_token in tl.static_range(seqlen):
@@ -619,16 +688,14 @@ def _causal_conv1d_update_kernel(
             if KERNEL_WIDTH == 2:
                 if j == 1:  # KERNEL_WIDTH-1:
                     matrix_w = w_col1
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                    matrix_x = x_tokens[idx_token]
             elif KERNEL_WIDTH == 3:
                 if j == 1:
                     matrix_w = w_col1
                     matrix_x = col1
                 elif j == 2:
                     matrix_w = w_col2
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                    matrix_x = x_tokens[idx_token]
             elif KERNEL_WIDTH == 4:
                 if j == 1:
                     matrix_w = w_col1
@@ -638,8 +705,7 @@ def _causal_conv1d_update_kernel(
                     matrix_x = col2
                 elif j == 3:
                     matrix_w = w_col3
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                    matrix_x = x_tokens[idx_token]
 
             acc += matrix_x * matrix_w  # [BLOCK_N]
 
@@ -666,6 +732,16 @@ def _causal_conv1d_update_kernel(
         )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
+        if HAS_REPLAY_PAYLOAD:
+            # The same rounded output, at the token's payload row.
+            replay_ptrs = (
+                replay_ptr
+                + (idx_seq * seqlen + idx_token).to(tl.int64) * stride_replay_row
+                + (idx_feats - REPLAY_FIRST_CHANNEL)
+            )
+            tl.store(
+                replay_ptrs, acc, mask=mask_1d & (idx_feats >= REPLAY_FIRST_CHANNEL)
+            )
 
         if SAVE_INTERMEDIATE:
             # Save the window state after consuming this token

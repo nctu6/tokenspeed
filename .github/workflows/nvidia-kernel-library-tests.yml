@@ -2,9 +2,15 @@ name: NVIDIA Kernel Library Tests
 
 on:
   schedule:
-    # Check the latest main at 00:17 and 12:17 UTC.
-    - cron: "17 */12 * * *"
+    # Check the latest main six times daily in US Pacific time.
+    - cron: "0 0,6,9,12,15,18 * * *"
+      timezone: "America/Los_Angeles"
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or commit to test
+        default: main
+        type: string
 
 permissions:
   contents: read
@@ -24,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ inputs.ref || 'main' }}
           persist-credentials: false
 
       - name: Run native library unit tests

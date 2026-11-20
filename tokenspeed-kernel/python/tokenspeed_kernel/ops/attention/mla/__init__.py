@@ -43,6 +43,41 @@ from tokenspeed_kernel.signature import (
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 
 
+def prepare_mla_resources(*, group, rank, heads, rank_size):
+    """Prepare selected fused MLA communication storage before capture."""
+    from tokenspeed_kernel.selection import select_kernel
+
+    return select_kernel("attention", "mla_prepare_resources", format_signature())(
+        group=group, rank=rank, heads=heads, rank_size=rank_size
+    )
+
+
+def prepare_mla_prolog(layer, *, group):
+    """Resolve MLA prolog and apply its registered weight preparation once."""
+    from tokenspeed_kernel.registry import KernelRegistry
+    from tokenspeed_kernel.selection import select_kernel
+
+    kernel = select_kernel(
+        "attention",
+        "mla_fused_prolog",
+        format_signature(x=dense_tensor_format(layer.q_b_proj.weight.dtype)),
+    )
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    if spec is None or spec.weight_preprocessor is None:
+        raise RuntimeError("MLA prolog has no registered weight preprocessor")
+    merge = select_kernel(
+        "attention",
+        "mla_fused_merge",
+        format_signature(output=dense_tensor_format(torch.float32)),
+    )
+    attention = select_kernel(
+        "attention",
+        "mla_fused_attention",
+        format_signature(query=dense_tensor_format(torch.bfloat16)),
+    )
+    return kernel, spec.weight_preprocessor(layer, group=group), attention, merge
+
+
 def mla_prolog_available() -> bool:
     """Whether the optional Ascend Lite MLA prolog is available."""
     if not current_platform().is_npu:
@@ -137,6 +172,7 @@ def mla_project_value_prefers_contiguous_weight(
         "kv_lora_rank": latent_dim,
         "gate_kind": "sigmoid" if gated else "none",
         "inputs_contiguous": True,
+        "weight_k_major": False,
     }
     try:
         select_kernel("attention", "mla_project_value", signature, traits=traits)
@@ -250,6 +286,8 @@ def mla_project_value(
             and (gate is None or gate.stride(-1) == 1)
             and out.is_contiguous()
         ),
+        # [heads, value_dim, latent_dim] contiguous: the reduction dim is inner.
+        "weight_k_major": weight.transpose(1, 2).is_contiguous(),
     }
     if plan is not None:
         plan.validate(
@@ -1404,6 +1442,140 @@ def mla_decode_with_kvcache(
         return kernel(**kernel_kwargs)
 
 
+def _mla_decode_query_rows_traits(
+    *,
+    q_len: int,
+    page_size: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    return_lse: bool,
+) -> dict:
+    return {
+        "q_len": q_len,
+        "page_size": page_size,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "return_lse": return_lse,
+    }
+
+
+def supports_mla_decode_query_rows(
+    *,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    page_size: int,
+    q_len: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    return_lse: bool,
+    solution: str | None = None,
+) -> bool:
+    """Whether a kernel runs :func:`mla_decode_query_rows` for this shape."""
+    try:
+        select_kernel(
+            "attention",
+            "mla_decode_query_rows",
+            format_signature(
+                q=dense_tensor_format(q_dtype),
+                kv_cache=dense_tensor_format(kv_dtype),
+            ),
+            traits=_mla_decode_query_rows_traits(
+                q_len=q_len,
+                page_size=page_size,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                return_lse=return_lse,
+            ),
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return False
+    return True
+
+
+def mla_decode_query_rows(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    row_lengths: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    *,
+    kv_lora_rank: int,
+    return_lse: bool = False,
+    solution: str | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """MLA decode of every query row of a request against its one page-table row.
+
+    Unlike :func:`mla_decode_with_kvcache` on the query axis, the visible
+    length is given per query row rather than derived from a causal offset,
+    so rows whose lengths follow no fixed pattern (a KVP rank's local causal
+    lengths) still share the request's KV reads.
+
+    Args:
+        q: Queries ``[requests, queries, heads, kv_lora_rank + rope_dim]``.
+        kv_cache: Paged latent cache ``[pages, page_size, 1, head_dim]``.
+        page_table: Int32 ``[requests, pages]``.
+        row_lengths: Int32 ``[requests, queries]``: query ``j`` of request
+            ``i`` attends the first ``row_lengths[i, j]`` tokens.
+        max_seqlen_k: Host-side upper bound on ``row_lengths``.
+        softmax_scale: Scale applied to QK logits.
+        kv_lora_rank: MLA latent width; the rest of the query is RoPE.
+        return_lse: Also return the natural-log LSE ``[requests, queries, heads]``.
+        solution: Optional solution to pin.
+        out: Optional output ``[requests, queries, heads, kv_lora_rank]``.
+
+    Returns:
+        The latent output, or ``(output, lse)`` when ``return_lse``. Rows with
+        no visible tokens have zero output and negative-infinity LSE.
+    """
+    traits = _mla_decode_query_rows_traits(
+        q_len=q.shape[1],
+        page_size=kv_cache.shape[1],
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=q.shape[-1] - kv_lora_rank,
+        return_lse=return_lse,
+    )
+    signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+    kernel = select_kernel(
+        "attention",
+        "mla_decode_query_rows",
+        signature,
+        traits=traits,
+        solution=solution,
+    )
+    shape_params = {
+        "batch_size": q.shape[0],
+        "q_len": q.shape[1],
+        "num_q_heads": q.shape[2],
+        "num_pages": kv_cache.shape[0],
+        "page_size": kv_cache.shape[1],
+        "max_pages_per_seq": page_table.shape[1],
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention", "mla_decode_query_rows", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "mla_decode_query_rows",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q,
+            kv_cache,
+            page_table,
+            row_lengths,
+            max_seqlen_k,
+            softmax_scale,
+            return_lse=return_lse,
+            out=out,
+        )
+
+
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.mla.cuda  # noqa: E402,F401
@@ -1419,6 +1591,8 @@ if current_platform().is_npu:
 
 
 __all__ = [
+    "prepare_mla_prolog",
+    "prepare_mla_resources",
     "mla_project_value_prefers_contiguous_weight",
     "mla_project_value",
     "mla_normalize_project_query",
@@ -1428,5 +1602,7 @@ __all__ = [
     "mla_use_absorbed_extend",
     "mla_extend_with_kvcache",
     "supports_mla_decode_query_blocks",
+    "supports_mla_decode_query_rows",
     "mla_decode_with_kvcache",
+    "mla_decode_query_rows",
 ]

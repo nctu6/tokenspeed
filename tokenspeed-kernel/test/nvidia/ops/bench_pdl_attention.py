@@ -38,9 +38,8 @@ from tokenspeed_kernel.ops.attention.qsa import (
 from tokenspeed_kernel.ops.attention.qsa.triton import (
     qwen4_exp_qsa_selected_slots,
 )
+from tokenspeed_kernel.ops.layernorm import gated_rmsnorm
 from tokenspeed_kernel.platform import pdl_enabled
-
-from tokenspeed.runtime.layers.attention.linear.layernorm_gated import rmsnorm_fn
 
 
 def _gdn(batch, steps, solution):
@@ -90,14 +89,15 @@ def _gdn(batch, steps, solution):
                 intermediate_states_buffer=None,
                 tree_ancestors=None,
             )
-        return rmsnorm_fn(
+        return gated_rmsnorm(
             out.reshape(-1, dim),
             weights,
-            z=z.reshape(-1, dim),
+            z.reshape(-1, dim),
             eps=1e-6,
             group_size=None,
             norm_before_gate=True,
             sigmoid_gate=False,
+            fp8_scale=None,
             weights_independent=True,
         )
 
@@ -138,7 +138,10 @@ def _qsa(rows, solution):
             block_topk=512,
             queries_per_request=1,
             max_partial_bytes=32 * 1024 * 1024,
-            algorithm=solution,
+            path=solution,
+            max_logits_bytes=256 << 20,
+            solution=None,
+            override=None,
             enable_pdl=pdl_enabled(),
         )
         slots = qwen4_exp_qsa_selected_slots(
@@ -163,6 +166,7 @@ def _qsa(rows, solution):
             v_scale=None,
             override=None,
             solution="cute_dsl",
+            sparse_metadata=None,
         )
 
     return forward

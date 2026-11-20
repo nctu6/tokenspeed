@@ -29,20 +29,20 @@ slot-state blob -- goes to the small request-private snapshot pool through a
 source tier, so both Host buffers land in the request's fresh Device pages
 under one completion event and the scheduler sees one ``RestoreDone``.
 
-An L3 prefetch (``PrefetchOp``) fills a waiting request's freshly allocated
-Host pages from the L3 store before its admission, in prefix order, so the
-admission that follows sees a plain Host hit; its ACK carries the pages that
-landed (a prefix length, MIN-reduced across the replica).
-
 The C++ scheduler emits these batched per plan (bound as ``Cache.SnapshotOp``
-/ ``Cache.RestoreOp`` / ``Cache.PrefetchOp``, lists-of-lists like the L2
+/ ``Cache.RestoreOp``, lists-of-lists like the L2
 batches); ``engine/scheduler_utils.cache_ops_from_plan`` maps every row of a
 batch onto one of these per-request dataclasses, which is the Host cache
-executor's unit of work: one slot exported or imported, one prefetch job, one
+executor's unit of work: one slot exported or imported, one
 ACK. The ACKs are the binding's ``Cache.SnapshotDoneEvent`` /
-``Cache.RestoreDoneEvent`` / ``Cache.PrefetchDoneEvent``; they join
+``Cache.RestoreDoneEvent``; they join
 ``WriteBackDoneEvent`` / ``LoadBackDoneEvent`` on the cache-result poll and are
 replica-intersected by the same hooks.
+
+Host-only ``Cache.StorageQueryOp`` / ``StorageGetOp`` / ``StoragePutOp`` /
+``StorageCancelOp`` are the engine host's L3 executor's (``ts-l3``); the
+adapter sets them aside. They use ``StorageDone`` retirement facts,
+independently of GPU copy completion.
 """
 
 from __future__ import annotations
@@ -90,6 +90,7 @@ class SnapshotOp:
     Attributes:
         op_id: The scheduler's ticket; the ACK carries it back.
         request_id: The victim.
+        admission_id: The immutable identity of this request admission.
         request_pool_index: The victim's slot, whose state is exported. The
             FSM frees the slot in the same plan build, and a new owner first
             writes it in a forward behind the store's fence, so the export
@@ -102,6 +103,7 @@ class SnapshotOp:
 
     op_id: int
     request_id: str
+    admission_id: int
     request_pool_index: int
     snapshot_slot: int
     transfers: tuple[CacheTransfer, ...]
@@ -114,6 +116,7 @@ class RestoreOp:
     Attributes:
         op_id: The scheduler's ticket; the ACK carries it back.
         request_id: The request resuming.
+        admission_id: The same identity the request had before retraction.
         request_pool_index: The request's NEW slot, whose state is imported.
         snapshot_slot: The arena row the store imaged into.
         transfers: Host block to Device block, both tiers.
@@ -122,10 +125,14 @@ class RestoreOp:
 
     op_id: int
     request_id: str
+    admission_id: int
     request_pool_index: int
     snapshot_slot: int
     transfers: tuple[CacheTransfer, ...]
     source_tier: tuple[HostTier, ...]
+
+
+# --- definitions restored from the pre-merge branch (D3-3) ---
 
 
 @dataclass(frozen=True, slots=True)

@@ -24,10 +24,13 @@
 #include <cstdint>
 #include <functional>
 
+#include "cache/core/prefetch.h"
+
 namespace tokenspeed {
 
 class BlockPool;
 class CacheBlockRef;
+class CacheBlockUniqueObserver;
 
 // Stable logical placement of one cache block inside an LCM-sized physical
 // block. LCM block 0 remains reserved as the kernel null page.
@@ -54,6 +57,7 @@ public:
     ~CacheBlock() noexcept;
 
     CacheBlockLocation Location() const noexcept { return location_; }
+    const BlockPool& OwnerPool() const noexcept { return *pool_; }
     bool IsOwnedBy(const BlockPool& pool) const noexcept { return pool_ == &pool; }
 
 private:
@@ -63,7 +67,7 @@ private:
 
 namespace internal_cache_block_ref {
 
-// Dynamically allocated shared-ownership control. The embedded CacheBlock is
+// Pool-owned, stable shared-ownership control. The embedded CacheBlock is
 // destroyed together with the control when the last CacheBlockRef releases it.
 class CacheBlockControl {
 public:
@@ -77,6 +81,7 @@ public:
 private:
     friend class ::tokenspeed::BlockPool;
     friend class ::tokenspeed::CacheBlockRef;
+    friend class ::tokenspeed::CacheBlockUniqueObserver;
 
     void retain() noexcept;
     void release() noexcept;
@@ -88,6 +93,7 @@ private:
 
     CacheBlock object_;
     std::uint32_t strong_count_{1};
+    CacheBlockUniqueObserver* unique_observers_{nullptr};
 };
 
 }  // namespace internal_cache_block_ref
@@ -108,6 +114,11 @@ public:
 
     std::uint32_t use_count() const noexcept;
     bool unique() const noexcept { return use_count() == 1; }
+    // A hint for reading or releasing the block: prefetches its shared
+    // control (owner count, location, pool) without reading it.
+    void Prefetch() const noexcept {
+        if (control_ != nullptr) PrefetchObject(*control_);
+    }
     bool IsOwnedBy(const BlockPool& pool) const noexcept;
     void reset() noexcept;
     void swap(CacheBlockRef& other) noexcept;
@@ -116,14 +127,61 @@ public:
 
 private:
     friend class BlockPool;
+    friend class CacheBlockUniqueObserver;
 
     explicit CacheBlockRef(internal_cache_block_ref::CacheBlockControl& control) noexcept : control_{&control} {}
 
     internal_cache_block_ref::CacheBlockControl* control_{nullptr};
 };
 
+// Inline: index scans and evictions read these once per cache entry.
+inline const CacheBlock* CacheBlockRef::operator->() const noexcept {
+    return control_ == nullptr ? nullptr : &control_->object();
+}
+
+inline const CacheBlock& CacheBlockRef::operator*() const noexcept {
+    return control_->object();
+}
+
+inline std::uint32_t CacheBlockRef::use_count() const noexcept {
+    return control_ == nullptr ? 0 : control_->useCount();
+}
+
 inline void swap(CacheBlockRef& lhs, CacheBlockRef& rhs) noexcept {
     lhs.swap(rhs);
 }
+
+// One-shot, non-owning notification when a block has only one owner left.
+// Like CacheBlockRef, this is confined to the scheduler's control thread.
+class CacheBlockUniqueObserver {
+public:
+    using Callback = void (*)(void*) noexcept;
+
+    CacheBlockUniqueObserver() noexcept = default;
+    CacheBlockUniqueObserver(const CacheBlockUniqueObserver&) = delete;
+    CacheBlockUniqueObserver& operator=(const CacheBlockUniqueObserver&) = delete;
+    ~CacheBlockUniqueObserver() noexcept { Reset(); }
+
+    // A unique block invokes callback immediately; an empty reference cancels
+    // any previous observation. The observer does not keep the block alive.
+    void Observe(const CacheBlockRef& block, Callback callback, void* context) noexcept;
+    void Reset() noexcept {
+        // An observer Observe has not linked has every field null already.
+        if (head_ != nullptr) {
+            unlink();
+        }
+    }
+
+private:
+    friend class internal_cache_block_ref::CacheBlockControl;
+
+    void unlink() noexcept;
+
+    CacheBlockUniqueObserver** head_{nullptr};
+    CacheBlockUniqueObserver* previous_{nullptr};
+    CacheBlockUniqueObserver* next_{nullptr};
+    Callback callback_{nullptr};
+    void* context_{nullptr};
+};
 
 }  // namespace tokenspeed

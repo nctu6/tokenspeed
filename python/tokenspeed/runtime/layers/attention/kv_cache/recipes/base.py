@@ -23,16 +23,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import cached_property
 from typing import TYPE_CHECKING, ClassVar
 
 from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
 from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
-)
-from tokenspeed.runtime.layers.attention.configs.linear_attn import (
-    LinearAttnConfig,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import (
     configured_token_limit,
@@ -50,6 +47,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupDeclaration,
     CacheGroupSpec,
+    SlidingWindowTokens,
     group,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
@@ -65,18 +63,21 @@ if TYPE_CHECKING:
         CacheModelFamily,
         CacheSetup,
     )
+    from tokenspeed.runtime.layers.attention.qsa.bf16_scratch import (
+        QSABf16ScratchPlan,
+    )
 
 
 class CacheRecipe(ABC):
     """One model family's cache recipe.
 
-    The pipeline is the same for every family and lives once, in :meth:`setup`:
+    The pipeline is the same for every family and lives once, in :meth:`setup_for_layers`:
 
     ``layers -> group -> pack -> bind``
 
     A family fills in the seams -- which layers exist and how they collapse
     into groups, what bytes each layer costs, how tightly groups pack into a
-    physical parent, and how many parents the budget affords. It never
+    physical parent, and which model limits cap the agreed capacity. It never
     restates the order of the stages.
     """
 
@@ -116,7 +117,29 @@ class CacheRecipe(ABC):
     # ------------------------------------------------------------------
 
     def setup(self) -> CacheSetup:
-        """Run the pipeline for this family and bind it to the budget."""
+        """Build a complete, local cache without distributed capacity agreement."""
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.capacity import (
+            local_cache_capacity,
+        )
+
+        return self.setup_for_layers(
+            resident_cache_window=(0, len(self.layer_types)),
+            synchronize_capacity=local_cache_capacity,
+        )
+
+    def setup_for_layers(
+        self,
+        *,
+        resident_cache_window: tuple[int, int],
+        synchronize_capacity: Callable[[int, str | None], int],
+    ) -> CacheSetup:
+        """Pack globally, agree on resident capacity, then bind the complete plan.
+
+        The runtime supplies the stage's cache-layer window and a collective
+        over capacity limits (probe builds agree on their minimum demand).
+        Errors travel through the same callback so a rank with insufficient
+        memory cannot leave its peers waiting in a collective.
+        """
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
             CachePoolSpec,
             CacheSetup,
@@ -131,6 +154,11 @@ class CacheRecipe(ABC):
             max_padding_fraction=self.max_padding_fraction,
         )
         self.check_layout(layout)
+        if type(self).num_lcm_blocks is not CacheRecipe.num_lcm_blocks:
+            raise TypeError(
+                "cache recipes must override select_num_lcm_blocks, not "
+                "num_lcm_blocks: resident memory limits are owned by the runtime"
+            )
         specs = tuple(spec for spec, _ in groups)
         probe_parents = None
         if self.probe_batch_rows is not None:
@@ -150,29 +178,68 @@ class CacheRecipe(ABC):
             None
             if policy is None
             else policy.bind(
-                request_slots=RequestSlotLayout(self.attn_config.max_bs).capacity,
-                device_rows=RequestSlotLayout(self.attn_config.max_bs).capacity
+                request_slots=RequestSlotLayout(
+                    self.attn_config.max_resident_requests
+                ).capacity,
+                device_rows=RequestSlotLayout(
+                    self.attn_config.max_resident_requests
+                ).capacity
                 * (policy.hot_tokens + policy.reserved_tokens),
             )
         )
-        if offload is not None:
-            num_lcm_blocks, offload = compute_offload_capacity(
-                layout,
-                specs,
-                offload=offload,
-                device_budget_bytes=self.cache_budget_bytes - self.workspace_bytes(),
-                max_lcm_blocks=self._capped_parents(
-                    2**31 - 1,
-                    parent_tokens=self._max_packing(layout) * layout.prefix_granularity,
-                ),
-                probe_lcm_blocks=probe_parents,
-            )
-        elif probe_parents is not None:
-            num_lcm_blocks = probe_parents
-        else:
-            num_lcm_blocks = self.num_lcm_blocks(layout)
+        unit = layout.bind(1).narrow_to_layers(*resident_cache_window)
+        workspace_bytes = self.workspace_bytes()
+        local_limit, error = 0, None
+        try:
+            if offload is not None:
+                # Offload policies currently bind complete model field sets.
+                # A partial stage must not price full-model hot/history pools
+                # as if they were resident-only allocations.
+                if unit.fields != layout.fields:
+                    raise ValueError("PP offload requires stage-local storage policies")
+                local_limit, offload = compute_offload_capacity(
+                    layout,
+                    specs,
+                    offload=offload,
+                    device_budget_bytes=self.cache_budget_bytes - workspace_bytes,
+                    max_lcm_blocks=self._capped_parents(
+                        self.parent_id_limit(layout),
+                        parent_tokens=self._max_packing(layout)
+                        * layout.prefix_granularity,
+                    ),
+                    probe_lcm_blocks=probe_parents,
+                )
+            elif probe_parents is not None:
+                local_limit = probe_parents
+            else:
+                local_limit = min(
+                    self._budgeted_parents(
+                        self.cache_budget_bytes - workspace_bytes,
+                        unit.resident_block_bytes,
+                    ),
+                    self.parent_id_limit(layout),
+                )
+        except ValueError as exc:
+            error = str(exc)
+        capacity = synchronize_capacity(local_limit, error)
+        num_lcm_blocks = (
+            self.select_num_lcm_blocks(layout, max_lcm_blocks=capacity)
+            if offload is None and self.probe_batch_rows is None
+            else capacity
+        )
+        if not 1 <= num_lcm_blocks <= capacity:
+            raise ValueError("recipe capacity must fit the agreed parent limit")
         memory_plan = layout.bind(num_lcm_blocks)
         storage_plan = plan_cache_storage(memory_plan, specs, offload=offload)
+        resident_storage = plan_cache_storage(
+            memory_plan.narrow_to_layers(*resident_cache_window), specs, offload=offload
+        )
+        if (
+            self.probe_batch_rows is None
+            and resident_storage.device_budget_bytes + workspace_bytes
+            > self.cache_budget_bytes
+        ):
+            raise ValueError("resident cache storage exceeds the planned budget")
         return CacheSetup(
             spec=CachePoolSpec(
                 family=self.family,
@@ -190,9 +257,11 @@ class CacheRecipe(ABC):
             cache_budget_bytes=(
                 self.cache_budget_bytes
                 if self.probe_batch_rows is None
-                else self.workspace_bytes() + storage_plan.device_budget_bytes
+                else workspace_bytes + resident_storage.device_budget_bytes
             ),
-            fixed_workspace_bytes=self.workspace_bytes(),
+            fixed_workspace_bytes=workspace_bytes,
+            local_parent_limit=local_limit,
+            agreed_parent_limit=capacity,
             uses_paged_state_verify=self.uses_paged_state_verify,
             kv_identical_across_attn_tp=self.kv_identical_across_attn_tp,
         )
@@ -241,6 +310,16 @@ class CacheRecipe(ABC):
         )
 
     @property
+    def sliding_window_tokens(self) -> SlidingWindowTokens:
+        """Sliding-window sizes for :attr:`layer_types`: one value for every
+        sliding layer, or one entry per layer.
+
+        Returns the target config's windows, which the default per-layer
+        :meth:`groups` walk reads; recipes that append draft layers override it.
+        """
+        return self.attn_config.component(SoftmaxAttnConfig).sliding_window_tokens
+
+    @property
     def num_target_layers(self) -> int:
         """Leading layers that belong to the target model."""
         return self.model_config.num_attention_layers
@@ -267,9 +346,14 @@ class CacheRecipe(ABC):
     # ------------------------------------------------------------------
 
     @property
+    @abstractmethod
     def prefix_granularity(self) -> int:
-        """Scheduler-wide identity grain in tokens."""
-        return int(self.attn_config.prefix_granularity)
+        """Scheduler-wide identity grain in tokens.
+
+        Every recipe declares its own: a multiple of each history group's
+        ``block_granularity``, sized for the kernels that read those blocks.
+        No launch option overrides it; the memory plan carries it from here.
+        """
 
     @property
     def alignment(self) -> int:
@@ -315,9 +399,7 @@ class CacheRecipe(ABC):
         return group(
             layer_types=self.layer_types,
             group_ids=self.group_ids,
-            sliding_window_tokens=self.attn_config.component(
-                SoftmaxAttnConfig
-            ).sliding_window_tokens,
+            sliding_window_tokens=self.sliding_window_tokens,
             prefix_granularity=self.prefix_granularity,
             fields_for_layer=self.fields_for_layer,
             pd_disaggregation_enabled=self.pd_disaggregation_enabled,
@@ -345,14 +427,25 @@ class CacheRecipe(ABC):
     # ------------------------------------------------------------------
 
     def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        """Physical parents to allocate, excluding the reserved null parent.
-
-        The budget minus this family's fixed workspace, capped by the
-        configured token limit.
-        """
+        """Standalone full-layout sizing; families override the selection seam."""
         usable_bytes = self.cache_budget_bytes - self.workspace_bytes()
+        return self.select_num_lcm_blocks(
+            layout,
+            max_lcm_blocks=min(
+                self._budgeted_parents(usable_bytes, layout.lcm_block_bytes),
+                self.parent_id_limit(layout),
+            ),
+        )
+
+    def parent_id_limit(self, layout: CacheLayout) -> int:
+        """Keep both physical and sharded virtual CacheBlock IDs in int32."""
+        # The null parent's virtual slots also occupy IDs in this range.
+        return 2**31 // self._max_packing(layout) - 1
+
+    def select_num_lcm_blocks(self, layout: CacheLayout, *, max_lcm_blocks: int) -> int:
+        """Apply model/token constraints to an already agreed memory limit."""
         return self._capped_parents(
-            self._budgeted_parents(usable_bytes, layout.lcm_block_bytes),
+            max_lcm_blocks,
             parent_tokens=self._max_packing(layout) * layout.prefix_granularity,
         )
 
@@ -362,6 +455,8 @@ class CacheRecipe(ABC):
         The one place the budget floor is checked, so every family fails the
         same way when it cannot hold the null parent plus one usable parent.
         """
+        if parent_bytes <= 0:
+            raise ValueError("resident cache must contain at least one physical plane")
         budgeted = usable_bytes // parent_bytes - 1
         if budgeted < 1:
             raise ValueError(
@@ -407,13 +502,19 @@ class CacheRecipe(ABC):
         unless verify scratch lives in the pool, which then needs a row per
         request whatever pool is bound.
         """
+        serving_limits = self.probe_batch_rows is None or self.verify_scratch_in_pool()
+        max_batch_size = (
+            self.attn_config.max_bs
+            if serving_limits
+            else min(self.attn_config.max_bs, self.probe_batch_rows)
+        )
         return SchedulerLimits(
             role=scheduler_role(self.server_args.disaggregation_mode),
-            # One live request per fabricated row; serving concurrency is elsewhere.
-            max_live_requests=(
-                self.attn_config.max_bs
-                if self.probe_batch_rows is None or self.verify_scratch_in_pool()
-                else min(self.attn_config.max_bs, self.probe_batch_rows)
+            max_batch_size=max_batch_size,
+            max_resident_requests=(
+                self.attn_config.max_resident_requests
+                if serving_limits
+                else max_batch_size
             ),
             max_scheduled_tokens=int(self.server_args.chunked_prefill_size),
             max_context_len=self.attn_config.context_len,
@@ -496,6 +597,21 @@ class CacheRecipe(ABC):
         """Cache-adjacent fixed allocation this family also needs."""
         return 0
 
+    @cached_property
+    def qsa_bf16_scratch_plan(self) -> QSABf16ScratchPlan | None:
+        """The QSA BF16 prefill scratch this engine reserves, or None.
+
+        ``--enable-qsa-prefill-bf16-scratch`` serves families with QSA
+        sparse-attention layers, which override this seam and count the plan
+        in ``workspace_bytes``; every other family refuses the flag.
+        """
+        if self.server_args.enable_qsa_prefill_bf16_scratch:
+            raise ValueError(
+                "--enable-qsa-prefill-bf16-scratch serves QSA sparse-attention "
+                f"models; this model's cache family is {self.family!r}"
+            )
+        return None
+
     def verify_scratch_in_pool(self) -> bool:
         """Whether speculative verify stages its scratch in the bound pool.
 
@@ -518,36 +634,3 @@ class CacheRecipe(ABC):
         is always safe: each rank keeps its own copy.
         """
         return False
-
-
-def kda_verify_scratch_in_pool(server_args, attn_config) -> bool:
-    """Raw-gate KDA replay reuses the committed conv slab as verify scratch."""
-    # A PD prefill role never verifies, so it stages no verify scratch.
-    if (
-        server_args.speculative_algorithm is None
-        or server_args.disaggregation_mode == "prefill"
-    ):
-        return False
-    from tokenspeed_kernel.ops.attention.kda import (
-        kda_batched_replay_uses_raw_gate,
-        kda_recurrent_layout,
-        kda_replay_commit_supported,
-    )
-
-    linear_attn = attn_config.component(LinearAttnConfig)
-    if linear_attn is None:
-        # No linear attention, so no conv slab for verify scratch to alias.
-        return False
-
-    heads, head_dim, _ = linear_attn.temporal_state_shape
-    return bool(
-        kda_replay_commit_supported(
-            attn_config.dtype,
-            recurrent_layout=kda_recurrent_layout(),
-            num_heads=heads,
-            head_dim=head_dim,
-        )
-        and kda_batched_replay_uses_raw_gate(
-            attn_config.dtype, num_heads=heads, head_dim=head_dim
-        )
-    )

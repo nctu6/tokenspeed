@@ -119,6 +119,31 @@ class GdnChunkPrefillResult:
     h_layout: GdnCheckpointLayout = GdnCheckpointLayout.NONE
 
 
+@dataclass(frozen=True)
+class GdnStateCheckpoints:
+    """Recurrent states a chunk prefill stores from inside its scan.
+
+    Sequence ``i`` stores the state after each whole multiple of
+    ``every_n_tokens`` of its own tokens (counted from its ``cu_seqlens``
+    start): ``len_i // every_n_tokens`` states, the ``j``-th (0-based) the
+    state after ``(j + 1) * every_n_tokens`` tokens, at row
+    ``cu_starts[i] + j`` of ``states``.
+
+    Args:
+        every_n_tokens: Interval in tokens; a positive multiple of
+            ``GDN_STATE_CHECKPOINT_GRANULARITY``, the scan's chunk size.
+        states: Caller-allocated K-last float32 buffer ``[total, num_v_heads,
+            head_v_dim, head_dim]`` with ``total = sum(len_i //
+            every_n_tokens)``; the kernel overwrites it.
+        cu_starts: ``[num_seqs + 1]`` int32 cumulative per-sequence counts on
+            the device of ``states``.
+    """
+
+    every_n_tokens: int
+    states: torch.Tensor
+    cu_starts: torch.Tensor
+
+
 # Chunk-prefill kernels whose launch geometry depends only on the sequence count
 # and which read the sequence bounds on device.
 _DEVICE_BOUNDS_CHUNK_PREFILL = frozenset({"flashinfer_gdn_chunk_prefill"})
@@ -131,6 +156,7 @@ def _chunk_prefill_traits(
     num_v_heads: int,
     output_h: bool,
     qk_l2norm: bool,
+    state_checkpoints: bool,
 ) -> dict[str, int | bool]:
     return {
         "head_dim": head_dim,
@@ -138,6 +164,7 @@ def _chunk_prefill_traits(
         "num_v_gte_num_q": num_v_heads >= num_q_heads,
         "output_h": output_h,
         "qk_l2norm": qk_l2norm,
+        "state_checkpoints": state_checkpoints,
     }
 
 
@@ -149,12 +176,15 @@ def gdn_chunk_prefill_capturable(
     num_q_heads: int,
     num_v_heads: int,
     qk_l2norm: bool,
+    state_checkpoints: bool,
 ) -> bool:
     """Whether a CUDA graph can capture ``gdn_chunk_prefill`` at a fixed sequence count.
 
     The kernel selected for this geometry must size its launch from the number
     of sequences alone and read ``cu_seqlens`` on device, so a graph replayed
-    with rewritten bounds of the same sequence count stays valid.
+    with rewritten bounds of the same sequence count stays valid. With
+    ``state_checkpoints`` it must also read ``GdnStateCheckpoints.cu_starts``
+    on device; the interval and buffer stay those of the capture.
 
     Args:
         dtype: Q/K/V dtype.
@@ -163,6 +193,7 @@ def gdn_chunk_prefill_capturable(
         num_q_heads: Query (and key) head count.
         num_v_heads: Value head count.
         qk_l2norm: Whether the scan L2-normalizes Q/K.
+        state_checkpoints: Whether the captured scan stores state checkpoints.
 
     Returns:
         ``True`` when the selected kernel can be captured that way.
@@ -174,12 +205,79 @@ def gdn_chunk_prefill_capturable(
             "gdn_chunk_prefill",
             _attention_format_signature(q=probe, k=probe, v=probe),
             traits=_chunk_prefill_traits(
-                head_dim, value_head_dim, num_q_heads, num_v_heads, False, qk_l2norm
+                head_dim,
+                value_head_dim,
+                num_q_heads,
+                num_v_heads,
+                False,
+                qk_l2norm,
+                state_checkpoints,
             ),
         )
     except NoKernelFoundError:
         return False
     return kernel.name in _DEVICE_BOUNDS_CHUNK_PREFILL
+
+
+# State checkpoints land on scan chunk boundaries: every interval is a
+# multiple of this many tokens.
+GDN_STATE_CHECKPOINT_GRANULARITY = 64
+
+
+def gdn_chunk_prefill_stores_state_checkpoints(
+    dtype: torch.dtype,
+    *,
+    head_dim: int,
+    value_head_dim: int,
+    num_q_heads: int,
+    num_v_heads: int,
+    qk_l2norm: bool,
+    interval_granularity: int,
+) -> bool:
+    """Whether a ``gdn_chunk_prefill`` kernel stores checkpoints at these intervals.
+
+    That is, whether the kernel for this geometry takes ``state_checkpoints``
+    (stores states from inside its scan) at intervals that are multiples of
+    ``interval_granularity``.
+
+    Args:
+        dtype: Q/K/V dtype.
+        head_dim: Query/key head dimension.
+        value_head_dim: Value head dimension.
+        num_q_heads: Query (and key) head count.
+        num_v_heads: Value head count.
+        qk_l2norm: Whether the scan L2-normalizes Q/K.
+        interval_granularity: Every interval the caller asks for is a multiple
+            of it; the scan stores only at multiples of
+            ``GDN_STATE_CHECKPOINT_GRANULARITY``.
+
+    Returns:
+        ``True`` when kernel selection finds one and the intervals fit it.
+    """
+    if (
+        interval_granularity <= 0
+        or interval_granularity % GDN_STATE_CHECKPOINT_GRANULARITY
+    ):
+        return False
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    try:
+        select_kernel(
+            "attention",
+            "gdn_chunk_prefill",
+            _attention_format_signature(q=probe, k=probe, v=probe),
+            traits=_chunk_prefill_traits(
+                head_dim,
+                value_head_dim,
+                num_q_heads,
+                num_v_heads,
+                False,
+                qk_l2norm,
+                True,
+            ),
+        )
+    except NoKernelFoundError:
+        return False
+    return True
 
 
 def gdn_chunk_prefill(
@@ -195,6 +293,7 @@ def gdn_chunk_prefill(
     qk_l2norm: bool = False,
     output_final_state: bool = True,
     output_h: bool = False,
+    state_checkpoints: GdnStateCheckpoints | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> GdnChunkPrefillResult:
@@ -216,6 +315,9 @@ def gdn_chunk_prefill(
         output_final_state: Whether to return the final recurrent state.
         output_h: Whether to return intermediate recurrent checkpoints in the
             selected backend's native layout.
+        state_checkpoints: Optional caller-owned buffer the scan stores
+            states into at a fixed interval (see ``GdnStateCheckpoints``);
+            exclusive with ``output_h``.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -228,8 +330,18 @@ def gdn_chunk_prefill(
     value_head_dim = v.shape[-1]
     num_q_heads = q.shape[-2]
     num_v_heads = v.shape[-2]
+    if output_h and state_checkpoints is not None:
+        raise ValueError(
+            "gdn_chunk_prefill: output_h and state_checkpoints are exclusive"
+        )
     traits = _chunk_prefill_traits(
-        head_dim, value_head_dim, num_q_heads, num_v_heads, output_h, qk_l2norm
+        head_dim,
+        value_head_dim,
+        num_q_heads,
+        num_v_heads,
+        output_h,
+        qk_l2norm,
+        state_checkpoints is not None,
     )
     signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
@@ -276,6 +388,7 @@ def gdn_chunk_prefill(
             qk_l2norm=qk_l2norm,
             output_final_state=output_final_state,
             output_h=output_h,
+            state_checkpoints=state_checkpoints,
         )
 
 
@@ -298,6 +411,14 @@ def _qkv_rows_strided(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool
                 return True
             row *= t.shape[dim]
     return False
+
+
+def _requires_padding_safe_decode(
+    state_dtype: torch.dtype, *, output_only: bool, solution: str | None
+) -> bool:
+    # Automatic BF16 writes must preserve the reserved null page. Explicit
+    # solutions retain their documented padding contract; overrides still win.
+    return state_dtype == torch.bfloat16 and not output_only and solution is None
 
 
 def gdn_decode_step(
@@ -351,7 +472,17 @@ def gdn_decode_step(
     """
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
-    traits = {"head_dim": head_dim}
+    traits = {
+        "head_dim": head_dim,
+        "value_head_dim": v.shape[-1],
+        "padding_safe": _requires_padding_safe_decode(
+            initial_state.dtype, output_only=False, solution=solution
+        ),
+    }
+    if solution != "flashinfer":
+        # Only the legacy FlashInfer solution retains its old padding contract.
+        # Other named solutions must still accept the actual state dtype.
+        traits["state_dtype"] = initial_state.dtype
     if _qkv_rows_strided(q, k, v):
         traits["strided_qkv"] = True
     kernel = select_kernel(
@@ -405,21 +536,76 @@ def gdn_tree_verify_needs_node_states(num_nodes: int) -> bool:
     )
 
 
-# A ReplaySSM chain verifies faster in the chunked form from these sizes on, measured on Blackwell.
+class GdnChainVerifyForm(str, Enum):
+    """How a ReplaySSM chain verify runs (``gdn_chain_verify_form``)."""
+
+    # Step by step through ``gdn_decode_mtp``.
+    STEP = "step"
+    # Chunked as a one-path tree through ``gdn_decode_mtp``.
+    TREE = "tree"
+    # Chunked through ``gdn_chain_verify`` (16-bit state, tensor-core products).
+    CHAIN = "chain"
+
+
+# A ReplaySSM chain verifies faster in the tree form from these sizes on, measured on Blackwell.
 GDN_CHAIN_VERIFY_CHUNKED_MIN_TOKENS = 13
 GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES = 24
 
+# State dtypes whose 2- to 16-token chains take the chain form (measured on Blackwell).
+GDN_CHAIN_VERIFY_CHAIN_STATE_DTYPES = frozenset({torch.bfloat16})
 
-def gdn_chain_verify_is_chunked(num_tokens: int, num_states: int) -> bool:
-    """Whether a ReplaySSM chain ``gdn_decode_mtp`` of ``num_tokens`` tokens over
-    ``num_states`` (request, value head) states verifies in the chunked form, as
-    a one-path tree, rather than step by step: only where that is faster."""
+
+def gdn_chain_verify_supported(
+    head_k_dim: int, head_v_dim: int, state_dtype: torch.dtype
+) -> bool:
+    """Whether ``gdn_chain_verify`` takes 16-bit state and equal power-of-two dims from 64."""
     return (
-        current_platform().is_blackwell
-        and GDN_CHAIN_VERIFY_CHUNKED_MIN_TOKENS
-        <= num_tokens
-        <= GDN_TREE_VERIFY_CHUNKED_MAX_NODES
+        state_dtype in (torch.bfloat16, torch.float16)
+        and head_k_dim == head_v_dim
+        and head_k_dim >= 64
+        and head_k_dim & (head_k_dim - 1) == 0
+    )
+
+
+def gdn_chain_verify_form(
+    num_tokens: int, num_states: int, state_dtype: torch.dtype, *, chain_form: bool
+) -> GdnChainVerifyForm:
+    """The fastest form of a chain of ``num_tokens`` over ``num_states`` states."""
+    if (
+        not current_platform().is_blackwell
+        or num_tokens > GDN_TREE_VERIFY_CHUNKED_MAX_NODES
+    ):
+        return GdnChainVerifyForm.STEP
+    if (
+        chain_form
+        and num_tokens >= 2
+        and state_dtype in GDN_CHAIN_VERIFY_CHAIN_STATE_DTYPES
+    ):
+        return GdnChainVerifyForm.CHAIN
+    if (
+        num_tokens >= GDN_CHAIN_VERIFY_CHUNKED_MIN_TOKENS
         and num_states >= GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES
+    ):
+        return GdnChainVerifyForm.TREE
+    return GdnChainVerifyForm.STEP
+
+
+def _chunked_chain_supported(
+    num_tokens: int, head_dim: int, value_head_dim: int, state_dtype: torch.dtype
+) -> bool:
+    return gdn_chain_verify_supported(head_dim, value_head_dim, state_dtype) and (
+        gdn_chain_verify_form(num_tokens, 0, state_dtype, chain_form=True)
+        is GdnChainVerifyForm.CHAIN
+    )
+
+
+def _chain_rows_dense(*tensors: torch.Tensor) -> bool:
+    """Dense heads and request-major rows, including packed-projection views."""
+    return all(
+        t.stride(-1) == 1
+        and (t.ndim != 4 or t.stride(2) == t.shape[3])
+        and (t.shape[0] <= 1 or t.stride(0) == t.shape[1] * t.stride(1))
+        for t in tensors
     )
 
 
@@ -501,11 +687,12 @@ def gdn_decode_mtp(
             without it (ReplaySSM verify) the pool is left untouched, which
             needs ``disable_state_update``, and an ``intermediate_states_buffer``
             is given exactly when ``gdn_tree_verify_needs_node_states(T)``.
-            Runs the Triton solution; ``None`` is a chain.
+            Kernel selection requires tree support; ``None`` is a chain.
         replay_payload: Optional contiguous ``[B * T, num_q_heads * head_dim +
             num_v_heads * head_v_dim + 2 * num_v_heads]`` ReplaySSM payload, in
             the inputs' dtype, that a chunked ReplaySSM tree verify fills with
-            each token's ``[k | v | a | b]`` as read.
+            each token's ``[k | v | a | b]`` as read. The CuTe DSL solution
+            also fills this payload for a chain.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -571,15 +758,38 @@ def gdn_decode_mtp(
                     "intermediate_states_buffer exactly when "
                     "gdn_tree_verify_needs_node_states"
                 )
-        if solution not in (None, "triton"):
-            raise ValueError(
-                f"draft-tree GDN verify runs the Triton solution, got {solution}"
-            )
-        solution = "triton"
 
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
-    traits = {"head_dim": head_dim}
+    output_only = (
+        disable_state_update
+        and intermediate_states_buffer is None
+        and output_state_indices is None
+        and output_state is None
+    )
+    traits = {
+        "head_dim": head_dim,
+        "value_head_dim": v.shape[-1],
+        "verify_tokens": q.shape[1],
+        "tree": tree_ancestors is not None,
+        "output_only": output_only,
+        "padding_safe": _requires_padding_safe_decode(
+            initial_state.dtype, output_only=output_only, solution=solution
+        ),
+        "chunked_chain": output_only
+        and tree_ancestors is None
+        and _chunked_chain_supported(
+            q.shape[1], head_dim, v.shape[-1], initial_state.dtype
+        )
+        and _chain_rows_dense(q, k, v, a, b),
+        "replay_payload": replay_payload is not None,
+    }
+    if solution != "flashinfer" and not output_only:
+        # Only the legacy FlashInfer solution retains its old padding contract;
+        # other named solutions must still accept the actual state dtype. A
+        # read-only verify keeps every dtype-compatible candidate: the legacy
+        # BF16 path only reads the reserved null page for padding.
+        traits["state_dtype"] = initial_state.dtype
     if output_state is not None:
         traits["separate_output_state"] = True
     if _qkv_rows_strided(q, k, v):
@@ -591,6 +801,19 @@ def gdn_decode_mtp(
         traits=traits,
         solution=solution,
         override=override,
+    )
+    ShapeCapture.get().record(
+        "attention",
+        "gdn_decode_mtp",
+        kernel.name,
+        q.dtype,
+        {
+            "batch_size": q.shape[0],
+            "seq_len": q.shape[1],
+            "num_v_heads": v.shape[-2],
+            "head_dim": head_dim,
+            "head_v_dim": v.shape[-1],
+        },
     )
     with kernel_scope(
         "attention",
@@ -621,6 +844,78 @@ def gdn_decode_mtp(
             output_state=output_state,
             tree_ancestors=tree_ancestors,
             replay_payload=replay_payload,
+        )
+
+
+def gdn_chain_verify(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    initial_state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float | None,
+    use_qk_l2norm: bool,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Read-only chain verify of whole windows from the committed states, in the chunked form.
+
+    Args:
+        q: Query ``[B, T, num_q_heads, head_dim]``, ``T <= 16``, request-major rows.
+        k: Key tensor shaped like ``q``.
+        v: Value tensor shaped ``[B, T, num_v_heads, head_v_dim]``, dense heads.
+        A_log: Log decay parameter shaped ``[num_v_heads]``.
+        a: Input-dependent decay shaped ``[B, T, num_v_heads]``, unit head stride.
+        dt_bias: Decay bias shaped ``[num_v_heads]``.
+        b: Update-gate (beta) input shaped like ``a``.
+        initial_state: K-last 16-bit pool ``[pages, num_v_heads, head_v_dim, head_dim]``.
+        initial_state_indices: Per-request page ``[B]``; negative marks padding (zero outputs).
+        scale: Attention scale; ``None`` uses ``head_dim ** -0.5``.
+        use_qk_l2norm: Whether to L2-normalize q and k in the kernel.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Verify output shaped ``[B, T, num_v_heads, head_v_dim]`` (q.dtype).
+    """
+    head_dim = q.shape[-1]
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "gdn_chain_verify",
+        signature,
+        traits={"head_dim": head_dim},
+        solution=solution,
+        override=override,
+    )
+    with kernel_scope(
+        "attention",
+        "gdn_chain_verify",
+        q.dtype,
+        kernel_name=kernel.name,
+        batch_size=q.shape[0],
+        seq_len=q.shape[1],
+        num_v_heads=v.shape[-2],
+        head_dim=head_dim,
+        head_v_dim=v.shape[-1],
+    ):
+        return kernel(
+            q=q,
+            k=k,
+            v=v,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            scale=scale,
+            use_qk_l2norm=use_qk_l2norm,
         )
 
 
@@ -681,7 +976,8 @@ def gdn_decode_supports(
     op: str,
     dtype: torch.dtype,
     *,
-    head_dim: int,
+    state_dtype: torch.dtype,
+    traits: dict[str, int | bool],
     trait: str,
     solution: str | None,
 ) -> bool:
@@ -691,7 +987,11 @@ def gdn_decode_supports(
     Args:
         op: ``"gdn_decode_step"`` or ``"gdn_decode_mtp"``.
         dtype: q/k/v dtype.
-        head_dim: Key head dimension.
+        state_dtype: Recurrent-state pool dtype, used by MTP selection and for
+            safe padding selection.
+        traits: The same geometry and execution traits as the actual decode
+            call, including ``head_dim`` and ``value_head_dim``. MTP also
+            includes ``verify_tokens``, ``output_only`` and ``tree``.
         trait: ``"separate_output_state"`` (an ``output_state`` pool) or
             ``"strided_qkv"`` (q/k/v rows spaced wider than one packed
             ``q | k | v`` row, with contiguous heads; such kernels read a/b by
@@ -704,19 +1004,46 @@ def gdn_decode_supports(
     """
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    traits = dict(traits)
+    output_only = op == "gdn_decode_mtp" and traits["output_only"]
+    traits.setdefault(
+        "padding_safe",
+        _requires_padding_safe_decode(
+            state_dtype,
+            output_only=output_only,
+            solution=solution,
+        ),
+    )
+    if solution != "flashinfer" and not output_only:
+        # Mirror the op's own state-dtype trait; read-only verifies keep every
+        # dtype-compatible candidate (see gdn_decode_mtp).
+        traits.setdefault("state_dtype", state_dtype)
+    if op == "gdn_decode_mtp":
+        traits.setdefault(
+            "chunked_chain",
+            traits["output_only"]
+            and not traits["tree"]
+            and _chunked_chain_supported(
+                traits["verify_tokens"],
+                traits["head_dim"],
+                traits["value_head_dim"],
+                state_dtype,
+            ),
+        )
+        traits.setdefault("replay_payload", False)
     try:
         default = select_kernel(
             "attention",
             op,
             signature,
-            traits={"head_dim": head_dim},
+            traits=traits,
             solution=solution,
         )
         featured = select_kernel(
             "attention",
             op,
             signature,
-            traits={"head_dim": head_dim, trait: True},
+            traits={**traits, trait: True},
             solution=solution,
         )
     except NoKernelFoundError:
@@ -785,6 +1112,7 @@ def gdn_replay_commit(
     draft_token_num: int,
     geometry: tuple[int, int, int, int],
     state_dtype: torch.dtype,
+    rows_aligned: bool,
     override: str | None = None,
     solution: str | None = None,
 ) -> None:
@@ -810,6 +1138,10 @@ def gdn_replay_commit(
         draft_token_num: Number of verify positions per request (``T``).
         geometry: ``(num_k_heads, num_v_heads, head_k_dim, head_v_dim)``.
         state_dtype: Element dtype shared by all recurrent-state pools.
+        rows_aligned: Whether every pool base address and row stride is a
+            multiple of 16 bytes, as the caller knows from its host-side pool
+            tables. Passed to the selected solution; the Triton one may then
+            take its pipelined kernel.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
     """
@@ -865,6 +1197,7 @@ def gdn_replay_commit(
             head_k_dim=head_k_dim,
             head_v_dim=head_v_dim,
             state_dtype=state_dtype,
+            rows_aligned=rows_aligned,
         )
 
 
@@ -903,6 +1236,7 @@ def gdn_replay_commit_supported(
 import tokenspeed_kernel.ops.attention.gdn.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.gdn.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.gdn.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.gdn.cute_dsl  # noqa: E402,F401
 
 # isort: on
 
@@ -911,9 +1245,15 @@ __all__ = [
     "GDN_TREE_VERIFY_CHUNKED_MAX_NODES",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
-    "gdn_chain_verify_is_chunked",
+    "GDN_STATE_CHECKPOINT_GRANULARITY",
+    "GdnChainVerifyForm",
+    "GdnStateCheckpoints",
+    "gdn_chain_verify",
+    "gdn_chain_verify_form",
+    "gdn_chain_verify_supported",
     "gdn_chunk_prefill",
     "gdn_chunk_prefill_capturable",
+    "gdn_chunk_prefill_stores_state_checkpoints",
     "gdn_decode_step",
     "gdn_decode_mtp",
     "gdn_decode_supports",

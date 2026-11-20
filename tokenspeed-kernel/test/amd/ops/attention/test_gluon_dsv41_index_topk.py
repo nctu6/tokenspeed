@@ -34,10 +34,12 @@ from tokenspeed_kernel.numerics.torch.attention.dsv41 import (
 )
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import gluon as gluon_backend
+from tokenspeed_kernel.ops.attention.dsv41 import triton as triton_backend
 from tokenspeed_kernel.ops.attention.dsv41._gluon import indexer as gluon_indexer
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from utils import assert_no_triton_compile
 
 pytest.importorskip("tokenspeed_triton")
 pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
@@ -195,6 +197,21 @@ def test_indexer_launch_metadata(arch, dtype, width, metric, kernel_name):
     assert getattr(module, kernel_name).launch_metadata is module._index_launch_metadata
 
 
+def test_gfx1250_page_scorer_launch_metadata():
+    module = importlib.import_module(
+        "tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.indexer"
+    )
+    args = {"logits": torch.empty((3, 512), dtype=torch.float32)}
+    metadata = module._page_launch_metadata(
+        (2, 1, 1), SimpleNamespace(name="index_score"), args
+    )
+    assert metadata["name"] == "index_score"
+    assert metadata["flops8"] == 2 * 3 * 32 * 512 * 128
+    assert metadata["bytes"] > args["logits"].numel() * 4
+    kernel = module.gluon_dsv41_index_qtile_gfx1250
+    assert kernel.launch_metadata is module._page_launch_metadata
+
+
 @pytest.mark.parametrize(
     ("queries", "width", "bound", "expected"),
     [
@@ -235,6 +252,9 @@ def test_indexer_score_chunk_bound(
     requested_chunk,
     score_chunk,
 ):
+    if arch == "gfx950":
+        # Few queries score in 64-row chunks, within the requested bound.
+        score_chunk = min(score_chunk, 64)
     hardware_chunk = (score_chunk + tile_n - 1) // tile_n * tile_n
     module = importlib.import_module(
         f"tokenspeed_kernel_amd.ops.{arch}.attention.dsv41.indexer"
@@ -242,13 +262,21 @@ def test_indexer_score_chunk_bound(
     launches = []
 
     class FakeKernel:
+        def __init__(self, name):
+            self.name = name
+
         def __getitem__(self, grid):
             def launch(*args, **kwargs):
-                launches.append((grid, kwargs["SCORE_CHUNK"], kwargs["CHUNK_N"]))
+                launches.append(
+                    (self.name, grid, kwargs.get("SCORE_CHUNK"), kwargs["CHUNK_N"])
+                )
 
             return launch
 
-    monkeypatch.setattr(module, kernel_name, FakeKernel())
+    monkeypatch.setattr(module, kernel_name, FakeKernel(kernel_name))
+    page_kernel = "gluon_dsv41_index_qtile_gfx1250"
+    if arch == "gfx1250":
+        monkeypatch.setattr(module, page_kernel, FakeKernel(page_kernel))
     tokens, width = 2, 257
     weights = torch.empty((tokens, 32), dtype=torch.float32)
     cache = torch.empty((5, 64 * 68), dtype=torch.uint8)
@@ -270,8 +298,15 @@ def test_indexer_score_chunk_bound(
         requested_chunk,
     )
 
+    if arch == "gfx1250" and score_chunk >= tile_n:
+        # Full scoring takes whole pages; two query rows keep one chunk per CTA.
+        page_chunk = score_chunk // tile_n * tile_n
+        expected = (page_kernel, (tokens, (width + page_chunk - 1) // page_chunk))
+        assert launches == [(*expected, None, page_chunk)]
+        return
     assert launches == [
         (
+            kernel_name,
             (tokens, (width + score_chunk - 1) // score_chunk),
             score_chunk,
             hardware_chunk,
@@ -279,17 +314,7 @@ def test_indexer_score_chunk_bound(
     ]
 
 
-# A 40-row score chunk masks part of each CTA's 64-row tile, and in Full mode
-# CTAs span page boundaries.
-@pytest.mark.parametrize("reindex", [False, True])
-@pytest.mark.parametrize("score_chunk", [40, 256])
-def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
-    if not current_platform().is_cdna5:
-        pytest.skip("GFX1250 indexer logits")
-    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.indexer import (
-        dsv41_index_logits_gfx1250,
-    )
-
+def _check_index_logits(device, reindex, score_chunk, index_logits, init=-torch.inf):
     g = torch.Generator(device=device).manual_seed(251)
     keys = torch.randn(512, 128, device=device, dtype=torch.bfloat16, generator=g)
     keys *= 0.1
@@ -313,9 +338,9 @@ def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
         else None
     )
     width = 40 if reindex else 256
-    out = torch.full((2, width), -torch.inf, device=device)
+    out = torch.full((2, width), init, device=device)
     values, scales, packed_weights = gluon_indexer._pack_index_q(q, weights)
-    dsv41_index_logits_gfx1250(
+    index_logits(
         values,
         scales,
         packed_weights,
@@ -341,6 +366,108 @@ def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
         dots = q_reference[row] @ key_reference[slots].float().T
         expected[row, valid] = (dots.relu() * weights[row].cpu()[:, None]).sum(0)
     torch.testing.assert_close(out.cpu(), expected, atol=2e-4, rtol=2e-4)
+
+
+# A 40-row score chunk masks part of each CTA's key tile, and in Full mode
+# CTAs span page boundaries.
+@pytest.mark.parametrize("reindex", [False, True])
+@pytest.mark.parametrize("score_chunk", [40, 256])
+def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
+    if not current_platform().is_cdna5:
+        pytest.skip("GFX1250 indexer logits")
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.indexer import (
+        dsv41_index_logits_gfx1250,
+    )
+
+    # Candidate logits need no pre-fill: every candidate column is written.
+    _check_index_logits(
+        device,
+        reindex,
+        score_chunk,
+        dsv41_index_logits_gfx1250,
+        float("nan") if reindex else -torch.inf,
+    )
+
+
+@pytest.mark.parametrize("queries", [1, 5])
+@pytest.mark.parametrize("score_chunk", [64, 256])
+@pytest.mark.parametrize("lengths_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("broadcast", [False, True])
+def test_gfx1250_page_tile_index_logits_match_reference(
+    device, queries, score_chunk, lengths_dtype, broadcast
+):
+    """Whole-page scorer: written columns, skipped pages and untouched tails."""
+    if not current_platform().is_cdna5:
+        pytest.skip("GFX1250 indexer logits")
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.indexer import (
+        dsv41_index_logits_gfx1250,
+    )
+
+    g = torch.Generator(device=device).manual_seed(253)
+    pages = 9
+    keys = torch.randn(pages * 64, 128, device=device, generator=g).to(torch.bfloat16)
+    keys *= 0.1
+    _, key_reference = torch_dsv41_cache_quantize(keys, "index")
+    storage = torch.zeros(pages, 64 * 68 + 16, device=device, dtype=torch.uint8)
+    cache = storage[:, : 64 * 68].view(pages, 64, 68)
+    dsv41.cache_scatter(keys, cache, torch.arange(pages * 64, device=device), "index")
+    # A null page, a page past the cache, and a reused page.
+    row = torch.tensor([3, 1, -1, 2, 9, 0, 5, 3], device=device, dtype=torch.int32)
+    table = (
+        row[None].expand(queries, -1)
+        if broadcast
+        else torch.stack([row.roll(i) for i in range(queries)])
+    )
+    width = row.numel() * 64
+    visible = torch.tensor(
+        [600, 0, 61, 300, 129, 448, 7, 512][:queries],
+        device=device,
+        dtype=lengths_dtype,
+    )
+    q = torch.randn(queries, 32, 128, device=device, generator=g).to(torch.bfloat16)
+    q *= 0.1
+    weights = torch.randn(queries, 32, device=device, generator=g)
+    values, scales, packed_weights = gluon_indexer._pack_index_q(q, weights)
+    out = torch.full((queries, width), float("nan"), device=device)
+    dsv41_index_logits_gfx1250(
+        values,
+        scales,
+        packed_weights,
+        cache.flatten(1),
+        table,
+        visible,
+        None,
+        out,
+        score_chunk,
+    )
+
+    _, q_reference = torch_dsv41_cache_quantize(q.reshape(-1, 128), "index")
+    q_reference = q_reference.reshape(queries, 32, 128)
+    logical = torch.arange(width)
+    for query in range(queries):
+        visible_rows = min(int(visible[query]), width)
+        written = (visible_rows + 7) // 8 * 8
+        physical = table[query].cpu()[logical // 64].long()
+        valid = (logical < visible_rows) & (physical >= 0) & (physical < pages)
+        expected = torch.full((written,), -torch.inf)
+        slots = physical[valid] * 64 + logical[valid] % 64
+        dots = q_reference[query] @ key_reference[slots].float().T
+        expected[valid[:written]] = (dots.relu() * weights[query].cpu()[:, None]).sum(0)
+        got = out[query].cpu()
+        torch.testing.assert_close(got[:written], expected, atol=2e-4, rtol=2e-4)
+        assert got[written:].isnan().all()
+
+
+@pytest.mark.parametrize("reindex", [False, True])
+@pytest.mark.parametrize("score_chunk", [40, 256])
+def test_gfx950_index_logits_match_reference(device, reindex, score_chunk):
+    if not current_platform().is_cdna4:
+        pytest.skip("GFX950 indexer logits")
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.indexer import (
+        dsv41_index_logits_gfx950,
+    )
+
+    _check_index_logits(device, reindex, score_chunk, dsv41_index_logits_gfx950)
 
 
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
@@ -466,7 +593,15 @@ def test_index_topk_preserves_arena_page_stride(
     calls = []
 
     def check_page_view(
-        q, w, cache_2d, table, visible, candidates, logits, score_chunk_size
+        values,
+        scales,
+        w,
+        cache_2d,
+        table,
+        visible,
+        candidates,
+        logits,
+        score_chunk_size,
     ):
         assert cache_2d.stride(1) == 1
         if byte_stride == 1 and not page_gap:
@@ -477,7 +612,8 @@ def test_index_topk_preserves_arena_page_stride(
             assert cache_2d.data_ptr() != cache.data_ptr()
         calls.append((cache_2d.shape, score_chunk_size))
         return launch(
-            q,
+            values,
+            scales,
             w,
             cache_2d,
             table,
@@ -493,3 +629,66 @@ def test_index_topk_preserves_arena_page_stride(
     for got, want in zip(actual, expected, strict=True):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
     assert actual[1].item() == (16 if reindex else 256)
+
+
+@pytest.mark.parametrize("rows", [0, 6, 12, 24, 48, 96, 192, 257])
+@pytest.mark.parametrize("heads", [1, 4, 32])
+@pytest.mark.parametrize("strided", [False, True])
+def test_index_query_planes_match_codec_and_padding(device, rows, heads, strided):
+    torch.manual_seed(333)
+    storage = torch.randn(rows, heads * 2, 128, dtype=torch.bfloat16, device=device)
+    ws = torch.randn(rows, heads * 2, dtype=torch.bfloat16, device=device)
+    q = storage[:, ::2] if strided else storage[:, :heads].contiguous()
+    w = ws[:, ::2] if strided else ws[:, :heads].contiguous()
+    packed = triton_backend.cache_pack(
+        q.contiguous().reshape(rows * heads, 128), "index", None
+    )
+    expected_values = packed[:, :64].reshape(rows, heads, 64).contiguous()
+    expected_scales = (
+        packed[:, 64:68].contiguous().view(torch.int32).reshape(rows, heads)
+    )
+    if heads < 32:
+        expected_values = torch.nn.functional.pad(
+            expected_values, (0, 0, 0, 32 - heads)
+        )
+        expected_scales = torch.nn.functional.pad(expected_scales, (0, 32 - heads))
+    expected_weights = torch.nn.functional.pad(w.float(), (0, 32 - heads))
+    actual = gluon_indexer._pack_index_q(q, w)
+    for got, expected in zip(
+        actual, (expected_values, expected_scales, expected_weights)
+    ):
+        assert got.is_contiguous()
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
+def test_index_query_planes_large_inner_stride(device):
+    stride = 1 << 25
+    elements = 191 * stride + 1
+    required_bytes = elements * torch.bfloat16.itemsize
+    if torch.cuda.mem_get_info(device)[0] < required_bytes + (256 << 20):
+        pytest.skip("requires space for a large-stride query view")
+    storage = torch.empty(elements, dtype=torch.bfloat16, device=device)
+    # Keep wrapped int32 reads in bounds so a regression fails by value.
+    storage.as_strided((192,), (stride,)).fill_(-17)
+    q = storage.as_strided((1, 1, 128), (0, 0, stride), storage_offset=64 * stride)
+    q.copy_(torch.arange(128, dtype=torch.bfloat16, device=device).view(1, 1, 128))
+    w = torch.ones(1, 1, dtype=torch.bfloat16, device=device)
+    expected = gluon_indexer._pack_index_q(q.contiguous(), w)
+    actual = gluon_indexer._pack_index_q(q, w)
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+def test_index_query_planes_do_not_specialize_on_rows_or_row_strides(device):
+    q = torch.randn(257, 32, 128, dtype=torch.bfloat16, device=device)
+    w = torch.randn(257, 32, dtype=torch.bfloat16, device=device)
+    gluon_indexer._pack_index_q(q[:6], w[:6])
+    with assert_no_triton_compile(gluon_indexer._pack_index_queries_padded):
+        for rows in (12, 24, 48, 96, 192, 257):
+            gluon_indexer._pack_index_q(q[:rows], w[:rows])
+        for padding in (1, 7, 31):
+            padded_q = torch.randn(12, 32 * 128 + padding, dtype=q.dtype, device=device)
+            padded_w = torch.randn(12, 32 + padding, dtype=w.dtype, device=device)
+            gluon_indexer._pack_index_q(
+                padded_q[:, : 32 * 128].view(12, 32, 128), padded_w[:, :32]
+            )

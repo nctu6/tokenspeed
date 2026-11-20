@@ -102,7 +102,7 @@ def test_public_argument_defaults():
         fn = getattr(dsv41, name)
         assert fn.__doc__, name
         for parameter in inspect.signature(fn).parameters.values():
-            if name == "index_topk" and parameter.name == "index_metadata":
+            if name == "index_topk" and parameter.name in ("index_metadata", "slots"):
                 assert parameter.default is None
                 continue
             assert (
@@ -1064,25 +1064,28 @@ def test_compressor_fused_norm_preserves_pooled_bf16_boundary(device):
 
 
 @pytest.mark.parametrize("rows", [2, 32])
-def test_compressor_pool_token_count_does_not_recompile(device, rows):
-    """Every prefill brings a new token count; the kernel must not key its
-    compile cache on the row count."""
-    tail = torch.randn(5, rows, 2, 512, device=device)
+def test_compressor_pool_token_count_and_capacity_do_not_recompile(device, rows):
+    """Token counts and tail capacities must not key the compile cache."""
 
-    def run(count):
+    def run(count, pages):
+        tail = torch.empty(pages, rows, 2, 512, device=device)
+        tail[-1].normal_()
         projection = torch.randn(count, 1024, device=device)
         content, scores = projection[:, :512], projection[:, 512:]
         previous = torch.arange(count, device=device) - 1
-        # The last row of page 1, so the in-page row offset is exercised.
-        slots = torch.full((count,), 2 * rows - 1, device=device, dtype=torch.int32)
+        # The last row of the last page, so the in-page row offset is exercised.
+        slots = torch.full(
+            (count,), pages * rows - 1, device=device, dtype=torch.int32
+        )
         active = torch.arange(count, device=device) % 2 == 1
+        active[0] = True
         pooled = dsv41.compressor_pool(
             content, scores, previous, tail, slots, active, None, None, 0.0
         )
         # Row 0 pairs with the tail slot; every later active row pairs with
         # its predecessor in this forward.
-        prior_content = torch.cat([tail[1, rows - 1, 0][None], content[:-1]])
-        prior_scores = torch.cat([tail[1, rows - 1, 1][None], scores[:-1]])
+        prior_content = torch.cat([tail[-1, rows - 1, 0][None], content[:-1]])
+        prior_scores = torch.cat([tail[-1, rows - 1, 1][None], scores[:-1]])
         maximum = torch.maximum(prior_scores, scores)
         old_exp = torch.exp(prior_scores - maximum)
         new_exp = torch.exp(scores - maximum)
@@ -1090,13 +1093,21 @@ def test_compressor_pool_token_count_does_not_recompile(device, rows):
         expected[~active] = 0
         torch.testing.assert_close(pooled, expected, rtol=1e-6, atol=1e-6)
 
-    # Warm both integer-specialization classes (16-divisible and not); Triton
-    # still keys on those two properties for runtime scalars.
-    run(32)
-    run(33)
+    # Warm at a fixed capacity, then vary both token count and capacity.
+    run(32, 5)
+    run(33, 5)
     with assert_no_triton_compile(implementation._compressor_pool):
-        for count in (48, 97, 130, 1483, 4096):
-            run(count)
+        for count, pages in ((48, 3), (97, 16), (130, 17), (1483, 32), (4096, 33)):
+            run(count, pages)
+
+    # The last page starts at 2**31 FP32 elements (for 2-row pages), beyond int32
+    # offsets.
+    pages = (1 << 20) + 1
+    required_bytes = pages * rows * 2 * 512 * torch.float32.itemsize
+    if torch.cuda.mem_get_info(device)[0] < required_bytes + (256 << 20):
+        pytest.skip("requires 8 GiB of free device memory")
+    # AMD may compile a separate variant for buffers larger than 2 GiB.
+    run(32, pages)
 
 
 def _native_available():
@@ -1279,11 +1290,8 @@ def _compressor_pairs(positions, requests, table, pages, rows):
     return expected
 
 
-@pytest.mark.skipif(
-    not _native_available(), reason="FlashMLA V4.1 on Hopper or newer required"
-)
-def test_native_prefill_output_rows_past_int32():
-    """Copy native prefill results into rows whose offsets pass 2**31 elements.
+def test_attention_head_copy_output_rows_past_int32(device):
+    """Copy attention heads into rows whose offsets pass 2**31 elements.
 
     The destination is the caller's, so its row stride is too. Three rows a
     2**30 stride apart put the last write at 2**31 elements, and a guard before
@@ -1292,45 +1300,21 @@ def test_native_prefill_output_rows_past_int32():
     tokens, heads, dim = 3, 64, 512
     stride, guard = 2**30, 2**31
     needed = guard + 2 * stride + heads * dim
-    if torch.cuda.mem_get_info()[0] < needed * 2 + (512 << 20):
+    if torch.cuda.mem_get_info(device)[0] < needed * 2 + (512 << 20):
         pytest.skip("requires 9 GiB of free device memory")
     torch.manual_seed(743)
-    storage = torch.empty(needed, dtype=torch.bfloat16, device="cuda")
+    storage = torch.empty(needed, dtype=torch.bfloat16, device=device)
     storage[: heads * dim].fill_(-7.0)
     out = storage[guard:].as_strided((tokens, heads, dim), (stride, dim, 1))
     out.fill_(float("nan"))
-    q = torch.randn(tokens, heads, dim, dtype=torch.bfloat16, device="cuda") * 0.3
-    kv = torch.randn(1024, 1, dim, dtype=torch.bfloat16, device="cuda")
-    indices = torch.randint(0, 1024, (tokens, 640), dtype=torch.int32, device="cuda")
-    sink = torch.linspace(-2, 2, heads, device="cuda")
+    src = torch.randn(tokens, heads, dim, dtype=torch.bfloat16, device=device)
 
-    got = dsv41.selected_attention(
-        q,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        sink,
-        dim**-0.5,
-        out,
-        tokens,
-        None,
-        kv,
-        indices,
-        lse=None,
-    )
-    assert got is out
-    selected = kv[indices.long(), 0].float()
-    logits = torch.bmm(q.float(), selected.transpose(1, 2)) * dim**-0.5
-    probs = torch.cat((logits, sink[None, :, None].expand(tokens, -1, 1)), -1).softmax(
-        -1
-    )[..., :-1]
-    expected = torch.bmm(probs, selected).bfloat16()
-    torch.testing.assert_close(out, expected, rtol=0.02, atol=0.004)
+    implementation._copy_attention_heads(out, src, None, None)
+    torch.testing.assert_close(out, src, rtol=0, atol=0)
     sentinel = storage[: heads * dim]
-    torch.testing.assert_close(sentinel, torch.full_like(sentinel, -7.0))
+    torch.testing.assert_close(
+        sentinel, torch.full_like(sentinel, -7.0), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("n", [0, 1, 16, 128, 129, 257, 8192, 32768])
@@ -1450,7 +1434,9 @@ def test_decode_rows_packed_request_bounds_padding_and_replay(target, width, bs)
     out = tuple(tensor[2:-2] for tensor in storage)
 
     def prepare(actual, extends):
-        dsv41.decode_rows(seq, pools, *out, actual, extends, width)
+        dsv41.decode_rows(
+            seq, pools, *out, actual, extends, width, query_start_loc=None
+        )
 
     def check(actual, extends):
         lengths = [max(int(seq[i]), width) if i < actual else 0 for i in range(bs)]
@@ -1504,6 +1490,7 @@ def test_decode_rows_rejects_request_token_shape_confusion():
             2,
             0,
             3,
+            query_start_loc=None,
         )
 
 
@@ -1680,6 +1667,7 @@ def test_dspark_anchors_pick_last_accepted_verify_rows(device):
         next_tokens,
         start,
         num_prefill_outputs=extends,
+        decode_query_indptr=None,
     )
     # Extend rows keep their sampled token; decode rows take the token at the
     # last accepted verify row, with accept lengths clamped into 1..width.
@@ -1696,6 +1684,7 @@ def test_dspark_anchors_pick_last_accepted_verify_rows(device):
         cpu_next,
         cpu_start,
         num_prefill_outputs=extends,
+        decode_query_indptr=None,
     )
     assert torch.equal(cpu_next, next_tokens.cpu()) and torch.equal(
         cpu_start, start.cpu()
@@ -1710,6 +1699,7 @@ def test_dspark_anchors_pick_last_accepted_verify_rows(device):
             next_tokens,
             start,
             num_prefill_outputs=extends,
+            decode_query_indptr=None,
         )
 
 
@@ -1780,6 +1770,7 @@ def test_dspark_sparse_outputs_preserve_inactive_rows_without_recompile(device):
             next_tokens,
             starts,
             num_prefill_outputs=outputs,
+            decode_query_indptr=None,
         )
         assert next_tokens[:outputs, 0].tolist() == list(range(10, 10 + outputs))
         assert (next_tokens[outputs:extends] == -7).all()
@@ -1792,38 +1783,1046 @@ def test_dspark_sparse_outputs_preserve_inactive_rows_without_recompile(device):
         run(2)
 
 
-def _prefill_indices_inputs(n, k, device, generator):
-    swa = torch.randint(-1, 900, (n, 128), device=device, generator=generator)
-    logical = torch.randint(-1, 300, (n, k), device=device, generator=generator)
-    slots = torch.randint(-1, 5000, (n, k), device=device, generator=generator)
-    base = torch.randint(-1, 2000, (n,), device=device, generator=generator)
-    return swa.to(torch.int32), logical.to(torch.int32), slots.to(torch.int32), base
-
-
-@pytest.mark.parametrize("subset", [False, True])
-@pytest.mark.parametrize("k", [4, 300, 512])
-def test_prefill_indices_join_swa_and_rebased_global_rows(device, k, subset):
-    generator = torch.Generator(device=device).manual_seed(k)
-    n = 37
-    swa, logical, slots, base = _prefill_indices_inputs(n, k, device, generator)
-    rows = (
-        torch.randperm(n, device=device, generator=generator)[:20] if subset else None
+@pytest.mark.parametrize(
+    "heads,rows",
+    [(32, rows) for rows in (0, 6, 12, 24, 48, 96, 128, 129, 192, 257)]
+    + [(heads, 257) for heads in (4, 8, 13, 16)],
+)
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_indexer_rope_weights_match_separate_operations(
+    device, heads, rows, strided, dtype
+):
+    torch.manual_seed(731)
+    dim = 128
+    query_storage = torch.randn(rows, heads * 2, dim, dtype=dtype, device=device)
+    weight_storage = torch.randn(rows, heads * 2, dtype=dtype, device=device)
+    queries = (
+        query_storage[:, ::2] if strided else query_storage[:, :heads].contiguous()
     )
-    got = dsv41.prefill_indices(swa, logical, slots, base, rows, None)
-    picked = range(n) if rows is None else rows.tolist()
-    assert got.dtype == torch.int32 and got.shape == (len(picked), 128 + k)
-    for i, row in enumerate(picked):
-        assert got[i, :128].tolist() == swa[row].tolist()
-        for j in range(k):
-            sel, slot, start = int(logical[row, j]), int(slots[row, j]), int(base[row])
-            want = sel + start if sel >= 0 and slot >= 0 and start >= 0 else -1
-            assert int(got[i, 128 + j]) == want
-    # The portable fallback agrees, and an explicit destination is filled in place.
-    cpu = dsv41.prefill_indices(
-        *(t.cpu() for t in (swa, logical, slots, base)),
-        None if rows is None else rows.cpu(),
+    weights = (
+        weight_storage[:, ::2] if strided else weight_storage[:, :heads].contiguous()
+    )
+    original_q, original_w = queries.clone(), weights.clone()
+    query_gaps, weight_gaps = (
+        query_storage[:, 1::2].clone(),
+        weight_storage[:, 1::2].clone(),
+    )
+    angles = torch.randn(512, 32, device=device)
+    table = torch.cat((angles.cos(), angles.sin()), dim=-1)
+    positions = torch.arange(rows, device=device, dtype=torch.int64) - 1
+    scale = dim**-0.5 * heads**-0.5
+    expected_q = dsv41.rope_inplace(original_q.clone(), positions, table, "triton")
+    expected_w = original_w * scale
+    q, w = dsv41.rope_weights_inplace(
+        queries, positions, table, weights, scale, "triton"
+    )
+    assert q is queries and w is weights
+    torch.testing.assert_close(q, expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(w, expected_w, rtol=0, atol=0)
+    if strided:
+        torch.testing.assert_close(query_storage[:, 1::2], query_gaps, rtol=0, atol=0)
+        torch.testing.assert_close(weight_storage[:, 1::2], weight_gaps, rtol=0, atol=0)
+    # Changing batch rows must reuse the compiled scalar parameters.
+    if rows >= 12:
+        dsv41.rope_weights_inplace(
+            queries[:6], positions[:6], table, weights[:6], scale, "triton"
+        )
+        with assert_no_triton_compile(implementation._rope_inplace_kernel):
+            dsv41.rope_weights_inplace(
+                queries[:12], positions[:12], table, weights[:12], scale, "triton"
+            )
+
+    if heads == 32 and rows >= 192:
+        # Both grid sizes use separate scaling and share the ordinary RoPE JIT.
+        with assert_no_triton_compile(implementation._rope_inplace_kernel):
+            dsv41.rope_weights_inplace(
+                queries[:129], positions[:129], table, weights[:129], scale, "triton"
+            )
+
+
+@pytest.mark.parametrize("rows", [128, 129])
+def test_indexer_rope_weight_dispatch_graph_replay(device, rows):
+    torch.manual_seed(4096)
+    queries = torch.randn(rows, 32, 128, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(rows, 32, dtype=torch.bfloat16, device=device)
+    initial_q, initial_w = queries.clone(), weights.clone()
+    positions = torch.zeros(rows, dtype=torch.int64, device=device)
+    angles = torch.randn(64, 32, device=device)
+    table = torch.cat((angles.cos(), angles.sin()), dim=-1)
+    scale = 128**-0.5 * 32**-0.5
+    dsv41.rope_weights_inplace(queries, positions, table, weights, scale, "triton")
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual_q, actual_w = dsv41.rope_weights_inplace(
+            queries, positions, table, weights, scale, "triton"
+        )
+    for position in (-1, 0, 17):
+        queries.copy_(initial_q)
+        weights.copy_(initial_w)
+        positions.fill_(position)
+        expected_q = dsv41.rope_inplace(initial_q.clone(), positions, table, "triton")
+        graph.replay()
+        assert actual_q is queries and actual_w is weights
+        torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
+        torch.testing.assert_close(actual_w, initial_w * scale, rtol=0, atol=0)
+
+
+def _clean_selection_reference(values, lengths, table, pages, capacity, size, align):
+    """clean_logits_for_selection on [0, end); NaN marks what it leaves unspecified."""
+    width = (capacity + align - 1) // align * align
+    out = torch.full((values.shape[0], width), torch.nan, dtype=values.dtype)
+    column = torch.arange(capacity)
+    page = table[:, column // size]
+    valid = (column[None] < lengths.clamp(0, capacity)[:, None]) & (
+        (page >= 0) & (page < pages)
+    )
+    out[:, :capacity] = values[:, :capacity].masked_fill(~valid, -torch.inf)
+    return out
+
+
+def _mask_table_pages_reference(values, lengths, table, pages, size):
+    capacity = table.shape[1] * size
+    column = torch.arange(capacity)
+    page = table[:, column // size]
+    hole = (column[None] < lengths.clamp(0, capacity)[:, None]) & (
+        (page < 0) | (page >= pages)
+    )
+    values[:, :capacity].masked_fill_(hole, -torch.inf)
+    return values
+
+
+@pytest.mark.parametrize("alignment_bytes", [256, 2048])
+def test_paged_scores_mask_native_rows_in_place(monkeypatch, alignment_bytes):
+    """Paged scoring selects from DeepGEMM's rows masked in place.
+
+    The native rows come back at the cleaned copy's padded width, equal to it
+    on [0, end). When DeepGEMM's row stride misses DeepSelect's alignment,
+    paged scoring keeps the cleaned copy.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm as native
+
+    rows, width, pages, capacity = 3, 5, 9, 5 * 64
+    table = torch.tensor(
+        [[1, -1, 2, 3, 99], [4, 5, 6, 7, 8], [-1, 0, 1, 2, 3]], dtype=torch.int32
+    )
+    lengths = torch.tensor([200, 400, 0], dtype=torch.int32)
+    # DeepGEMM pads each BF16 row to 1024 bytes and returns the capacity slice.
+    torch.manual_seed(5)
+    storage = torch.randn(rows, 512).to(torch.bfloat16)
+    storage[:, capacity:] = torch.nan
+    original = storage.clone()
+    calls = []
+
+    class Api:
+        def get_num_sms(self):
+            return 4
+
+        def get_paged_mqa_logits_metadata(self, context_lens, size, sms, indices):
+            return torch.zeros(sms + 1, 2, dtype=torch.int32)
+
+        def fp8_fp4_paged_mqa_logits(self, **kwargs):
+            return storage[:, : kwargs["max_context_len"]]
+
+    def clean(*args):
+        calls.append("clean")
+        return _clean_selection_reference(*args)
+
+    def mask(*args):
+        calls.append("mask")
+        return _mask_table_pages_reference(*args)
+
+    monkeypatch.setattr(native, "_api", lambda queries: Api())
+    monkeypatch.setattr(
+        native,
+        "safe_metadata",
+        lambda t, lens, p, cap, size: (
+            t.masked_fill((t < 0) | (t >= p), 0),
+            lens.clamp(0, cap).to(torch.int32),
+        ),
+    )
+    monkeypatch.setattr(native, "clean_logits_for_selection", clean)
+    monkeypatch.setattr(native, "mask_invalid_table_pages", mask)
+    monkeypatch.setattr(native, "deep_select_alignment", lambda: (alignment_bytes, 32))
+    scores, ends, blocks = native._paged_scores(
+        (
+            torch.zeros(rows, 32, 64, dtype=torch.uint8),
+            torch.zeros(rows, 32, dtype=torch.int32),
+        ),
+        torch.zeros(pages, 64 * 68, dtype=torch.uint8),
+        torch.zeros(rows, 32),
+        table,
+        lengths,
+        capacity,
+        64,
         None,
+        0,
+        rows,
+        False,
     )
-    out = torch.empty_like(got)
-    assert dsv41.prefill_indices(swa, logical, slots, base, rows, out) is out
-    torch.testing.assert_close(out.cpu(), cpu, rtol=0, atol=0)
+    alignment = alignment_bytes // 2
+    native_rows = 512 * 2 % alignment_bytes == 0
+    assert calls == (["mask"] if native_rows else ["clean"])
+    assert blocks is None and ends.tolist() == [200, 320, 0]
+    expected = _clean_selection_reference(
+        original, ends, table, pages, capacity, 64, alignment
+    )
+    assert scores.shape == expected.shape
+    for row, end in enumerate(ends.tolist()):
+        torch.testing.assert_close(scores[row, :end], expected[row, :end])
+        if end:
+            # Same top-k over [0, end) as the cleaned copy.
+            k = min(16, end)
+            torch.testing.assert_close(
+                scores[row, :end].float().topk(k).indices.sort().values,
+                expected[row, :end].float().topk(k).indices.sort().values,
+            )
+    assert torch.isinf(scores[0, 64:128]).all()
+    if native_rows:
+        assert scores.data_ptr() == storage.data_ptr()
+        assert scores.stride(0) == 512
+        # Past each row's end the native rows are left as DeepGEMM wrote them.
+        for row, end in enumerate(ends.tolist()):
+            assert torch.equal(storage[row, end:].isnan(), original[row, end:].isnan())
+            torch.testing.assert_close(
+                storage[row, end:capacity], original[row, end:capacity]
+            )
+
+
+def test_padded_rows_view_only_within_the_native_row():
+    from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm as native
+
+    storage = torch.zeros(3, 512, dtype=torch.bfloat16)
+    logits = storage[:, :320]
+    padded = native._padded_rows(logits, 128)
+    assert padded.shape == (3, 384) and padded.stride() == (512, 1)
+    assert padded.data_ptr() == storage.data_ptr()
+    assert native._padded_rows(logits, 64) is logits
+    assert native._padded_rows(logits, 1024) is logits
+    # A row stride without room for the padded width keeps the logits.
+    narrow = torch.zeros(3, 320, dtype=torch.bfloat16)
+    assert native._padded_rows(narrow, 128) is narrow
+
+
+@pytest.fixture
+def triton_device():
+    """A GPU, or the CPU when TRITON_INTERPRET=1 runs the Triton kernels there."""
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    if os.environ.get("TRITON_INTERPRET") == "1":
+        return torch.device("cpu")
+    pytest.skip("requires CUDA/ROCm or TRITON_INTERPRET=1")
+
+
+def _bits(values):
+    return values.view(torch.int16 if values.element_size() == 2 else torch.int32)
+
+
+@pytest.mark.parametrize("table_layout", ["contiguous", "strided", "int64"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_mask_invalid_table_pages_chunks_match_the_reference(
+    triton_device, dtype, table_layout
+):
+    """The chunk-parallel paged mask writes exactly the reference's -inf stores.
+
+    1M-token tables (16385 pages, 17 chunks of 1024) with ends from below zero
+    to past the table, many not multiples of 64. Holes sit in the first chunk,
+    across a chunk boundary, in the last live chunk and on each row's last
+    page, plus past each end, where the kernel may not write; one long row has
+    no hole at all. The whole buffer, padding included, must match bitwise.
+    """
+    device = triton_device
+    torch.manual_seed(61)
+    pages, width = 70, 16385
+    capacity = width * 64
+    ends = [-5, 0, 1, 63, 64, 65, 1024 * 64, 1024 * 64 + 1, 2048 * 64 - 7]
+    ends += [703_001, 703_001, capacity - 1, capacity + 100]
+    rows = len(ends)
+    table = torch.randint(0, pages, (rows, width), dtype=torch.int32)
+    for row, end in enumerate(ends):
+        live = (min(max(end, 0), capacity) + 63) // 64
+        if row == 10:
+            continue  # A long row without holes: nothing to write.
+        table[row, [0, 3, 1023, 1024, 2047]] = torch.tensor(
+            [pages, -1, -1, -2, 99], dtype=torch.int32
+        )
+        table[row, max(live - 5, 0)] = pages + 9
+        table[row, max(live - 1, 0)] = -1
+        table[row, live : live + 4] = -1
+        table[row, 1500::977] = -3
+    if table_layout == "strided":
+        strided = torch.zeros((rows, 2 * width), dtype=torch.int32, device=device)
+        strided[:, ::2] = table.to(device)
+        device_table = strided[:, ::2]
+    else:
+        device_table = table.to(
+            device, torch.int64 if table_layout == "int64" else None
+        )
+    lengths = torch.tensor(ends, dtype=torch.int32, device=device)
+    storage = torch.randn((rows, capacity + 128), dtype=dtype, device=device)
+    storage[:, capacity:] = torch.nan
+
+    reference = storage.to("cpu", copy=True)
+    _mask_table_pages_reference(
+        reference[:, :capacity], lengths.cpu(), table, pages, 64
+    )
+    out = implementation.mask_invalid_table_pages(
+        storage[:, :capacity], lengths, device_table, pages, 64
+    )
+    assert out.data_ptr() == storage.data_ptr()
+    assert torch.equal(_bits(storage).cpu(), _bits(reference))
+    assert torch.isneginf(storage[2, 0]) and not torch.isinf(storage[10]).any()
+
+
+def _fused_slots(rows, k, ratio, device):
+    """Slot inputs covering padding, causality, null pages and page bounds."""
+    positions = torch.tensor([-1, 0, 200, 160, 639, 700, 255, 64][:rows], device=device)
+    # Request 3 is past the table; -1 is a padded query.
+    requests = torch.tensor([-1, 0, 0, 1, 2, 3, 1, 2][:rows], device=device)
+    # Page 0 is the null page (first_page 1); pages 8 and 9 are past the bound.
+    # Rows 64-127 of request 0 sit on the null page, of request 1 past it.
+    storage = torch.tensor(
+        [[1, 0, 5, 9, 2, 3], [2, 9, 4, 8, 1, 7], [7, 6, 1, 2, 0, 5]],
+        dtype=torch.int32,
+        device=device,
+    ).repeat_interleave(2, dim=1)
+    out = torch.full((rows, k), 4444, dtype=torch.int32, device=device)
+    return dsv41.SelectionSlots(out, positions, requests, storage[:, ::2], ratio, 8)
+
+
+def test_selection_slots_slices_keep_out_a_view():
+    """Slicing SelectionSlots keeps out a view of the caller's tensor, and an
+    index that would copy it is rejected rather than detaching the writes."""
+    out = torch.zeros((4, 2), dtype=torch.int32)
+    slots = dsv41.SelectionSlots(
+        out,
+        torch.arange(4),
+        torch.zeros(4, dtype=torch.int64),
+        torch.zeros((1, 2), dtype=torch.int32),
+        1,
+        2,
+    )
+    part = slots[1:3]
+    part.out.fill_(7)
+    assert out[1:3].eq(7).all() and out[0].eq(0).all() and out[3].eq(0).all()
+    with pytest.raises(TypeError, match="slice indexing"):
+        slots[torch.tensor([0, 2])]
+
+
+def _finish_write_reference(rows, pool, out, slots):
+    """The unfused tail: finish_selection, write_selection, then global_slots."""
+    indices, scores, ends, candidates, width, block_size = rows
+    selected = implementation.finish_selection(
+        indices, scores, ends, candidates, width, block_size, True
+    )
+    chosen = None
+    if pool is not None:
+        chosen = implementation.finish_selection(
+            *pool, None, pool[1].shape[1], 8, False
+        )
+    implementation.write_selection(selected, chosen, out)
+    if slots is not None:
+        slots.out.copy_(
+            implementation.global_slots(
+                out[0],
+                slots.positions,
+                slots.requests,
+                slots.table,
+                slots.ratio,
+                slots.pages,
+            )
+        )
+
+
+def _poisoned_outputs(rows, k, pool_k, device):
+    shapes = ((rows, k), (rows,), (rows, pool_k), (rows,))
+    return tuple(
+        torch.full(shape, 12345, dtype=torch.int32, device=device) for shape in shapes
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("layout", ["rows", "pool", "candidates"])
+@pytest.mark.parametrize("ratio", [None, 1, 2])
+def test_fused_selection_matches_finish_write_and_global_slots(
+    triton_device, dtype, layout, ratio
+):
+    """finish_write_selection's one launch writes what the three passes write.
+
+    Row picks (plain or candidate-compacted) and a source pass's block picks
+    finish into poisoned outputs, with slots resolved from the same rows.
+    """
+    device = triton_device
+    torch.manual_seed(1931)
+    n, k = 8, 16
+    width = 96
+    capacity = width
+    candidates = None
+    block_size = 1
+    if layout == "candidates":
+        # Candidate-compacted columns map through their block; -1, repeated
+        # and out-of-history blocks, and rows past the capacity, drop out.
+        block_size = 8
+        capacity = 100
+        candidates = torch.randint(
+            -1, 15, (n, width // 8), dtype=torch.int32, device=device
+        )
+        candidates[:, 0] = -1
+    # Strided score rows, -inf holes and a NaN, as native logits arrive.
+    scores = torch.randn(n, width + 32, device=device).to(dtype)[:, :width]
+    scores[:, ::7] = -torch.inf
+    scores[2, 5] = torch.nan
+    # Rows 2 and 3 reach rows 64-95 of their requests: null and out-of-bound
+    # pages.
+    ends = torch.tensor([0, 1, 96, 70, 17, 40, 15, 3], dtype=torch.int32, device=device)
+    # Unsorted picks with -1 padding, repeats and columns at or past end.
+    indices = torch.randint(
+        -1, width + 8, (n, k + 16), dtype=torch.int32, device=device
+    )
+    indices = indices[:, :k]
+    picks = (indices, scores, ends, candidates, capacity, block_size)
+    pool = None
+    pool_k = 0
+    if layout == "pool":
+        pool_k = 32
+        block_scores = torch.randn(n, 64, device=device)
+        block_scores[:, ::5] = -torch.inf
+        block_ends = torch.tensor(
+            [0, 1, 7, 20, 33, 64, 64, 2], dtype=torch.int32, device=device
+        )
+        block_picks = torch.randint(
+            -1, 70, (n, pool_k), dtype=torch.int32, device=device
+        )
+        pool = (block_picks, block_scores, block_ends)
+    expected = _poisoned_outputs(n, k, pool_k, device)
+    expected_slots = _fused_slots(n, k, ratio, device) if ratio else None
+    _finish_write_reference(picks, pool, expected, expected_slots)
+    actual = _poisoned_outputs(n, k, pool_k, device)
+    actual_slots = _fused_slots(n, k, ratio, device) if ratio else None
+    implementation.finish_write_selection(picks, pool, actual, actual_slots, False)
+    for got, want in zip(actual, expected, strict=True):
+        assert torch.equal(got, want)
+    assert (expected[1] > 0).any()
+    if ratio:
+        assert torch.equal(actual_slots.out, expected_slots.out)
+        live = expected[0] >= 0
+        # Some selected rows resolve; null, out-of-bound and future ones do not.
+        assert (actual_slots.out[live] >= 0).any()
+        assert (actual_slots.out[live] < 0).any()
+    if pool is not None:
+        assert (expected[3] > 0).any()
+
+
+def test_mask_invalid_table_pages_rows_past_int32(triton_device):
+    """The paged mask addresses score rows whose offsets pass 2**31 elements.
+
+    Three rows a 2**30 stride apart put the last row at 2**31 elements, and a
+    guard before the base holds a sentinel that a wrapped write would hit.
+    """
+    device = triton_device
+    if device.type != "cuda":
+        pytest.skip("requires CUDA")
+    stride, guard, capacity = 2**30, 2**31, 4 * 64
+    needed = guard + 2 * stride + capacity
+    if torch.cuda.mem_get_info(device)[0] < needed * 2 + (256 << 20):
+        pytest.skip("requires 9 GiB of free device memory")
+    torch.manual_seed(62)
+    storage = torch.empty(needed, dtype=torch.bfloat16, device=device)
+    storage[:capacity].fill_(3.0)
+    values = storage[guard:].as_strided((3, capacity), (stride, 1))
+    values.copy_(torch.randn((3, capacity), dtype=torch.bfloat16, device=device))
+    table = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7], [1, -1, 3, 9]], dtype=torch.int32)
+    lengths = torch.full((3,), capacity, dtype=torch.int32, device=device)
+    reference = values.to("cpu", copy=True)
+    _mask_table_pages_reference(reference, lengths.cpu(), table, 8, 64)
+
+    implementation.mask_invalid_table_pages(values, lengths, table.to(device), 8, 64)
+    assert torch.equal(_bits(values).cpu(), _bits(reference))
+    assert torch.isneginf(values[2, 64:128]).all()
+    sentinel = storage[:capacity]
+    torch.testing.assert_close(sentinel, torch.full_like(sentinel, 3.0))
+
+
+def test_fused_selection_reads_score_rows_past_int32(triton_device):
+    """finish_write_selection reads score rows whose offsets pass 2**31 elements.
+
+    Three score rows a 2**30 stride apart put the last read at 2**31 elements;
+    a guard before the base holds large sentinel scores that a wrapped read
+    would rank first. The fused launch must match the unfused passes run on a
+    contiguous copy of the same rows.
+    """
+    device = triton_device
+    if device.type != "cuda":
+        pytest.skip("requires CUDA")
+    n, k, width = 3, 16, 96
+    stride, guard = 2**30, 2**31
+    needed = guard + 2 * stride + width
+    if torch.cuda.mem_get_info(device)[0] < needed * 2 + (256 << 20):
+        pytest.skip("requires 9 GiB of free device memory")
+    torch.manual_seed(1932)
+    storage = torch.empty(needed, dtype=torch.bfloat16, device=device)
+    storage[:width].fill_(100.0)
+    scores = storage[guard:].as_strided((n, width), (stride, 1))
+    scores.copy_(torch.randn((n, width), dtype=torch.bfloat16, device=device))
+    ends = torch.full((n,), width, dtype=torch.int32, device=device)
+    indices = torch.randint(-1, width, (n, k), dtype=torch.int32, device=device)
+
+    expected = _poisoned_outputs(n, k, 0, device)
+    _finish_write_reference(
+        (indices, scores.contiguous(), ends, None, width, 1), None, expected, None
+    )
+    actual = _poisoned_outputs(n, k, 0, device)
+    implementation.finish_write_selection(
+        (indices, scores, ends, None, width, 1), None, actual, None, False
+    )
+    for got, want in zip(actual, expected, strict=True):
+        assert torch.equal(got, want)
+    sentinel = storage[:width]
+    torch.testing.assert_close(sentinel, torch.full_like(sentinel, 100.0))
+
+
+def _deep_select_reference(scores, ends, k):
+    """DeepSelect's documented picks: a row whose end is at most k returns its
+    whole [0, end) first; longer rows return k columns of [0, end) with the
+    largest scores. Picks are unsorted and -1 padded."""
+    picks = torch.full((scores.shape[0], k), -1, dtype=torch.int32)
+    for row, end in enumerate(ends.tolist()):
+        if end <= k:
+            picks[row, :end] = torch.arange(end - 1, -1, -1)
+            continue
+        values = scores[row, :end].float().cpu()
+        assert not values.isnan().any(), "DeepSelect aborts on NaN"
+        order = torch.sort(values, descending=True, stable=True).indices[:k]
+        picks[row] = order.flip(0)
+    return picks.to(scores.device)
+
+
+def test_fused_selection_takes_unscored_short_pools_whole(triton_device):
+    """Sparse Reindex without _mask_candidate_logits selects what it did.
+
+    Pools that fit k were not scored; the mask wrote 0.0 on their [0, end)
+    and finishing took the whole pool. The fused kernel takes it without
+    reading those uninitialized logits or the selector's picks. Scored rows
+    are read only on [0, end), which the mask merely round-trips.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41._deep_gemm.indexer import (
+        _mask_candidate_logits,
+    )
+
+    device = triton_device
+    torch.manual_seed(2207)
+    n, k, blocks = 8, 16, 16
+    width = blocks * 8
+    ends = torch.tensor([0, 1, 9, 16, 17, 40, 128, 100], dtype=torch.int32)
+    # Normalized pools: ascending request-local blocks, then -1. Blocks 38 and
+    # 39 reach past a 300-row capacity, so their last rows drop out.
+    normalized = torch.full((n, blocks), -1, dtype=torch.int32)
+    for row, end in enumerate(ends.tolist()):
+        count = (end + 7) // 8
+        normalized[row, :count] = torch.randperm(40)[:count].sort().values
+    normalized[6, -1] = 39
+    raw = torch.randn(n, width).to(torch.bfloat16)
+    raw[:, ::9] = -torch.inf
+    short = ends <= k
+    past = torch.arange(width)[None, :] >= ends[:, None]
+    # Unscored rows and columns past end are uninitialized; NaN stands in.
+    raw[short] = torch.nan
+    raw[past] = torch.nan
+    raw, ends, normalized, short = (
+        t.to(device) for t in (raw, ends, normalized, short)
+    )
+    masked = raw.clone()
+    _mask_candidate_logits[(n, (width + 1023) // 1024)](
+        masked, ends, masked.stride(0), width, k, 1024
+    )
+    picks = _deep_select_reference(masked, ends, k)
+    slots = _fused_slots(n, k, 1, device)
+    expected = _poisoned_outputs(n, k, 0, device)
+    _finish_write_reference(
+        (picks, masked, ends, normalized, 300, 8), None, expected, slots
+    )
+    # The fused kernel never reads the picks of an unscored row.
+    poisoned = picks.masked_fill(short[:, None], 12345)
+    actual = _poisoned_outputs(n, k, 0, device)
+    actual_slots = _fused_slots(n, k, 1, device)
+    implementation.finish_write_selection(
+        (poisoned, raw, ends, normalized, 300, 8), None, actual, actual_slots, True
+    )
+    for got, want in zip(actual, expected, strict=True):
+        assert torch.equal(got, want)
+    assert torch.equal(actual_slots.out, slots.out)
+    # Short pools were taken whole: one row per candidate row below end.
+    assert actual[1][short].tolist() == ends[short].tolist()
+    assert (actual[1][~short] > 0).all()
+
+
+def test_fused_selection_rejects_outputs_that_disagree_with_picks(triton_device):
+    device = triton_device
+    picks = (
+        torch.full((2, 4), -1, dtype=torch.int32, device=device),
+        torch.zeros(2, 8, device=device),
+        torch.zeros(2, dtype=torch.int32, device=device),
+        None,
+        8,
+        1,
+    )
+    out = _poisoned_outputs(2, 4, 0, device)
+    with pytest.raises(ValueError):
+        implementation.finish_write_selection(
+            picks, None, (out[0][:, :3], *out[1:]), None, False
+        )
+    # A pass with candidate blocks needs their picks.
+    with pytest.raises(ValueError):
+        implementation.finish_write_selection(
+            picks, None, _poisoned_outputs(2, 4, 2, device), None, False
+        )
+    implementation.finish_write_selection(picks, None, out, None, False)
+    assert (out[0] == -1).all() and (out[1] == 0).all() and (out[3] == 0).all()
+
+
+class _FakeDeepGemm:
+    """DeepGEMM's packed index scorers over a fixed score table, without a GPU.
+
+    The test numbers query rows through their first head weight; history
+    holds each row's logits by request-local history row. Columns a native
+    scorer leaves unwritten are NaN.
+    """
+
+    def __init__(self, history):
+        self.history = history
+
+    def get_num_sms(self):
+        return 4
+
+    def get_pdl(self):
+        return False
+
+    def get_paged_mqa_logits_metadata(self, context_lens, page_size, sms, indices):
+        return torch.zeros(sms + 1, 2, dtype=torch.int32)
+
+    def fp8_fp4_paged_mqa_logits(self, *, weights, context_lens, max_context_len, **_):
+        rows = weights[:, 0].long()
+        # DeepGEMM pads each BF16 row to 1024 bytes and returns the capacity.
+        padded = -(-max_context_len // 512) * 512
+        logits = torch.full((rows.numel(), padded), torch.nan, dtype=torch.bfloat16)
+        scored = torch.arange(max_context_len)[None, :] < context_lens.view(-1, 1)
+        logits[:, :max_context_len] = self.history[rows, :max_context_len].masked_fill(
+            ~scored, torch.nan
+        )
+        return logits[:, :max_context_len]
+
+    def get_paged_sparse_mqa_logits_metadata(
+        self, context, table, requests, page_size, sparse, q_dtype, block_kv
+    ):
+        return context, sparse
+
+    def fp8_fp4_paged_sparse_mqa_logits(
+        self, *, weights, metadata, num_max_sparse_blocks, sparse_block_kv, **_
+    ):
+        context, sparse = metadata
+        rows = weights[:, 0].long()
+        width = num_max_sparse_blocks * sparse_block_kv
+        positions = sparse.long()[:, :, None] * 8 + torch.arange(8)
+        positions = positions.reshape(rows.numel(), width)
+        values = self.history[
+            rows[:, None], positions.clamp(0, self.history.shape[1] - 1)
+        ]
+        scored = torch.arange(width)[None, :] < context.view(-1, 1)
+        return values.masked_fill(~scored, torch.nan)
+
+
+def _native_selection_inputs(rows, columns, cache_stride, ratio):
+    """Decode-shaped index_topk inputs: per-request tables, as selection_table
+    builds them, numbered query rows, and the owner's slot geometry."""
+    torch.manual_seed(4129 + rows + columns)
+    pages = columns * 3 + 2
+    storage = torch.zeros(pages, cache_stride, dtype=torch.uint8)
+    cache = storage.as_strided((pages, 64, 68), (cache_stride, 68, 1))
+    requests = torch.tensor([0, 0, 1, 1, 2, -1, 2, 0][:rows])
+    owner = torch.randint(1, pages, (3, columns + 1), dtype=torch.int32)
+    owner[0, 1] = 0
+    owner[1, 2] = pages + 3
+    owner[2, 0] = -1
+    lengths = [0, 9, 70, 200, 777, 0, columns * 64, 131]
+    positions = torch.tensor(lengths[:rows]) * ratio - 1 + ratio
+    positions[requests < 0] = -1
+    visible = ((positions + 1) // ratio).clamp_min(0).to(torch.int32)
+    table = owner[requests.clamp_min(0), :columns]
+    table = table.masked_fill((table <= 0) | (requests[:, None] < 0), -1)
+    q = torch.randn(rows, 2, 128).to(torch.bfloat16)
+    weights = torch.rand(rows, 2)
+    weights[:, 0] = torch.arange(rows)
+    history = torch.randn(rows, columns * 64).to(torch.bfloat16)
+    history[:, 3::11] = -torch.inf
+    return q, weights, cache, table, visible, positions, requests, owner, pages, history
+
+
+def _native_index_topk(
+    native, inputs, candidates, topk, candidate_topk, chunk, slot_ratio
+):
+    q, weights, cache, table, visible, positions, requests, owner, pages, _ = inputs
+    rows = q.shape[0]
+    out = tuple(
+        torch.full(shape, 12345, dtype=torch.int32)
+        for shape in ((rows, topk), (rows,), (rows, candidate_topk), (rows,))
+    )
+    slots = None
+    if slot_ratio:
+        slots = dsv41.SelectionSlots(
+            torch.full((rows, topk), 4444, dtype=torch.int32),
+            positions,
+            requests,
+            owner,
+            slot_ratio,
+            pages,
+        )
+    native.index_topk(
+        q,
+        weights,
+        cache,
+        table,
+        visible,
+        candidates,
+        topk,
+        candidate_topk,
+        8,
+        chunk,
+        256,
+        None,
+        out,
+        None,
+        slots,
+    )
+    return out + ((slots.out,) if slots is not None else ())
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "full",  # L2-type: paged Full
+        "source",  # L20-type: candidate source, table above 65536 rows
+        "source_prepared",  # candidate source with clean-fused block maxima
+        "sparse",  # L24-type: native sparse Reindex, short pools unscored
+        "reindex",  # Reindex on unaligned pages: candidate gather
+    ],
+)
+@pytest.mark.parametrize("slot_ratio", [None, 2])
+def test_native_index_topk_fused_selection_matches_the_separate_passes(
+    monkeypatch, case, slot_ratio
+):
+    """The fused finish leaves every native index_topk output bit-identical.
+
+    The reference run replaces finish_write_selection with finish_selection,
+    write_selection and global_slots, and scores sparse Reindex with the
+    candidate mask (_sparse_candidate_scores), as before the fusion.
+    DeepGEMM, DeepSelect (its documented picks), the paged clean copy and the
+    CUDA device checks are replaced; the other Triton kernels run
+    (TRITON_INTERPRET=1 on CPU). Two query tiles check that slots follow
+    their rows.
+    """
+    if os.environ.get("TRITON_INTERPRET") != "1":
+        pytest.skip("runs the Triton kernels on CPU under TRITON_INTERPRET=1")
+    from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm as native
+    from tokenspeed_kernel.ops.attention.dsv41 import deep_select
+    from tokenspeed_kernel.ops.attention.dsv41._deep_gemm import indexer
+
+    columns = 1026 if case == "source" else 13
+    stride = 4416 if case == "reindex" else 4608
+    inputs = _native_selection_inputs(6, columns, stride, 2)
+    candidates = None
+    candidate_topk = 0
+    topk = 16
+    if case in ("source", "source_prepared"):
+        candidate_topk = 32
+    if case in ("sparse", "reindex"):
+        visible = inputs[4]
+        # Pools at most topk rows long go unscored; repeats, -1 and future
+        # blocks drop out, and the newest block stays a candidate.
+        candidates = torch.randint(-1, columns * 8 + 2, (6, 24), dtype=torch.int32)
+        candidates[:, :4] = torch.tensor([3, 3, -1, 0])
+        candidates[:, -1] = ((visible - 1) // 8).clamp_min(0)
+        candidates[2, 4:] = -1
+    api = _FakeDeepGemm(inputs[-1])
+
+    def deep_select_topk(scores, lengths, k, output):
+        output.copy_(_deep_select_reference(scores, lengths, k))
+        return output
+
+    monkeypatch.setattr(native, "_api", lambda queries: api)
+    monkeypatch.setattr(indexer, "_warmup_sparse_mqa", lambda *args: None)
+    # _clean_logits strides its tiles with a loop the interpreter cannot run.
+    monkeypatch.setattr(
+        native, "clean_logits_for_selection", _clean_selection_reference
+    )
+    for module in (native, deep_select, indexer):
+        monkeypatch.setattr(module, "deep_select_alignment", lambda: (256, 32))
+    monkeypatch.setattr(deep_select, "deep_select_topk", deep_select_topk)
+    monkeypatch.setattr(deep_select, "eligible", lambda *args: True)
+    monkeypatch.setattr(implementation, "_same_device", lambda x, tensors: None)
+
+    def run():
+        return _native_index_topk(
+            native, inputs, candidates, topk, candidate_topk, 4, slot_ratio
+        )
+
+    fused = run()
+    with monkeypatch.context() as separate:
+        separate.setattr(
+            native,
+            "finish_write_selection",
+            lambda rows, pool, out, slots, short_rows_unscored: (
+                _finish_write_reference(rows, pool, out, slots)
+            ),
+        )
+        separate.setattr(
+            native, "_sparse_candidate_logits", indexer._sparse_candidate_scores
+        )
+        expected = run()
+    for got, want in zip(fused, expected, strict=True):
+        assert torch.equal(got, want)
+    rows, lengths, blocks, block_lengths = fused[:4]
+    assert (lengths > 0).sum() >= 3 and lengths.max() <= topk
+    assert (block_lengths > 0).any() == bool(candidate_topk)
+    if slot_ratio:
+        q, weights, cache, table, visible, positions, requests, owner, pages, _ = inputs
+        torch.testing.assert_close(
+            fused[4],
+            implementation.global_slots(rows, positions, requests, owner, 2, pages),
+            rtol=0,
+            atol=0,
+        )
+
+
+def _paged_api(built, seen):
+    class Api:
+        def get_num_sms(self):
+            return 4
+
+        def get_paged_mqa_logits_metadata(self, context_lens, size, sms, indices):
+            built.append("schedule")
+            return torch.cat((context_lens.flatten(), indices, torch.tensor([sms])))
+
+        def fp8_fp4_paged_mqa_logits(self, **kwargs):
+            seen.append(kwargs)
+            rows = kwargs["context_lens"].shape[0]
+            return torch.zeros(rows, 512, dtype=torch.bfloat16)
+
+    return Api()
+
+
+def test_prepared_paged_geometry_is_the_scoring_geometry(monkeypatch):
+    """prepare_index_topk builds paged Full's tile geometry under the key the
+    scorer looks it up by: scoring uses it as built and rebuilds nothing."""
+    from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm as native
+
+    rows, pages, capacity = 3, 9, 5 * 64
+    table = torch.tensor(
+        [[1, -1, 2, 3, 99], [4, 5, 6, 7, 8], [-1, 0, 1, 2, 3]], dtype=torch.int32
+    )
+    lengths = torch.tensor([200, 400, 0], dtype=torch.int32)
+    requests = torch.tensor([0, 1, 2], dtype=torch.int32)
+    built, seen = [], []
+    api = _paged_api(built, seen)
+
+    def safe(t, lens, p, cap, size):
+        built.append("table")
+        return t.masked_fill((t < 0) | (t >= p), 0), lens.clamp(0, cap).to(torch.int32)
+
+    monkeypatch.setattr(native, "_api", lambda queries: api)
+    monkeypatch.setattr(native, "_api_for", lambda heads, device: api)
+    monkeypatch.setattr(native, "safe_metadata", safe)
+    monkeypatch.setattr(native, "clean_logits_for_selection", lambda *args: args[0])
+    monkeypatch.setattr(native, "mask_invalid_table_pages", lambda *args: args[0])
+    monkeypatch.setattr(native, "deep_select_alignment", lambda: (1024, 32))
+    index_cache = torch.zeros(pages, 64, 68, dtype=torch.uint8)
+    cache = index_cache.as_strided((pages, 64 * 68), (index_cache.stride(0), 1))
+    queries = (
+        torch.zeros(rows, 32, 64, dtype=torch.uint8),
+        torch.zeros(rows, 32, dtype=torch.int32),
+    )
+
+    def score(metadata):
+        seen.clear()
+        native._paged_scores(
+            queries,
+            cache,
+            torch.zeros(rows, 32),
+            table,
+            lengths,
+            capacity,
+            64,
+            metadata,
+            0,
+            rows,
+            False,
+        )
+        return seen[0]
+
+    plain = score(dsv41.new_index_metadata(table, lengths, requests, history_rows=None))
+    assert built == ["table", "schedule"]
+    built.clear()
+    metadata = dsv41.new_index_metadata(table, lengths, requests, history_rows=None)
+    native.prepare_index_topk(
+        index_cache, table, lengths, None, 4, 0, 32, rows, metadata
+    )
+    assert built == ["table", "schedule"]
+    (entry,) = metadata.paged.values()
+    prepared = score(metadata)
+    assert built == ["table", "schedule"]
+    table_p, _, context_p, schedule_p, indices_p = entry.tensors
+    assert prepared["block_table"] is table_p
+    assert prepared["context_lens"] is context_p
+    assert prepared["schedule_meta"] is schedule_p
+    assert prepared["indices"] is indices_p
+    for name in ("block_table", "context_lens", "schedule_meta", "indices"):
+        assert torch.equal(prepared[name], plain[name])
+    # Dense (history_rows) scoring and empty tables keep no prepared geometry.
+    dense = dsv41.new_index_metadata(table, lengths, None, history_rows=(rows,))
+    native.prepare_index_topk(index_cache, table, lengths, None, 4, 0, 32, rows, dense)
+    empty = table[:, :0]
+    blank = dsv41.new_index_metadata(empty, lengths, None, history_rows=None)
+    native.prepare_index_topk(index_cache, empty, lengths, None, 4, 0, 32, rows, blank)
+    assert not dense.paged and not blank.paged and built == ["table", "schedule"]
+
+
+def test_prepared_sparse_geometry_is_the_scoring_geometry(monkeypatch):
+    """prepare_index_topk builds the native sparse scorer's normalized
+    candidates and schedule for the same views; scoring reuses them as built."""
+    from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm as native
+    from tokenspeed_kernel.ops.attention.dsv41._deep_gemm import indexer
+
+    rows, pages = 3, 9
+    table = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8], [1, 0, 0, 0]], dtype=torch.int32)
+    visible = torch.tensor([100, 250, 0], dtype=torch.int32)
+    candidates = torch.tensor(
+        [[3, 0, 5, -1], [1, 2, 31, 7], [0, -1, -1, -1]], dtype=torch.int32
+    )
+    built, scored = [], []
+
+    class Normalize:
+        def __getitem__(self, grid):
+            def launch(C, L, T, normalized, sparse, context, end, *args, num_warps):
+                built.append("normalize")
+                order = C.sort(dim=1).values
+                normalized.fill_(-1)[:, : C.shape[1]] = order
+                sparse.copy_(normalized + 1)
+                context.copy_(L.clamp_min(0) * 2)
+                end.copy_(L // 3)
+
+            return launch
+
+    class Mask:
+        def __getitem__(self, grid):
+            return lambda *args: None
+
+    class Api:
+        def get_num_sms(self):
+            return 4
+
+        def get_pdl(self):
+            return False
+
+        def get_paged_sparse_mqa_logits_metadata(self, *args):
+            built.append("schedule")
+            context, table, requests, page, sparse = args[:5]
+            return torch.cat((context, requests, sparse.flatten(), table.flatten()))
+
+        def fp8_fp4_paged_sparse_mqa_logits(self, **kwargs):
+            scored.append(kwargs["metadata"])
+            width = kwargs["num_max_sparse_blocks"] * 8
+            return torch.zeros(rows, width, dtype=torch.bfloat16)
+
+    api = Api()
+    monkeypatch.setattr(indexer, "_normalize_candidate_blocks", Normalize())
+    monkeypatch.setattr(indexer, "_mask_candidate_logits", Mask())
+    monkeypatch.setattr(indexer, "_warmup_sparse_mqa", lambda *args: None)
+    monkeypatch.setattr(native, "deep_select_alignment", lambda: (1024, 32))
+    monkeypatch.setattr(native, "_api_for", lambda heads, device: api)
+    # Native sparse reads need 512-byte page strides.
+    index_cache = torch.zeros(pages, 4608, dtype=torch.uint8).as_strided(
+        (pages, 64, 68), (4608, 68, 1)
+    )
+    cache = index_cache.as_strided((pages, 64 * 68), (4608, 1))
+    queries = (
+        torch.zeros(rows, 32, 64, dtype=torch.uint8),
+        torch.zeros(rows, 32, dtype=torch.int32),
+    )
+
+    def score(metadata):
+        return indexer._sparse_candidate_scores(
+            queries,
+            torch.zeros(rows, 32, dtype=torch.bfloat16),
+            cache,
+            table,
+            visible,
+            candidates,
+            api,
+            # The selector's score row alignment: half its input bytes (1024).
+            score_alignment=512,
+            skip_score_topk=4,
+            index_metadata=metadata,
+        )
+
+    plain = score(dsv41.new_index_metadata(table, visible, None, history_rows=None))
+    assert built == ["normalize", "schedule"]
+    built.clear()
+    metadata = dsv41.new_index_metadata(table, visible, None, history_rows=None)
+    native.prepare_index_topk(
+        index_cache, table, visible, candidates, 4, 0, 32, rows, metadata
+    )
+    assert built == ["normalize", "schedule"]
+    (entry,) = metadata.sparse.values()
+    prepared = score(metadata)
+    assert built == ["normalize", "schedule"]
+    normalized, ends, schedule = entry.tensors[:3]
+    assert scored[-1] is schedule and torch.equal(scored[-1], scored[0])
+    assert prepared[1] is ends and prepared[2] is normalized
+    for got, want in zip(prepared, plain, strict=True):
+        assert torch.equal(got, want)
+
+
+def test_prepare_index_topk_follows_the_selected_scorer(monkeypatch):
+    """The family call prepares through the scorer index_topk would select,
+    with the same traits, and reports False when that scorer has no preparer."""
+    from types import SimpleNamespace
+
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    calls = []
+    scorer = {"name": "deep_gemm_dsv41_index_topk"}
+
+    def select(
+        family, mode, signature, *, features, platform, traits, solution, override
+    ):
+        calls.append((mode, solution, traits))
+        if mode == "dsv41_index_topk":
+            return SimpleNamespace(name=scorer["name"])
+        if solution != "deep_gemm":
+            raise NoKernelFoundError("no preparer")
+        return lambda *args: calls.append(args)
+
+    monkeypatch.setattr(dsv41, "select_kernel", select)
+    table = torch.ones(3, 4, dtype=torch.int32)
+    lengths = torch.tensor([10, 20, 30], dtype=torch.int32)
+    metadata = dsv41.new_index_metadata(table, lengths, None, history_rows=None)
+    cache = torch.zeros(9, 64, 68, dtype=torch.uint8)
+    args = (cache, table, lengths, None, 4, 0, 32, torch.bfloat16, 3, metadata)
+    assert dsv41.prepare_index_topk(*args)
+    (scorer_mode, scorer_solution, traits), prepare, prepared = calls
+    assert (scorer_mode, scorer_solution) == ("dsv41_index_topk", None)
+    assert prepare == ("dsv41_index_topk_prepare", "deep_gemm", traits)
+    assert traits["index_heads"] == 32 and traits["index_k_format"] == "mxfp4"
+    assert prepared == (cache, table, lengths, None, 4, 0, 32, 3, metadata)
+    calls.clear()
+    scorer["name"] = "triton_dsv41_index_topk"
+    assert not dsv41.prepare_index_topk(*args)
+    assert [call[:2] for call in calls] == [
+        ("dsv41_index_topk", None),
+        ("dsv41_index_topk_prepare", "triton"),
+    ]
+    with pytest.raises(TypeError, match="new_index_metadata"):
+        dsv41.prepare_index_topk(*args[:-1], object())
+    other = dsv41.new_index_metadata(table.clone(), lengths, None, history_rows=None)
+    with pytest.raises(ValueError, match="different table"):
+        dsv41.prepare_index_topk(*args[:-1], other)

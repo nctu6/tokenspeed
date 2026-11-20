@@ -84,12 +84,13 @@ def test_off_by_default_everywhere():
         # A prefill engine shards its pages with or without a query shard.
         dict(kvp_size=4, dcp_size=1, qcp_size=1, disaggregation_mode="prefill"),
         dict(kvp_size=4, dcp_size=1, qcp_size=4, disaggregation_mode="prefill"),
+        dict(kvp_size=1, dcp_size=1, qcp_size=4, disaggregation_mode="prefill"),
         dict(kvp_size=4, dcp_size=4, qcp_size=1, disaggregation_mode="decode"),
         dict(kvp_size=8, dcp_size=8, qcp_size=1, disaggregation_mode="null"),
     ],
 )
 def test_the_roles_that_take_the_flags(kwargs):
-    validate_context_parallel_roles(**kwargs, enable_mixed_batch=False)
+    validate_context_parallel_roles(**kwargs)
 
 
 @pytest.mark.parametrize(
@@ -139,10 +140,6 @@ def test_the_roles_that_take_the_flags(kwargs):
             "--query-context-parallel-size > 1 requires --disaggregation-mode prefill",
         ),
         (
-            dict(kvp_size=1, dcp_size=1, qcp_size=2, disaggregation_mode="prefill"),
-            "--query-context-parallel-size must equal --kv-parallel-size",
-        ),
-        (
             dict(kvp_size=2, dcp_size=1, qcp_size=4, disaggregation_mode="prefill"),
             "--query-context-parallel-size must equal --kv-parallel-size",
         ),
@@ -150,7 +147,7 @@ def test_the_roles_that_take_the_flags(kwargs):
 )
 def test_the_roles_that_refuse_the_flags(kwargs, match):
     with pytest.raises(ValueError, match=match):
-        validate_context_parallel_roles(**kwargs, enable_mixed_batch=False)
+        validate_context_parallel_roles(**kwargs)
 
 
 def test_the_decode_role_reads_the_shards_with_dcp():
@@ -172,8 +169,7 @@ def test_an_aggregated_engine_reads_shards_with_dcp(backend):
     assert args.disaggregation_mode == "null"
     assert args.mapping.attn.kvp_size == args.decode_context_parallel_size == 2
     assert not args.enable_mixed_batch
-    with pytest.raises(ValueError, match="Aggregated DCP.*--enable-mixed-batch"):
-        prepare_server_args(argv + ["--enable-mixed-batch"])
+    assert prepare_server_args(argv + ["--enable-mixed-batch"]).enable_mixed_batch
 
 
 @pytest.mark.parametrize("argv", [["--model", "x", "--attn-tp-size", "2"], DECODE])
@@ -226,7 +222,6 @@ def test_the_prefill_role_shards_its_pages_without_a_query_shard():
             ["--disaggregation-mode", "decode"],
             "--query-context-parallel-size > 1 requires --disaggregation-mode prefill",
         ),
-        (["--kv-parallel-size", "1"], "must equal --kv-parallel-size"),
         (["--enable-mixed-batch"], "--enable-mixed-batch"),
         (["--data-parallel-size", "2"], "attention DP 1"),
     ],
@@ -385,10 +380,13 @@ def _dsa_attn_config(**overrides):
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=64,
         kernel_page_size=64,
         context_len=4096,
         max_bs=4,
+        max_resident_requests=4,
+        kvp_size=2,
+        kvp_rank=0,
+        kvp_group=(0, 1),
         qcp_size=2,
         qcp_rank=0,
         qcp_group=(0, 1),
@@ -436,10 +434,6 @@ def test_v41_aggregated_kvp_requires_explicit_matching_dcp(size):
     args = prepare_server_args(argv + ["--decode-context-parallel-size", str(size)])
     assert args.mapping.attn.kvp_size == args.decode_context_parallel_size == size
     assert not args.mapping.attn.has_qcp
-    with pytest.raises(ValueError, match="Aggregated DCP.*--enable-mixed-batch"):
-        prepare_server_args(
-            argv + ["--decode-context-parallel-size", str(size), "--enable-mixed-batch"]
-        )
     with pytest.raises(ValueError, match="must equal --kv-parallel-size"):
         prepare_server_args(argv + ["--decode-context-parallel-size", str(size * 2)])
     with pytest.raises(ValueError, match="requires --disaggregation-mode prefill"):
@@ -452,3 +446,8 @@ def test_v41_aggregated_kvp_requires_explicit_matching_dcp(size):
                 str(size),
             ]
         )
+
+
+def test_dsa_query_sharding_still_requires_sharded_kv():
+    with pytest.raises(ValueError, match="KVP equal to QCP"):
+        _dsa_attn_config(kvp_size=1, kvp_rank=0, kvp_group=(0,))

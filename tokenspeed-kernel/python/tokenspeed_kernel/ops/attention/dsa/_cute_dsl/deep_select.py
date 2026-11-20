@@ -816,7 +816,12 @@ class DeepSelectTopK:
                     index = cutlass.Int32(-1)
                     value = _bits_f32(cutlass.Uint32(NEG_INF_BITS))
                     if i < end:
-                        score = scores[row, i]
+                        # Int64 row offset: a wide table's last rows start past
+                        # 2**31 elements; the column offset stays Int32.
+                        score = cute.make_tensor(
+                            scores.iterator + cutlass.Int64(row) * scores.stride[0],
+                            cute.make_layout((scores.shape[1],)),
+                        )[i]
                         if score == score:
                             index = cutlass.Int32(i) + base
                             value = score
@@ -866,7 +871,8 @@ class DeepSelectTopK:
     ):
         max_topk = cutlass.const_expr(self.max_topk)
         cluster_size = cutlass.const_expr(self.cluster_size)
-        row_base = (scores.iterator + row * scores.stride[0]).toint()
+        # Int64 row offset (see the shortcut above); segment offsets stay Int32.
+        row_base = (scores.iterator + cutlass.Int64(row) * scores.stride[0]).toint()
         placeholder = cutlass.Uint64(PLACEHOLDER_PAIR)
         neg_inf = _bits_f32(cutlass.Uint32(NEG_INF_BITS))
 

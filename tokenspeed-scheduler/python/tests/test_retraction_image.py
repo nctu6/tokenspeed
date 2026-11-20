@@ -44,10 +44,12 @@ def _make_config() -> ts.SchedulerConfig:
     cfg.prefix_granularity = PAGE
     cfg.num_device_pages = DEVICE_PAGES
     cfg.num_host_pages = 33
+    cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     cfg.num_snapshot_pages = 9
     cfg.max_retracted_requests = 2
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.disable_l2_cache = False
     cfg.disable_prefix_cache = False
     cfg.cache_groups = [
@@ -58,6 +60,7 @@ def _make_config() -> ts.SchedulerConfig:
             attn_kind=ts.AttnKind.Full,
         )
     ]
+    cfg.host_group_packing = [1]
     return cfg
 
 
@@ -151,6 +154,15 @@ def test_image_splits_into_l2_prefix_and_blob_and_waits_for_both_acks(
         host_rows
     ), "only pages not yet on Host are stored"
     assert scheduler.host_pool_pinned_blocks() == 2
+    # The Host counters see the same L2 leg: of the five published slots, two
+    # were Host entries already and three are this retraction's own store.
+    stats = scheduler.host_cache_stats()
+    assert stats.retraction_stores.ops == 1
+    assert list(stats.retraction_stores.blocks) == [len(stored_keys)] == [3]
+    assert stats.retraction_stores.host_cached == 2
+    assert stats.retraction_stores.in_flight == 0
+    assert stats.retraction_stores.snapshot_fallback == 0
+    assert stats.retraction_stores.image_refused == 0
     # No tail: the snapshot leg carries only the slot-state blob.
     assert list(snapshot.request_ids) == ["a"]
     assert [list(row) for row in snapshot.src_pages] == [[]]
@@ -195,6 +207,9 @@ def test_image_splits_into_l2_prefix_and_blob_and_waits_for_both_acks(
     assert set(tiers) == {int(ts.Cache.HostTier.L2)}
     assert 0 < len(sources) <= 5
     assert [host_rows[key] for key in keys] == list(sources)
+    stats = scheduler.host_cache_stats()
+    assert stats.restore_loads.ops == 1
+    assert list(stats.restore_loads.blocks) == [len(sources)]
     # A copy fills its destination whole: the plan zeroes none of them.
     zeroed = set(dict(restore_plan.pages_to_zero)["full"])
     assert not set(destinations) & zeroed
@@ -280,12 +295,12 @@ def test_finish_while_retracted_releases_the_pins_at_the_acks(
 
 
 def test_snapshot_slots_stay_inside_the_executor_arena() -> None:
-    # Regression: the SnapshotSlotAllocator hands out slots 1..N, while the
-    # runtime's retraction snapshot arena is sized max_retracted_requests and
-    # indexed [0, max_retracted_requests). A slot == max_retracted_requests is
-    # out of range and crashes the data plane (observed as
+    # Regression: the SnapshotSlotAllocator hands out slots 1..N, so the
+    # runtime's retraction snapshot arena has max_retracted_requests + 1 rows
+    # (the executor sizes it so). A slot outside [1, max_retracted_requests]
+    # would index past the arena and crash the data plane (observed as
     # "IndexError: snapshot slot 452" once the capacity-deadlock fallback drove
-    # retractions to the limit). Every emitted slot must stay below the bound.
+    # retractions to the limit). Every emitted slot must stay inside the bound.
     config = _make_config()
     bound = config.max_retracted_requests
     scheduler = ts.Scheduler(config)
@@ -320,7 +335,94 @@ def test_snapshot_slots_stay_inside_the_executor_arena() -> None:
 
     assert emitted, "no retraction was driven; the test exercised nothing"
     for slot in emitted:
-        assert 1 <= slot < bound, (
-            f"snapshot slot {slot} outside the arena [0, {bound}); "
-            "the allocator must stay one below max_retracted_requests"
+        assert 1 <= slot <= bound, (
+            f"snapshot slot {slot} outside the arena rows [0, {bound}]; "
+            "the allocator hands out 1..max_retracted_requests"
         )
+
+
+def test_under_write_back_the_image_copies_every_published_slot() -> None:
+    """Under the write-back policy nothing streams at publication, so a's
+    image copies every published slot to the Host itself -- none is a Host
+    entry already. Its restore needs pages the finished requests left as
+    Device cache: the plan that restores a writes them back, the store
+    listed ahead of the restore."""
+    cfg = _make_config()
+    cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteBack
+    scheduler = ts.Scheduler(cfg)
+    request_ids = ("a", "b", "c", "d")
+    scheduler.submit_requests(
+        [_spec("a", [1, 2, 3, 4, 5])]
+        + [
+            _spec(r, [100 * i + 1, 100 * i + 2])
+            for i, r in enumerate(request_ids[1:], 1)
+        ]
+    )
+    prefill_plan = scheduler.next_execution_plan()
+    host_rows: dict[str, int] = {}
+    assert not _ops(prefill_plan, ts.Cache.WriteBackOp)
+    for index, request_id in enumerate(request_ids):
+        _advance(scheduler, request_id, [1000 + index])
+
+    a_row: list[int] = []
+    next_token = 2000
+    for _ in range(16):
+        plan = scheduler.next_execution_plan()
+        op = _find_forward_op(plan)
+        scheduled = () if op is None else tuple(op.request_ids)
+        if _ops(plan, ts.Cache.SnapshotOp):
+            break
+        if "a" in scheduled:
+            a_row = list(dict(op.block_tables)["full"][scheduled.index("a")])
+        _ack_write_backs(scheduler, plan, host_rows)
+        for request_id in scheduled:
+            _advance(scheduler, request_id, [next_token])
+            next_token += 1
+    else:
+        pytest.fail("decode growth never retracted a request")
+
+    [snapshot] = _ops(plan, ts.Cache.SnapshotOp)
+    [write_back] = _ops(plan, ts.Cache.WriteBackOp)
+    assert list(write_back.source_pinned) == [False]
+    [stored_pages] = write_back.src_pages
+    assert sorted(stored_pages) == sorted(a_row)
+    stats = scheduler.host_cache_stats()
+    assert stats.retraction_stores.ops == 1
+    assert list(stats.retraction_stores.blocks) == [5]
+    assert stats.retraction_stores.host_cached == 0
+    assert stats.retraction_stores.in_flight == 0
+
+    for request_id in scheduled:
+        _advance(scheduler, request_id, [next_token])
+        next_token += 1
+    _ack_write_backs(scheduler, plan, host_rows)
+    done = ts.Cache.SnapshotDoneEvent()
+    done.op_id = int(snapshot.op_ids[0])
+    _ack(scheduler, done)
+    for request_id in ("b", "c", "d"):
+        _finish(scheduler, request_id)
+
+    for _ in range(4):
+        before = scheduler.host_cache_stats()
+        plan = scheduler.next_execution_plan()
+        if _ops(plan, ts.Cache.RestoreOp):
+            break
+        _ack_write_backs(scheduler, plan, host_rows)
+    else:
+        pytest.fail("a was never restored")
+    after = scheduler.host_cache_stats()
+    assert list(_ops(plan, ts.Cache.RestoreOp)[0].request_ids) == ["a"]
+    assert (
+        after.device_evictions.restore.blocks > before.device_evictions.restore.blocks
+    )
+    assert after.eviction_stores.ops == before.eviction_stores.ops + 1
+    kinds = [type(op) for op in plan.cache]
+    assert kinds.index(ts.Cache.WriteBackOp) < kinds.index(ts.Cache.RestoreOp)
+    _ack_write_backs(scheduler, plan, host_rows)
+    [restore] = _ops(plan, ts.Cache.RestoreOp)
+    restored = ts.Cache.RestoreDoneEvent()
+    restored.op_id = int(restore.op_ids[0])
+    _ack(scheduler, restored)
+    assert scheduler.retracted_size() == 0
+    assert scheduler.decoding_size() == 1
+    assert scheduler.host_pool_pinned_blocks() == 0

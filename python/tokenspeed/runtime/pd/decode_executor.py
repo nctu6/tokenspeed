@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 
-from tokenspeed_scheduler import PD, Forward
+from tokenspeed_engine.scheduler import PD, Forward
 
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.pd.base.status import TransferPoll
@@ -34,6 +34,9 @@ logger = get_colorful_logger(__name__)
 
 
 class DisaggDecodeExecutor:
+    # The peer role, read by ``execution.device._arm_layerwise_streaming``.
+    mode = "decode"
+
     def __init__(self, args, kv_args, gloo_group):
         self.cache_layout = kv_args.cache_layout
         self.receivers: dict[str, MooncakeKVReceiver] = {}

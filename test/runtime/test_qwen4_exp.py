@@ -20,7 +20,10 @@
 
 from __future__ import annotations
 
+import gc
 import logging
+import weakref
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -30,18 +33,23 @@ from tokenspeed_kernel.ops.ple import (
     ple_page_gather_pair,
     prepare_ngram_reciprocals,
 )
+from transformers import PretrainedConfig
 
+import tokenspeed.runtime.distributed.comm_manager as comm_module
 import tokenspeed.runtime.layers.attention.backends.paged.qsa as qsa_backend_module
 import tokenspeed.runtime.layers.attention.qsa.indexer as qsa_indexer_module
 import tokenspeed.runtime.layers.attention.qsa.metadata as qsa_metadata_module
+import tokenspeed.runtime.layers.logits_processor as logits_module
 from tokenspeed.runtime.cache.transfer.layout import select_layer_fields
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_qwen4_exp
 from tokenspeed.runtime.configs.qwen4_exp_config import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
 )
+from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.factory import _check_shared_head_layout
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention import registry as attention_registry
@@ -61,6 +69,9 @@ from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
 )
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import (
     PLEForwardMetadata,
+)
+from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
+    InForwardStateCheckpoints,
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
@@ -86,6 +97,7 @@ from tokenspeed.runtime.layers.attention.qsa import (
 )
 from tokenspeed.runtime.layers.attention.qsa.metadata import (
     QSALayout,
+    QSASelection,
     qsa_forward_layout,
 )
 from tokenspeed.runtime.layers.hyperconnection import (
@@ -93,8 +105,10 @@ from tokenspeed.runtime.layers.hyperconnection import (
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
+from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.ple_lookup import PLELookup
+from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
@@ -108,10 +122,12 @@ from tokenspeed.runtime.layers.qwen4_exp_ple import (
     qwen4_exp_ple_conv_field,
 )
 from tokenspeed.runtime.models import qwen4_exp_nextn
+from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpAttentionDecoderLayer,
     _qwen4_exp_uses_sigmoid_output_gate,
     _qwen4_exp_uses_sparse_moe,
+    _Qwen4ExpDecoderMixin,
     _Qwen4ExpRMSNormGated,
     load_qwen4_exp_weights,
 )
@@ -163,7 +179,7 @@ def test_qwen4_exp_nextn_preserves_quantized_mtp_config() -> None:
     assert qwen4_exp_nextn._resolve_mtp_quant_config(excluded) is None
 
 
-def test_qwen4_exp_nextn_drops_quark_quantization_for_excluded_mtp() -> None:
+def test_qwen4_exp_nextn_resolves_mtp_linear_exclusions() -> None:
     mtp_linear_modules = [
         f"mtp.layers.0.{module}"
         for module in (
@@ -177,10 +193,15 @@ def test_qwen4_exp_nextn_drops_quark_quantization_for_excluded_mtp() -> None:
         )
     ]
     # Quark lists linear modules only; the fused MTP experts are never named.
-    excluded = Mxfp4Config(ignored_layers=["lm_head", *mtp_linear_modules])
+    excluded = Mxfp4Config(
+        quant_method="quark", ignored_layers=["lm_head", *mtp_linear_modules]
+    )
     assert qwen4_exp_nextn._resolve_mtp_quant_config(excluded) is None
 
-    quantized = Mxfp4Config(ignored_layers=["lm_head"])
+    # An MXFP4 export can keep the linears BF16 and pack only routed experts.
+    quantized = Mxfp4Config.from_config(
+        {"quant_method": "mxfp4", "ignored_layers": ["lm_head", *mtp_linear_modules]}
+    )
     assert qwen4_exp_nextn._resolve_mtp_quant_config(quantized) is quantized
 
 
@@ -256,6 +277,36 @@ def test_qwen4_exp_decoder_policies_are_model_local() -> None:
     assert Qwen4ExpAttentionDecoderLayer._uses_sparse_moe(moe_qwen38)
     assert Qwen4ExpAttentionDecoderLayer._uses_attention_output_gate(moe_qwen38)
     assert moe_qwen38.model_type == "qwen4_exp_text"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_qwen4_exp_attention_layer_gates_its_output_whatever_the_config_says() -> None:
+    config = Qwen4ExpTextConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        layer_types=["linear_attention", "full_attention"],
+        hc_count=2,
+        hc_lowrank=8,
+        num_experts=None,
+        attn_output_gate=False,
+    )
+    with torch.device("cuda"):
+        layer = Qwen4ExpAttentionDecoderLayer(
+            config,
+            Mapping(rank=0, world_size=1),
+            1,
+            prefix="model.layers.1.self_attn",
+            enable_fp8_attn_proj=False,
+        )
+
+    # The query projection carries a gate per head on top of q, k and v.
+    assert layer.attn_output_gate
+    assert layer.qkv_proj.weight.shape[0] == (2 * 2 + 1 + 1) * 32
 
 
 def test_qwen4_exp_config_normalizes_layer_and_ple_geometry() -> None:
@@ -502,10 +553,10 @@ def _qsa_config(*, kernel_page_size: int | None, max_bs: int, spec: int) -> Attn
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
         kv_cache_mxfp8=False,
-        prefix_granularity=256,
         kernel_page_size=kernel_page_size,
         context_len=1024,
         max_bs=max_bs,
+        max_resident_requests=max_bs,
         pd_disaggregation_enabled=False,
         speculative_num_steps=0,
         speculative_num_draft_tokens=spec,
@@ -595,10 +646,16 @@ def _qsa_root(
     return backend
 
 
-def _qsa_extend_round(router: CacheGroupRouter, block_tables: dict, seq_lens) -> None:
+def _qsa_extend_round(
+    router: CacheGroupRouter,
+    block_tables: dict,
+    seq_lens: list[int],
+    *,
+    query_lengths: list[int],
+) -> None:
     bs = len(seq_lens)
     seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
-    ones = torch.ones(bs, dtype=torch.int32)
+    lengths = torch.tensor(query_lengths, dtype=torch.int32)
     router.init_forward_metadata(
         bs,
         bs,
@@ -606,12 +663,12 @@ def _qsa_extend_round(router: CacheGroupRouter, block_tables: dict, seq_lens) ->
         seq_lens,
         ForwardMode.EXTEND,
         block_tables=block_tables,
-        extend_seq_lens=ones,
-        extend_seq_lens_cpu=ones,
-        extend_prefix_lens=seq_lens - 1,
-        extend_prefix_lens_cpu=seq_lens - 1,
-        extend_replay_lens_cpu=torch.zeros_like(seq_lens - 1),
-        extend_prompt_lens_cpu=seq_lens - 1 + ones,
+        extend_seq_lens=lengths,
+        extend_seq_lens_cpu=lengths,
+        extend_prefix_lens=seq_lens - lengths,
+        extend_prefix_lens_cpu=seq_lens - lengths,
+        extend_replay_lens_cpu=torch.zeros_like(seq_lens),
+        extend_prompt_lens_cpu=seq_lens,
         extend_with_prefix=True,
         query_shard=None,
         block_tables_cpu={},
@@ -650,7 +707,12 @@ def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
         )
         kv_width = 4
     else:
-        _qsa_extend_round(router, tables, seq_lens=lengths)
+        _qsa_extend_round(
+            router,
+            tables,
+            seq_lens=lengths,
+            query_lengths=[query_width] * len(lengths),
+        )
         kv_width = 1
     attention = (
         HybridLinearAttnBackend(router, SimpleNamespace(), [3]) if hybrid else router
@@ -718,29 +780,49 @@ def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
     )
 
 
-def test_qwen4_exp_qsa_topk_algorithm_reads_env(monkeypatch) -> None:
-    indexer = object.__new__(QSAIndexer)
-    small = torch.empty(1, 64)  # 1 x 4096 blocks x 4B fits any default budget
-    large = torch.empty(1, 8192)  # 1 x 524288 blocks x 4B exceeds 1 MiB
+@pytest.mark.parametrize(
+    ("path", "budget_mb"), [("auto", 256), ("stream", 1), ("logits", 0)]
+)
+def test_qwen4_exp_qsa_forwards_topk_policy(monkeypatch, path, budget_mb) -> None:
+    indexer, _, _, compressed, _ = _qsa_cache_test_indexer("cpu")
+    query = torch.empty(8, 4, indexer.index_head_dim)
+    positions = torch.arange(8)
+    requests = torch.zeros(8, dtype=torch.int32)
+    complete = torch.ones(8, dtype=torch.int32)
+    table = torch.ones(1, 1, dtype=torch.int32)
+    output = torch.empty(8, indexer.token_topk + indexer.compress_ratio - 1)
+    calls = []
 
-    monkeypatch.delenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", raising=False)
-    monkeypatch.delenv("TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB", raising=False)
-    assert indexer._topk_algorithm(1, small, 64) == "logits"
-    assert indexer._topk_algorithm(1, large, 64) == "logits"
+    def select_blocks(*args, **kwargs):
+        calls.append(kwargs)
+        return torch.zeros(8, indexer.block_topk, dtype=torch.int32)
 
-    # A tighter budget flips only the oversized batch onto the stream path.
-    monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB", "1")
-    assert indexer._topk_algorithm(1, small, 64) == "logits"
-    assert indexer._topk_algorithm(1, large, 64) == "stream"
-
-    # Explicit backends pin the routing regardless of shape or budget.
-    for pinned in ("stream", "logits"):
-        monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", pinned)
-        assert indexer._topk_algorithm(1, large, 64) == pinned
-
-    monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", "bogus")
-    with pytest.raises(ValueError, match="TOPK_PATH"):
-        indexer._topk_algorithm(1, small, 64)
+    monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", path)
+    monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB", str(budget_mb))
+    monkeypatch.setattr(qsa_indexer_module, "qwen4_exp_qsa_block_topk", select_blocks)
+    monkeypatch.setattr(
+        qsa_indexer_module,
+        "qwen4_exp_qsa_selected_slots",
+        lambda *args, **kwargs: output,
+    )
+    selection = indexer._select(
+        query,
+        positions,
+        requests,
+        table,
+        table,
+        compressed,
+        full_page_size=64,
+        complete_blocks=complete,
+        queries_per_request=8,
+    )
+    assert selection.selected_slots is output
+    assert selection.selected_blocks.shape == (8, indexer.block_topk)
+    assert selection.block_size == indexer.compress_ratio
+    assert len(calls) == 1
+    assert calls[0]["path"] == path
+    assert calls[0]["max_logits_bytes"] == budget_mb << 20
+    assert calls[0]["queries_per_request"] == 8
 
 
 def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
@@ -757,7 +839,10 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     router = backend.attention_backend
     raw = torch.tensor([[3], [5]], dtype=torch.int32)
     _qsa_extend_round(
-        backend, {gid: raw for gid in _QSA_GROUP_GRANULARITIES}, seq_lens=[8, 9]
+        backend,
+        {gid: raw for gid in _QSA_GROUP_GRANULARITIES},
+        seq_lens=[8, 9],
+        query_lengths=[1, 1],
     )
     logical = torch.tensor([7, 8])
     requests = torch.tensor([0, 1])
@@ -781,7 +866,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
         cache_accesses.append(("fields", indexer.layer_id))
         return None, torch.empty(0), None
 
-    indexer._fields = fields
+    indexer.cache_fields = fields
     stacks = router.stacks
     metadata = backend.indexer_backend.metadata_for(ForwardMode.EXTEND)
     qsa_table = metadata.qsa_block_table
@@ -793,6 +878,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
         qsa_locs=cache_locs,
         recent_locs=cache_locs,
         complete_blocks=torch.ones(2, dtype=torch.int32),
+        queries_per_request=1,
         qsa_page_table=qsa_table,
         full_page_table=stacks.table(FULL_ATTENTION, 2),
         full_kernel_page_size=64,
@@ -812,8 +898,9 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     indexer._write_and_compress = write_and_compress
 
     selections = []
-    indexer._select_slots = lambda *args, **kwargs: (
-        selections.append((args, kwargs)) or rows
+    blocks = torch.zeros((2, 1), dtype=torch.int32)
+    indexer._select = lambda *args, **kwargs: (
+        selections.append((args, kwargs)) or QSASelection(rows, blocks, 4)
     )
     ctx = SimpleNamespace(
         bs=2,
@@ -829,6 +916,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     torch.testing.assert_close(actual, rows)
     # The MTP-shared selection is published on the router, not the context.
     torch.testing.assert_close(router.sparse_topk.decode, rows)
+    assert router.sparse_topk.qsa_selection.selected_blocks is blocks
     assert cache_accesses == [("wait", 3), ("fields", 3)]
     assert len(updates) == 1
     assert updates[0][1]["query"] is not None
@@ -837,7 +925,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     assert qsa_table[:, :1].tolist() == [[3], [5]]
     assert recent_table[:, :1].tolist() == [[3], [5]]
     assert selections[0][0][3] is qsa_table
-    assert selections[0][1]["queries_per_request"] is None
+    assert selections[0][1]["queries_per_request"] == 1
     assert torch.equal(selections[0][0][4], stacks.table(FULL_ATTENTION, 2))
     assert prepare_calls[0][1] == {
         "compressed_token_page_size": 256,
@@ -849,7 +937,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     def fail_selection(*args, **kwargs):
         raise AssertionError("top-k selection must be skipped")
 
-    indexer._select_slots = fail_selection
+    indexer._select = fail_selection
     actual = indexer(torch.zeros((2, 4)), torch.tensor([9, 10]), ctx)
 
     torch.testing.assert_close(actual, rows)
@@ -864,9 +952,11 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("projected", [False, True])
 def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
     monkeypatch,
     hybrid,
+    projected,
 ) -> None:
     indexer = QSAIndexer.__new__(QSAIndexer)
     torch.nn.Module.__init__(indexer)
@@ -876,23 +966,25 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
     indexer.recent_page_size = 64
     indexer.compress_ratio = 4
     pool = SimpleNamespace(layerwise_load_tracker=None)
-    indexer._fields = lambda pool: (None, torch.empty(0), None)
+    indexer.cache_fields = lambda pool: (None, torch.empty(0), None)
     indexer._project_qk_raw = lambda hidden: (hidden, hidden[:, None, :])
     selection_widths = []
 
     def select(q, *args, **kwargs):
         selection_widths.append(kwargs["queries_per_request"])
-        return torch.zeros((q.shape[0], 1), dtype=torch.int32)
+        selected = torch.zeros((q.shape[0], 1), dtype=torch.int32)
+        return QSASelection(selected, selected, 4)
 
-    indexer._select_slots = select
+    indexer._select = select
     draft_scratch = tuple(torch.empty(2) for _ in range(3))
-    indexer._draft_scratch_buffers = lambda *args: draft_scratch
+    indexer.draft_scratch = lambda *args: draft_scratch
     prepared = SimpleNamespace(
         logical_positions=torch.arange(8),
         request_indices=torch.zeros(8, dtype=torch.int64),
         qsa_locs=torch.ones(8, dtype=torch.int32),
         recent_locs=torch.ones(8, dtype=torch.int32),
         complete_blocks=torch.ones(8, dtype=torch.int32),
+        queries_per_request=None,
         qsa_page_table=torch.ones((2, 1), dtype=torch.int32),
         full_page_table=torch.ones((2, 1), dtype=torch.int32),
         full_kernel_page_size=64,
@@ -929,6 +1021,7 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
         (target_backend, 5, ForwardMode.MIXED, 1),
         (ordinary_backend, 2, ForwardMode.DECODE, 0),
     ):
+        prepared.queries_per_request = rows // 2 if mode.is_decode() else None
         ctx = ForwardContext(
             attn_backend=backend,
             token_to_kv_pool=pool,
@@ -940,7 +1033,16 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
             input_num_tokens=rows,
             forward_mode=mode,
         )
-        result = indexer(torch.ones((rows, 4)), torch.arange(rows), ctx)
+        hidden = torch.ones((rows, 4))
+        assert indexer.can_overlap(ctx, num_rows=rows) == (
+            backend is target_backend and mode.is_decode()
+        )
+        assert not indexer.can_overlap(ctx, num_rows=rows + 1)
+        if projected:
+            raw_q, token_k = indexer._project_qk_raw(hidden)
+            result = indexer.forward_projected(raw_q, token_k, torch.arange(rows), ctx)
+        else:
+            result = indexer(hidden, torch.arange(rows), ctx)
         assert result.shape == (rows, 1)
 
     single_request_ctx = ForwardContext(
@@ -952,6 +1054,7 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
         input_num_tokens=8,
         forward_mode=ForwardMode.EXTEND,
     )
+    prepared.queries_per_request = 8
     result = indexer(torch.ones((8, 4)), torch.arange(8), single_request_ctx)
     assert result.shape == (8, 1)
 
@@ -981,7 +1084,10 @@ def test_qwen4_exp_qsa_reuses_per_forward_metadata_across_layers(monkeypatch) ->
     backend = _qsa_root(kernel_page_size=64, max_bs=4, spec=1, is_draft=False)
     raw = torch.tensor([[3], [5]], dtype=torch.int32)
     _qsa_extend_round(
-        backend, {gid: raw for gid in _QSA_GROUP_GRANULARITIES}, seq_lens=[8, 12]
+        backend,
+        {gid: raw for gid in _QSA_GROUP_GRANULARITIES},
+        seq_lens=[8, 12],
+        query_lengths=[4, 4],
     )
     ctx = SimpleNamespace(
         bs=2,
@@ -1045,7 +1151,7 @@ def test_qwen4_exp_qsa_pure_verify_skips_recent_write(monkeypatch) -> None:
         mrope_section=None,
         mrope_interleaved=False,
     )
-    indexer._fields = lambda pool: (
+    indexer.cache_fields = lambda pool: (
         torch.empty((2, 4, 1, 8)),
         torch.empty((2, 64, 1, 8)),
         torch.empty((2, 3), dtype=torch.int64),
@@ -1090,8 +1196,12 @@ def test_qwen4_exp_qsa_pure_verify_skips_recent_write(monkeypatch) -> None:
 def test_qwen4_exp_draft_attention_preserves_rows_and_cache_context(
     sparse, narrow, mode
 ) -> None:
+    from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
     layer = object.__new__(qwen4_exp_nextn.Qwen4ExpDraftAttentionDecoderLayer)
     torch.nn.Module.__init__(layer)
+    layer.enable_fp8_attn_proj = False
+    layer.qsa_fork = StreamFork(None)
     q = torch.arange(24, dtype=torch.float32).reshape(6, 4)
     k, v = q + 100, q + 200
     topk = torch.arange(12, dtype=torch.int32).reshape(6, 2)
@@ -1208,7 +1318,7 @@ def _qsa_cache_test_indexer(device: str = "cuda"):
     raw = torch.zeros((3, 4, 1, 2), dtype=torch.float32, device=device)
     compressed = torch.zeros((3, 64, 1, 2), dtype=torch.float32, device=device)
     rope_positions = torch.zeros((3, 3), dtype=torch.int64, device=device)
-    indexer._fields = lambda pool: (raw, compressed, rope_positions)
+    indexer.cache_fields = lambda pool: (raw, compressed, rope_positions)
     indexer._draft_scratch = {}
     return indexer, SimpleNamespace(), raw, compressed, rope_positions
 
@@ -1311,12 +1421,7 @@ def test_qwen4_exp_qsa_draft_scratch_spans_compression_boundaries() -> None:
         stage_draft=False,
     )
     raw[1, 3, 0] = -99
-    seed_position = torch.tensor([3], dtype=torch.long, device=device)
-    scratch = indexer._draft_scratch_buffers(
-        committed_keys[:1],
-        indexer._position_values(seed_position),
-        1,
-    )
+    scratch = indexer.draft_scratch(1, committed_keys.dtype, committed_keys.device)
 
     for value in range(3, 8):
         logical = torch.tensor([value], dtype=torch.long, device=device)
@@ -1452,7 +1557,7 @@ def test_qwen4_exp_qsa_select_slots_matches_reference() -> None:
     ratio = indexer.compress_ratio
     complete = (logical + 1) // ratio
 
-    selected = indexer._select_slots(
+    selection = indexer._select(
         q,
         logical,
         requests,
@@ -1463,6 +1568,10 @@ def test_qwen4_exp_qsa_select_slots_matches_reference() -> None:
         complete_blocks=complete.to(torch.int32),
         queries_per_request=1,
     )
+    selected = selection.selected_slots
+    for row in range(2):
+        count = int(complete[row])
+        assert set(selection.selected_blocks[row, :count].tolist()) == set(range(count))
 
     # Only blocks before ``complete_blocks`` hold valid compressed keys, so
     # the selection is deterministic; compare selected token sets per row
@@ -1487,33 +1596,199 @@ def test_qwen4_exp_qsa_select_slots_matches_reference() -> None:
         torch.testing.assert_close(got, expected)
 
 
-def test_qwen4_exp_nextn_head_matches_attention_dp_layout(monkeypatch) -> None:
-    calls = []
+class _EmbeddingOnlyDraft(torch.nn.Module):
+    """CPU stand-in for transformer weights; real heads handle the logits."""
 
-    def fake_replicated(*args, **kwargs):
-        calls.append(("replicated", args, kwargs))
-        return object()
+    def __init__(self, config, mapping, quant_config, prefix):
+        super().__init__()
+        self.qsa_indexers = []
+        self.embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size)
 
-    def fake_parallel(*args, **kwargs):
-        calls.append(("parallel", args, kwargs))
-        return object()
 
-    monkeypatch.setattr(qwen4_exp_nextn, "ReplicatedLinear", fake_replicated)
-    monkeypatch.setattr(qwen4_exp_nextn, "ParallelLMHead", fake_parallel)
-    config = SimpleNamespace(hidden_size=16, vocab_size=128)
-    attn = SimpleNamespace(has_dp=True, tp_rank=0, tp_size=2, tp_group=object())
+class _HeadOnlyTarget(BaseCausalLM):
+    model_cls = _EmbeddingOnlyDraft
 
-    qwen4_exp_nextn._build_mtp_lm_head(
-        config, SimpleNamespace(attn=attn), None, "draft"
+
+@pytest.mark.parametrize("rank", range(8))
+@pytest.mark.parametrize("attn_tp", [1, 2, 4])
+def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp):
+    mapping = Mapping(
+        rank=rank, world_size=8, attn_tp_size=attn_tp, attn_dp_size=8 // attn_tp
     )
-    attn.has_dp = False
-    qwen4_exp_nextn._build_mtp_lm_head(
-        config, SimpleNamespace(attn=attn), None, "draft"
+    config = PretrainedConfig(
+        hc_count=4,
+        hidden_size=4,
+        vocab_size=8,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=1,
+        tie_word_embeddings=False,
+    )
+    # The GPU transformer and CUDA cache management are outside this test;
+    # the head, logits processors and factory layout check are real classes.
+    monkeypatch.setattr(qwen4_exp_nextn, "Qwen4ExpDraftModel", _EmbeddingOnlyDraft)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    target = _HeadOnlyTarget(config, mapping)
+    with torch.no_grad():
+        target.lm_head.weight.copy_(
+            torch.arange(target.lm_head.weight.numel()).reshape_as(
+                target.lm_head.weight
+            )
+            / 100
+            - 0.16
+        )
+    draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(config, mapping)
+    _check_shared_head_layout(target, draft)
+    draft.set_embed_and_head(target.model.embed_tokens.weight, target.lm_head.weight)
+
+    hidden = (
+        torch.arange(3 * config.hidden_size, dtype=torch.float32).reshape(3, -1) / 7
+    )
+    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
+    actual = draft.logits_processor._get_logits(
+        hidden, draft.lm_head, metadata, require_full_vocab=False
+    )
+    expected = torch.nn.functional.linear(hidden, target.lm_head.weight)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("rank", range(8))
+@pytest.mark.parametrize("attn_tp,head_tp", [(1, 2), (2, 8)])
+def test_attention_dp_mtp_shares_vocab_sharded_head(
+    monkeypatch, rank, attn_tp, head_tp
+):
+    mapping = Mapping(
+        rank=rank,
+        world_size=8,
+        attn_tp_size=attn_tp,
+        attn_dp_size=8 // attn_tp,
+        lm_head_tp_size=head_tp,
+    )
+    config = PretrainedConfig(
+        hc_count=4,
+        hidden_size=4,
+        vocab_size=128,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=1,
+        tie_word_embeddings=False,
+    )
+    monkeypatch.setattr(qwen4_exp_nextn, "Qwen4ExpDraftModel", _EmbeddingOnlyDraft)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    target = _HeadOnlyTarget(config, mapping)
+    draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(config, mapping)
+    _check_shared_head_layout(target, draft)
+    full_weight = torch.arange(128 * 4, dtype=torch.float32).reshape(128, 4) / 100
+    width = target.lm_head.weight.shape[0]
+    start = mapping.lm_head.tp_rank * width
+    with torch.no_grad():
+        target.lm_head.weight.copy_(full_weight[start : start + width])
+    draft.set_embed_and_head_module(target.model.embed_tokens.weight, target.lm_head)
+    assert draft.lm_head is target.lm_head
+    rows = [1 + (r // attn_tp) % 3 for r in range(8)]
+    hidden = [
+        torch.arange(n * 4, dtype=torch.float32).reshape(n, 4) / 7 + r // attn_tp
+        for r, n in enumerate(rows)
+    ]
+
+    # Only the distributed transport is simulated on CPU. The real target and
+    # draft heads, layout validation, and logits GEMM handle distinct DP rows
+    # and vocabulary shards; the peer contributes its independently computed shard.
+    def gather(local, group, counts):
+        return torch.cat(
+            [
+                (local if r == rank else hidden[r])[:count]
+                for r, count in zip(group, counts)
+            ]
+        )
+
+    def transpose(local_logits, group, *, input_split_sizes):
+        offset = sum(input_split_sizes[: group.index(rank)])
+        return torch.cat(
+            [
+                (
+                    local_logits[offset : offset + rows[rank]]
+                    if r == rank
+                    else torch.nn.functional.linear(
+                        hidden[rank], full_weight[i * width : (i + 1) * width]
+                    )
+                )
+                for i, r in enumerate(group)
+            ],
+            dim=1,
+        )
+
+    def reduce_hidden(local, group):
+        assert group == mapping.lm_head.tp_group
+        distinct = torch.cat(hidden[::attn_tp])
+        expected = torch.zeros_like(distinct)
+        if rank % attn_tp == 0:
+            start = sum(rows[:rank:attn_tp])
+            expected[start : start + rows[rank]] = hidden[rank]
+        torch.testing.assert_close(local, expected)
+        return distinct
+
+    def gather_vocab(output, local, group):
+        assert group == mapping.lm_head.tp_group
+        all_hidden = torch.cat(hidden[::attn_tp])
+        torch.testing.assert_close(
+            local, torch.nn.functional.linear(all_hidden, draft.lm_head.weight)
+        )
+        output.copy_(
+            torch.cat(
+                [
+                    torch.nn.functional.linear(all_hidden, shard)
+                    for shard in full_weight.split(width, dim=0)
+                ],
+                dim=0,
+            )
+        )
+
+    monkeypatch.setattr(logits_module, "all_reduce", reduce_hidden)
+    monkeypatch.setattr(logits_module, "all_gather_single", gather_vocab)
+    monkeypatch.setattr(logits_module, "token_all_gather", gather)
+    monkeypatch.setattr(logits_module, "all_to_all_transpose", transpose)
+    metadata = LogitsMetadata(
+        forward_mode=ForwardMode.DECODE,
+        query_shard=None,
+        global_num_tokens=rows,
+        all_decode_or_idle=True,
+    )
+    actual = draft.logits_processor._get_logits(
+        hidden[rank], draft.lm_head, metadata, require_full_vocab=False
+    )
+    torch.testing.assert_close(
+        actual, torch.nn.functional.linear(hidden[rank], full_weight)
     )
 
-    assert [kind for kind, _, _ in calls] == ["replicated", "parallel"]
-    assert calls[0][1] == (16, 128)
-    assert calls[1][1] == (128, 16)
+    # Exercise the model wrapper too: MTP step zero receives four verify rows
+    # per request but the transformer narrows them before the LM head. Only
+    # transformer weights/GPU input fusion and collective transport are mocked.
+    def transformer_forward(input_ids, positions, ctx, *, input_embeds):
+        return input_embeds[::4], None
+
+    monkeypatch.setattr(draft.model, "forward", transformer_forward)
+    expanded = hidden[rank].repeat_interleave(4, dim=0)
+    monkeypatch.setattr(draft, "_fuse_inputs", lambda embedding, captured: expanded)
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=rows[rank],
+        num_extends=0,
+        input_num_tokens=4 * rows[rank],
+        output_layout=None,
+        forward_mode=ForwardMode.DECODE,
+        all_decode_or_idle=True,
+        global_num_tokens=[4 * n for n in rows],
+        global_bs=rows,
+        gather_ids=4 * torch.arange(rows[rank]) + 3,
+    )
+    ids = torch.zeros(4 * rows[rank], dtype=torch.int64)
+    result = draft(ctx, ids, torch.arange(ids.numel()), captured_hidden_states=expanded)
+    torch.testing.assert_close(
+        result.next_token_logits, torch.nn.functional.linear(hidden[rank], full_weight)
+    )
+    assert ctx.collective_global_num_tokens is None
 
 
 def test_qwen4_exp_nextn_reads_nested_mtp_index_sharing_config() -> None:
@@ -1691,7 +1966,7 @@ def test_qwen4_exp_qsa_sparse_attention_reads_the_cache(
     v_cache = torch.empty_like(k_cache)
     pool = SimpleNamespace(get_kv_buffer=lambda layer_id: (k_cache, v_cache))
     ctx = SimpleNamespace(
-        attn_backend=backend,
+        attn_backend=_qsa_router(kernel_page_size=64, max_bs=1, spec=1),
         bs=1,
         forward_mode=ForwardMode.DECODE,
         draft_narrowing=None,
@@ -1722,6 +1997,185 @@ def test_qwen4_exp_qsa_sparse_attention_reads_the_cache(
     assert kwargs["metadata_capacity_rows"] == 32
     unit = 1.0 if cache_dtype == torch.float8_e4m3fn else None
     assert kwargs["k_scale"] == unit and kwargs["v_scale"] == unit
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("query_width", [None, 1, 4])
+def test_qsa_passes_logical_selection_to_kernel(query_width: int | None) -> None:
+    from test.runtime.cache_pool_test_utils import make_mha_memory_plan, make_pool
+
+    from tokenspeed_kernel.numerics.torch.attention.qsa import (
+        torch_qsa_selected_attention,
+    )
+    from tokenspeed_kernel.ops.attention.qsa.triton import qwen4_exp_qsa_selected_slots
+    from tokenspeed_kernel.platform import ArchVersion, current_platform
+    from tokenspeed_kernel.selection import kernel_override
+
+    from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
+
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("PrimTS QSA requires SM100 or SM103")
+    plan = make_mha_memory_plan(
+        size=512,
+        prefix_granularity=64,
+        layer_num=1,
+        kv_heads=1,
+        head_dim=256,
+        dtype=torch.bfloat16,
+    )
+    _, pool = make_pool(
+        MHATokenToKVPool,
+        plan,
+        device="cuda",
+        dtype=torch.bfloat16,
+        head_num=1,
+        head_dim=256,
+        layer_num=1,
+        rank=0,
+    )
+    spec = MHAConfig(
+        backend_name="mha",
+        num_attention_heads=8,
+        num_kv_heads=1,
+        head_dim=256,
+        attn_tp_size=1,
+    )
+    config = replace(
+        _qsa_config(kernel_page_size=64, max_bs=2, spec=4),
+        device="cuda",
+        context_len=512,
+        components=(spec,),
+    )
+    router = attention_registry.create_paged_router(
+        config, AttentionArch.MHA, backend_name="qsa"
+    )
+    router.set_cache_pool(pool)
+    router.init_cuda_graph_state(2)
+    backend = router.leaves[FULL_ATTENTION]
+    lengths = (3, 2) if query_width is None else (query_width, query_width)
+    rows = sum(lengths)
+    mode = ForwardMode.EXTEND if query_width is None else ForwardMode.DECODE
+    seq_lens = torch.tensor(
+        [16 + lengths[0], 32 + lengths[1]], device="cuda", dtype=torch.int32
+    )
+    table = torch.tensor([[1], [2]], dtype=torch.int32, device="cuda")
+    requests = torch.arange(1, 3, dtype=torch.int32, device="cuda")
+    if query_width is None:
+        prefix = torch.tensor([16, 32], dtype=torch.int32)
+        cpu_lengths = torch.tensor(lengths, dtype=torch.int32)
+        router.init_forward_metadata(
+            2,
+            2,
+            requests,
+            seq_lens,
+            mode,
+            block_tables={FULL_ATTENTION: table},
+            extend_seq_lens=cpu_lengths.cuda(),
+            extend_seq_lens_cpu=cpu_lengths,
+            extend_prefix_lens=prefix.cuda(),
+            extend_prefix_lens_cpu=prefix,
+            extend_replay_lens_cpu=torch.zeros(2, dtype=torch.int32),
+            extend_prompt_lens_cpu=prefix + cpu_lengths,
+            extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
+        )
+    else:
+        router.refresh_decode_metadata(
+            2,
+            2,
+            requests,
+            seq_lens,
+            forward_mode=mode,
+            block_tables={FULL_ATTENTION: table},
+            num_extends=0,
+            for_graph_replay=False,
+        )
+    positions = [
+        position
+        for prefix, length in zip((16, 32), lengths)
+        for position in range(prefix, prefix + length)
+    ]
+    logical = torch.tensor(positions, device="cuda")
+    owners = torch.repeat_interleave(
+        torch.arange(2, device="cuda", dtype=torch.int32),
+        torch.tensor(lengths, device="cuda"),
+    )
+    complete = ((logical + 1) // 4).to(torch.int32)
+    blocks = torch.full((rows, 512), -1, dtype=torch.int32, device="cuda")
+    for row, position in enumerate(positions):
+        count = (position + 1) // 4
+        blocks[row, :count] = torch.arange(count, device="cuda")
+    slots = qwen4_exp_qsa_selected_slots(
+        blocks, complete, logical, owners, table, 64, 4, 2048, enable_pdl=False
+    )
+    router.sparse_topk.qsa_selection = QSASelection(slots, blocks, 4)
+    router.sparse_topk.qsa_metadata = QSALayout(
+        seq_lens=seq_lens,
+        logical_positions=logical,
+        request_indices=owners,
+        qsa_locs=torch.empty_like(logical),
+        recent_locs=torch.empty_like(logical),
+        complete_blocks=complete,
+        queries_per_request=query_width,
+        qsa_page_table=table,
+        full_page_table=table,
+        full_kernel_page_size=64,
+        reset_draft_tags=None,
+    )
+    ctx = ForwardContext(
+        attn_backend=router,
+        token_to_kv_pool=pool,
+        bs=2,
+        num_extends=2 if query_width is None else 0,
+        input_num_tokens=rows,
+        forward_mode=mode,
+        output_layout=(
+            ForwardOutputLayout(2, 2, 0, 1)
+            if query_width is None
+            else ForwardOutputLayout(0, 0, 2, query_width)
+        ),
+    )
+    layer = PagedAttention(
+        num_heads=8,
+        head_dim=256,
+        scaling=1 / 16,
+        num_kv_heads=1,
+        layer_id=0,
+        rotary_emb=None,
+        qk_norm=None,
+    )
+    k, v = pool.get_kv_buffer(0)
+    torch.manual_seed(91)
+    k.copy_(torch.randn_like(k) * 0.25)
+    v.copy_(torch.randn_like(v) * 0.25)
+    q = torch.randn(rows, 8, 256, dtype=torch.bfloat16, device="cuda")
+    expected = torch_qsa_selected_attention(q, k, v, slots, 1 / 16, 1.0, 1.0).flatten(1)
+    with kernel_override(
+        "attention", "qsa_sparse_attention", "flashinfer_prims_qsa_sparse_attention"
+    ):
+        for physical_slots in (slots, slots.clone()):
+            actual = backend._sparse_attention(
+                q.flatten(1), layer, pool, physical_slots, ctx
+            )
+            torch.testing.assert_close(actual, expected, atol=2e-3, rtol=1e-2)
+
+    old_storage = weakref.ref(k if k._base is None else k._base)
+    _, replacement = make_pool(
+        MHATokenToKVPool,
+        plan,
+        device="cuda",
+        dtype=torch.bfloat16,
+        head_num=1,
+        head_dim=256,
+        layer_num=1,
+        rank=0,
+    )
+    router.set_cache_pool(replacement)
+    ctx.token_to_kv_pool = replacement
+    del k, v, pool
+    gc.collect()
+    assert old_storage() is None
 
 
 def test_qwen4_exp_ple_lengths_accept_a_padded_row_count() -> None:
@@ -1773,6 +2227,72 @@ def test_qwen4_exp_ple_handles_a_ragged_padded_batch() -> None:
     torch.testing.assert_close(context[4], torch.tensor([21]))
 
 
+def test_qwen4_exp_ple_in_forward_checkpoint_matches_a_forward_ending_there() -> None:
+    # The PLE state an in-forward State checkpoint stores 8 tokens into a
+    # 12-token chunk -- the token context and the short-conv window before
+    # position 8 -- is, bit for bit, what a forward over those 8 tokens
+    # leaves in its live block.
+    torch.manual_seed(0)
+    layer, fields, _ = _ple_layer_stub(pages=6)
+    del layer._conv_sequences  # the real short conv, not the recording stub
+    layer.conv_state_len = (2 - 1) * layer.ngram_size
+    layer.conv1d = torch.nn.Conv1d(2, 2, kernel_size=2, groups=2, bias=False)
+    fields[qwen4_exp_ple_conv_field(0)] = torch.zeros(
+        (6, layer.hc_hidden_size, layer.conv_state_len), dtype=torch.bfloat16
+    )
+
+    class KVProjection(torch.nn.Module):
+        """Per-token values, so a window taken at the wrong rows differs."""
+
+        def forward(self, values):
+            values = values.to(torch.float32)
+            return torch.cat((values.sin(), values.cos()), dim=-1), None
+
+    layer.kv_proj = KVProjection()
+    layer._ple_backend = lambda ctx: SimpleNamespace()
+    pool = SimpleNamespace(arena=SimpleNamespace(field=fields.__getitem__))
+    tokens = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8]
+    hidden = torch.linspace(-1.0, 1.0, 2 * len(tokens)).reshape(len(tokens), 2)
+
+    def forward(length: int, live_block: int, checkpoints) -> None:
+        metadata = PLEForwardMetadata(
+            input_blocks=torch.tensor([0], dtype=torch.int32),
+            output_blocks=torch.tensor([live_block], dtype=torch.int32),
+            query_lengths=[length],
+            verify_width=None,
+            state_checkpoints=checkpoints,
+        )
+        layer._metadata = lambda ctx: metadata
+        ctx = SimpleNamespace(
+            bs=1,
+            forward_mode=ForwardMode.EXTEND,
+            token_to_kv_pool=pool,
+            global_num_tokens=None,
+        )
+        layer(hidden[:length], torch.tensor(tokens[:length]), ctx)
+
+    forward(
+        12,
+        live_block=1,
+        checkpoints=InForwardStateCheckpoints(
+            rows=torch.tensor([0]),
+            offsets=torch.tensor([8]),
+            token_index=torch.tensor([8]),
+            blocks_by_group={
+                QWEN4_EXP_PLE_CACHE_GROUP: torch.tensor([2], dtype=torch.int32)
+            },
+        ),
+    )
+    forward(8, live_block=3, checkpoints=None)
+
+    context = fields[layer.context_field_id]
+    conv = fields[qwen4_exp_ple_conv_field(0)]
+    assert torch.equal(context[2], context[3])
+    assert torch.equal(conv[2], conv[3])
+    assert conv[3].abs().sum() > 0, "the window holds real inputs"
+    assert not torch.equal(conv[1], conv[3]), "the live block holds the chunk end"
+
+
 def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     text_config = SimpleNamespace(
         model_type="qwen4_exp_text",
@@ -1820,7 +2340,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         kv_cache_mxfp8=False,
         context_len=1024,
         max_bs=2,
-        prefix_granularity=64,
+        max_resident_requests=2,
         kernel_page_size=64,
         kv_cache_quant_method="none",
         components=(softmax, linear),
@@ -1830,6 +2350,8 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         max_total_tokens=None,
         speculative_num_draft_tokens=0,
         kv_offload_config=None,
+        mamba_ssm_dtype="float32",
+        enable_qsa_prefill_bf16_scratch=False,
     )
 
     setup = prepare_cache_setup(
@@ -1895,7 +2417,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     assert fields[qsa_rope_position_field(1)].dtype == "int64"
 
     def group_pages(max_tokens: int) -> dict[str, int]:
-        from tokenspeed_scheduler import SchedulerConfig
+        from tokenspeed_engine.scheduler import SchedulerConfig
 
         specs = setup.spec.cache_group_specs
         model = capacity_model(
@@ -1909,7 +2431,8 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
             },
             limits=SchedulerLimits(
                 role=SchedulerConfig.Role.Fused,
-                max_live_requests=2,
+                max_batch_size=2,
+                max_resident_requests=2,
                 # A chunk must cover one PLE state checkpoint (256 tokens).
                 max_scheduled_tokens=256,
                 max_context_len=max_tokens,
@@ -1932,6 +2455,96 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     assert (
         short_counts[QWEN4_EXP_QSA_CACHE_GROUP] < long_counts[QWEN4_EXP_QSA_CACHE_GROUP]
     )
+
+
+def _fp8_kv_qwen4_exp_cache_setup(*, with_ple: bool):
+    """A Qwen4-Exp cache plan whose PLE state outgrows one FP8 K page.
+
+    The recurrent state (8 x 32 x 32 fp32, 32 KiB) is far wider than an FP8 K
+    page (the recipe's 128-token grain x 1 head x 32 dims, 4 KiB), and the PLE
+    state (512 x 9 bf16 plus its context, about 9 KiB) falls between them, as
+    on the real model with FP8 KV.
+    """
+    text_config = SimpleNamespace(
+        model_type="qwen4_exp_text",
+        mamba2_cache_params=(
+            (64, 3),
+            (8, 32, 32),
+            torch.bfloat16,
+            torch.float32,
+            (0,),
+        ),
+        ple_layer_ids=[1] if with_ple else [],
+        ngram_context_len=2,
+        short_conv_state_shape=(512, 9),
+        short_conv_layer_ids=[0],
+    )
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(text_config=text_config),
+        hf_text_config=text_config,
+        num_attention_layers=2,
+    )
+    softmax = MHAConfig(
+        backend_name="fa2",
+        num_attention_heads=2,
+        cache_layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
+        num_kv_heads=1,
+        attn_tp_size=1,
+        head_dim=32,
+    )
+    linear = LinearAttnConfig(
+        num_k_heads=1,
+        num_v_heads=8,
+        head_k_dim=32,
+        head_v_dim=32,
+        conv_kernel_size=4,
+        layer_ids=(0,),
+        tp_size=1,
+    )
+    attn_config = AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_mxfp8=False,
+        context_len=1024,
+        max_bs=2,
+        max_resident_requests=2,
+        kernel_page_size=64,
+        kv_cache_quant_method="none",
+        components=(softmax, linear),
+    )
+    server_args = SimpleNamespace(
+        block_size=64,
+        max_total_tokens=None,
+        speculative_num_draft_tokens=0,
+        kv_offload_config=None,
+        mamba_ssm_dtype="float32",
+        mapping=Mapping(rank=0, world_size=1),
+        enable_qsa_prefill_bf16_scratch=False,
+    )
+    return prepare_cache_setup(
+        family="qwen4_exp",
+        server_args=server_args,
+        model_config=model_config,
+        attn_config=attn_config,
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=8 << 20,
+        probe_batch_rows=None,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+
+
+def test_qwen4_exp_ple_state_wider_than_an_fp8_k_page_adds_no_parent_bytes() -> None:
+    with_ple = _fp8_kv_qwen4_exp_cache_setup(with_ple=True).spec.memory_plan
+    without_ple = _fp8_kv_qwen4_exp_cache_setup(with_ple=False).spec.memory_plan
+
+    assert with_ple.group(QWEN4_EXP_PLE_CACHE_GROUP).cache_blocks_per_lcm_block >= 1
+    # A parent belongs to one group at a time: the PLE state fits the planes
+    # the recurrent state already reserves, so every K and state parent keeps
+    # its size instead of carrying a PLE-only plane.
+    assert with_ple.lcm_block_bytes == without_ple.lcm_block_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -2087,6 +2700,26 @@ def test_ple_batch_indices_uniform_matches_general_path() -> None:
     assert torch.equal(fast[0], general[0][: fast[5]])
     assert torch.equal(fast[1], general[1][: fast[5]])
     assert torch.equal(fast[3], general[3][: len(lengths)])
+
+
+@_requires_cuda
+def test_ple_ragged_batch_indices_do_not_synchronize() -> None:
+    # Prefill builds them on the forward thread, behind the step in flight.
+    lengths = [3, 1, 4]
+    device = torch.device("cuda")
+    torch.cuda.synchronize()
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        req, col, lengths_t, starts, *_ = Qwen4ExpPLELayer._batch_indices(
+            lengths, device
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+    assert req.tolist() == [0, 0, 0, 1, 2, 2, 2, 2]
+    assert col.tolist() == [0, 1, 2, 0, 0, 1, 2, 3]
+    assert lengths_t.tolist() == lengths
+    assert starts.tolist() == [0, 3, 4]
 
 
 @_requires_cuda
@@ -3085,6 +3718,182 @@ def test_ple_prequantized_checkpoint_scale_is_applied(
     assert loaded == {"ple.lookup.ngram_embedding.weight"}
 
 
+_PLE_LAYER_PREFIX = "model.language_model.layers.1.ple"
+_PLE_TABLE_PREFIX = f"{_PLE_LAYER_PREFIX}.ple_embedding.ngram_embedding"
+
+
+def _checkpoint_quant_config(kind: str):
+    """The quantization config each checkpoint format declares, if any."""
+
+    if kind == "none":
+        return None
+    if kind.startswith("modelopt"):
+        layers = {"model.language_model.layers.0.mlp.experts": {"quant_algo": "NVFP4"}}
+        if kind == "modelopt_fp8_table":
+            layers[_PLE_TABLE_PREFIX] = {"quant_algo": "FP8"}
+        return ModelOptMixedConfig.from_config(
+            {"quant_algo": "MIXED_PRECISION", "quantized_layers": layers}
+        )
+    fp8 = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+        # As in Qwen/Qwen3.8-Flash-Next-FP8, the PLE projections stay BF16.
+        "modules_to_not_convert": [
+            f"{_PLE_LAYER_PREFIX}.key_proj",
+            f"{_PLE_LAYER_PREFIX}.value_proj",
+        ],
+    }
+    if kind == "hf_fp8_table":
+        fp8["modules_to_convert"] = ["ple.ple_embedding.ngram_embedding"]
+    return Fp8Config.from_config(fp8)
+
+
+def _tiny_ple_config(**overrides) -> Qwen4ExpTextConfig:
+    """A two-layer Qwen4-Exp text config whose second layer has PLE.
+
+    ``ngram_vocab_size_base`` is tiny so the n-gram table is small; the hash
+    geometry that decides which rows are read is unaffected by it.
+    """
+
+    kwargs = dict(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        layer_types=["linear_attention", "full_attention"],
+        ple_layer_ids=[2],
+        ngram_size=3,
+        heads_per_ngram=4,
+        ngram_vocab_size_base=257,
+        make_ngram_vocab_size_divisible_by=8,
+        hc_count=2,
+        num_experts=None,
+        eos_token_id=7,
+    )
+    kwargs.update(overrides)
+    return Qwen4ExpTextConfig(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "ple_embed_dtype", "expect_fp8"),
+    [
+        ("none", None, False),
+        ("none", "float8_e4m3fn", True),
+        ("modelopt", None, False),
+        ("modelopt_fp8_table", None, True),
+        ("hf_fp8", None, False),
+        ("hf_fp8_table", None, True),
+    ],
+)
+def test_ple_table_storage_follows_checkpoint(
+    checkpoint: str, ple_embed_dtype: str | None, expect_fp8: bool
+) -> None:
+    """Without ``ple_embed_dtype`` the n-gram table keeps the checkpoint's format.
+
+    ModelOpt mixed-precision exports list an FP8 table in ``quantized_layers``
+    and Hugging Face fp8 exports in ``modules_to_convert``; either keeps the
+    table in FP8, and a checkpoint that declares neither stores the compute
+    dtype. An explicit ``float8_e4m3fn`` stores FP8 regardless.
+    """
+
+    layer = Qwen4ExpPLELayer(
+        _tiny_ple_config(ple_embed_dtype=ple_embed_dtype, ple_offload_embedding=False),
+        Mapping(rank=0, world_size=1),
+        layer_id=1,
+        ple_layer_index=0,
+        quant_config=_checkpoint_quant_config(checkpoint),
+        prefix=_PLE_LAYER_PREFIX,
+    )
+
+    expected = torch.float8_e4m3fn if expect_fp8 else torch.get_default_dtype()
+    assert layer.ple_embedding.lookup.ngram_embedding.weight.dtype == expected
+
+
+def test_ple_table_rejects_unsupported_storage_dtype() -> None:
+    config = _tiny_ple_config(ple_embed_dtype="bfloat16", ple_offload_embedding=False)
+
+    with pytest.raises(ValueError, match="ple_embed_dtype"):
+        Qwen4ExpNGramEmbedding(
+            config, Mapping(rank=0, world_size=1), 64, 0, None, "ple_embedding"
+        )
+
+
+def test_fp8_config_matches_modules_to_convert_on_module_boundaries() -> None:
+    quant_config = _checkpoint_quant_config("hf_fp8_table")
+
+    assert quant_config.stores_fp8_embedding(_PLE_TABLE_PREFIX)
+    assert quant_config.stores_fp8_embedding("ple.ple_embedding.ngram_embedding")
+    assert not quant_config.stores_fp8_embedding(
+        "model.language_model.layers.1.xple.ple_embedding.ngram_embedding"
+    )
+
+
+@_requires_cuda
+@pytest.mark.parametrize("scale_first", [False, True])
+@pytest.mark.parametrize("offload", [False, True])
+def test_ple_fp8_checkpoint_table_reads_like_dequantized_table(
+    offload: bool, scale_first: bool
+) -> None:
+    """Keeping an FP8 checkpoint table in FP8 returns the dequantized rows.
+
+    The kept table holds the checkpoint payload verbatim and applies the
+    per-tensor scale at lookup; a table stored in the compute dtype applies the
+    same scale at load. Lookups through both must match exactly.
+    """
+
+    config = _tiny_ple_config(ple_offload_embedding=offload, split_ngram_parts=1)
+    mapping = Mapping(rank=0, world_size=1)
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with torch.device("cuda"):
+            kept, dequantized = [
+                Qwen4ExpNGramEmbedding(
+                    config,
+                    mapping,
+                    64,
+                    0,
+                    _checkpoint_quant_config(checkpoint),
+                    f"{_PLE_LAYER_PREFIX}.ple_embedding",
+                )
+                for checkpoint in ("modelopt_fp8_table", "modelopt")
+            ]
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    assert kept.lookup.embed_store_dtype == torch.float8_e4m3fn
+    assert dequantized.lookup.embed_store_dtype is None
+
+    torch.manual_seed(6)
+    rows = kept.lookup.ngram_embedding.org_vocab_size
+    payload = (
+        (torch.randn(rows, kept.head_dim) * 64).clamp(-448, 448).to(torch.float8_e4m3fn)
+    )
+    shard = ("ple.ngram_embedding.shard_0.weight", payload)
+    # The scale of the released checkpoints' table.
+    scale = (
+        "ple.ngram_embedding.weight_scale",
+        torch.tensor([1.9931793212890625e-4], dtype=torch.bfloat16),
+    )
+    for embedding in (kept, dequantized):
+        root = torch.nn.Module()
+        root.ple = embedding
+        load_qwen4_exp_weights(
+            root,
+            config,
+            mapping,
+            [scale, shard] if scale_first else [shard, scale],
+            include_visual=False,
+        )
+
+    assert torch.equal(kept.lookup.ngram_embedding.weight[:rows].cpu(), payload)
+    contexts = torch.randint(0, 128, (96, 3), device="cuda")
+    torch.testing.assert_close(kept(contexts), dequantized(contexts), rtol=0, atol=0)
+
+
 def test_should_exclude_quant_module_expands_fused_members() -> None:
     from tokenspeed.runtime.layers.quantization.utils import (
         should_exclude_quant_module,
@@ -3213,38 +4022,18 @@ def _lookup_flat(embedding, input_ids, initial, req, col, starts):
 def _ngram_embedding_pair(
     store_fp8: bool,
 ) -> tuple[Qwen4ExpNGramEmbedding, Qwen4ExpNGramEmbedding]:
-    """A device-resident and a host-offloaded n-gram table holding equal rows.
+    """A device-resident and a host-offloaded n-gram table holding equal rows."""
 
-    ``ngram_vocab_size_base`` is tiny here so the two tables fit side by side;
-    the hash geometry that decides which rows are read is unaffected by it.
-    """
-
-    kwargs = dict(
-        vocab_size=128,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=16,
-        layer_types=["linear_attention", "full_attention"],
-        ple_layer_ids=[2],
-        ngram_size=3,
-        heads_per_ngram=4,
-        ngram_vocab_size_base=257,
-        make_ngram_vocab_size_divisible_by=8,
-        ple_embed_dtype="float8_e4m3fn" if store_fp8 else None,
-        hc_count=2,
-        num_experts=None,
-        eos_token_id=7,
-    )
     mapping = Mapping(rank=0, world_size=1)
     built = []
     for offload in (False, True):
-        config = Qwen4ExpTextConfig(**kwargs, ple_offload_embedding=offload)
+        config = _tiny_ple_config(
+            ple_embed_dtype="float8_e4m3fn" if store_fp8 else None,
+            ple_offload_embedding=offload,
+        )
         with torch.device("cuda"):
             built.append(
-                Qwen4ExpNGramEmbedding(config, mapping, 64, 0, "ple_embedding")
+                Qwen4ExpNGramEmbedding(config, mapping, 64, 0, None, "ple_embedding")
             )
     device, host = built
 
@@ -3347,32 +4136,309 @@ def test_ple_host_table_skips_device_allocation(
     """
 
     caplog.set_level(logging.INFO, logger="tokenspeed.runtime.layers.qwen4_exp_ple")
-    config = Qwen4ExpTextConfig(
-        vocab_size=128,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=16,
-        layer_types=["linear_attention", "full_attention"],
-        ple_layer_ids=[2],
-        ngram_size=3,
-        heads_per_ngram=4,
-        ngram_vocab_size_base=1_000_003,
-        make_ngram_vocab_size_divisible_by=8,
-        hc_count=2,
-        num_experts=None,
-        eos_token_id=7,
-    )
+    config = _tiny_ple_config(ngram_vocab_size_base=1_000_003)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     before = torch.cuda.max_memory_allocated()
     with torch.device("cuda"):
         embedding = Qwen4ExpNGramEmbedding(
-            config, Mapping(rank=0, world_size=1), 64, 0, "ple_embedding"
+            config, Mapping(rank=0, world_size=1), 64, 0, None, "ple_embedding"
         )
     growth = torch.cuda.max_memory_allocated() - before
 
     table_bytes = embedding.lookup.ngram_embedding.weight.numel() * 2
     assert growth < table_bytes // 4
+
+
+class _SharedHeadDraftTransformer(torch.nn.Module):
+    """CPU substitute for the GPU transformer; head construction remains real."""
+
+    def __init__(self, config, mapping, quant_config, prefix):
+        super().__init__()
+        self.embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size)
+        self.qsa_indexers = []
+
+
+@pytest.mark.parametrize("attention_dp", [False, True])
+def test_qwen4_exp_nextn_shares_unquantized_target_head(monkeypatch, attention_dp):
+    from tokenspeed.runtime.layers.linear import ReplicatedLinear
+    from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
+    from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
+
+    monkeypatch.setattr(
+        qwen4_exp_nextn, "Qwen4ExpDraftModel", _SharedHeadDraftTransformer
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    config = PretrainedConfig(
+        hidden_size=128,
+        vocab_size=128,
+        hc_count=4,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=1,
+        tie_word_embeddings=False,
+    )
+    mapping = Mapping(
+        rank=0,
+        world_size=2 if attention_dp else 1,
+        attn_tp_size=1,
+        attn_dp_size=2 if attention_dp else 1,
+    )
+    quant = Nvfp4Config(
+        exclude_modules=["lm_head", "mtp.fc_embedding", "mtp.fc_hidden"]
+    )
+    draft = qwen4_exp_nextn.Qwen4ExpForCausalLMNextN(config, mapping, quant)
+    target_head = ReplicatedLinear(
+        128,
+        128,
+        bias=False,
+        quant_config=quant,
+        prefix="lm_head",
+        params_dtype=torch.bfloat16,
+    )
+    with torch.no_grad():
+        target_head.weight.copy_(torch.randn_like(target_head.weight))
+    embed = torch.nn.Embedding(128, 128, dtype=torch.bfloat16).weight
+    draft.set_embed_and_head_module(embed, target_head)
+    hidden = torch.randn(3, 128, dtype=torch.bfloat16)
+    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
+    actual = draft.logits_processor._get_logits(
+        hidden,
+        draft.lm_head,
+        metadata,
+        require_full_vocab=False,
+    )
+    torch.testing.assert_close(
+        actual, torch.nn.functional.linear(hidden, target_head.weight)
+    )
+    assert draft.lm_head is target_head
+    assert draft.model.embed_tokens.weight is embed
+
+
+class _HyperConnectionAttentionTail(_Qwen4ExpDecoderMixin, torch.nn.Module):
+    def __init__(self, mapping, layer_id, is_moe, prev_is_moe):
+        super().__init__()
+        self.comm_manager = CommManager(
+            mapping,
+            layer_id,
+            is_moe,
+            prev_is_moe,
+            dense_batch_invariant=False,
+            query_sharded=False,
+        )
+        config = HyperConnectionConfig(
+            hc_count=4,
+            hidden_size=8,
+            hc_lowrank=4,
+            params_dtype=torch.float32,
+        )
+        self.attn_hyper_connection = GatedResidualSimple(config).cuda()
+        self.mlp_hyper_connection = GatedResidualSimple(config).cuda()
+
+
+@_requires_cuda
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("rows", [1, 7, 8])
+@pytest.mark.parametrize(
+    "layer_id,is_moe,prev_is_moe",
+    [
+        (0, True, True),
+        (1, True, True),
+        (1, True, False),
+        (1, False, True),
+        (1, False, False),
+    ],
+)
+def test_hyperconnection_attention_residual_rows(
+    monkeypatch,
+    rank,
+    rows,
+    layer_id,
+    is_moe,
+    prev_is_moe,
+):
+    mapping = Mapping(
+        rank=rank,
+        world_size=8,
+        attn_tp_size=2,
+        attn_dp_size=4,
+        dense_tp_size=2,
+        moe_tp_size=1,
+        moe_ep_size=8,
+        lm_head_tp_size=1,
+    )
+    layer = _HyperConnectionAttentionTail(mapping, layer_id, is_moe, prev_is_moe)
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=1,
+        num_extends=1,
+        input_num_tokens=rows,
+        forward_mode=ForwardMode.EXTEND,
+        output_layout=None,
+        global_num_tokens=[rows] * 8,
+    )
+    hyper_input = torch.randn(rows, 32, device="cuda")
+    output = torch.randn(rows, 8, device="cuda")
+    _, residuals = layer.attn_hyper_connection.mix(hyper_input, normalized=None)
+    counts = layer.comm_manager.attn_tp_group_scattered_num_tokens(ctx)
+    start = sum(counts[:rank])
+    selected = slice(start, start + counts[rank])
+
+    # Emulate only the absent TP peers; HC and communication layout logic are real.
+    def reduce_scatter(value, *, group, scattered_num_tokens):
+        assert group == mapping.attn.tp_group
+        assert scattered_num_tokens == counts
+        return (value * 2)[selected]
+
+    def reduce(value, group):
+        assert group == mapping.attn.tp_group
+        return value * 2
+
+    monkeypatch.setattr(comm_module, "token_reduce_scatter", reduce_scatter)
+    monkeypatch.setattr(comm_module, "all_reduce", reduce)
+
+    def gather(value, *, group, scattered_num_tokens):
+        assert group == mapping.attn.tp_group
+        assert scattered_num_tokens == counts
+        torch.testing.assert_close(value, hyper_input[selected])
+        # A real collective allocates new storage, requiring fresh HC normalization.
+        return hyper_input.clone()
+
+    monkeypatch.setattr(comm_module, "token_all_gather", gather)
+
+    expected_rows = selected if is_moe else slice(None)
+    reference_residuals = tuple(value[expected_rows] for value in residuals)
+    combined, normalized = layer.mlp_hyper_connection.combine_norm(
+        (output * 2)[expected_rows],
+        reference_residuals,
+    )
+    expected, expected_residuals = layer.mlp_hyper_connection.mix(
+        combined,
+        normalized=normalized,
+    )
+    actual, actual_residuals = layer._finish_attention(output, residuals, ctx)
+    torch.testing.assert_close(actual, expected)
+    for actual_value, expected_value in zip(
+        actual_residuals, expected_residuals, strict=True
+    ):
+        torch.testing.assert_close(actual_value, expected_value)
+
+
+@_requires_cuda
+@pytest.mark.skipif(torch.version.hip is not None, reason="CUDA graph ordering check")
+@pytest.mark.parametrize(
+    "hidden_size,num_heads,num_kv_heads,head_dim,index_heads,index_dim",
+    [(64, 2, 1, 32, 1, 32), (2560, 24, 4, 256, 4, 128)],
+    ids=["small", "tp1-full-width"],
+)
+@torch.inference_mode()
+def test_qsa_front_overlap_preserves_outputs_cache_and_graph_replay(
+    monkeypatch, hidden_size, num_heads, num_kv_heads, head_dim, index_heads, index_dim
+):
+    """Exercise the real layer and stream fork with tensor-only GPU kernels.
+
+    Index/cache kernels are replaced by deterministic tensor operations to
+    isolate stream ordering from the sparse-attention implementation. Model
+    projections, gating and output projection remain the real layer's path.
+    The full-width case keeps TP1 QKV/O and replicated index projection sizes;
+    this is an ordering regression, not a sparse-attention performance test.
+    """
+    from tokenspeed_kernel.ops.attention.prologue import GQAPrologueOutput
+
+    from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
+    config = Qwen4ExpTextConfig(
+        vocab_size=128,
+        hidden_size=hidden_size,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        head_dim=head_dim,
+        layer_types=["linear_attention", "full_attention"],
+        hc_count=2,
+        hc_lowrank=8,
+        num_experts=None,
+        indexer_n_heads=index_heads,
+        indexer_kv_heads=1,
+        indexer_head_dim=index_dim,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+    )
+    with torch.device("cuda"):
+        layer = Qwen4ExpAttentionDecoderLayer(
+            config,
+            Mapping(rank=0, world_size=1),
+            1,
+            enable_fp8_attn_proj=False,
+        ).to(dtype=torch.bfloat16)
+    for parameter in layer.parameters():
+        parameter.normal_(std=0.05)
+    backend = _qsa_root(kernel_page_size=64, max_bs=1, spec=4, is_draft=False)
+
+    class Pool:
+        def __init__(self):
+            self.layerwise_load_tracker = None
+
+    ctx = ForwardContext(
+        attn_backend=backend,
+        token_to_kv_pool=Pool(),
+        bs=1,
+        num_extends=0,
+        output_layout=ForwardOutputLayout(0, 0, 1, 4),
+        input_num_tokens=4,
+        forward_mode=ForwardMode.DECODE,
+    )
+    hidden = torch.randn(4, hidden_size, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(4, device="cuda")
+    cache = torch.empty((4, num_kv_heads, head_dim), device="cuda", dtype=hidden.dtype)
+
+    def select(raw_q, token_k, positions, ctx):
+        # A slow branch makes a missing join observable in the attention output.
+        torch.cuda._sleep(100_000)
+        scores = raw_q.reshape(4, index_heads, index_dim).sum(1) + token_k[:, 0, :]
+        slots = (scores.argmax(-1) + positions).int().view(-1, 1)
+        ctx.attn_backend.sparse_topk.qsa_selection = QSASelection(slots, slots, 4)
+        return slots
+
+    def prologue(q, k, v, positions, ctx):
+        cache.copy_((k + v).reshape_as(cache))
+        return GQAPrologueOutput(q=q * 2, k=None, v=None)
+
+    def attention(q, k, v, positions, ctx, *, topk_indices):
+        if k is not None:
+            q = prologue(q, k, v, positions, ctx).q
+        keys = cache.repeat_interleave(num_heads // num_kv_heads, dim=1)
+        return (q.reshape(4, -1) + keys.reshape(4, -1) + topk_indices).contiguous()
+
+    monkeypatch.setattr(layer.indexer, "forward_projected", select)
+    monkeypatch.setattr(layer.attn, "prologue", prologue)
+    monkeypatch.setattr(layer.attn, "forward", attention)
+    serial = layer.qsa_fork
+    parallel = StreamFork(torch.cuda.Stream())
+    for _ in range(3):
+        layer.qsa_fork = parallel
+        layer.self_attention(positions, hidden, ctx)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured = layer.self_attention(positions, hidden, ctx)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    for delta in (0.1, -0.3, 0.7):
+        hidden.add_(delta)
+        positions.add_(1)
+        layer.qsa_fork = serial
+        expected = layer.self_attention(positions, hidden, ctx).clone()
+        expected_cache = cache.clone()
+        cache.fill_(-100)
+        layer.qsa_fork = parallel
+        eager = layer.self_attention(positions, hidden, ctx)
+        torch.testing.assert_close(eager, expected, atol=0, rtol=0)
+        torch.testing.assert_close(cache, expected_cache, atol=0, rtol=0)
+        cache.fill_(-100)
+        graph.replay()
+        torch.testing.assert_close(captured, expected, atol=0, rtol=0)
+        torch.testing.assert_close(cache, expected_cache, atol=0, rtol=0)

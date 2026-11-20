@@ -30,6 +30,10 @@ from tokenspeed.runtime.layers.attention.backends.paged.base import (
 from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
     CacheGroupGeometry,
 )
+from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+    GroupTableSpec,
+    GroupTableStacks,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
 from tokenspeed.runtime.layers.attention.backends.paged.write_locations import (
     decode_write_locations,
@@ -235,3 +239,126 @@ class TestBaseWriteLocationsDefaultTest:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+
+
+class TestInt32WriteSlots:
+    def test_stacked_slots_refresh_and_pad_without_replacing_decode_storage(self):
+        stacks = GroupTableStacks(
+            [GroupTableSpec("history", 128, 128, 2)],
+            max_bs=1,
+            max_tokens_per_req=4,
+            max_extend_tokens=4,
+            device="cpu",
+        )
+        stacks.fill(1, 1, {"history": torch.tensor([[17, 18]], dtype=torch.int32)})
+        lengths = torch.tensor([2], dtype=torch.int32)
+        stacks.compute_decode_locations(1, lengths, 1)
+        view = stacks.decode_locations("history", 1, 1)
+        pointer = view.data_ptr()
+        assert view.dtype == torch.int32 and view.tolist() == [17 * 128 + 1]
+        one = torch.ones(1, dtype=torch.int32)
+        stacks.extend_locations(one, one, 1)
+        stacks.append_decode_rows(0, 1)
+        padded = stacks.padded_extend_span("history", 4)
+        assert padded.dtype == torch.int32
+        assert padded.tolist() == [17 * 128 + 1, 17 * 128 + 1, 0, 0]
+        fresh = stacks.extend_locations(one, torch.full_like(one, 5), 5)["history"]
+        assert fresh.dtype == torch.int32
+        assert fresh.tolist() == [17 * 128 + offset for offset in range(1, 6)]
+        assert stacks.padded_extend_span("history", 7).tolist() == fresh.tolist() + [
+            0,
+            0,
+        ]
+        stacks.tables[0, 0, 0].fill_(19)
+        lengths.fill_(3)
+        stacks.compute_decode_locations(1, lengths, 1)
+        assert view.data_ptr() == pointer and view.tolist() == [19 * 128 + 2]
+
+
+class TestHostPageSizeMirror:
+    @pytest.mark.parametrize("device", ["cpu", "npu"])
+    @pytest.mark.parametrize("width", [1, 4])
+    def test_stacks_avoid_scalar_reads_and_replay_changed_lengths(self, device, width):
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+            GroupTableSpec,
+            GroupTableStacks,
+        )
+
+        if device == "npu":
+            pytest.importorskip("torch_npu")
+            if not torch.npu.is_available():
+                pytest.skip("NPU unavailable")
+            torch.npu.set_device(0)
+
+        class NoScalarReads(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func == torch.ops.aten._local_scalar_dense.default:
+                    raise AssertionError("device page-size scalar read")
+                return func(*args, **(kwargs or {}))
+
+        specs = [GroupTableSpec("a", 2, 2, 3), GroupTableSpec("b", 4, 4, 3)]
+        stacks = GroupTableStacks(
+            specs, max_bs=3, max_tokens_per_req=4, max_extend_tokens=8, device=device
+        )
+        assert stacks.page_sizes_cpu == (2, 4)
+        tables = torch.tensor([3, 0, -1], dtype=torch.int32).expand(2, 3, 3).clone()
+        stacks.tables.copy_(tables.to(device))
+        lengths = torch.tensor([3, 7, 2**31 - 2], dtype=torch.int32, device=device)
+        # Prove the guard detects the old device-scalar fallback.
+        with pytest.raises(AssertionError, match="page-size scalar"):
+            with NoScalarReads():
+                decode_write_locations(
+                    stacks.tables,
+                    stacks.page_sizes,
+                    lengths,
+                    stacks.decode_locs,
+                    3,
+                    width,
+                )
+
+        def compute():
+            with NoScalarReads():
+                stacks.compute_decode_locations(3, lengths, width)
+
+        def check():
+            expected = torch.empty((2, 3 * width), dtype=torch.int32)
+            decode_write_locations(
+                tables, torch.tensor([2, 4]), lengths.cpu(), expected, 3, width
+            )
+            torch.testing.assert_close(
+                stacks.decode_locs[:, : 3 * width].cpu(), expected
+            )
+
+        compute()
+        check()
+        if device == "npu":
+            torch.npu.synchronize()
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph):
+                compute()
+            lengths.copy_(torch.tensor([1, 3, 8], dtype=torch.int32, device=device))
+            graph.replay()
+            torch.npu.synchronize()
+            check()
+        with NoScalarReads():
+            stacks.compute_window_locations(3, lengths, width)
+        expected = torch.empty((2, 3 * width), dtype=torch.int32)
+        window_write_locations(
+            tables, torch.tensor([2, 4]), lengths.cpu(), expected, 3, width
+        )
+        torch.testing.assert_close(stacks.decode_locs[:, : 3 * width].cpu(), expected)
+
+    @pytest.mark.parametrize("mirror", [(2,), (2, 0), (2, True), [2, 4]])
+    def test_invalid_host_page_sizes_are_rejected(self, mirror):
+        with pytest.raises(ValueError, match="host page sizes"):
+            decode_write_locations(
+                torch.ones((2, 1, 2), dtype=torch.int32),
+                torch.tensor([2, 4]),
+                torch.tensor([2]),
+                torch.empty((2, 1), dtype=torch.int32),
+                1,
+                1,
+                page_sizes_cpu=mirror,
+            )

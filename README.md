@@ -9,8 +9,8 @@ Core components:
   finite-state machine, with safe KV resource reuse enforced by the type system at compile time.
 - **Kernels**: pluggable, layered kernel system with a portable public API and
   a centralized registry; Triton Gluon kernels for AMD gfx950 and CuteDSL kernels for NVIDIA.
-- **Entrypoint**: SMG-integrated AsyncLLM for low-overhead CPU-side request
-  handling.
+- **Entrypoint**: SMG and Dynamo drive the engine from Rust over its msgpack
+  wire, with no Python on the request path.
 
 ## SM120 (RTX PRO 6000 Blackwell)
 
