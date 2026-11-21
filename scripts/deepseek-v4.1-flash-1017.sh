@@ -30,6 +30,15 @@
 #     tok/s +15% at C=128.
 #   Hopper (sm90): marlin, plain TP.
 #
+# CUDA-graph memory with DSPARK: the decode graph scratch is about 11-13 MB per
+# verified row per rank at MAX_MODEL_LEN=32768 (measured on SM120 TP2: 22 GB
+# decode reserve at MAX_NUM_SEQS=512 with 4 rows per request, 6.6 GB for 512 rows
+# without DSPARK). On a 96 GB GPU, MAX_NUM_SEQS=512 + DSPARK +
+# GPU_MEMORY_UTILIZATION=0.9 leaves no KV budget and the engine stops at startup
+# with "cache budget leaves -1.52 GiB". The reserve grows with MAX_NUM_SEQS, so
+# lower it (the default 32 is far below the limit) or set
+# MAX_CUDAGRAPH_CAPTURE_SIZE to cap the graph ladder.
+#
 # Matched baseline knobs (override via env):
 #   MODEL_PATH           default: /models/deepseek-ai/DeepSeek-V4.1-Flash-1017 when
 #                        that directory exists, else deepseek-ai/DeepSeek-V4.1-Flash-1017
