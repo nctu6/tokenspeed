@@ -38,7 +38,7 @@ Signed-off-by: `nctu6 <nctu6.tw@gmail.com>`.
   tower; transcription adapted to chat in SMG gRPC router).
 - SMG: `smg/crates/protocols/src/transcription.rs`, multipart,
   `/v1/audio/transcriptions`.
-- Model config: `/Users/nctu6/Downloads/ascend/infra/model_config/whisper-large-v3/`
+- Model config: `model_config/whisper-large-v3/` (local, outside the repo)
   (`WhisperForConditionalGeneration`, `model_type: whisper`).
 - Weights on both remotes: `/models/openai/whisper-large-v3`.
 

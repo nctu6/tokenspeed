@@ -3,7 +3,7 @@
 Workload: `vllm bench serve` random, out 256, ignore_eos.
 - 1K: in 1024, C=1/8/32, N=max(16,8*C), max-model-len 131072
 - 128K: in 126976, C=1 (N=3) / C=4 (N=8)
-Scripts: remote `g4perf/` on sm90 build tree (`/workspace/nctu6/build/merge1012/g4perf/`), tmux `nctu6_test` window `g4chain*`.
+Scripts: `g4perf/` on the sm90 build tree of the test host, run in tmux windows `g4chain*`.
 Model: `/models/google/gemma-4-31B-it`. SERVED_MODEL_NAME=test.
 
 Kernel / tree: build merge1012 tokenspeed @ 19d4dc1d (detached HEAD; plane-packing on 4e34b409) + local uncommitted gemma3-era wins (mixed-batch / prefill-graph / kvstore DMA etc.).
