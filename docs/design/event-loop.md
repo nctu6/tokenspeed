@@ -821,6 +821,15 @@ every gather, even when its own part is empty. The poll runs these
 collectives only while a cache op is open: every rank counts the same plans
 and advances the same intersections, so the open count is the same
 everywhere and an idle replica polls nothing.
+
+A large pinned write-back is paced: the Host executor launches one slice per
+plan that reaches the data plane. A round whose plan has no device work stays
+off the data plane, and that is exactly the round that waits for the
+write-back, because its pinned pages are what block every admission. So the
+same poll asks the Host executor whether slices are left and queues one
+`PumpCacheWrites` operation on the forward thread (at most one outstanding)
+that launches the next. The ACK the scheduler waits for therefore never
+depends on a later plan.
 The data plane acknowledges each op exactly once, one ACK per op of a batch,
 and the counts rely on it: `acknowledged` takes each polled ACK off the
 in-flight count before it deduplicates, so a repeated ACK breaks the counts.
