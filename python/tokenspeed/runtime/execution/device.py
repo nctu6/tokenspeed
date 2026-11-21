@@ -712,6 +712,19 @@ class DeviceHandle:
             )
         return l2.poll_results()
 
+    def cache_writes_pending(self) -> bool:
+        """Whether a paced Host write-back has slices left to launch; the
+        control thread calls it, and it touches no stream."""
+        l2 = self._l2
+        return l2 is not None and l2.has_paced_writes()
+
+    def pump_cache_writes(self) -> None:
+        """Launch the next slice of a paced Host write-back; the forward
+        thread runs it for a round whose plan had no device work."""
+        l2 = self._l2
+        if l2 is not None:
+            l2.pump_paced_writes()
+
     def shutdown_model(self) -> None:
         """Drain local readers, then release shared model weights
         collectively. Called by the forward thread as its last task, after

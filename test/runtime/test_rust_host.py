@@ -738,12 +738,19 @@ def test_a_plan_without_a_batch_runs_no_forward(executor):
 class _HostCache:
     """Stands in for the Host cache executor: its acknowledgments, landed."""
 
-    def __init__(self, landed) -> None:
+    def __init__(self, landed, paced_slices=0) -> None:
         self.landed = landed
+        self.paced_slices = paced_slices
 
     def poll_results(self) -> list:
         landed, self.landed = self.landed, []
         return landed
+
+    def has_paced_writes(self) -> bool:
+        return self.paced_slices > 0
+
+    def pump_paced_writes(self) -> None:
+        self.paced_slices -= 1
 
 
 def test_the_data_plane_reports_cache_acknowledgments_in_landing_order(executor):
@@ -760,6 +767,20 @@ def test_the_data_plane_reports_cache_acknowledgments_in_landing_order(executor)
         ("LoadBackDoneEvent", 9),
     ]
     assert plane.poll_cache_events() == []
+
+
+def test_the_data_plane_pumps_a_paced_write_back_until_its_slices_are_out(executor):
+    host_cache = _HostCache([], paced_slices=2)
+    plane = _data_plane(DeviceHandle(executor, host_cache_executor=host_cache))
+    pumped = 0
+    while plane.cache_writes_pending():
+        plane.pump_cache_writes()
+        pumped += 1
+    assert pumped == 2
+    # Without a Host cache there is nothing to pump.
+    bare = _data_plane(DeviceHandle(executor))
+    assert not bare.cache_writes_pending()
+    bare.pump_cache_writes()
 
 
 def test_the_data_plane_leaves_a_plans_storage_operations_to_the_host(executor):

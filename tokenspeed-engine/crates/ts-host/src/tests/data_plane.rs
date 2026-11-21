@@ -118,6 +118,7 @@ class Plane:
         self.failing = False
         self.completion_failing = False
         self.cumulative_probs = None
+        self.paced = False
 
     def note(self, name):
         self.calls.append((name, threading.get_ident()))
@@ -165,6 +166,10 @@ class Plane:
     def poll_cache_events(self):
         self.note("poll_cache_events")
         return [("WriteBackDoneEvent", 3)]
+    def cache_writes_pending(self):
+        return self.paced
+    def pump_cache_writes(self):
+        self.note("pump_cache_writes")
 
 
 cfg = ts.SchedulerConfig()
@@ -355,6 +360,53 @@ fn the_forward_thread_runs_the_queue_and_the_control_thread_its_queries() {
     );
 }
 
+#[test]
+fn a_paced_write_back_is_pumped_on_the_forward_thread_without_a_plan() {
+    let (plane, mut scheduler) = plane();
+    let batch = batch();
+    let dispatch = Dispatch {
+        forward: Some(&batch),
+        ..Dispatch::default()
+    };
+    let pumps = |plane: &Py<PyAny>| {
+        calls(plane)
+            .iter()
+            .filter(|(name, _)| name == "pump_cache_writes")
+            .map(|(_, thread)| *thread)
+            .collect::<Vec<_>>()
+    };
+    let mut data_plane = start(&plane);
+    // Nothing paced: polling queues nothing.
+    data_plane.poll_cache_events().unwrap();
+    data_plane.ask(|reply| Op::Barrier { reply }).unwrap();
+    assert!(pumps(&plane).is_empty());
+    // The forward thread sits in a launch while the control thread polls
+    // every round: one pump waits behind it, not one per poll.
+    set(&plane, "held", 100);
+    Python::attach(|py| plane.setattr(py, "paced", true).unwrap());
+    data_plane
+        .execute(scheduler.next_execution_plan(true, false), &dispatch)
+        .unwrap()
+        .unwrap();
+    for _ in 0..3 {
+        data_plane.poll_cache_events().unwrap();
+    }
+    Python::attach(|py| {
+        plane
+            .getattr(py, "unblock")
+            .unwrap()
+            .call_method0(py, "set")
+            .unwrap()
+    });
+    data_plane.ask(|reply| Op::Barrier { reply }).unwrap();
+    let ran = pumps(&plane);
+    assert_eq!(ran.len(), 1, "{ran:?}");
+    assert_ne!(ran[0], this_thread());
+    // Once it ran, the next poll queues the next.
+    data_plane.poll_cache_events().unwrap();
+    data_plane.ask(|reply| Op::Barrier { reply }).unwrap();
+    assert_eq!(pumps(&plane).len(), 2);
+}
 #[test]
 fn a_healthy_lifecycle_exits_without_notifying_the_launcher() {
     crate::tests::assert_no_launcher_notification(

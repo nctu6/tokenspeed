@@ -936,6 +936,18 @@ class HostDataPlane:
             )
         ]
 
+    def cache_writes_pending(self) -> bool:
+        """Whether a paced Host write-back has slices left to launch. The
+        control thread asks while cache ops are open, and the forward thread
+        is then asked to ``pump_cache_writes``."""
+        return self._device.cache_writes_pending()
+
+    def pump_cache_writes(self) -> None:
+        """Launch the next slice of a paced Host write-back. A paced
+        write-back advances one slice per plan, and a round whose plan has no
+        device work never reaches ``execute``."""
+        self._device.pump_cache_writes()
+
     def release(self, rids: list[str]) -> None:
         """Forget requests that ended. Their grammar matchers and
         shared-memory features go behind every forward launched before this,

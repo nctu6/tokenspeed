@@ -2175,6 +2175,46 @@ class TestCompactLayoutRoundTripTest:
                 [1, 2, 3, 9]
             )
 
+    def test_a_paced_write_back_finishes_without_another_plan_submitting(self):
+        """The control plane launches the slices of a paced pinned write-back
+        itself when its plans carry no device work: the store's own pinned
+        pages block every admission, so no later plan comes to launch them."""
+        torch = self.torch
+        device = torch.zeros((128,), dtype=torch.uint8, device="cuda")
+        layout = self._single_group_layout(
+            device, self.CacheField("layer.0.k", 0, 8, 8, 4)
+        )
+        executor, _, _ = self._make_executor(layout, io_backend="kernel", kvp_rank=0)
+        executor._paced_slice_blocks = 1  # pylint: disable=protected-access
+        # A lane's first launch waits for the device, so warm it up before the
+        # sleep that keeps the first slice on the stream. The later slices then
+        # wait for a pump.
+        executor._start_writing(  # pylint: disable=protected-access
+            [4],
+            [(0, 1, 1)],
+            lane=executor._pinned_write_lane,  # pylint: disable=protected-access
+            prerequisite_stream=torch.cuda.current_stream(),
+        )
+        torch.cuda.synchronize()
+        assert [int(event.op_id) for event in executor.poll_results()] == [4]
+        with torch.cuda.stream(executor.write_stream):
+            torch.cuda._sleep(200_000_000)
+        executor._queue_pinned_writes(  # pylint: disable=protected-access
+            [5],
+            [(0, 1, 1), (0, 2, 2), (0, 3, 3)],
+            prerequisite_stream=torch.cuda.current_stream(),
+        )
+        assert executor.has_paced_writes()
+        assert executor.poll_results() == []
+        for _ in range(3):
+            executor.write_stream.synchronize()
+            executor.pump_paced_writes()
+            if not executor.has_paced_writes():
+                break
+        assert not executor.has_paced_writes()
+        executor.write_stream.synchronize()
+        assert [int(event.op_id) for event in executor.poll_results()] == [5]
+
     @pytest.mark.parametrize("io_backend", ["kernel", "direct"])
     def test_a_stream_ordered_write_back_reads_blocks_the_plan_reuses(self, io_backend):
         """An eviction's store reads what the evicted block held, though the

@@ -38,7 +38,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{mpsc, Arc, Condvar, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Condvar, Mutex, MutexGuard,
+    },
     thread,
     time::Instant,
 };
@@ -139,6 +142,10 @@ enum Op {
     },
     /// EPD: landed embeddings to publish onto their items.
     EpdPublish(Vec<LandedRequest>),
+    /// Launch the next slice of a paced Host write-back. A paced write-back
+    /// otherwise advances one slice per plan, and a round whose plan has no
+    /// device work never reaches the data plane.
+    PumpCacheWrites,
     ApplyExpertPlacement {
         layer_ids: Vec<usize>,
         rows: Vec<Vec<i32>>,
@@ -168,6 +175,7 @@ impl Op {
             Op::ResumeMemory { .. } => "Op::ResumeMemory",
             Op::SnapshotExpertLoad { .. } => "Op::SnapshotExpertLoad",
             Op::EpdPublish(_) => "Op::EpdPublish",
+            Op::PumpCacheWrites => "Op::PumpCacheWrites",
             Op::ApplyExpertPlacement { .. } => "Op::ApplyExpertPlacement",
         }
     }
@@ -193,6 +201,10 @@ struct Shared {
     state: Mutex<State>,
     /// Signalled when a forward was launched or the data plane failed.
     changed: Condvar,
+    /// A [`Op::PumpCacheWrites`] is queued and has not started: the control
+    /// thread asks every round while a write-back is paced, and the forward
+    /// thread must not collect one operation per round behind a long forward.
+    pump_queued: AtomicBool,
 }
 
 #[derive(Default)]
@@ -472,11 +484,22 @@ impl DataPlane for PythonDataPlane {
 
     fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
         let _span = profile::span("DataPlane::poll_cache_events");
-        let polled: Vec<(String, u32)> = self.query(|plane| {
-            plane
+        let (polled, paced_writes_pending): (Vec<(String, u32)>, bool) = self.query(|plane| {
+            let polled = plane
                 .call_method0("poll_cache_events")
-                .and_then(|events| events.extract())
+                .and_then(|events| events.extract())?;
+            let pending = plane
+                .call_method0("cache_writes_pending")
+                .and_then(|pending| pending.extract())?;
+            Ok((polled, pending))
         })?;
+        // A paced write-back's later slices launch on the forward thread,
+        // once per plan. Without a plan with device work (every request
+        // blocked behind the store's own pinned pages) nothing would launch
+        // them and the ACK would never come, so queue the launch here.
+        if paced_writes_pending && !self.shared.pump_queued.swap(true, Ordering::AcqRel) {
+            self.queue(Op::PumpCacheWrites)?;
+        }
         polled
             .into_iter()
             .map(|(kind, op_id)| {
@@ -698,6 +721,7 @@ fn forward_loop(
                 | Op::Release(_)
                 | Op::Land { .. }
                 | Op::EpdPublish(_)
+                | Op::PumpCacheWrites
                 | Op::AttachGrammars(_) => {}
             }
             continue;
@@ -820,6 +844,12 @@ fn run(
                     return Err("a plan without a batch ran a forward".to_owned());
                 }
             }
+        }
+        Op::PumpCacheWrites => {
+            // Cleared first: a slice that finishes while this one runs
+            // must be able to queue the next.
+            shared.pump_queued.store(false, Ordering::Release);
+            plane.call_method0("pump_cache_writes").map_err(python)?;
         }
         Op::Committed(launched) => {
             plane

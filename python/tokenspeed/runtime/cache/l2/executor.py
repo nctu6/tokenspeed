@@ -764,6 +764,20 @@ class HostCacheExecutor:
             )
         self._pump_paced_writes()
 
+    def has_paced_writes(self) -> bool:
+        """Whether a paced pinned write-back still has slices to launch.
+
+        Safe on the control thread: it only reads the queue's length.
+        """
+        return bool(self._paced_writes)
+
+    def pump_paced_writes(self) -> None:
+        """Launch the next slice of a paced write-back if the previous one
+        left the stream. The forward thread calls it when no plan does: a
+        round with nothing for the device never reaches ``submit_load_backs``,
+        and the blocked admissions wait for the write-back's own ACK."""
+        self._pump_paced_writes()
+
     def _pump_paced_writes(self, *, drain: bool = False) -> None:
         """Launch the next slice once the previous one has left the stream.
 
