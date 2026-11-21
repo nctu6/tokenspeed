@@ -23,10 +23,11 @@
 #   Hopper (sm90): marlin, plain TP.
 #
 # Matched baseline knobs (override via env):
-#   MODEL_PATH           default: deepseek-ai/DeepSeek-V4.1-Flash-1017
+#   MODEL_PATH           default: /models/deepseek-ai/DeepSeek-V4.1-Flash-1017 when
+#                        that directory exists, else deepseek-ai/DeepSeek-V4.1-Flash-1017
 #   SERVED_MODEL_NAME    default: test. SPACE-separated for multiple names
 #                        (e.g. "DeepSeek-V4.1-Flash-1017 test"); NOT comma-separated.
-#   HOST_PORT            default: 8977
+#   HOST_PORT            default: 8977 (the script exits if it is in use)
 #   TENSOR_PARALLEL_SIZE default: 4  (set 2 for TP=2; must match CUDA_DEVICES count)
 #   CUDA_DEVICES         default: arch/TP-aware (0..TP-1); override to pin GPUs
 #   MOE_BACKEND          default: arch-aware (mega_moe on sm100/sm103; auto on
@@ -175,9 +176,20 @@ case "${_CUDA_ARCH}" in
     "")          _MOE_POLICY=auto ;;  # arch unknown: let the engine decide
 esac
 
-MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V4.1-Flash-1017}"
+# Prefer the local checkpoint when it exists; otherwise use the hub id.
+_LOCAL_MODEL=/models/deepseek-ai/DeepSeek-V4.1-Flash-1017
+if [[ -d "$_LOCAL_MODEL" ]]; then
+    MODEL_PATH="${MODEL_PATH:-$_LOCAL_MODEL}"
+else
+    MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V4.1-Flash-1017}"
+fi
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-test}"
 HOST_PORT="${HOST_PORT:-8977}"
+# Fail fast when HOST_PORT is taken (another server, possibly another user's).
+if (exec 3<>"/dev/tcp/127.0.0.1/${HOST_PORT}") 2>/dev/null; then
+    echo "ERROR: port ${HOST_PORT} is already in use. Set HOST_PORT to a free port, e.g. HOST_PORT=18778 $0" >&2
+    exit 1
+fi
 
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-4}"
 if [[ "${TENSOR_PARALLEL_SIZE}" != "2" && "${TENSOR_PARALLEL_SIZE}" != "4" ]]; then

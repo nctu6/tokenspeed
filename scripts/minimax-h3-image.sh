@@ -17,7 +17,7 @@
 # Knobs (override via env):
 #   MODEL_PATH           default: /models/MiniMaxAI/MiniMax-H3-Image
 #   SERVED_MODEL_NAME    default: test
-#   HOST_PORT            default: 8782
+#   HOST_PORT            default: 8782 (the script exits if it is in use)
 #   CUDA_DEVICES         default: 6,7
 #   NUM_GPUS             default: 2 (must match CUDA_DEVICES count)
 #   RESIDENCY            default: auto (device_split when NUM_GPUS>=2: Qwen3-VL
@@ -54,6 +54,11 @@ cd "$REPO_ROOT"
 MODEL_PATH="${MODEL_PATH:-/models/MiniMaxAI/MiniMax-H3-Image}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-test}"
 HOST_PORT="${HOST_PORT:-8782}"
+# Fail fast when HOST_PORT is taken (another server, possibly another user's).
+if (exec 3<>"/dev/tcp/127.0.0.1/${HOST_PORT}") 2>/dev/null; then
+    echo "ERROR: port ${HOST_PORT} is already in use. Set HOST_PORT to a free port, e.g. HOST_PORT=18778 $0" >&2
+    exit 1
+fi
 CUDA_DEVICES="${CUDA_DEVICES:-6,7}"
 NUM_GPUS="${NUM_GPUS:-2}"
 RESIDENCY="${RESIDENCY:-auto}"

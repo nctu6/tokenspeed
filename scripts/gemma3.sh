@@ -6,7 +6,7 @@
 # Matched baseline knobs (override via env):
 #   MODEL_PATH           default: /models/google/gemma-3-27b-it
 #   SERVED_MODEL_NAME    default: test
-#   HOST_PORT            default: 8778
+#   HOST_PORT            default: 8778 (the script exits if it is in use)
 #   CUDA_DEVICES         default: 6
 #   MAX_NUM_SEQS         default: 452
 #   MAX_MODEL_LEN        default: 131072
@@ -50,6 +50,11 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-test}"
 # them); passthrough returns text as generated, nctu6's proven config.
 REASONING_PARSER="${REASONING_PARSER:-passthrough}"
 HOST_PORT="${HOST_PORT:-8778}"
+# Fail fast when HOST_PORT is taken (another server, possibly another user's).
+if (exec 3<>"/dev/tcp/127.0.0.1/${HOST_PORT}") 2>/dev/null; then
+    echo "ERROR: port ${HOST_PORT} is already in use. Set HOST_PORT to a free port, e.g. HOST_PORT=18778 $0" >&2
+    exit 1
+fi
 CUDA_DEVICES="${CUDA_DEVICES:-6}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-452}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"

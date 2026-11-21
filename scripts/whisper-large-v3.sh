@@ -19,7 +19,7 @@
 # Matched baseline knobs (override via env):
 #   MODEL_PATH           default: /models/openai/whisper-large-v3
 #   SERVED_MODEL_NAME    default: test
-#   HOST_PORT            default: 8778
+#   HOST_PORT            default: 8778 (the script exits if it is in use)
 #   CUDA_DEVICES         default: 6  (single GPU; large-v3 bf16 ~3 GiB weights
 #                        + cross-KV buffer sized by max_num_seqs)
 #   TENSOR_PARALLEL_SIZE default: 1
@@ -144,6 +144,11 @@ fi
 MODEL_PATH="${MODEL_PATH:-/models/openai/whisper-large-v3}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-test}"
 HOST_PORT="${HOST_PORT:-8778}"
+# Fail fast when HOST_PORT is taken (another server, possibly another user's).
+if (exec 3<>"/dev/tcp/127.0.0.1/${HOST_PORT}") 2>/dev/null; then
+    echo "ERROR: port ${HOST_PORT} is already in use. Set HOST_PORT to a free port, e.g. HOST_PORT=18778 $0" >&2
+    exit 1
+fi
 CUDA_DEVICES="${CUDA_DEVICES:-6}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
