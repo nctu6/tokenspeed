@@ -715,9 +715,13 @@ its thinking between `<|channel>thought` and `<channel|>`; the `gemma4`
 reasoning parser moves it to `reasoning_content`, and without it the thinking
 stays in `content`.
 
-Gemma 4's tokenizer adds no BOS to raw `/v1/completions` prompts (the same as
-the Hugging Face tokenizer); start such prompts with `<bos>`. Chat requests get
-exactly one BOS from the chat template.
+`/v1/completions` tokenizes a prompt the way vLLM does: the tokenizer's special
+tokens are added unless the request sets `"add_special_tokens": false`, and a
+literal `<bos>` in the text is kept, not deduplicated. Gemma 3's tokenizer adds
+a BOS, so a raw prompt gets one. Gemma 4's tokenizer (`tokenizer.json` has no
+BOS template and `tokenizer_config.json` has no `add_bos_token`) adds none, in
+vLLM and here; start a raw Gemma 4 prompt with `<bos>` yourself. Chat requests
+get exactly one BOS from the chat template.
 
 ## Speculative decoding
 
