@@ -52,7 +52,9 @@
 #       unexpected hidden_states_scale shape (196608,); expected (24, 8192).
 #       MoE backend=triton fixes it. BF16 at TP=2 OOMs (~114 GiB weights/GPU).
 #     Alt: /models/nvidia/Qwen3.5-122B-A10B-NVFP4 (~39 GiB/GPU at TP=2) if
-#     modelopt NVFP4 path is preferred over online FP8.
+#     modelopt NVFP4 path is preferred over online FP8. It needs
+#     QUANTIZATION=nvfp4 MOE_BACKEND=auto: the sm120 default MOE_BACKEND=triton
+#     has no NVFP4 kernel (NoKernelFoundError for moe.apply).
 #   Override CUDA_DEVICES / TENSOR_PARALLEL_SIZE / QUANTIZATION / MOE_BACKEND /
 #   TOKENSPEED_CUDA_ARCH to pin.
 #
