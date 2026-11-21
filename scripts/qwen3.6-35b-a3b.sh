@@ -6,7 +6,7 @@
 # Matched baseline knobs (override via env):
 #   MODEL_PATH           default: /models/Qwen/Qwen3.6-35B-A3B
 #   SERVED_MODEL_NAME    default: test
-#   HOST_PORT            default: 8778
+#   HOST_PORT            default: 8778 (the script exits if it is in use)
 #   CUDA_DEVICES         arch-aware default (see below); override to pin GPUs
 #   TENSOR_PARALLEL_SIZE arch-aware default (see below); must match device count
 #   QUANTIZATION         default: empty (bf16 fits TP=1 on both sm90 and sm120;
@@ -157,6 +157,11 @@ fi
 MODEL_PATH="${MODEL_PATH:-/models/Qwen/Qwen3.6-35B-A3B}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-test}"
 HOST_PORT="${HOST_PORT:-8778}"
+# Fail fast when HOST_PORT is taken (another server, possibly another user's).
+if (exec 3<>"/dev/tcp/127.0.0.1/${HOST_PORT}") 2>/dev/null; then
+    echo "ERROR: port ${HOST_PORT} is already in use. Set HOST_PORT to a free port, e.g. HOST_PORT=18778 $0" >&2
+    exit 1
+fi
 if [[ "${_IS_SM120}" -eq 1 ]]; then
     # bf16 MoE ~67 GiB on one GPU at TP=1 fits PRO 6000 ~96 GiB only with
     # shorter ctx / lower max-num-seqs (cudagraph capture + KV need leftover).
