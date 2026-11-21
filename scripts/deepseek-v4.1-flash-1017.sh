@@ -18,8 +18,16 @@
 # MoE backend is arch-aware:
 #   Datacenter Blackwell (sm100/sm103, B200/GB200): mega_moe + expert parallel
 #     (the FlashInfer TRT-LLM vendor MoE, validated only on this window).
-#   Workstation Blackwell (sm120/sm121, RTX PRO 6000): auto -> CUTLASS MXFP4 /
-#     Marlin W4A16, plain TP (mega_moe is NOT admitted on sm120).
+#   Workstation Blackwell (sm120/sm121, RTX PRO 6000): auto, plain TP. The
+#     engine resolves `auto` to the SM120 MegaMoE leaf (DeepGEMM MXFP4) when the
+#     launch passes its gates (task 60: attention TP = MoE TP, MXFP4 experts, no
+#     speculative decoding / PD / all-to-all / EPLB) and to CUTLASS MXFP4 /
+#     Marlin W4A16 otherwise. DSPARK (ENABLE_DSPARK=1, the default here) is
+#     speculative decoding, so with the defaults `auto` stays Marlin; use
+#     ENABLE_DSPARK=0 to get MegaMoE (the engine logs `DeepSeek V4.1 default
+#     moe_backend=...` with the reason). MegaMoE gain over Marlin, measured
+#     without DSPARK on the 128-expert TP2 subset: TPOT -1% to -13%, input
+#     tok/s +15% at C=128.
 #   Hopper (sm90): marlin, plain TP.
 #
 # Matched baseline knobs (override via env):
@@ -44,7 +52,8 @@
 #   MAX_TOTAL_TOKENS     default: 262144  (KV budget; caps admission)
 #   MAX_NUM_SEQS         default: 32
 #   CHUNKED_PREFILL_SIZE default: 8192
-#   MAX_CUDAGRAPH_CAPTURE_SIZE  default: 32
+#   MAX_CUDAGRAPH_CAPTURE_SIZE  default: 32 on sm90/sm100; empty on sm120/sm121
+#                        (flag omitted: the default ladder runs up to MAX_NUM_SEQS)
 #   GPU_MEMORY_UTILIZATION  default: empty (engine default). Set e.g. 0.9 if tight.
 #   REASONING_PARSER     default: deepseek_v41. Fanned out to engine + gateway
 #                        (the serve orchestrator splits it). Set empty to omit.
@@ -101,6 +110,14 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 # scripts/ lives one level below the repo root; keep .venv at REPO_ROOT.
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
 cd "$REPO_ROOT"
+
+# SM120 defaults (compute capability 12.x of the first CUDA_DEVICES GPU, here
+# sm120 / sm121; explicit env always wins, other archs are unchanged): MOE_BACKEND
+# auto (MegaMoE when admitted, see above), the 128 of 384 routed experts subset at
+# TP=2 on <128 GiB cards, MODEL_PATH from /models, no CUDA graph capture cap
+# (ladder up to MAX_NUM_SEQS), engine-default attention (V4.1 native indexer and
+# SM120 attention leaves) and KV events at the engine default. MAX_NUM_SEQS 32 and
+# MAX_TOTAL_TOKENS 262144 are the DSPARK / KV-budget recipe values, not sm90 tuning.
 
 # --- CUDA arch detection (prefer compute_cap; allow env override) ------------
 # Normalize "10.0" / "sm_100" / "SM100" -> "sm100".
@@ -171,7 +188,7 @@ _GPU_MEM_MIB="$(_detect_gpu_mem_mib)"
 _MOE_POLICY=marlin
 case "${_CUDA_ARCH}" in
     sm100|sm103) _MOE_POLICY=datacenter_blackwell ;;
-    sm120|sm121) _MOE_POLICY=auto ;;
+    sm12[0-9])   _MOE_POLICY=auto ;;
     sm90)        _MOE_POLICY=marlin ;;
     "")          _MOE_POLICY=auto ;;  # arch unknown: let the engine decide
 esac
@@ -226,7 +243,12 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-262144}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
-MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-32}"
+# SM120: no cap, so the engine's default ladder runs up to MAX_NUM_SEQS.
+if [[ "${_CUDA_ARCH}" == sm12* ]]; then
+    MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-}"
+else
+    MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-32}"
+fi
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-}"
 REASONING_PARSER="${REASONING_PARSER-deepseek_v41}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER-deepseek_v41}"
@@ -245,7 +267,7 @@ ENABLE_AUTO_TOOL_CHOICE="${ENABLE_AUTO_TOOL_CHOICE:-}"
 # and it fits alongside the host-offloaded Engram tables (~85 GB/GPU).
 # To serve TEXT-ONLY (slightly less memory), set LANGUAGE_MODEL_ONLY=1, which
 # adds --language-model-only and drops the vision tower.
-if [[ "${_CUDA_ARCH}" == "sm120" || "${_CUDA_ARCH}" == "sm121" ]]; then
+if [[ "${_CUDA_ARCH}" == sm12* ]]; then
     ENGRAM_HOST_TABLE="${ENGRAM_HOST_TABLE-1}"
 else
     ENGRAM_HOST_TABLE="${ENGRAM_HOST_TABLE-}"
@@ -343,7 +365,7 @@ else
     exit 1
 fi
 
-echo "[deepseek-v4.1-flash-1017] arch=${_CUDA_ARCH:-unknown} gpu_mem=${_GPU_MEM_MIB:-unknown}MiB moe_policy=${_MOE_POLICY} CUDA_DEVICES=${CUDA_DEVICES} TP=${TENSOR_PARALLEL_SIZE} moe_backend=${MOE_BACKEND} expert_parallel=${ENABLE_EXPERT_PARALLEL} dspark=${ENABLE_DSPARK} kvstore=${ENABLE_KVSTORE} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS} MAX_NUM_SEQS=${MAX_NUM_SEQS} gpu_mem_util=${GPU_MEMORY_UTILIZATION:-engine_default} reasoning=${REASONING_PARSER:-none} tool_parser=${TOOL_CALL_PARSER:-none} auto_tool_choice=${ENABLE_AUTO_TOOL_CHOICE:-off} routed_experts=${ROUTED_EXPERTS:-all}${ROUTED_EXPERTS:+/${CHECKPOINT_EXPERTS}} engram_host_table=${ENGRAM_HOST_TABLE:-off} lm_only=${LANGUAGE_MODEL_ONLY:-off} model=${MODEL_PATH}" >&2
+echo "[deepseek-v4.1-flash-1017] arch=${_CUDA_ARCH:-unknown} gpu_mem=${_GPU_MEM_MIB:-unknown}MiB moe_policy=${_MOE_POLICY} CUDA_DEVICES=${CUDA_DEVICES} TP=${TENSOR_PARALLEL_SIZE} moe_backend=${MOE_BACKEND} expert_parallel=${ENABLE_EXPERT_PARALLEL} dspark=${ENABLE_DSPARK} kvstore=${ENABLE_KVSTORE} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS} MAX_NUM_SEQS=${MAX_NUM_SEQS} cudagraph_cap=${MAX_CUDAGRAPH_CAPTURE_SIZE:-max_num_seqs} gpu_mem_util=${GPU_MEMORY_UTILIZATION:-engine_default} reasoning=${REASONING_PARSER:-none} tool_parser=${TOOL_CALL_PARSER:-none} auto_tool_choice=${ENABLE_AUTO_TOOL_CHOICE:-off} routed_experts=${ROUTED_EXPERTS:-all}${ROUTED_EXPERTS:+/${CHECKPOINT_EXPERTS}} engram_host_table=${ENGRAM_HOST_TABLE:-off} lm_only=${LANGUAGE_MODEL_ONLY:-off} model=${MODEL_PATH}" >&2
 
 # --served-model-name is nargs="+": SPACE-separated names, each its own argv
 # item (NOT comma-separated -- a comma becomes part of a single literal name).
@@ -363,9 +385,11 @@ cmd=(
     --max-total-tokens "$MAX_TOTAL_TOKENS"
     --max-num-seqs "$MAX_NUM_SEQS"
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
-    --max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE"
     --enable-prefix-caching
 )
+if [[ -n "$MAX_CUDAGRAPH_CAPTURE_SIZE" ]]; then
+    cmd+=(--max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE")
+fi
 if [[ "$ENABLE_KVSTORE" == "0" ]]; then
     cmd+=(--disable-kvstore)
 fi

@@ -28,6 +28,11 @@
 #                        is what a single 80 GB GPU needs (NUM_GPUS=1)
 #   VENV_DIR             default: ./.venv
 #
+# SM120 (RTX PRO 6000, compute capability 12.x of the first CUDA_DEVICES GPU):
+# nothing to switch. This is a Diffusers pipeline; it has no attention backend,
+# MoE backend, quantization or CUDA graph knob that the SM120 leaves replace, and
+# the script forces none. The detected arch is only logged.
+#
 # The text encoder is loaded from the `text_encoder/` folder of the checkpoint
 # (model_index.json points at MiniMaxAI/MiniMax-H3; keep a local copy or the
 # HF cache populated).
@@ -64,6 +69,14 @@ NUM_GPUS="${NUM_GPUS:-2}"
 RESIDENCY="${RESIDENCY:-auto}"
 DTYPE="${DTYPE:-bfloat16}"
 ENABLE_CPU_OFFLOAD="${ENABLE_CPU_OFFLOAD:-0}"
+# SM120 (compute capability 12.x) of the first selected GPU. TOKENSPEED_CUDA_ARCH
+# (e.g. sm120 / 12.0) overrides the nvidia-smi query. Same variables as the
+# other model scripts: _CUDA_ARCH_RAW, _IS_SM120.
+_CUDA_ARCH_RAW="${TOKENSPEED_CUDA_ARCH:-$(nvidia-smi --id="${CUDA_DEVICES%%,*}" --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -1 || true)}"
+_IS_SM120=0
+case "$(tr '[:upper:]' '[:lower:]' <<<"${_CUDA_ARCH_RAW}" | tr -d '[:space:]_')" in
+    12.*|sm12*) _IS_SM120=1 ;;
+esac
 VENV_DIR="${VENV_DIR:-$REPO_ROOT/.venv}"
 
 _NDEV="$(awk -F',' '{print NF}' <<<"$CUDA_DEVICES")"
@@ -91,7 +104,7 @@ if ! python -c "from diffusers import MiniMaxH3ImageModularPipeline" >/dev/null 
     exit 2
 fi
 
-echo "[minimax-h3-image] CUDA_DEVICES=${CUDA_DEVICES} NUM_GPUS=${NUM_GPUS} residency=${RESIDENCY} offload=${ENABLE_CPU_OFFLOAD} dtype=${DTYPE} model=${MODEL_PATH}" >&2
+echo "[minimax-h3-image] sm120=${_IS_SM120} CUDA_DEVICES=${CUDA_DEVICES} NUM_GPUS=${NUM_GPUS} residency=${RESIDENCY} offload=${ENABLE_CPU_OFFLOAD} dtype=${DTYPE} model=${MODEL_PATH}" >&2
 
 cmd=(
     tokenspeed serve "$MODEL_PATH"

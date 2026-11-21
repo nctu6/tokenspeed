@@ -26,6 +26,16 @@
 #   FORCE_DETERMINISTIC_RSAG / DISABLE_NCCL_NVLS
 #                        legacy per-knob switches (non-empty = on); still work.
 #
+# SM120 defaults (RTX PRO 6000, compute capability 12.x of the first
+# CUDA_DEVICES GPU; explicit env always wins, other archs are unchanged):
+#   No attention/GEMM backend is forced: the engine picks the SM120 attention
+#   leaves and the DeepGEMM SM120 GEMM leaves, and the CUDA graph ladder runs up
+#   to MAX_NUM_SEQS (no capture cap is passed). Prefill graphs and KV events keep
+#   the engine defaults.
+#   /v1/completions: the gateway adds special tokens by the tokenizer's own
+#   rules, like vLLM (task 87), so gemma-3 raw prompts get <bos> automatically;
+#   do not prefix <bos> yourself.
+#
 # Multi-model (SMG IGW): override SERVED_MODEL_NAME to a unique id when
 # registering beside other models; pair with gemma4.sh on another port/GPUs
 # and enable IGW on the gateway. See multi-model-gemma.md.
@@ -61,6 +71,14 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 DTYPE="${DTYPE:-bfloat16}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"
+# SM120 (compute capability 12.x) of the first selected GPU. TOKENSPEED_CUDA_ARCH
+# (e.g. sm120 / 12.0) overrides the nvidia-smi query. Same variables as the
+# other model scripts: _CUDA_ARCH_RAW, _IS_SM120.
+_CUDA_ARCH_RAW="${TOKENSPEED_CUDA_ARCH:-$(nvidia-smi --id="${CUDA_DEVICES%%,*}" --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -1 || true)}"
+_IS_SM120=0
+case "$(tr '[:upper:]' '[:lower:]' <<<"${_CUDA_ARCH_RAW}" | tr -d '[:space:]_')" in
+    12.*|sm12*) _IS_SM120=1 ;;
+esac
 DISABLE_KVSTORE="${DISABLE_KVSTORE:-0}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 FORCE_DETERMINISTIC_RSAG="${FORCE_DETERMINISTIC_RSAG:-}"
@@ -89,6 +107,7 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
+echo "[gemma3] sm120=${_IS_SM120} CUDA_DEVICES=${CUDA_DEVICES} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_NUM_SEQS=${MAX_NUM_SEQS} KV=${KV_CACHE_DTYPE:-auto}" >&2
 cmd=(
     tokenspeed serve "$MODEL_PATH"
     --served-model-name "$SERVED_MODEL_NAME"

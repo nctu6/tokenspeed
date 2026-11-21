@@ -54,6 +54,13 @@
 #   VENV_DIR             default: ./.venv
 #   TOKENSPEED_CUDA_ARCH override detected arch (e.g. sm120 / sm90 / 12.0 / 9.0)
 #
+# SM120 defaults (compute capability 12.x of the first CUDA_DEVICES GPU; explicit
+# env always wins, other archs are unchanged): the decoder attention backend and
+# CUDA graph ladder are the engine's auto choice (no cap is passed). The one
+# forced knob is the encoder MM_ATTENTION_BACKEND=sdpa: measured at about half
+# the time of the triton_attn auto choice on SM120, and fa4 hit illegal memory
+# accesses there (see MM_ATTENTION_BACKEND above).
+#
 # Arch → defaults (CUDA compute capability of first selected GPU):
 #   sm90  (H200 ~141 GiB): CUDA_DEVICES=6 TP=1
 #   sm120 (PRO 6000 ~96 GiB, Blackwell): CUDA_DEVICES=6 TP=1
@@ -132,12 +139,14 @@ _detect_gpu_mem_mib() {
         | head -1 | tr -d '[:space:]'
 }
 
+# Default GPUs first: the arch below is read from the first selected device.
+CUDA_DEVICES="${CUDA_DEVICES:-6}"
 _CUDA_ARCH_RAW="${TOKENSPEED_CUDA_ARCH:-$(_detect_cuda_arch)}"
 _CUDA_ARCH="$(_normalize_cuda_arch "${_CUDA_ARCH_RAW}")"
 _GPU_MEM_MIB="$(_detect_gpu_mem_mib)"
 
 _IS_SM120=0
-if [[ "${_CUDA_ARCH}" == "sm120" ]]; then
+if [[ "${_CUDA_ARCH}" == sm12* ]]; then
     _IS_SM120=1
 fi
 
@@ -149,7 +158,6 @@ if (exec 3<>"/dev/tcp/127.0.0.1/${HOST_PORT}") 2>/dev/null; then
     echo "ERROR: port ${HOST_PORT} is already in use. Set HOST_PORT to a free port, e.g. HOST_PORT=18778 $0" >&2
     exit 1
 fi
-CUDA_DEVICES="${CUDA_DEVICES:-6}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-448}"

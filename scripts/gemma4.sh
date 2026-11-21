@@ -11,6 +11,9 @@
 #   TENSOR_PARALLEL_SIZE default: 2 (must match CUDA_DEVICES count)
 #   MAX_NUM_SEQS         default: 452
 #   MAX_MODEL_LEN        default: 131072
+#   CHUNKED_PREFILL_SIZE default: empty (engine default 8192). On SM120 with
+#                        MAX_MODEL_LEN above 199000 it defaults to 1024, see
+#                        "SM120 defaults" below.
 #   DTYPE                default: bfloat16
 #   KV_CACHE_DTYPE       default: empty (omit flag)
 #   ATTENTION_BACKEND    default: empty (engine auto). Set e.g. triton to force.
@@ -30,6 +33,22 @@
 #   MM_ENCODER_TP_MODE   default: empty (engine default: weights). "data" runs
 #                        the vision tower data-parallel across the TP ranks.
 #
+# SM120 defaults (RTX PRO 6000, compute capability 12.x of the first
+# CUDA_DEVICES GPU; explicit env always wins, other archs are unchanged):
+#   No attention/GEMM backend is forced: the engine picks the SM120 attention
+#   leaves and the DeepGEMM SM120 GEMM leaves, and the CUDA graph ladder runs up
+#   to MAX_NUM_SEQS (no capture cap is passed).
+#   Long context: one 8192-token prefill chunk is reserved per sliding-window
+#   group, so a 262144-token request does not fit the KV pool of one 96 GB GPU
+#   (single-request limit 199614 at TP1). With MAX_MODEL_LEN above 199000 the
+#   script passes --chunked-prefill-size 1024 (BF16 KV, no --kv-cache-dtype):
+#   single-request limit 261886-262143 at TP1 (measured, tasks 52 and 84).
+#   An explicit CHUNKED_PREFILL_SIZE or KV_CACHE_DTYPE (fp8 also reaches 262143)
+#   disables this default.
+#   /v1/completions: the gateway adds special tokens by the tokenizer's own
+#   rules, like vLLM (task 87); no <bos> prefix is needed for gemma-3, and
+#   gemma-4's tokenizer adds none for raw prompts.
+#
 # Recommended sm90 (H200) invoke:
 #   CUDA_DEVICES=6,7 VLLM_BATCH_INVARIANT=1 ./scripts/gemma4.sh
 #
@@ -39,6 +58,8 @@
 #
 # Usage:
 #   ./scripts/gemma4.sh
+#   # SM120, TP1, 256K context (chunk 1024 is added automatically)
+#   CUDA_DEVICES=6 TENSOR_PARALLEL_SIZE=1 MAX_MODEL_LEN=262144 GPU_MEMORY_UTILIZATION=0.9 ./scripts/gemma4.sh
 #   CUDA_DEVICES=6,7 HOST_PORT=8779 ./scripts/gemma4.sh
 #   ATTENTION_BACKEND=triton ./scripts/gemma4.sh
 #   # multi-model: override served name when needed
@@ -69,6 +90,18 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 DTYPE="${DTYPE:-bfloat16}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"
+# SM120 (compute capability 12.x) of the first selected GPU. TOKENSPEED_CUDA_ARCH
+# (e.g. sm120 / 12.0) overrides the nvidia-smi query. Same variables as the
+# other model scripts: _CUDA_ARCH_RAW, _IS_SM120.
+_CUDA_ARCH_RAW="${TOKENSPEED_CUDA_ARCH:-$(nvidia-smi --id="${CUDA_DEVICES%%,*}" --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -1 || true)}"
+_IS_SM120=0
+case "$(tr '[:upper:]' '[:lower:]' <<<"${_CUDA_ARCH_RAW}" | tr -d '[:space:]_')" in
+    12.*|sm12*) _IS_SM120=1 ;;
+esac
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-}"
+if [[ -z "$CHUNKED_PREFILL_SIZE" && -z "$KV_CACHE_DTYPE" && "$_IS_SM120" == "1" && "$MAX_MODEL_LEN" -gt 199000 ]]; then
+    CHUNKED_PREFILL_SIZE=1024
+fi
 # Hosts with broken NVLS multicast need these; default off for other hosts.
 FORCE_DETERMINISTIC_RSAG="${FORCE_DETERMINISTIC_RSAG:-}"
 DISABLE_NCCL_NVLS="${DISABLE_NCCL_NVLS:-}"
@@ -98,6 +131,7 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
+echo "[gemma4] sm120=${_IS_SM120} CUDA_DEVICES=${CUDA_DEVICES} TP=${TENSOR_PARALLEL_SIZE} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_NUM_SEQS=${MAX_NUM_SEQS} KV=${KV_CACHE_DTYPE:-auto} chunked_prefill=${CHUNKED_PREFILL_SIZE:-engine_default}" >&2
 cmd=(
     tokenspeed serve "$MODEL_PATH"
     --served-model-name "$SERVED_MODEL_NAME"
@@ -116,6 +150,9 @@ if [[ -n "$KV_CACHE_DTYPE" ]]; then
 fi
 if [[ -n "$ATTENTION_BACKEND" ]]; then
     cmd+=(--attention-backend "$ATTENTION_BACKEND")
+fi
+if [[ -n "$CHUNKED_PREFILL_SIZE" ]]; then
+    cmd+=(--chunked-prefill-size "$CHUNKED_PREFILL_SIZE")
 fi
 if [[ -n "$GPU_MEMORY_UTILIZATION" ]]; then
     cmd+=(--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION")

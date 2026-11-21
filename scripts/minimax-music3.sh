@@ -39,6 +39,12 @@
 #   sm120 (PRO 6000 ~96 GiB): same; keep smoke audio_duration short
 #   Single-GPU still works (~23 GB): CUDA_DEVICES=6 NUM_GPUS=1
 #
+# SM120 (compute capability 12.x of the first CUDA_DEVICES GPU): nothing to
+# switch. This is a Diffusers pipeline with no attention backend, MoE backend,
+# quantization or CUDA graph knob that the SM120 leaves replace, and the script
+# forces none (the 2-GPU layout and CPU offload defaults are memory choices, the
+# same on every arch). The detected arch is only logged.
+#
 # Recommended invoke:
 #   CUDA_DEVICES=6,7 ./scripts/minimax-music3.sh
 #
@@ -139,12 +145,14 @@ _detect_gpu_mem_mib() {
         | head -1 | tr -d '[:space:]'
 }
 
+# Default GPUs first: the arch below is read from the first selected device.
+CUDA_DEVICES="${CUDA_DEVICES:-6,7}"
 _CUDA_ARCH_RAW="${TOKENSPEED_CUDA_ARCH:-$(_detect_cuda_arch)}"
 _CUDA_ARCH="$(_normalize_cuda_arch "${_CUDA_ARCH_RAW}")"
 _GPU_MEM_MIB="$(_detect_gpu_mem_mib)"
 
 _IS_SM120=0
-if [[ "${_CUDA_ARCH}" == "sm120" ]]; then
+if [[ "${_CUDA_ARCH}" == sm12* ]]; then
     _IS_SM120=1
 fi
 
@@ -156,7 +164,6 @@ if (exec 3<>"/dev/tcp/127.0.0.1/${HOST_PORT}") 2>/dev/null; then
     echo "ERROR: port ${HOST_PORT} is already in use. Set HOST_PORT to a free port, e.g. HOST_PORT=18778 $0" >&2
     exit 1
 fi
-CUDA_DEVICES="${CUDA_DEVICES:-6,7}"
 NUM_GPUS="${NUM_GPUS:-2}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-$NUM_GPUS}"
 DTYPE="${DTYPE:-bfloat16}"

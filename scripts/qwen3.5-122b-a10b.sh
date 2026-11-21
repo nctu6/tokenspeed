@@ -32,8 +32,10 @@
 #   VENV_DIR             default: ./.venv
 #   TOKENSPEED_CUDA_ARCH override detected arch (e.g. sm120 / sm90 / 12.0 / 9.0)
 #   TOKENSPEED_TRITON_PREFILL_SKIP_OOR   default: 1 (F1; kernel default on)
-#   TOKENSPEED_TRITON_DECODE_KV_SPLITS   default: legacy (F2; not auto)
-#   TOKENSPEED_FLASHINFER_FA2_EXTEND    default: off (F3; not 512/all)
+#   TOKENSPEED_TRITON_DECODE_KV_SPLITS   default: legacy (F2; not auto); unset
+#                        (kernel default) on SM120
+#   TOKENSPEED_FLASHINFER_FA2_EXTEND    default: off (F3; not 512/all); unset
+#                        (kernel default) on SM120
 #   VLLM_BATCH_INVARIANT default: empty. Truthy (1/true/yes/on) = deterministic
 #                        comm preset: --force-deterministic-rsag +
 #                        --disable-nccl-nvls (NCCL_NVLS_ENABLE=0). Needed on
@@ -60,6 +62,20 @@
 #     kernel). Explicit QUANTIZATION / MOE_BACKEND still win.
 #   Override CUDA_DEVICES / TENSOR_PARALLEL_SIZE / QUANTIZATION / MOE_BACKEND /
 #   TOKENSPEED_CUDA_ARCH to pin.
+#
+# SM120 defaults (compute capability 12.x of the first CUDA_DEVICES GPU; explicit
+# env always wins, other archs are unchanged):
+#   - ATTENTION_BACKEND is not forced (engine picks the SM120 attention leaves),
+#     the TOKENSPEED_TRITON_DECODE_KV_SPLITS / FA2_EXTEND pins are not exported,
+#     and no CUDA graph capture cap is passed: the ladder runs up to MAX_NUM_SEQS.
+#   - NVFP4 checkpoint: --quantization nvfp4 --moe-backend auto (DeepGEMM / CUTLASS
+#     FP4 leaves), detected from the checkpoint config.
+#   - BF16 checkpoint: --quantization fp8 as before (BF16 OOMs at ~114 GiB/GPU on
+#     2 x 96 GB). --moe-backend triton stays for this online-FP8 case because the
+#     default FlashInfer TRT-LLM FP8 MoE crashes on SM120 (bring-up on the SM120
+#     host: hidden_states_scale shape error); `MOE_BACKEND=auto` re-tests it.
+#   - MAX_MODEL_LEN 8192 / MAX_NUM_SEQS 64 / KV fp8 are memory limits (~86 GiB
+#     used at 8192 context), not sm90 leftovers (32k KV OOMs, see above).
 #
 # Recommended invoke:
 #   # sm90 (H200) — NVLS multicast broken → batch-invariant preset
@@ -139,6 +155,8 @@ _detect_gpu_mem_mib() {
         | head -1 | tr -d '[:space:]'
 }
 
+# Default GPUs first: the arch below is read from the first selected device.
+CUDA_DEVICES="${CUDA_DEVICES:-6,7}"
 _CUDA_ARCH_RAW="${TOKENSPEED_CUDA_ARCH:-$(_detect_cuda_arch)}"
 _CUDA_ARCH="$(_normalize_cuda_arch "${_CUDA_ARCH_RAW}")"
 _GPU_MEM_MIB="$(_detect_gpu_mem_mib)"
@@ -166,7 +184,7 @@ PY
 # sm120 (Blackwell / PRO 6000) → FP8 + triton MoE + TP=2 on 6,7.
 # sm90 / other high-mem (H200) → bf16 TP=2 on 6,7; no forced FP8/triton.
 _IS_SM120=0
-if [[ "${_CUDA_ARCH}" == "sm120" ]]; then
+if [[ "${_CUDA_ARCH}" == sm12* ]]; then
     _IS_SM120=1
 fi
 
@@ -248,8 +266,15 @@ export HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN:-}"
 # DECODE_KV_SPLITS=auto / FA2_EXTEND=512 after A/B. (The sliding-window
 # KV-range trim is always on in the kernel, upstream #1559.)
 export TOKENSPEED_TRITON_PREFILL_SKIP_OOR="${TOKENSPEED_TRITON_PREFILL_SKIP_OOR:-1}"
-export TOKENSPEED_TRITON_DECODE_KV_SPLITS="${TOKENSPEED_TRITON_DECODE_KV_SPLITS:-legacy}"
-export TOKENSPEED_FLASHINFER_FA2_EXTEND="${TOKENSPEED_FLASHINFER_FA2_EXTEND:-off}"
+if [[ "${_IS_SM120}" -eq 1 ]]; then
+    # SM120: leave both unset (kernel defaults) so the SM120 attention leaves are
+    # not pinned to the older split-KV sizing / extend path. Exporting them
+    # yourself still wins.
+    :
+else
+    export TOKENSPEED_TRITON_DECODE_KV_SPLITS="${TOKENSPEED_TRITON_DECODE_KV_SPLITS:-legacy}"
+    export TOKENSPEED_FLASHINFER_FA2_EXTEND="${TOKENSPEED_FLASHINFER_FA2_EXTEND:-off}"
+fi
 
 if [[ ! -x "$VENV_DIR/bin/tokenspeed" && ! -f "$VENV_DIR/bin/activate" ]]; then
     echo "ERROR: venv not found at $VENV_DIR. Run ./scripts/install.sh first (or set VENV_DIR)." >&2
