@@ -202,6 +202,14 @@ class Music3Pipeline:
             self.model_path, components_manager=manager
         )
         pipe.load_components(**self._load_kwargs())
+        # Diffusers' denoise step feeds the LM-dtype frame hiddens to the
+        # condition encoder, which is loaded in acoustic_dtype (float32 by
+        # default). Cast the input to the encoder's own dtype, as the
+        # device_split acoustic worker does.
+        encoder = pipe.condition_encoder
+        encoder.register_forward_pre_hook(
+            lambda module, args: (args[0].to(module.dtype), *args[1:])
+        )
         if not self.config.enable_cpu_offload and device.startswith("cuda"):
             pipe.to(device)
         self._pipe = pipe
