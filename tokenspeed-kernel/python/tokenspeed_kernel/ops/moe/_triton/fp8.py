@@ -348,3 +348,323 @@ def _triton_fp8_moe_impl(
     )
     _combine(route_output, topk_weights, output, None, 0)
     return output
+
+
+# ===-----------------------------------------------------------------------===#
+# FP8 activations: both GEMMs run on the FP8 tensor cores
+# ===-----------------------------------------------------------------------===#
+# The activations are quantized to E4M3 with one FP32 scale per row and 128
+# columns, the layout of the weights' scale blocks, so each K step is one FP8
+# `tl.dot` whose FP32 result is multiplied by the activation scale times the
+# weight block scale. `x` is quantized once by `_quantize_rows_kernel`; stage 1
+# quantizes its own output in the epilogue (a stage-1 tile is exactly 128
+# intermediate columns), so stage 2 reads FP8 rows too.
+@triton.jit
+def _quantize_rows_kernel(
+    x_ptr,
+    q_ptr,
+    scale_ptr,
+    hidden_size: tl.constexpr,
+    GROUP: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    group = tl.program_id(1)
+    cols = group * GROUP + tl.arange(0, GROUP)
+    x = tl.load(x_ptr + row * hidden_size + cols).to(tl.float32)
+    scale = tl.maximum(tl.max(tl.abs(x)), 1e-10) / 448.0
+    tl.store(q_ptr + row * hidden_size + cols, (x / scale).to(tl.float8e4nv))
+    tl.store(scale_ptr + row * (hidden_size // GROUP) + group, scale)
+
+
+@triton.jit
+def _stage1_fp8_act_kernel(
+    xq_ptr,
+    xs_ptr,
+    w13_ptr,
+    w13_scale_ptr,
+    inter_q_ptr,
+    inter_s_ptr,
+    expert_route_ids_ptr,
+    expert_counts_ptr,
+    num_tokens,
+    num_programs,
+    hidden_size: tl.constexpr,
+    intermediate_size: tl.constexpr,
+    num_experts: tl.constexpr,
+    top_k: tl.constexpr,
+    swiglu_alpha: tl.constexpr,
+    swiglu_limit: tl.constexpr,
+    swiglu_beta: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
+    SCALE_BLOCK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    tl.static_assert(BLOCK_N == SCALE_BLOCK)
+    tl.static_assert(BLOCK_K == SCALE_BLOCK)
+    route_count = num_tokens * top_k
+    scale_k = hidden_size // SCALE_BLOCK
+    inter_scale_k = intermediate_size // SCALE_BLOCK
+    up_scale_offset = inter_scale_k * scale_k
+    tile_idx = tl.program_id(0)
+    problem_start = 0
+    for expert_id in range(num_experts):
+        group_m = tl.load(expert_counts_ptr + expert_id)
+        num_m_tiles = tl.cdiv(group_m, BLOCK_M)
+        num_n_tiles = inter_scale_k
+        problem_tiles = num_m_tiles * num_n_tiles
+        expert_weight = w13_ptr + expert_id.to(tl.int64) * (
+            2 * intermediate_size * hidden_size
+        )
+        expert_scale = w13_scale_ptr + expert_id * 2 * up_scale_offset
+        while tile_idx >= problem_start and tile_idx < problem_start + problem_tiles:
+            tile_in_problem = tile_idx - problem_start
+            tile_m = tile_in_problem // num_n_tiles
+            tile_n = tile_in_problem % num_n_tiles
+            local_rows = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            row_mask = local_rows < group_m
+            route_ids = tl.load(
+                expert_route_ids_ptr + expert_id * route_count + local_rows,
+                mask=row_mask,
+                other=-1,
+            ).to(tl.int32)
+            token_ids = tl.where(row_mask, route_ids // top_k, 0).to(tl.int32)
+            n_offset = tile_n * BLOCK_N
+            gate_rows = n_offset + tl.arange(0, BLOCK_N)
+            up_rows = intermediate_size + gate_rows
+            gate_scale = expert_scale + tile_n * scale_k
+            up_scale = gate_scale + up_scale_offset
+            gate_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for k_offset in range(0, hidden_size, BLOCK_K):
+                k_cols = k_offset + tl.arange(0, BLOCK_K)
+                xq = tl.load(
+                    xq_ptr + token_ids[:, None] * hidden_size + k_cols[None, :],
+                    mask=row_mask[:, None],
+                    other=0.0,
+                )
+                xs = tl.load(
+                    xs_ptr + token_ids * scale_k + k_offset // SCALE_BLOCK,
+                    mask=row_mask,
+                    other=0.0,
+                )
+                gate = tl.load(
+                    expert_weight + gate_rows[:, None] * hidden_size + k_cols[None, :]
+                )
+                up = tl.load(
+                    expert_weight + up_rows[:, None] * hidden_size + k_cols[None, :]
+                )
+                scale_col = k_offset // SCALE_BLOCK
+                gate_acc += tl.dot(xq, gate.T) * (
+                    xs[:, None] * tl.load(gate_scale + scale_col)
+                )
+                up_acc += tl.dot(xq, up.T) * (
+                    xs[:, None] * tl.load(up_scale + scale_col)
+                )
+            activated = _swiglu(
+                gate_acc,
+                up_acc,
+                swiglu_alpha,
+                swiglu_limit,
+                swiglu_beta,
+                HAS_LIMIT,
+            )
+            # Round to BF16 first, as the BF16 path stores it, then quantize the
+            # tile's 128 columns per row.
+            activated = activated.to(tl.bfloat16).to(tl.float32)
+            scale = tl.maximum(tl.max(tl.abs(activated), axis=1), 1e-10) / 448.0
+            inter_offsets = route_ids[:, None] * intermediate_size + gate_rows[None, :]
+            tl.store(
+                inter_q_ptr + inter_offsets,
+                (activated / scale[:, None]).to(tl.float8e4nv),
+                mask=row_mask[:, None],
+            )
+            tl.store(
+                inter_s_ptr + route_ids * inter_scale_k + tile_n,
+                scale,
+                mask=row_mask,
+            )
+            tile_idx += num_programs
+        problem_start += problem_tiles
+
+
+@triton.jit
+def _stage2_fp8_act_kernel(
+    inter_q_ptr,
+    inter_s_ptr,
+    w2_ptr,
+    w2_scale_ptr,
+    route_output_ptr,
+    expert_route_ids_ptr,
+    expert_counts_ptr,
+    num_tokens,
+    num_programs,
+    hidden_size: tl.constexpr,
+    intermediate_size: tl.constexpr,
+    num_experts: tl.constexpr,
+    top_k: tl.constexpr,
+    SCALE_BLOCK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    tl.static_assert(SCALE_BLOCK % BLOCK_N == 0)
+    tl.static_assert(BLOCK_K == SCALE_BLOCK)
+    route_count = num_tokens * top_k
+    scale_k = intermediate_size // SCALE_BLOCK
+    tile_idx = tl.program_id(0)
+    problem_start = 0
+    for expert_id in range(num_experts):
+        group_m = tl.load(expert_counts_ptr + expert_id)
+        num_m_tiles = tl.cdiv(group_m, BLOCK_M)
+        num_n_tiles = tl.cdiv(hidden_size, BLOCK_N)
+        problem_tiles = num_m_tiles * num_n_tiles
+        expert_weight = w2_ptr + expert_id.to(tl.int64) * (
+            hidden_size * intermediate_size
+        )
+        expert_scale = w2_scale_ptr + expert_id * (hidden_size // SCALE_BLOCK * scale_k)
+        while tile_idx >= problem_start and tile_idx < problem_start + problem_tiles:
+            tile_in_problem = tile_idx - problem_start
+            tile_m = tile_in_problem // num_n_tiles
+            tile_n = tile_in_problem % num_n_tiles
+            local_rows = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            row_mask = local_rows < group_m
+            route_ids = tl.load(
+                expert_route_ids_ptr + expert_id * route_count + local_rows,
+                mask=row_mask,
+                other=-1,
+            ).to(tl.int32)
+            route_ids = tl.where(row_mask, route_ids, -1).to(tl.int32)
+            n_offset = tile_n * BLOCK_N
+            weight_rows = n_offset + tl.arange(0, BLOCK_N)
+            weight_scale = expert_scale + n_offset // SCALE_BLOCK * scale_k
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for k_offset in range(0, intermediate_size, BLOCK_K):
+                k_cols = k_offset + tl.arange(0, BLOCK_K)
+                aq = tl.load(
+                    inter_q_ptr
+                    + route_ids[:, None] * intermediate_size
+                    + k_cols[None, :],
+                    mask=row_mask[:, None],
+                    other=0.0,
+                )
+                a_scale = tl.load(
+                    inter_s_ptr + route_ids * scale_k + k_offset // SCALE_BLOCK,
+                    mask=row_mask,
+                    other=0.0,
+                )
+                weight = tl.load(
+                    expert_weight
+                    + weight_rows[:, None] * intermediate_size
+                    + k_cols[None, :]
+                )
+                acc += tl.dot(aq, weight.T) * (
+                    a_scale[:, None] * tl.load(weight_scale + k_offset // SCALE_BLOCK)
+                )
+            output_offsets = route_ids[:, None] * hidden_size + weight_rows[None, :]
+            tl.store(route_output_ptr + output_offsets, acc, mask=row_mask[:, None])
+            tile_idx += num_programs
+        problem_start += problem_tiles
+
+
+def _fp8_act_is_compute_bound(route_count: int, num_experts: int) -> bool:
+    """Whether the FP8-activation kernels pay off: from 64 routed rows per expert
+    on average the GEMMs are compute bound; below, the expert weight reads
+    dominate and the extra quantization launch only costs (ops/moe/README.md)."""
+    return route_count >= 64 * num_experts
+
+
+def _fp8_act_row_tile(route_count: int, num_experts: int) -> int:
+    """Rows per tile from the mean routed rows per expert (64 up to 255, else 128)."""
+    return 64 if route_count < 256 * num_experts else 128
+
+
+def _triton_fp8_act_moe_impl(
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    num_tokens, hidden_size = x.shape
+    num_experts, twice_intermediate_size, _ = w.w13_weight.shape
+    intermediate_size = twice_intermediate_size // 2
+    top_k = topk_ids.shape[1]
+    if num_tokens == 0:
+        return torch.empty_like(x)
+    if not _fp8_act_is_compute_bound(num_tokens * top_k, num_experts):
+        return _triton_fp8_moe_impl(x, w, topk_weights, topk_ids)
+    swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_params(w)
+    expert_route_ids, expert_counts, route_output, output = _prepare_routed_output(
+        x, topk_ids, num_experts
+    )
+    route_count = num_tokens * top_k
+    x_q = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
+    x_scale = torch.empty(
+        (num_tokens, hidden_size // _FP8_BLOCK), device=x.device, dtype=torch.float32
+    )
+    _quantize_rows_kernel[(num_tokens, hidden_size // _FP8_BLOCK)](
+        x, x_q, x_scale, hidden_size=hidden_size, GROUP=_FP8_BLOCK, num_warps=4
+    )
+    inter_q = torch.empty(
+        (route_count, intermediate_size), device=x.device, dtype=torch.float8_e4m3fn
+    )
+    inter_scale = torch.empty(
+        (route_count, intermediate_size // _FP8_BLOCK),
+        device=x.device,
+        dtype=torch.float32,
+    )
+    block_m = _fp8_act_row_tile(route_count, num_experts)
+    stage1_programs = _num_programs(
+        x.device, route_count, intermediate_size, _FP8_BLOCK
+    )
+    stage2_programs = _num_programs(x.device, route_count, hidden_size, _FP8_BLOCK)
+    _stage1_fp8_act_kernel[(stage1_programs,)](
+        x_q,
+        x_scale,
+        w.w13_weight,
+        w.w13_weight_scale_inv,
+        inter_q,
+        inter_scale,
+        expert_route_ids,
+        expert_counts,
+        num_tokens,
+        stage1_programs,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=1.0 if swiglu_limit is None else swiglu_limit,
+        swiglu_beta=swiglu_beta,
+        HAS_LIMIT=swiglu_limit is not None,
+        SCALE_BLOCK=_FP8_BLOCK,
+        BLOCK_M=block_m,
+        BLOCK_N=_FP8_BLOCK,
+        BLOCK_K=_FP8_BLOCK,
+        num_warps=8,
+        num_stages=3,
+    )
+    _stage2_fp8_act_kernel[(stage2_programs,)](
+        inter_q,
+        inter_scale,
+        w.w2_weight,
+        w.w2_weight_scale_inv,
+        route_output,
+        expert_route_ids,
+        expert_counts,
+        num_tokens,
+        stage2_programs,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        SCALE_BLOCK=_FP8_BLOCK,
+        BLOCK_M=block_m,
+        BLOCK_N=_FP8_BLOCK,
+        BLOCK_K=_FP8_BLOCK,
+        num_warps=8,
+        num_stages=3,
+    )
+    _combine(route_output, topk_weights, output, None, 0)
+    return output

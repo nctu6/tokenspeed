@@ -82,6 +82,7 @@ def _kv_producer_options(args: ServerArgs, *, draft_dtype: str) -> dict[str, Any
             (args.draft_moe_backend or args.moe_backend) if draft_dtype else ""
         ),
         "moe_mxfp4_fp8_activation": args.moe_mxfp4_fp8_activation,
+        "moe_block_fp8_fp8_activation": args.moe_block_fp8_fp8_activation,
         "all2all_backend": args.all2all_backend,
         "deepep_mode": args.deepep_mode,
         "attn_head_tp_size": mapping.attn.head_tp_size,

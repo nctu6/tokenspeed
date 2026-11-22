@@ -680,6 +680,9 @@ class ServerArgs:
     # Opt-in: run MXFP4 routed experts with FP8 activations (FlashInfer cutlass
     # W4A8 on Hopper). Off keeps the checkpoint's BF16 activation contract.
     moe_mxfp4_fp8_activation: bool = False
+    # Opt-in: run block-FP8 routed experts with FP8 activations (E4M3 tensor-core
+    # GEMMs, per-row 128-column scales). Off keeps BF16 activations.
+    moe_block_fp8_fp8_activation: bool = False
     all2all_backend: str = "none"
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
@@ -4219,6 +4222,20 @@ class ServerArgs:
             "every MXFP4 expert layer, target and draft; the MoE plan fails at "
             "startup where the selected backend has no FP8-activation kernel for "
             "the layer.",
+        )
+        parser.add_argument(
+            "--moe-block-fp8-fp8-activation",
+            action="store_true",
+            help="Run block-FP8 routed experts with FP8 activations: both expert "
+            "GEMMs run E4M3 x E4M3 on the tensor cores, with the activations "
+            "quantized per row and 128 columns (the W8A8 scheme of vLLM's "
+            "block-FP8 MoE). On SM120 the Triton leaf is 1.1-1.4x faster from "
+            "2048 tokens per step (smaller steps keep BF16 activations) and "
+            "about 4% relative error is added to the expert outputs; validate "
+            "the served model before relying on it. "
+            "Applies to every block-FP8 expert layer, target and draft; the MoE "
+            "plan fails at startup where no FP8-activation kernel serves the "
+            "layer.",
         )
         parser.add_argument(
             "--draft-moe-backend",

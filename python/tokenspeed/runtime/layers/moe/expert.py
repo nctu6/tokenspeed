@@ -312,6 +312,23 @@ class MoELayer(torch.nn.Module):
                     "drop the flag for this model"
                 )
             internal_activation_dtype = "fp8"
+        # --moe-block-fp8-fp8-activation: FP8 activations for every block-FP8
+        # routed expert layer. A layer that is not block-FP8 cannot honour it
+        # and rejects it, and so does a model that pins another precision.
+        if global_server_args_dict["moe_block_fp8_fp8_activation"]:
+            if self._quant_kind != "fp8":
+                raise ValueError(
+                    "--moe-block-fp8-fp8-activation applies to block-FP8 routed "
+                    f"experts; {self.prefix!s} stores them as {self._quant_kind!s}"
+                )
+            if self._internal_activation_dtype_override not in (None, "fp8"):
+                raise ValueError(
+                    "--moe-block-fp8-fp8-activation asks for FP8 activations, but "
+                    f"{self.prefix!s} pins its experts to "
+                    f"{self._internal_activation_dtype_override!r} activations; "
+                    "drop the flag for this model"
+                )
+            internal_activation_dtype = "fp8"
         if self._internal_activation_dtype_override is not None:
             internal_activation_dtype = self._internal_activation_dtype_override
 

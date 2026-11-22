@@ -36,7 +36,14 @@ from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
-def _layer(monkeypatch, quant_config, *, flag: bool, override=None):
+def _layer(
+    monkeypatch,
+    quant_config,
+    *,
+    flag: bool,
+    override=None,
+    block_fp8_flag: bool = False,
+):
     plans = []
 
     def fake_plan(weight_dtype, **kwargs):
@@ -46,6 +53,9 @@ def _layer(monkeypatch, quant_config, *, flag: bool, override=None):
     monkeypatch.setattr(expert_module, "kernel_moe_plan", fake_plan)
     monkeypatch.setattr(expert_module, "create_layer_weights", lambda *a, **k: None)
     monkeypatch.setitem(global_server_args_dict, "moe_mxfp4_fp8_activation", flag)
+    monkeypatch.setitem(
+        global_server_args_dict, "moe_block_fp8_fp8_activation", block_fp8_flag
+    )
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
     MoELayer(
         top_k=2,
@@ -121,3 +131,46 @@ def test_flag_is_accepted_for_any_backend_and_fails_closed_in_the_plan():
             ["--model", "x", "--moe-mxfp4-fp8-activation", *argv]
         )
         assert args.moe_mxfp4_fp8_activation
+
+
+def _block_fp8():
+    return Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        ignored_layers=[],
+        weight_block_size=[128, 128],
+    )
+
+
+def test_block_fp8_flag_plans_fp8_activations_for_block_fp8_experts(monkeypatch):
+    plan = _layer(monkeypatch, _block_fp8(), flag=False, block_fp8_flag=True)
+    assert plan["weight_dtype"] == "fp8"
+    assert plan["internal_activation_dtype"] == "fp8"
+
+
+def test_without_the_block_fp8_flag_block_fp8_experts_keep_the_input_dtype(
+    monkeypatch,
+):
+    plan = _layer(monkeypatch, _block_fp8(), flag=False)
+    assert plan["internal_activation_dtype"] == "input"
+
+
+def test_block_fp8_flag_is_rejected_for_experts_that_are_not_block_fp8(monkeypatch):
+    with pytest.raises(ValueError, match="applies to block-FP8 routed experts"):
+        _layer(monkeypatch, _mxfp4(), flag=False, block_fp8_flag=True)
+
+
+def test_block_fp8_flag_is_rejected_when_the_model_pins_another_activation(
+    monkeypatch,
+):
+    with pytest.raises(ValueError, match="pins its experts to 'input'"):
+        _layer(
+            monkeypatch, _block_fp8(), flag=False, override="input", block_fp8_flag=True
+        )
+
+
+def test_block_fp8_flag_is_a_server_argument():
+    from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+    args = prepare_server_args(["--model", "x", "--moe-block-fp8-fp8-activation"])
+    assert args.moe_block_fp8_fp8_activation
+    assert not prepare_server_args(["--model", "x"]).moe_block_fp8_fp8_activation

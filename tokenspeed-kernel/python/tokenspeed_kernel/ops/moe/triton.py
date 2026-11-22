@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.moe._triton.decode_sigmoid_topk import (
     decode_sigmoid_bias_topk,
 )
 from tokenspeed_kernel.ops.moe._triton.fp8 import (
+    _triton_fp8_act_moe_impl,
     _triton_fp8_moe_impl,
     _validate_fp8_moe,
 )
@@ -756,6 +757,79 @@ def triton_fp8_block_precomputed_moe_apply(
         plan, x, w, topk_weights, topk_ids, do_finalize
     )
     return _triton_fp8_moe_impl(x, w, topk_weights, topk_ids)
+
+
+@register_kernel(
+    "moe",
+    "apply",
+    name="triton_fp8_block_fp8_act_precomputed_moe_apply",
+    solution="triton",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        vendor_min_arch_versions={"nvidia": ArchVersion(8, 9)},
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    traits={
+        "weight_dtype": frozenset({"fp8"}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({False}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({128}),
+        "hidden_alignment": frozenset({128}),
+        "internal_activation_dtype": frozenset({"fp8"}),
+        "fp8_scale_block_shape": frozenset({(128, 128)}),
+        "supports_bias": frozenset({False}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_fp8_block_fp8_act_precomputed_moe_apply(
+    plan: dict,
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    num_tokens_global: int | None = None,
+    max_num_tokens_per_gpu: int | None = None,
+    do_finalize: bool = True,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Apply 128x128 block-scaled E4M3 experts to E4M3-quantized activations.
+
+    Like `triton_fp8_block_precomputed_moe_apply`, but both GEMMs run FP8 x FP8
+    on the tensor cores. The activations are quantized per row and 128 columns
+    (FP32 scale, the block layout of the weights): `x` on entry and the SwiGLU
+    output inside stage 1. This adds the error of two FP8 roundings of the
+    activations (about 4% relative on the expert output of random data, the
+    error of any FP8 W8A8 MoE) and is 1.1-1.4x faster from 2048 tokens (64 routed
+    rows per expert), where the GEMMs are compute bound. Smaller batches run
+    the BF16-multiply kernels of `triton_fp8_block_precomputed_moe_apply`: they
+    tie there and the extra quantization launch would cost (ops/moe/README.md).
+
+    Args:
+        plan: MoE plan selecting SiLU/SwiGLU activation (`swiglu_arg` limit,
+            alpha and `swiglu_beta` on `w` apply to either name).
+        x: Contiguous BF16 hidden states `[tokens, hidden]`.
+        w: Module with contiguous E4M3 `w13_weight` `[E, 2I, H]` and
+            `w2_weight` `[E, H, I]`, plus FP32 `w13_weight_scale_inv`
+            `[E, 2I/128, H/128]` and `w2_weight_scale_inv` `[E, H/128, I/128]`.
+        router_logits: Unused because routing must be precomputed.
+        topk_weights: Route weights `[tokens, top_k]`.
+        topk_ids: Expert ids `[tokens, top_k]`. Out-of-range ids contribute zero.
+        num_tokens_global: Unused; distributed expert parallelism is unsupported.
+        max_num_tokens_per_gpu: Unused token-capacity hint.
+        do_finalize: Must be true.
+        enable_pdl: Unused launch hint.
+
+    Returns:
+        Finalized BF16 hidden states `[tokens, hidden]`.
+    """
+    topk_weights, topk_ids = _validate_fp8_moe(
+        plan, x, w, topk_weights, topk_ids, do_finalize
+    )
+    return _triton_fp8_act_moe_impl(x, w, topk_weights, topk_ids)
 
 
 # ===-----------------------------------------------------------------------===#
