@@ -105,6 +105,16 @@ def _require_diffusers():
         ) from exc
 
 
+def place_resident(pipe, device: str, enable_cpu_offload: bool):
+    """Put a loaded pipeline's components on ``device`` unless offload manages them.
+
+    ``load_components`` leaves the weights on the host. With CPU offload the
+    components manager moves them per use; without it nothing else does, and
+    every denoise step would run on the CPU.
+    """
+    return pipe if enable_cpu_offload else pipe.to(device)
+
+
 class H3Pipeline:
     """Load once, generate many. Single-flight: caller serializes jobs."""
 
@@ -209,6 +219,9 @@ class H3Pipeline:
                     self.model_path, components_manager=text_mgr
                 )
                 conditioner.load_components(dtype=dtype)
+                conditioner = place_resident(
+                    conditioner, "cuda:1", self.config.enable_cpu_offload
+                )
 
                 rest_mgr = ComponentsManager()
                 if self.config.enable_cpu_offload:
@@ -218,6 +231,7 @@ class H3Pipeline:
                     )
                 rest = flow.init_pipeline(self.model_path, components_manager=rest_mgr)
                 rest.load_components(dtype=dtype)
+                rest = place_resident(rest, "cuda:0", self.config.enable_cpu_offload)
                 self._apply_audio_shift(rest)
                 self._pipe = ("split", conditioner, rest)
                 logger.info(
@@ -242,6 +256,7 @@ class H3Pipeline:
         if workflow is not None:
             load_kwargs["workflow"] = workflow
         pipe.load_components(**load_kwargs)
+        pipe = place_resident(pipe, device, self.config.enable_cpu_offload)
         self._apply_audio_shift(pipe)
         self._pipe = ("single", pipe)
         logger.info(
