@@ -27,7 +27,10 @@
 #     ENABLE_DSPARK=0 to get MegaMoE (the engine logs `DeepSeek V4.1 default
 #     moe_backend=...` with the reason). MegaMoE gain over Marlin, measured
 #     without DSPARK on the 128-expert TP2 subset: TPOT -1% to -13%, input
-#     tok/s +15% at C=128.
+#     tok/s +15% at C=128. DSPARK is still the faster default on SM120: RAG
+#     12000-char prompts, 256 output tokens, TP2, MAX_NUM_SEQS=256, out tok/s at
+#     C=1/16/64/256: DSPARK (Marlin) 276.9/1046.1/2197.7/3310.3 vs
+#     ENABLE_DSPARK=0 (MegaMoE) 110.7/668.6/1567.7/3271.2 (+150%/+56%/+40%/+1%).
 #   Hopper (sm90): marlin, plain TP.
 #
 # CUDA-graph memory with DSPARK: the decode graph scratch is about 11-13 MB per
