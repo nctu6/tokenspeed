@@ -1736,7 +1736,7 @@ def test_qwen_state_blocks_carry_no_attention_planes() -> None:
 
 def test_qwen_conv_windows_fill_a_free_state_segment() -> None:
     """When the SSM states leave a segment free, the conv windows pack into it and KV pages pad nothing."""
-    plan = _qwen_gdn_setup(2).spec.memory_plan
+    plan = _qwen_gdn_setup(1, gdn_layers_per_block=1).spec.memory_plan
     payload = {
         suffix: {
             field.payload_bytes
@@ -1745,14 +1745,47 @@ def test_qwen_conv_windows_fill_a_free_state_segment() -> None:
         }.pop()
         for suffix in (".ssm", ".conv")
     }
-
-    # Six GDN layers over four segments: two groups of three states, one segment left for their conv windows.
-    assert plan.lcm_block_bytes == 4 * payload[".ssm"]
+    # One GDN layer against the two segments of one attention layer: the conv window takes the second.
+    assert plan.lcm_block_bytes == 2 * payload[".ssm"]
     assert _page_padding(plan) == {
         FULL_ATTENTION: 0,
-        "linear_attention_0": payload[".ssm"] - 3 * payload[".conv"],
-        "linear_attention_1": payload[".ssm"] - 3 * payload[".conv"],
+        "linear_attention_0": payload[".ssm"] - payload[".conv"],
     }
+
+
+def test_qwen_splits_attention_layers_until_state_groups_fill_the_parent() -> None:
+    """12 attention layers and 36 GDN layers: one KV group of 24 segments leaves two state groups
+    a quarter empty, so the attention layers split in two and the parent shrinks to 12 segments.
+    """
+    setup = _qwen_gdn_setup(12)
+    plan = setup.spec.memory_plan
+    group_ids = sorted(group.group_id for group in plan.groups)
+    assert group_ids == [
+        f"{FULL_ATTENTION}_0",
+        f"{FULL_ATTENTION}_1",
+        f"{LINEAR_ATTENTION}_0",
+        f"{LINEAR_ATTENTION}_1",
+        f"{LINEAR_ATTENTION}_2",
+    ]
+    ssm_bytes = {
+        field.payload_bytes for field in plan.fields if field.field_id.endswith(".ssm")
+    }.pop()
+    conv_bytes = {
+        field.payload_bytes for field in plan.fields if field.field_id.endswith(".conv")
+    }.pop()
+    # A request holds one parent per state group: three of 12 segments instead of two of 24.
+    assert plan.lcm_block_bytes == 12 * ssm_bytes + 12 * conv_bytes
+    assert 3 * plan.lcm_block_bytes < 2 * 24 * ssm_bytes
+    padding = _page_padding(plan)
+    assert {padding[f"{LINEAR_ATTENTION}_{i}"] for i in range(3)} == {0}
+    assert padding[f"{FULL_ATTENTION}_0"] == 12 * conv_bytes
+    # Each KV group holds half of the attention layers.
+    layers_by_group = {}
+    for field in plan.fields:
+        if field.field_id.endswith(".k"):
+            layers_by_group.setdefault(field.group_id, []).append(field.field_id)
+    assert {len(layers) for layers in layers_by_group.values()} == {6}
+    assert setup.spec.token_capacity > 0
 
 
 def test_qwen_mtp_draft_layer_fills_state_segments() -> None:

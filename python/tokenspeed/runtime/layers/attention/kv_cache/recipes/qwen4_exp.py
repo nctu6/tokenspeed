@@ -96,6 +96,12 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
 
     @property
     @override
+    def _max_kv_groups(self) -> int:
+        """QSA and the PLE planes address the one ``full_attention`` group by name."""
+        return 1
+
+    @property
+    @override
     def prefix_granularity(self) -> int:
         """Return an identity grain compatible with every QSA logical page."""
         prefix_granularity = super().prefix_granularity

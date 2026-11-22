@@ -84,13 +84,16 @@ class QwenGDNRecipe(CacheRecipe):
     @cached_property
     def group_ids(self) -> tuple[str, ...]:
         group_ids = []
-        state_index = 0
+        state_index = attention_index = 0
         for label in self.layer_types:
             if label in STATE_LAYER_TYPES:
                 group_ids.append(f"{label}_{state_index % self._num_state_groups}")
                 state_index += 1
-            else:
+            elif self._num_kv_groups == 1:
                 group_ids.append(label)
+            else:
+                group_ids.append(f"{label}_{attention_index % self._num_kv_groups}")
+                attention_index += 1
         return tuple(group_ids)
 
     @cached_property
@@ -98,19 +101,85 @@ class QwenGDNRecipe(CacheRecipe):
         return sum(label in STATE_LAYER_TYPES for label in self.target_layer_types)
 
     @cached_property
-    def _num_segments(self) -> int:
-        """K/V segments of the KV group, a draft layer's included when it shares them."""
+    def _num_kv_layers(self) -> int:
+        """Attention layers the KV groups hold, a draft layer's included when it shares segments."""
         num_kv = len(self.target_layer_types) - self._num_state_layers
         if num_kv == 0:
             raise ValueError("Qwen3.5 cache requires at least one full-attention layer")
         if self.num_draft_layers and self._draft_shares_segments:
             num_kv += self.num_draft_layers
-        return 2 * num_kv
+        return num_kv
+
+    def _state_layout(self, num_kv_groups: int) -> tuple[int, int, bool]:
+        """State groups, segments per parent and conv-in-free-segments for ``num_kv_groups`` KV groups.
+
+        A KV group of ``n`` layers spans ``2 * n`` segments and sets the parent's
+        segment count; the state layers fill as many state groups of at most that
+        many SSM states as they need.
+        """
+        segments = 2 * math.ceil(self._num_kv_layers / num_kv_groups)
+        state_groups = max(math.ceil(self._num_state_layers / segments), 1)
+        states = math.ceil(self._num_state_layers / state_groups)
+        conv_shape, conv_dtype, ssm_shape, ssm_dtype = self._state_shapes
+        per_segment = (math.prod(ssm_shape) * cache_dtype_bytes(ssm_dtype)) // (
+            math.prod(conv_shape) * cache_dtype_bytes(conv_dtype)
+        )
+        return state_groups, segments, per_segment * (segments - states) >= states
+
+    @property
+    def _max_kv_groups(self) -> int:
+        """Most KV groups the family accepts: one per attention layer.
+
+        A family whose side groups or kernels address the one ``full_attention``
+        group by name pins this to 1.
+        """
+        return self._num_kv_layers
+
+    @cached_property
+    def _num_kv_groups(self) -> int:
+        """KV groups that minimize the bytes of the state parents one request holds.
+
+        Every request holds one parent per state group, so the parent's bytes
+        times the state-group count is the fixed cost per request, while KV
+        pages share parents among requests. One KV group of ``n`` layers sets
+        the parent to ``2 * n`` segments, and the state layers then fill it only
+        in whole state groups: 36 states against 24 segments take two groups of
+        18 and leave six segments of each parent empty. Splitting the attention
+        layers into more KV groups shrinks the parent until the state groups
+        fill it. The first count with the fewest bytes wins, so a layout that
+        needs no split keeps one KV group. A draft layer of other K/V bytes pads
+        every state group by its own planes, which this count does not model, so
+        that layout keeps one KV group.
+        """
+        if self._num_state_layers == 0:
+            return 1
+        if self.num_draft_layers and not self._draft_shares_segments:
+            return 1
+        _, _, ssm_shape, ssm_dtype = self._state_shapes
+        segment_bytes = math.prod(ssm_shape) * cache_dtype_bytes(ssm_dtype)
+        conv_shape, conv_dtype, _, _ = self._state_shapes
+        conv_bytes = math.prod(conv_shape) * cache_dtype_bytes(conv_dtype)
+
+        def state_bytes(num_kv_groups: int) -> int:
+            state_groups, segments, conv_fits = self._state_layout(num_kv_groups)
+            states = math.ceil(self._num_state_layers / state_groups)
+            conv = 0 if conv_fits else states * conv_bytes
+            return state_groups * (segments * segment_bytes + conv)
+
+        return min(
+            range(1, self._max_kv_groups + 1),
+            key=lambda num_kv_groups: (state_bytes(num_kv_groups), num_kv_groups),
+        )
+
+    @cached_property
+    def _num_segments(self) -> int:
+        """K/V segments of one KV group, a draft layer's included when it shares them."""
+        return self._state_layout(self._num_kv_groups)[1]
 
     @cached_property
     def _num_state_groups(self) -> int:
-        """State groups of at most as many SSM states as the KV group has K/V segments."""
-        return max(math.ceil(self._num_state_layers / self._num_segments), 1)
+        """State groups of at most as many SSM states as a KV group has K/V segments."""
+        return self._state_layout(self._num_kv_groups)[0]
 
     @cached_property
     def _conv_planes(self) -> tuple[str, ...]:
@@ -120,7 +189,7 @@ class QwenGDNRecipe(CacheRecipe):
         per_segment = (math.prod(ssm_shape) * cache_dtype_bytes(ssm_dtype)) // (
             math.prod(conv_shape) * cache_dtype_bytes(conv_dtype)
         )
-        if per_segment * (self._num_segments - states) < states:
+        if not self._state_layout(self._num_kv_groups)[2]:
             return tuple(f"conv.{occurrence}" for occurrence in range(states))
         return tuple(
             f"unit.{self._num_segments - 1 - occurrence // per_segment}"
