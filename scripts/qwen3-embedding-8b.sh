@@ -68,6 +68,8 @@
 #   CUDA_DEVICES=6,7 TENSOR_PARALLEL_SIZE=2 VLLM_BATCH_INVARIANT=1 \
 #     ./scripts/qwen3-embedding-8b.sh
 #
+#   EXTRA_SERVE_ARGS     extra serve args (space-separated), appended verbatim.
+#
 # Smoke probe (after server is up):
 #   curl -sS http://127.0.0.1:${HOST_PORT}/v1/embeddings \
 #     -H 'Content-Type: application/json' \
@@ -263,4 +265,10 @@ if [[ -n "$DISABLE_NCCL_NVLS" ]]; then
     export NCCL_NVLS_ENABLE=0
 fi
 
+# Extra serve args (space-separated), appended verbatim, e.g. EXTRA_SERVE_ARGS="--chunked-prefill-size 4096".
+if [[ -n "${EXTRA_SERVE_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206
+    _extra=($EXTRA_SERVE_ARGS)
+    cmd+=("${_extra[@]}")
+fi
 exec "${cmd[@]}"

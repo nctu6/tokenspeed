@@ -330,4 +330,10 @@ if [[ -n "$DISABLE_NCCL_NVLS" ]]; then
     export NCCL_NVLS_ENABLE=0
 fi
 
+# Extra serve args (space-separated), appended verbatim, e.g. EXTRA_SERVE_ARGS="--chunked-prefill-size 4096".
+if [[ -n "${EXTRA_SERVE_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206
+    _extra=($EXTRA_SERVE_ARGS)
+    cmd+=("${_extra[@]}")
+fi
 exec "${cmd[@]}"
