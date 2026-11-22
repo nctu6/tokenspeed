@@ -607,6 +607,9 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                     [
                         "text",
                         "output_ids",
+                        # A pooled vector is hidden_size floats (74 KB of log
+                        # text per request for a 4096-wide model).
+                        "embedding",
                     ]
                 )
             elif self.log_requests_level == 1:
