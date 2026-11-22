@@ -44,9 +44,15 @@
 #   Prefill graphs stop at 1024 tokens (--prefill-graph-max-tokens 1024): the
 #   8192-token bucket ladder reserves 2.3 GB of the 96 GB card (CUDA-graph
 #   memory reserve, 56 buckets), which the KV pool gets back (19.9 -> 21.7 GB at
-#   TP1; more concurrent 12000-char RAG requests fit). TP1 RAG, 256 output
-#   tokens, MAX_NUM_SEQS=512: see the numbers below. Longer chunks still run,
-#   without a graph.
+#   TP1; more concurrent 12000-char RAG requests fit). Longer chunks still
+#   run, without a graph. RAG, 256 output tokens, MAX_NUM_SEQS=512, out tok/s at
+#   C=1/16/64/256 (vLLM 0.32.0 in brackets):
+#     TP1 23.1/264.7/364.8/360.6 (22.3/250.6/379.5/378.1); 339.7/344.7 at C=64/256
+#         before this default;
+#     TP2 42.9/479.8/931.4/1090.4 (41.2/444.1/869.1/975.2).
+#   MAX_CUDAGRAPH_CAPTURE_SIZE=128 adds 4% at TP1 C=64/256 (379.9/377.5) by
+#   shrinking the decode graph reserve, but decode batches above 128 then run
+#   without a graph, so it is opt-in.
 #   Long context: one 8192-token prefill chunk is reserved per sliding-window
 #   group, so a 262144-token request does not fit the KV pool of one 96 GB GPU
 #   (single-request limit 199614 at TP1). With MAX_MODEL_LEN above 199000 the
