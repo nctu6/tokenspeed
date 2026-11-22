@@ -33,7 +33,11 @@ off prefix caching, opens the prefill chunk budget to `--max-prefill-tokens`
 so a prompt is never split (a pooled vector reduces over the whole prompt, so
 `--max-prefill-tokens` must be at least the context length), and disables the
 overlap schedule. Speculative decoding is rejected. No decode CUDA graph is
-captured, as for the prefill role of a disaggregated deployment.
+captured, as for the prefill role of a disaggregated deployment. The engine
+holds each request's prompt tokens against that chunk budget until its vector
+returns, so the prompts waiting at the scheduler (a `/v1/embeddings` call with
+many inputs, or many clients) fit one scheduling round and none is cut into a
+partial chunk; the rest wait in arrival order.
 
 `ts serve` on an embedding checkpoint does not start the smg gateway (its
 engine protocol has no embedding RPC). It serves OpenAI-compatible

@@ -80,6 +80,7 @@ from tokenspeed.runtime.engine.protocol import EngineClient
 from tokenspeed.runtime.engine.scheduler_control_client import (
     SchedulerControlClient,
 )
+from tokenspeed.runtime.engine.token_budget import TokenBudget
 from tokenspeed.runtime.entrypoints import rl_control
 from tokenspeed.runtime.metrics.collector import RequestMetrics
 from tokenspeed.runtime.metrics.service import metrics_service
@@ -156,6 +157,17 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.is_image_gen = self.model_config.is_image_gen
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
+        # A pooling request is prefilled whole. Holding every prompt's tokens
+        # until its vector returns keeps the prompts waiting at the scheduler
+        # within one round's token budget, so none is cut into a partial chunk
+        # (see TokenBudget). None for generative models.
+        self.pooling_budget: TokenBudget | None = (
+            None
+            if self.is_generation or self.is_image_gen
+            else TokenBudget(
+                min(server_args.max_prefill_tokens, server_args.chunked_prefill_size)
+            )
+        )
         # Create tokenizer. The engine never preprocesses images -- the SMG
         # gateway ships precomputed multimodal inputs -- so even multimodal
         # models only need the tokenizer, not the full HF AutoProcessor.
@@ -286,7 +298,9 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
         async with self.model_update_lock.reader_lock:
             is_single = obj.is_single
-            if is_single:
+            if self.pooling_budget is not None and isinstance(obj, EmbeddingReqInput):
+                yield await self._generate_pooled(obj, created_time)
+            elif is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
                 self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj):
@@ -294,6 +308,28 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             else:
                 async for response in self._handle_batch_request(obj, created_time):
                     yield response
+
+    async def _generate_pooled(
+        self, obj: EmbeddingReqInput, created_time: float
+    ) -> dict | list[dict]:
+        """Embed one input or a batch; a batch returns its outputs in input order.
+
+        Every input holds its prompt tokens in ``pooling_budget`` from the
+        moment it is sent until its vector returns.
+        """
+
+        async def one(item: EmbeddingReqInput) -> dict:
+            tokenized_obj = await self._tokenize_one_request(item)
+            async with self.pooling_budget.hold(len(tokenized_obj.input_ids)):
+                self._send_one_request(item, tokenized_obj, created_time)
+                output = None
+                async for output in self._wait_one_response(item):
+                    pass
+                return output
+
+        if obj.is_single:
+            return await one(obj)
+        return list(await asyncio.gather(*(one(obj[i]) for i in range(obj.batch_size))))
 
     async def _tokenize_one_request(
         self,
