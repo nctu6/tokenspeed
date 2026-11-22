@@ -705,6 +705,26 @@ TPOT); the GEMMs are 165 us. Not done: the barrier skew between ranks, which
 is most of the 0.8-1.05 ms the serving trace shows for the two barriers, does
 not shrink with fusion.
 
+## Triton FP8 MoE tiles
+`triton_fp8_block_precomputed_moe_apply` (`_triton/fp8.py`) runs both GEMMs
+with 128 weight columns per tile, 8 warps and 3 stages. The row tile is 16
+rows while the routed rows per expert average 16 or fewer
+(`routes <= 16 * experts`), else 32. Measured on an RTX PRO 6000 (SM120) at
+the Qwen3.5-122B-A10B TP2 geometry (256 experts, top-8, hidden 3072,
+intermediate 512), per MoE layer:
+
+| tokens | 32 columns, 16/64 rows | 128 columns, 16/32 rows |
+| ---: | ---: | ---: |
+| 4 | 0.132 ms | 0.112 ms |
+| 32 | 0.791 ms | 0.552 ms |
+| 256 | 1.186 ms | 0.861 ms |
+| 1024 | 1.296 ms | 0.993 ms |
+| 8192 | 5.491 ms | 3.401 ms |
+
+Outputs are bit-identical: the tile shape changes neither the K order of a dot
+nor the route combine. 64- and 128-row tiles were slower at every size, and
+four stages do not fit the 128-column tile in SM120 shared memory.
+
 ## Triton MXFP4 expert offsets
 The Triton MXFP4 stage kernels advance every expert base (weights, scales,
 biases, route ids) in int64. At the V4.1 shapes (384 experts, hidden 5120,

@@ -210,16 +210,21 @@ def test_triton_fp8_moe_token_count():
         counts = (
             tokens,
             routes,
-            _common._num_programs(x.device, routes, intermediate_size, 32),
-            _common._num_programs(x.device, routes, hidden_size, 32),
+            _common._num_programs(x.device, routes, intermediate_size, 128),
+            _common._num_programs(x.device, routes, hidden_size, 128),
         )
-        # Up to 16 tokens take the small row tile, up to 128 routes the small
-        # routing block.
-        return (*map(int_specialization_class, counts), tokens <= 16, routes <= 128)
+        # Up to 16 routed rows per expert take the small row tile, up to 128
+        # routes the small routing block.
+        return (
+            *map(int_specialization_class, counts),
+            routes <= 16 * num_experts,
+            routes <= 128,
+        )
 
     # Tokens are independent: a shorter batch is a prefix of one that uses
     # the same row tile.
-    small, full = run(16), run(max_tokens)
+    small_tile_tokens = 16 * num_experts // top_k
+    small, full = run(small_tile_tokens), run(max_tokens)
     sweep = (3, 7, 12, 24, 100, 300, 1000, 1483)
     warm_specialization_classes(run, key, sweep, range(1, max_tokens))
     with assert_no_triton_compile(
@@ -229,5 +234,5 @@ def test_triton_fp8_moe_token_count():
         _common._combine_kernel,
     ):
         for tokens in sweep:
-            expected = small if tokens <= 16 else full
+            expected = small if tokens <= small_tile_tokens else full
             torch.testing.assert_close(run(tokens), expected[:tokens], rtol=0, atol=0)

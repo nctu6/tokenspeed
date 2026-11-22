@@ -292,9 +292,13 @@ def _triton_fp8_moe_impl(
     intermediate = torch.empty(
         (route_count, intermediate_size), device=x.device, dtype=x.dtype
     )
-    block_m = 16 if num_tokens <= 16 else 64
-    block_n = 32
-    num_warps = 4 if block_m == 16 else 8
+    # Measured tiles (ops/moe/README.md, "Triton FP8 MoE tiles"): 128 weight
+    # columns with 8 warps beat 32 columns from 1 to 8192 tokens. The row tile
+    # follows the mean routed rows per expert, the rows one tile of an expert
+    # covers: 16 rows up to 16 rows per expert, else 32.
+    block_m = 16 if route_count <= 16 * num_experts else 32
+    block_n = 128
+    num_warps = 8
     stage1_programs = _num_programs(x.device, route_count, intermediate_size, block_n)
     stage2_programs = _num_programs(x.device, route_count, hidden_size, block_n)
 
