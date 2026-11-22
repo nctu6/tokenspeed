@@ -37,7 +37,11 @@
 #   1 request -> Diffusers CP over all GPUs, N waiting -> one request per GPU.
 #   Recommended for throughput and latency: ULYSSES_DEGREE=2. text-encoder-TP still rejected
 #
-# SM120 (compute capability 12.x of the first CUDA_DEVICES GPU): nothing to
+# SM120 (compute capability 12.x of the first CUDA_DEVICES GPU): with 2 GPUs the
+# DiT context parallel (ULYSSES_DEGREE=2, all weights resident, no CPU offload) is
+# the default: t2va 672x384 2-step 0.245 req/s at c1 (device_split + offload 0.182,
+# vLLM-omni 0.236), 0.312 at c2 (0.184, 0.262), 25-step 0.0150 (0.0117, 0.0134).
+# Set ULYSSES_DEGREE=1 for the old layout. Otherwise nothing to
 # switch. This is a Diffusers pipeline with no attention backend, MoE backend,
 # quantization or CUDA graph knob that the SM120 leaves replace, and the script
 # forces none (the 2-GPU layout and CPU offload defaults are memory choices, the
@@ -156,8 +160,14 @@ MODEL_VARIANT="${MODEL_VARIANT:-${TASK_TYPE:-fl2va}}"
 TASK_TYPE="${TASK_TYPE:-$MODEL_VARIANT}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-$NUM_GPUS}"
 DTYPE="${DTYPE:-bfloat16}"
-# DiT Context Parallel (TokenSpeed ulysses residency). Default 1 = device_split path.
-ULYSSES_DEGREE="${ULYSSES_DEGREE:-${USP:-1}}"
+# DiT Context Parallel (TokenSpeed ulysses residency). Default 1 = device_split
+# path; on SM120 with 2 GPUs the default is 2 (measured vs device_split + offload,
+# t2va 672x384: 0.245 vs 0.182 req/s at c1, 0.312 vs 0.184 at c2, 75 GiB per GPU).
+_DEFAULT_USP=1
+if [[ "${_IS_SM120}" == 1 && "${NUM_GPUS}" == 2 ]]; then
+    _DEFAULT_USP=2
+fi
+ULYSSES_DEGREE="${ULYSSES_DEGREE:-${USP:-${_DEFAULT_USP}}}"
 RING_DEGREE="${RING_DEGREE:-1}"
 # ulysses residency keeps everything resident and rejects CPU offload.
 if [[ "${ULYSSES_DEGREE}" -gt 1 || "${RING_DEGREE}" -gt 1 ]]; then
