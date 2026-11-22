@@ -16,7 +16,8 @@
 #                        "SM120 defaults" below.
 #   PREFILL_GRAPH_MAX_TOKENS  default: 1024 on SM120, else empty (engine default).
 #                        Largest prefill CUDA-graph bucket; see "SM120 defaults".
-#   MAX_CUDAGRAPH_CAPTURE_SIZE  default: empty (ladder up to MAX_NUM_SEQS).
+#   MAX_CUDAGRAPH_CAPTURE_SIZE  default: 128 on SM120 at TENSOR_PARALLEL_SIZE=1,
+#                        else empty (ladder up to MAX_NUM_SEQS). See "SM120 defaults".
 #   DTYPE                default: bfloat16
 #   KV_CACHE_DTYPE       default: empty (omit flag)
 #   ATTENTION_BACKEND    default: empty (engine auto). Set e.g. triton to force.
@@ -39,8 +40,19 @@
 # SM120 defaults (RTX PRO 6000, compute capability 12.x of the first
 # CUDA_DEVICES GPU; explicit env always wins, other archs are unchanged):
 #   No attention/GEMM backend is forced: the engine picks the SM120 attention
-#   leaves and the DeepGEMM SM120 GEMM leaves, and the CUDA graph ladder runs up
-#   to MAX_NUM_SEQS (no capture cap is passed).
+#   leaves and the DeepGEMM SM120 GEMM leaves.
+#   The decode CUDA-graph ladder stops at 128 requests at TP1
+#   (--max-cudagraph-capture-size 128). One 96 GB GPU holds the weights (58.8 GB)
+#   and KV for only about 26K tokens (0.9 MB per token over 60 layers), so at most
+#   about 33 requests decode together on the 12000-char RAG load; the ladder up to
+#   MAX_NUM_SEQS=512 reserved 1.64 GB for graphs that are never used (decode graph
+#   memory is linear in the ladder top: 0.43/0.86/1.64 GB for 128/256/512). The
+#   KV pool grows 2248 -> 2371 parents (+5.5%): RAG out tok/s at C=64/256 +3.1/+3.2%
+#   (mean of 5/4 runs 376.2/376.9 vs 8/7 runs 365.0/365.2; vLLM 379.5/378.1). Short
+#   requests that do reach batches of 230-250 (64 in/64 out, 256 in/128 out at
+#   C=256) also gain 1.4/1.5%: a batch above 128 runs without a graph, which costs
+#   nothing measurable beside a 31B decode step. TP2 keeps the full ladder: it has
+#   room for batches above 128 and loses 6-8% with the cap (872/1001 vs 931/1090).
 #   Prefill graphs stop at 1024 tokens (--prefill-graph-max-tokens 1024): the
 #   8192-token bucket ladder reserves 2.3 GB of the 96 GB card (CUDA-graph
 #   memory reserve, 56 buckets), which the KV pool gets back (19.9 -> 21.7 GB at
@@ -50,9 +62,6 @@
 #     TP1 23.1/264.7/364.8/360.6 (22.3/250.6/379.5/378.1); 339.7/344.7 at C=64/256
 #         before this default;
 #     TP2 42.9/479.8/931.4/1090.4 (41.2/444.1/869.1/975.2).
-#   MAX_CUDAGRAPH_CAPTURE_SIZE=128 adds 4% at TP1 C=64/256 (379.9/377.5) by
-#   shrinking the decode graph reserve, but decode batches above 128 then run
-#   without a graph, so it is opt-in.
 #   Long context: one 8192-token prefill chunk is reserved per sliding-window
 #   group, so a 262144-token request does not fit the KV pool of one 96 GB GPU
 #   (single-request limit 199614 at TP1). With MAX_MODEL_LEN above 199000 the
@@ -118,6 +127,9 @@ PREFILL_GRAPH_MAX_TOKENS="${PREFILL_GRAPH_MAX_TOKENS:-}"
 MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-}"
 if [[ -z "$PREFILL_GRAPH_MAX_TOKENS" && "$_IS_SM120" == "1" ]]; then
     PREFILL_GRAPH_MAX_TOKENS=1024
+fi
+if [[ -z "$MAX_CUDAGRAPH_CAPTURE_SIZE" && "$_IS_SM120" == "1" && "$TENSOR_PARALLEL_SIZE" == "1" ]]; then
+    MAX_CUDAGRAPH_CAPTURE_SIZE=128
 fi
 if [[ -z "$CHUNKED_PREFILL_SIZE" && -z "$KV_CACHE_DTYPE" && "$_IS_SM120" == "1" && "$MAX_MODEL_LEN" -gt 199000 ]]; then
     CHUNKED_PREFILL_SIZE=1024
