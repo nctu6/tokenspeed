@@ -725,6 +725,34 @@ Outputs are bit-identical: the tile shape changes neither the K order of a dot
 nor the route combine. 64- and 128-row tiles were slower at every size, and
 four stages do not fit the 128-column tile in SM120 shared memory.
 
+## Triton FP8-activation MoE
+`triton_fp8_block_fp8_act_precomputed_moe_apply` (`_triton/fp8.py`,
+`internal_activation_dtype="fp8"`, opt-in through
+`--moe-block-fp8-fp8-activation`) runs both GEMMs as E4M3 x E4M3 `tl.dot`.
+`_quantize_rows_kernel` quantizes `x` with one FP32 scale per row and 128
+columns, the layout of the weight scale blocks, so a K step multiplies its FP32
+dot by the activation scale times the weight block scale. A stage-1 tile is one
+128-column scale group of the intermediate, so the epilogue rounds the SwiGLU
+output to BF16 (as the BF16 path stores it) and quantizes it in place; stage 2
+reads FP8 rows. Row tiles are 64 up to 255 routed rows per expert, else 128.
+
+The FP8 kernels run only from 64 routed rows per expert on average
+(`routes >= 64 * experts`, 2048 tokens at top-8 of 256 experts). Below that the
+weight reads dominate, both paths tie, and one or two tokens lose 0.72-0.85x to
+the quantization launch, so the leaf runs the BF16-multiply kernels there.
+Same GPU and geometries as above (256 experts, top-8, intermediate 512):
+
+| tokens | hidden 3072, BF16 multiply | FP8 activations | hidden 2048, BF16 multiply | FP8 activations |
+| ---: | ---: | ---: | ---: | ---: |
+| 2048 | 1.237 ms | 1.125 ms | 0.819 ms | 0.756 ms |
+| 4096 | 1.917 ms | 1.522 ms | 1.310 ms | 1.022 ms |
+| 8192 | 3.548 ms | 2.625 ms | 2.453 ms | 1.800 ms |
+| 16384 | 6.733 ms | 4.805 ms | 4.692 ms | 3.327 ms |
+
+The two activation roundings add 4.4% relative error on random data, measured
+against the BF16-multiply kernels. That is the error of a W8A8 block-FP8 MoE,
+which is why the leaf is opt-in.
+
 ## Triton MXFP4 expert offsets
 The Triton MXFP4 stage kernels advance every expert base (weights, scales,
 biases, route ids) in int64. At the V4.1 shapes (384 experts, hidden 5120,
