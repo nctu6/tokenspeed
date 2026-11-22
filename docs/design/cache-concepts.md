@@ -2003,11 +2003,26 @@ Hybrid recurrent recipes keep their groups balanced instead: every group's page
 spans the whole parent, so a parent is fully used only when every group fills
 the same planes. Both recipes size a plane segment to one SSM state and give an
 attention layer's K and V a segment each, so state pages carry no attention
-planes, and deal state layers round-robin. Qwen3.5 keeps its attention layers
-in one KV group, the full-history group drafters write through, and deals its
-state layers into groups of as many SSM states as that group has segments; a
-draft layer of a target attention layer's K/V bytes fills state segments, any
-other pads the state groups (`recipes/qwen35.py`). Nemotron-H's Mamba2 runs
+planes, and deal state layers round-robin. Qwen3.5 deals its state layers into
+groups of as many SSM states as a KV group has segments; a draft layer of a
+target attention layer's K/V bytes fills state segments, any other pads the
+state groups (`recipes/qwen35.py`).
+
+A request holds one parent per state group at every step, while KV pages share
+parents among requests, so the state parents' bytes set how many requests fit.
+A KV group of `n` layers sets the parent to `2 * n` segments and the states
+fill it only in whole groups: Qwen3.5-122B has 12 attention and 36 GDN layers,
+and one KV group of 24 segments takes two state groups of 18 states, leaving
+a quarter of each parent empty (96 MiB of state parents per request at TP2
+where 72 MiB hold the states). The recipe therefore counts the KV groups
+(`_num_kv_groups`): it picks the count whose state parents hold the fewest
+bytes per request (ties go to fewer groups), dealing the attention layers
+round-robin into `full_attention_<i>` groups as Nemotron-H does. Two KV groups
+of six layers give a 12-segment parent and three full state groups, 73.5 MiB
+per request. A layout that needs no split keeps the single `full_attention`
+group, as does a draft layer of other K/V bytes (it pads the state groups by
+its own planes) and the Qwen4-Exp family (QSA and the PLE planes name the one
+`full_attention` group). Nemotron-H's Mamba2 runs
 are four or five layers long; its recipe splits the attention layers into two
 KV groups (`recipes/mamba2.py`).
 Qwen3.5's state groups leave segments free, so its conv windows pack into them
