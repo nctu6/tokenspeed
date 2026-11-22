@@ -14,6 +14,9 @@
 #   CHUNKED_PREFILL_SIZE default: empty (engine default 8192). On SM120 with
 #                        MAX_MODEL_LEN above 199000 it defaults to 1024, see
 #                        "SM120 defaults" below.
+#   PREFILL_GRAPH_MAX_TOKENS  default: 1024 on SM120, else empty (engine default).
+#                        Largest prefill CUDA-graph bucket; see "SM120 defaults".
+#   MAX_CUDAGRAPH_CAPTURE_SIZE  default: empty (ladder up to MAX_NUM_SEQS).
 #   DTYPE                default: bfloat16
 #   KV_CACHE_DTYPE       default: empty (omit flag)
 #   ATTENTION_BACKEND    default: empty (engine auto). Set e.g. triton to force.
@@ -38,6 +41,12 @@
 #   No attention/GEMM backend is forced: the engine picks the SM120 attention
 #   leaves and the DeepGEMM SM120 GEMM leaves, and the CUDA graph ladder runs up
 #   to MAX_NUM_SEQS (no capture cap is passed).
+#   Prefill graphs stop at 1024 tokens (--prefill-graph-max-tokens 1024): the
+#   8192-token bucket ladder reserves 2.3 GB of the 96 GB card (CUDA-graph
+#   memory reserve, 56 buckets), which the KV pool gets back (19.9 -> 21.7 GB at
+#   TP1; more concurrent 12000-char RAG requests fit). TP1 RAG, 256 output
+#   tokens, MAX_NUM_SEQS=512: see the numbers below. Longer chunks still run,
+#   without a graph.
 #   Long context: one 8192-token prefill chunk is reserved per sliding-window
 #   group, so a 262144-token request does not fit the KV pool of one 96 GB GPU
 #   (single-request limit 199614 at TP1). With MAX_MODEL_LEN above 199000 the
@@ -99,6 +108,11 @@ case "$(tr '[:upper:]' '[:lower:]' <<<"${_CUDA_ARCH_RAW}" | tr -d '[:space:]_')"
     12.*|sm12*) _IS_SM120=1 ;;
 esac
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-}"
+PREFILL_GRAPH_MAX_TOKENS="${PREFILL_GRAPH_MAX_TOKENS:-}"
+MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-}"
+if [[ -z "$PREFILL_GRAPH_MAX_TOKENS" && "$_IS_SM120" == "1" ]]; then
+    PREFILL_GRAPH_MAX_TOKENS=1024
+fi
 if [[ -z "$CHUNKED_PREFILL_SIZE" && -z "$KV_CACHE_DTYPE" && "$_IS_SM120" == "1" && "$MAX_MODEL_LEN" -gt 199000 ]]; then
     CHUNKED_PREFILL_SIZE=1024
 fi
@@ -131,7 +145,7 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
-echo "[gemma4] sm120=${_IS_SM120} CUDA_DEVICES=${CUDA_DEVICES} TP=${TENSOR_PARALLEL_SIZE} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_NUM_SEQS=${MAX_NUM_SEQS} KV=${KV_CACHE_DTYPE:-auto} chunked_prefill=${CHUNKED_PREFILL_SIZE:-engine_default}" >&2
+echo "[gemma4] sm120=${_IS_SM120} CUDA_DEVICES=${CUDA_DEVICES} TP=${TENSOR_PARALLEL_SIZE} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_NUM_SEQS=${MAX_NUM_SEQS} KV=${KV_CACHE_DTYPE:-auto} chunked_prefill=${CHUNKED_PREFILL_SIZE:-engine_default} prefill_graph_max_tokens=${PREFILL_GRAPH_MAX_TOKENS:-engine_default} cudagraph_cap=${MAX_CUDAGRAPH_CAPTURE_SIZE:-max_num_seqs}" >&2
 cmd=(
     tokenspeed serve "$MODEL_PATH"
     --served-model-name "$SERVED_MODEL_NAME"
@@ -153,6 +167,12 @@ if [[ -n "$ATTENTION_BACKEND" ]]; then
 fi
 if [[ -n "$CHUNKED_PREFILL_SIZE" ]]; then
     cmd+=(--chunked-prefill-size "$CHUNKED_PREFILL_SIZE")
+fi
+if [[ -n "$PREFILL_GRAPH_MAX_TOKENS" ]]; then
+    cmd+=(--prefill-graph-max-tokens "$PREFILL_GRAPH_MAX_TOKENS")
+fi
+if [[ -n "$MAX_CUDAGRAPH_CAPTURE_SIZE" ]]; then
+    cmd+=(--max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE")
 fi
 if [[ -n "$GPU_MEMORY_UTILIZATION" ]]; then
     cmd+=(--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION")
