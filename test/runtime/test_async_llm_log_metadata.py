@@ -22,6 +22,7 @@
 A pooled vector is ``hidden_size`` floats; logging it at level 0 wrote a 74 KB
 line per embedding request on the engine's event-loop thread.
 """
+
 import os
 import sys
 
