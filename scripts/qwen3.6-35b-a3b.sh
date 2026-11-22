@@ -20,6 +20,9 @@
 #                        headroom. Use fp8 KV.)
 #   GPU_MEMORY_UTILIZATION  default: empty (engine default; VLM may clamp to 0.9).
 #                           Set e.g. 0.85 on tight cards after weights fit.
+#   PREFILL_GRAPH_MAX_TOKENS  default: 1024 on SM120, else empty (engine
+#                        default). Largest prefill CUDA-graph bucket; see
+#                        "SM120 defaults".
 #   DTYPE                default: bfloat16
 #   KV_CACHE_DTYPE       default: fp8 (unset/empty = omit flag)
 #   ATTENTION_BACKEND    default: empty (engine auto). Set e.g. triton to force.
@@ -76,6 +79,12 @@
 # CUDA graph capture cap is passed (the ladder runs up to MAX_NUM_SEQS).
 # MAX_MODEL_LEN 8192, MAX_NUM_SEQS 32, KV fp8 and GPU_MEMORY_UTILIZATION 0.85 are
 # memory limits of the ~67 GiB bf16 weights on one 96 GB GPU, not sm90 leftovers.
+# Prefill graphs stop at 1024 tokens (--prefill-graph-max-tokens 1024); the KV
+# pool gets the memory of the larger buckets back and longer chunks run without
+# a graph. RAG, 256 output tokens, MAX_NUM_SEQS=512, MAX_MODEL_LEN=32768,
+# GPU_MEMORY_UTILIZATION=0.9, out tok/s at C=16/64/256: 726.5/1369.5/2236.2 and
+# 725.5/1371.5/2233.1 (repeat) vs 726.1-726.5/1368.1-1370.0/2124.6-2149.6
+# without it (vLLM 0.32.0 699.2/1385.8/2205.3).
 #
 # Recommended invoke:
 #   # sm90 (H200) — single-GPU TP=1 on GPU 6
@@ -197,6 +206,10 @@ else
     MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
     GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-}"
 fi
+PREFILL_GRAPH_MAX_TOKENS="${PREFILL_GRAPH_MAX_TOKENS:-}"
+if [[ -z "$PREFILL_GRAPH_MAX_TOKENS" && "${_IS_SM120}" -eq 1 ]]; then
+    PREFILL_GRAPH_MAX_TOKENS=1024
+fi
 DTYPE="${DTYPE:-bfloat16}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"
@@ -250,7 +263,7 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
-echo "[qwen3.6-35b] arch=${_CUDA_ARCH:-unknown} gpu_mem=${_GPU_MEM_MIB:-unknown}MiB sm120=${_IS_SM120} CUDA_DEVICES=${CUDA_DEVICES} TP=${TENSOR_PARALLEL_SIZE} quant=${QUANTIZATION:-none} moe_backend=${MOE_BACKEND:-auto} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_NUM_SEQS=${MAX_NUM_SEQS} KV=${KV_CACHE_DTYPE:-auto} gpu_mem_util=${GPU_MEMORY_UTILIZATION:-engine_default} reasoning=${REASONING_PARSER:-none} tool_parser=${TOOL_CALL_PARSER:-none}" >&2
+echo "[qwen3.6-35b] arch=${_CUDA_ARCH:-unknown} gpu_mem=${_GPU_MEM_MIB:-unknown}MiB sm120=${_IS_SM120} CUDA_DEVICES=${CUDA_DEVICES} TP=${TENSOR_PARALLEL_SIZE} quant=${QUANTIZATION:-none} moe_backend=${MOE_BACKEND:-auto} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_NUM_SEQS=${MAX_NUM_SEQS} KV=${KV_CACHE_DTYPE:-auto} gpu_mem_util=${GPU_MEMORY_UTILIZATION:-engine_default} prefill_graph_max_tokens=${PREFILL_GRAPH_MAX_TOKENS:-engine_default} reasoning=${REASONING_PARSER:-none} tool_parser=${TOOL_CALL_PARSER:-none}" >&2
 
 cmd=(
     tokenspeed serve "$MODEL_PATH"
@@ -275,6 +288,9 @@ if [[ -n "$MOE_BACKEND" ]]; then
 fi
 if [[ -n "$GPU_MEMORY_UTILIZATION" ]]; then
     cmd+=(--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION")
+fi
+if [[ -n "$PREFILL_GRAPH_MAX_TOKENS" ]]; then
+    cmd+=(--prefill-graph-max-tokens "$PREFILL_GRAPH_MAX_TOKENS")
 fi
 if [[ -n "$KV_CACHE_DTYPE" ]]; then
     cmd+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
