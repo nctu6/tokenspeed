@@ -93,6 +93,29 @@ def test_embeddings_texts_and_usage(engine):
     assert engine.calls == [{"prompt": ["abc", "de"], "input_ids": None}]
 
 
+def test_embeddings_vector_survives_json_exactly(engine):
+    vector = np.random.default_rng(0).standard_normal(4096).astype(np.float32)
+    engine.encode = lambda prompt=None, input_ids=None: {
+        "embedding": vector.tolist(),
+        "meta_info": {"prompt_tokens": 3},
+    }
+    resp = _client(engine).post("/v1/embeddings", json={"input": "x"})
+    assert resp.headers["content-type"] == "application/json"
+    np.testing.assert_array_equal(
+        np.asarray(resp.json()["data"][0]["embedding"], dtype=np.float32), vector
+    )
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_embeddings_non_finite_vector_fails_instead_of_null(engine, bad):
+    engine.encode = lambda prompt=None, input_ids=None: {
+        "embedding": [0.5, bad],
+        "meta_info": {"prompt_tokens": 1},
+    }
+    with pytest.raises(RuntimeError, match="non-finite"):
+        _client(engine).post("/v1/embeddings", json={"input": "x"})
+
+
 def test_embeddings_single_token_list_is_one_input(engine):
     resp = _client(engine).post("/v1/embeddings", json={"input": [7, 8, 9]})
     assert resp.status_code == 200

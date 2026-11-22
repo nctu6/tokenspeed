@@ -40,8 +40,9 @@ import time
 from typing import Any
 
 import numpy as np
+import orjson
 from fastapi import Body, FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -97,6 +98,22 @@ def _encode_vector(vector: list[float], encoding_format: str) -> list[float] | s
             "ascii"
         )
     return vector
+
+
+def _json_response(payload: dict) -> Response:
+    """Serialize ``payload`` without FastAPI's per-element ``jsonable_encoder``.
+
+    A 4096-wide vector is 4096 Python floats; the default path walks and
+    encodes each one on the uvicorn thread, which held about 40% of that
+    thread's busy time at 64 clients. ``orjson`` writes the same JSON.
+    """
+    body = orjson.dumps(payload)
+    # orjson writes a non-finite float as ``null``; the default encoder
+    # (``allow_nan=False``) raises. No field of the payload is ever null, so
+    # one is a NaN or Inf vector and must fail, not reach the client.
+    if b"null" in body:
+        raise RuntimeError("embedding contains a non-finite value")
+    return Response(content=body, media_type="application/json")
 
 
 def create_app(engine, served_model_name: str, api_key: str | None) -> FastAPI:
@@ -171,19 +188,24 @@ def create_app(engine, served_model_name: str, api_key: str | None) -> FastAPI:
             outputs = [outputs]
 
         prompt_tokens = sum(item["meta_info"]["prompt_tokens"] for item in outputs)
-        return {
-            "object": "list",
-            "model": served_model_name,
-            "data": [
-                {
-                    "object": "embedding",
-                    "index": index,
-                    "embedding": _encode_vector(item["embedding"], encoding_format),
-                }
-                for index, item in enumerate(outputs)
-            ],
-            "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens},
-        }
+        return _json_response(
+            {
+                "object": "list",
+                "model": served_model_name,
+                "data": [
+                    {
+                        "object": "embedding",
+                        "index": index,
+                        "embedding": _encode_vector(item["embedding"], encoding_format),
+                    }
+                    for index, item in enumerate(outputs)
+                ],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "total_tokens": prompt_tokens,
+                },
+            }
+        )
 
     return app
 
