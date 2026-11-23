@@ -20,9 +20,8 @@
 #                        headroom. Use fp8 KV.)
 #   GPU_MEMORY_UTILIZATION  default: empty (engine default; VLM may clamp to 0.9).
 #                           Set e.g. 0.85 on tight cards after weights fit.
-#   PREFILL_GRAPH_MAX_TOKENS  default: 1024 on SM120, else empty (engine
-#                        default). Largest prefill CUDA-graph bucket; see
-#                        "SM120 defaults".
+#   PREFILL_GRAPH_MAX_TOKENS  default: empty (engine default; the engine caps it
+#                        at 1024 on SM120, see "SM120 defaults"). Set to override.
 #   DTYPE                default: bfloat16
 #   KV_CACHE_DTYPE       default: fp8 (unset/empty = omit flag)
 #   ATTENTION_BACKEND    default: empty (engine auto). Set e.g. triton to force.
@@ -79,9 +78,10 @@
 # CUDA graph capture cap is passed (the ladder runs up to MAX_NUM_SEQS).
 # MAX_MODEL_LEN 8192, MAX_NUM_SEQS 32, KV fp8 and GPU_MEMORY_UTILIZATION 0.85 are
 # memory limits of the ~67 GiB bf16 weights on one 96 GB GPU, not sm90 leftovers.
-# Prefill graphs stop at 1024 tokens (--prefill-graph-max-tokens 1024); the KV
-# pool gets the memory of the larger buckets back and longer chunks run without
-# a graph. RAG, 256 output tokens, MAX_NUM_SEQS=512, MAX_MODEL_LEN=32768,
+# The engine caps the prefill graphs at 1024 tokens on SM120
+# (--prefill-graph-max-tokens, logged as "auto: prefill_graph_max_tokens=1024",
+# docs/configuration/server.md); the KV pool gets the memory of the larger
+# buckets back and longer chunks run without a graph. RAG, 256 output tokens, MAX_NUM_SEQS=512, MAX_MODEL_LEN=32768,
 # GPU_MEMORY_UTILIZATION=0.9, out tok/s at C=16/64/256: 726.5/1369.5/2236.2 and
 # 725.5/1371.5/2233.1 (repeat) vs 726.1-726.5/1368.1-1370.0/2124.6-2149.6
 # without it (vLLM 0.32.0 699.2/1385.8/2205.3).
@@ -207,9 +207,6 @@ else
     GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-}"
 fi
 PREFILL_GRAPH_MAX_TOKENS="${PREFILL_GRAPH_MAX_TOKENS:-}"
-if [[ -z "$PREFILL_GRAPH_MAX_TOKENS" && "${_IS_SM120}" -eq 1 ]]; then
-    PREFILL_GRAPH_MAX_TOKENS=1024
-fi
 DTYPE="${DTYPE:-bfloat16}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"

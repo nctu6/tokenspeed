@@ -12,9 +12,10 @@
 #   QUANTIZATION         arch-aware (fp8 on sm120 / PRO 6000; empty on sm90 H200);
 #                        nvfp4 for an NVFP4 checkpoint (detected from the
 #                        checkpoint's quantization config, not its path)
-#   MOE_BACKEND          arch-aware (triton required for online FP8 MoE on sm120;
-#                        empty = engine auto on bf16 H200 / sm90 path;
-#                        auto for an NVFP4 checkpoint)
+#   MOE_BACKEND          arch-aware (auto on sm120: the engine selects the
+#                        Triton block-FP8 MoE there for online FP8 and the FP4
+#                        leaves for NVFP4; empty = engine auto on the bf16 H200
+#                        / sm90 path; auto for an NVFP4 checkpoint)
 #   MAX_NUM_SEQS         default: 128 on sm90; 64 on sm120 (~96 GiB)
 #   MAX_MODEL_LEN        default: 32768 on sm90; 8192 on sm120 FP8 TP=2
 #                        (KV ~23 GiB at 8k with ~9 GiB free on 96 GiB; 32k KV OOMs)
@@ -54,11 +55,11 @@
 #     MoE backend = engine auto (no forced triton).
 #   sm120 (PRO 6000 ~96 GiB, Blackwell):
 #     CUDA_DEVICES=6,7  TENSOR_PARALLEL_SIZE=2  (only 6,7 available on the sm120 host)
-#     Online --quantization fp8 + --moe-backend triton:
-#       MoE weights ~59.6 GB/GPU; total ~86 GiB used at max_model_len=8192.
-#     Default flashinfer_trtllm FP8 MoE crashes on sm120:
-#       unexpected hidden_states_scale shape (196608,); expected (24, 8192).
-#       MoE backend=triton fixes it. BF16 at TP=2 OOMs (~114 GiB weights/GPU).
+#     Online --quantization fp8 (MoE backend auto = Triton block-FP8 on sm120):
+#       MoE weights ~59.6 GB/GPU; total ~86 GiB used at max_model_len=8192.
+#     BF16 at TP=2 OOMs (~114 GiB weights/GPU). The FlashInfer TRT-LLM FP8 MoE has
+#     no sm12x kernel (it crashed with a hidden_states_scale shape error); the
+#     kernel registry no longer offers it there, so auto skips it.
 #     NVFP4 checkpoint (e.g. /models/nvidia/Qwen3.5-122B-A10B-NVFP4, ~39GiB/GPU
 #     at TP=2): the script detects it from the checkpoint config and defaults to
 #     --quantization nvfp4 --moe-backend auto (the triton MoE has no NVFP4
@@ -73,10 +74,9 @@
 #     and no CUDA graph capture cap is passed: the ladder runs up to MAX_NUM_SEQS.
 #   - NVFP4 checkpoint: --quantization nvfp4 --moe-backend auto (DeepGEMM / CUTLASS
 #     FP4 leaves), detected from the checkpoint config.
-#   - BF16 checkpoint: --quantization fp8 as before (BF16 OOMs at ~114 GiB/GPU on
-#     2 x 96 GB). --moe-backend triton stays for this online-FP8 case because the
-#     default FlashInfer TRT-LLM FP8 MoE crashes on SM120 (bring-up on the SM120
-#     host: hidden_states_scale shape error); `MOE_BACKEND=auto` re-tests it.
+#   - BF16 checkpoint: --quantization fp8 (BF16 OOMs at ~114 GiB/GPU on 2 x 96 GB).
+#     Online FP8 changes the numerics, so it stays an explicit choice of this
+#     script; the MoE backend is the engine auto choice (Triton block-FP8).
 #   - Online FP8: --enable-fp8-attn-proj (block-FP8 QKV/O and GDN projections) is
 #     on. 2 x 96 GB, out tok/s C=1/16/64/256: 168.1/665.9/1178.8/1971.6 vs
 #     146.3/634.2/1141.1/1902.1 without (+14.9/+5.0/+3.3/+3.7 %). 400 multi-step
@@ -89,7 +89,7 @@
 # Recommended invoke:
 #   # sm90 (H200) — NVLS multicast broken → batch-invariant preset
 #   CUDA_DEVICES=6,7 VLLM_BATCH_INVARIANT=1 ./scripts/qwen3.5-122b-a10b.sh
-#   # sm120 (PRO 6000) — FP8 TP=2 + triton MoE on free GPUs 6,7
+#   # sm120 (PRO 6000) — FP8 TP=2 on free GPUs 6,7
 #   CUDA_DEVICES=6,7 ./scripts/qwen3.5-122b-a10b.sh
 #   # sm120 NVFP4 checkpoint (no quantization / MoE env needed)
 #   MODEL_PATH=/models/nvidia/Qwen3.5-122B-A10B-NVFP4 ./scripts/qwen3.5-122b-a10b.sh
@@ -190,7 +190,7 @@ for name, keys in (("config.json", ("quantization_config",)), ("hf_quant_config.
 sys.exit(0 if "NVFP4" in algos else 1)
 PY
 }
-# sm120 (Blackwell / PRO 6000) → FP8 + triton MoE + TP=2 on 6,7.
+# sm120 (Blackwell / PRO 6000) → online FP8 + TP=2 on 6,7 (MoE backend auto).
 # sm90 / other high-mem (H200) → bf16 TP=2 on 6,7; no forced FP8/triton.
 _IS_SM120=0
 if [[ "${_CUDA_ARCH}" == sm12* ]]; then
@@ -211,8 +211,7 @@ if [[ -d "$MODEL_PATH" ]] && _checkpoint_is_nvfp4 "$MODEL_PATH"; then
 fi
 if [[ "${_IS_SM120}" -eq 1 ]]; then
     # Online FP8 shrinks weights enough for TP=2 on ~96 GiB (verified on the sm120 host
-    # GPUs 6,7). Triton MoE required; default flashinfer_trtllm FP8 MoE crashes
-    # on sm120 (hidden_states_scale shape mismatch).
+    # GPUs 6,7). The engine picks the Triton block-FP8 MoE with auto.
     CUDA_DEVICES="${CUDA_DEVICES:-6,7}"
     TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-2}"
     if [[ "${_NVFP4}" -eq 1 ]]; then
@@ -221,7 +220,7 @@ if [[ "${_IS_SM120}" -eq 1 ]]; then
         MOE_BACKEND="${MOE_BACKEND:-auto}"
     else
         QUANTIZATION="${QUANTIZATION:-fp8}"
-        MOE_BACKEND="${MOE_BACKEND:-triton}"
+        MOE_BACKEND="${MOE_BACKEND:-auto}"
     fi
     MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
     MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
@@ -268,7 +267,7 @@ if [[ "${_NDEV}" -ne "${TENSOR_PARALLEL_SIZE}" ]]; then
     echo "ERROR: CUDA_DEVICES='$CUDA_DEVICES' has ${_NDEV} device(s) but TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE}." >&2
     echo "  bf16 Qwen3.5-122B-A10B needs ~114 GiB/GPU at TP=2 (OK on H200 ~141 GiB;" >&2
     echo "  OOM on PRO 6000 ~96 GiB / sm120). On sm120 use online FP8 + TP=2, e.g.:" >&2
-    echo "    CUDA_DEVICES=6,7 TENSOR_PARALLEL_SIZE=2 QUANTIZATION=fp8 MOE_BACKEND=triton $0" >&2
+    echo "    CUDA_DEVICES=6,7 TENSOR_PARALLEL_SIZE=2 QUANTIZATION=fp8 $0" >&2
     exit 1
 fi
 

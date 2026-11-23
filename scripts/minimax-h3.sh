@@ -25,6 +25,8 @@
 #   TENSOR_PARALLEL_SIZE default: equal to NUM_GPUS (vLLM-shaped; maps to num_gpus)
 #   MODEL_VARIANT / TASK_TYPE  default: fl2va  (fl2va | ref2va | t2va | all)
 #   DTYPE                default: bfloat16
+#   ULYSSES_DEGREE / USP default: empty (engine default: 2 on two SM12x GPUs, else 1)
+#   RING_DEGREE          default: empty (engine default 1)
 #   ENABLE_CPU_OFFLOAD   default: 1 (ComponentsManager auto offload); 0 with USP>1
 #                        (ulysses residency is fully resident and rejects offload)
 #   VENV_DIR             default: ./.venv
@@ -38,11 +40,12 @@
 #   Recommended for throughput and latency: ULYSSES_DEGREE=2. text-encoder-TP still rejected
 #
 # SM120 (compute capability 12.x of the first CUDA_DEVICES GPU): with 2 GPUs the
-# DiT context parallel (ULYSSES_DEGREE=2, all weights resident, no CPU offload) is
-# the default: t2va 672x384 2-step 0.245 req/s at c1 (device_split + offload 0.182,
-# vLLM-omni 0.236), 0.312 at c2 (0.184, 0.262), 25-step 0.0150 (0.0117, 0.0134).
-# Set ULYSSES_DEGREE=1 for the old layout. Otherwise nothing to
-# switch. This is a Diffusers pipeline with no attention backend, MoE backend,
+# engine defaults to DiT context parallel (--ulysses-degree 2, all weights
+# resident, no CPU offload; logged as "auto: ulysses_degree=2") when neither
+# ULYSSES_DEGREE/USP nor RING_DEGREE is set: t2va 672x384 2-step 0.245 req/s at
+# c1 (device_split + offload 0.182, vLLM-omni 0.236), 0.312 at c2 (0.184, 0.262),
+# 25-step 0.0150 (0.0117, 0.0134). Set ULYSSES_DEGREE=1 for the old layout.
+# This is a Diffusers pipeline with no attention backend, MoE backend,
 # quantization or CUDA graph knob that the SM120 leaves replace, and the script
 # forces none (the 2-GPU layout and CPU offload defaults are memory choices, the
 # same on every arch). The detected arch is only logged.
@@ -160,17 +163,12 @@ MODEL_VARIANT="${MODEL_VARIANT:-${TASK_TYPE:-fl2va}}"
 TASK_TYPE="${TASK_TYPE:-$MODEL_VARIANT}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-$NUM_GPUS}"
 DTYPE="${DTYPE:-bfloat16}"
-# DiT Context Parallel (TokenSpeed ulysses residency). Default 1 = device_split
-# path; on SM120 with 2 GPUs the default is 2 (measured vs device_split + offload,
-# t2va 672x384: 0.245 vs 0.182 req/s at c1, 0.312 vs 0.184 at c2, 75 GiB per GPU).
-_DEFAULT_USP=1
-if [[ "${_IS_SM120}" == 1 && "${NUM_GPUS}" == 2 ]]; then
-    _DEFAULT_USP=2
-fi
-ULYSSES_DEGREE="${ULYSSES_DEGREE:-${USP:-${_DEFAULT_USP}}}"
-RING_DEGREE="${RING_DEGREE:-1}"
-# ulysses residency keeps everything resident and rejects CPU offload.
-if [[ "${ULYSSES_DEGREE}" -gt 1 || "${RING_DEGREE}" -gt 1 ]]; then
+# DiT Context Parallel (TokenSpeed ulysses residency). Unset = the engine picks
+# the layout for the device (device_split, or ulysses degree 2 on two SM12x GPUs).
+ULYSSES_DEGREE="${ULYSSES_DEGREE:-${USP:-}}"
+RING_DEGREE="${RING_DEGREE:-}"
+# An explicit ulysses residency keeps everything resident and rejects CPU offload.
+if [[ "${ULYSSES_DEGREE:-1}" -gt 1 || "${RING_DEGREE:-1}" -gt 1 ]]; then
     ENABLE_CPU_OFFLOAD="${ENABLE_CPU_OFFLOAD:-0}"
 else
     ENABLE_CPU_OFFLOAD="${ENABLE_CPU_OFFLOAD:-1}"
@@ -220,7 +218,7 @@ if [[ "$(basename "$MODEL_PATH")" == "FL2VA" || "$(basename "$MODEL_PATH")" == "
     fi
 fi
 
-echo "[minimax-h3] arch=${_CUDA_ARCH:-unknown} gpu_mem=${_GPU_MEM_MIB:-unknown}MiB sm120=${_IS_SM120} CUDA_DEVICES=${CUDA_DEVICES} NUM_GPUS=${NUM_GPUS} TP=${TENSOR_PARALLEL_SIZE} usp=${ULYSSES_DEGREE} ring=${RING_DEGREE} task=${TASK_TYPE} dtype=${DTYPE} model=${MODEL_PATH}" >&2
+echo "[minimax-h3] arch=${_CUDA_ARCH:-unknown} gpu_mem=${_GPU_MEM_MIB:-unknown}MiB sm120=${_IS_SM120} CUDA_DEVICES=${CUDA_DEVICES} NUM_GPUS=${NUM_GPUS} TP=${TENSOR_PARALLEL_SIZE} usp=${ULYSSES_DEGREE:-engine_default} ring=${RING_DEGREE:-1} task=${TASK_TYPE} dtype=${DTYPE} model=${MODEL_PATH}" >&2
 
 cmd=(
     tokenspeed serve "$MODEL_PATH"
@@ -232,15 +230,19 @@ cmd=(
     --num-gpus "$NUM_GPUS"
     --dtype "$DTYPE"
     --task-type "$TASK_TYPE"
-    --ulysses-degree "$ULYSSES_DEGREE"
-    --ring "$RING_DEGREE"
 )
+if [[ -n "$ULYSSES_DEGREE" ]]; then
+    cmd+=(--ulysses-degree "$ULYSSES_DEGREE")
+fi
+if [[ -n "$RING_DEGREE" ]]; then
+    cmd+=(--ring "$RING_DEGREE")
+fi
 if [[ "$ENABLE_CPU_OFFLOAD" == "0" ]]; then
     cmd+=(--no-cpu-offload)
 fi
 
 # USP/ring>1: diffusion_http re-execs under torchrun; ensure torchrun is on PATH.
-if [[ "${ULYSSES_DEGREE}" -gt 1 || "${RING_DEGREE}" -gt 1 ]]; then
+if [[ "${ULYSSES_DEGREE:-1}" -gt 1 || "${RING_DEGREE:-1}" -gt 1 ]]; then
     if ! command -v torchrun >/dev/null 2>&1; then
         echo "ERROR: ULYSSES_DEGREE/RING>1 needs torchrun (activate venv / install torch)." >&2
         exit 2

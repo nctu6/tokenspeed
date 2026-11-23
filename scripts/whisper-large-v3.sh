@@ -39,12 +39,13 @@
 #   KV_CACHE_DTYPE       default: bfloat16 (match dtype; avoid fp16/bf16 mix)
 #   ATTENTION_BACKEND    default: empty (engine auto)
 #   MM_ATTENTION_BACKEND encoder attention (--mm-attention-backend). default:
-#                        sdpa on sm120 (PyTorch's flash kernel; the encoder
-#                        window is fixed, so every batch is equal-length; ~half
-#                        the time of the triton_attn auto choice there), empty
-#                        (engine auto: fa3 on sm90) elsewhere. fa4 is not used
-#                        on sm120: its varlen kernel hit illegal memory accesses
-#                        under varying request counts.
+#                        empty (engine auto). The engine picks sdpa on sm12x
+#                        (PyTorch's flash kernel; the encoder window is fixed,
+#                        so every batch is equal-length; ~half the time of the
+#                        triton_attn choice there) and the platform default
+#                        elsewhere (fa3 on sm90). fa4 is not used on sm120: its
+#                        varlen kernel hit illegal memory accesses under varying
+#                        request counts.
 #   ENCODER_CUDA_GRAPH   default: 1. Sets TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH:
 #                        the encoder + cross-KV write replay a CUDA graph per
 #                        request count (1..16, captured at startup, ~1.3 GB pool)
@@ -55,11 +56,10 @@
 #   TOKENSPEED_CUDA_ARCH override detected arch (e.g. sm120 / sm90 / 12.0 / 9.0)
 #
 # SM120 defaults (compute capability 12.x of the first CUDA_DEVICES GPU; explicit
-# env always wins, other archs are unchanged): the decoder attention backend and
-# CUDA graph ladder are the engine's auto choice (no cap is passed). The one
-# forced knob is the encoder MM_ATTENTION_BACKEND=sdpa: measured at about half
-# the time of the triton_attn auto choice on SM120, and fa4 hit illegal memory
-# accesses there (see MM_ATTENTION_BACKEND above).
+# env always wins, other archs are unchanged): the decoder attention backend, the
+# CUDA graph ladder and the encoder attention backend (sdpa on SM12x, logged as
+# "auto: mm_attention_backend=sdpa") are the engine's auto choice; the script
+# forces nothing (see MM_ATTENTION_BACKEND above).
 #
 # Arch → defaults (CUDA compute capability of first selected GPU):
 #   sm90  (H200 ~141 GiB): CUDA_DEVICES=6 TP=1
@@ -165,11 +165,9 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-}"
 DTYPE="${DTYPE:-bfloat16}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-bfloat16}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"
-if [[ "${_IS_SM120}" == "1" ]]; then
-    MM_ATTENTION_BACKEND="${MM_ATTENTION_BACKEND-sdpa}"
-else
-    MM_ATTENTION_BACKEND="${MM_ATTENTION_BACKEND:-}"
-fi
+# Empty = engine default (sdpa for the dense 1500-frame window on SM12x, logged
+# as "auto: mm_attention_backend=sdpa"; the platform default elsewhere).
+MM_ATTENTION_BACKEND="${MM_ATTENTION_BACKEND:-}"
 ENCODER_CUDA_GRAPH="${ENCODER_CUDA_GRAPH:-1}"
 VENV_DIR="${VENV_DIR:-$REPO_ROOT/.venv}"
 
