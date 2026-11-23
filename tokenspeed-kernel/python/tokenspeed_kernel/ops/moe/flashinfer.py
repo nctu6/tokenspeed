@@ -723,9 +723,13 @@ if platform.is_nvidia:
         name="flashinfer_cutlass_fp8_moe_apply",
         solution="flashinfer_cutlass",
         weight_preprocessor=flashinfer_cutlass_fp8_moe_weights,
+        # FlashInfer's CUTLASS fused MoE implements the DeepSeek block scale
+        # only for SM90 (``cutlass_fused_moe`` raises "FP8 block scaling not
+        # yet implemented for Blackwell" elsewhere).
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(9, 0),
         ),
         signatures=format_signatures(
             "x",

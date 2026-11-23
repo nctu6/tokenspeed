@@ -421,7 +421,25 @@ def test_trtllm_block_fp8_moe_is_not_offered_on_sm120(
     assert not spec.capability.satisfied_by(sm120_platform), name
 
 
-def test_sm120_offers_a_block_fp8_moe_leaf_without_trtllm(
+def test_cutlass_block_fp8_moe_is_offered_on_sm90_only(
+    h100_platform: PlatformInfo,
+    b200_platform: PlatformInfo,
+    sm120_platform: PlatformInfo,
+) -> None:
+    """FlashInfer's CUTLASS fused MoE raises "FP8 block scaling not yet
+    implemented for Blackwell" outside SM90; ``auto`` reached it on SM120 once
+    the TRT-LLM leaves were gone."""
+    import tokenspeed_kernel.ops.moe  # noqa: F401  (registers the leaves)
+
+    spec = KernelRegistry.get().get_by_name("flashinfer_cutlass_fp8_moe_apply")
+    if spec is None:
+        pytest.skip("FlashInfer CUTLASS MoE leaves are not registered here")
+    assert spec.capability.satisfied_by(h100_platform)
+    assert not spec.capability.satisfied_by(b200_platform)
+    assert not spec.capability.satisfied_by(sm120_platform)
+
+
+def test_sm120_block_fp8_moe_leaves_are_triton(
     sm120_platform: PlatformInfo,
 ) -> None:
     import tokenspeed_kernel.ops.moe  # noqa: F401  (registers the leaves)
@@ -429,12 +447,11 @@ def test_sm120_offers_a_block_fp8_moe_leaf_without_trtllm(
     offered = KernelRegistry.get().get_for_operator(
         "moe", "apply", platform=sm120_platform
     )
-    block_fp8 = [
-        spec
+    block_fp8 = {
+        spec.solution
         for spec in offered
         if "fp8" in spec.traits.get("weight_dtype", ())
         and (128, 128) in spec.traits.get("fp8_scale_block_shape", ())
-    ]
-    assert block_fp8, "no block-FP8 MoE leaf on SM120"
-    assert "triton" in {spec.solution for spec in block_fp8}
-    assert not {spec.name for spec in block_fp8 if spec.solution == "flashinfer_trtllm"}
+    }
+    assert "triton" in block_fp8, block_fp8
+    assert not block_fp8 & {"flashinfer_trtllm", "flashinfer_cutlass"}, block_fp8
