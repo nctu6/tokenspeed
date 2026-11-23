@@ -725,6 +725,34 @@ Outputs are bit-identical: the tile shape changes neither the K order of a dot
 nor the route combine. 64- and 128-row tiles were slower at every size, and
 four stages do not fit the 128-column tile in SM120 shared memory.
 
+## Triton FP8 MoE for few tokens
+Up to 64 routed rows (`_ROUTE_PARALLEL_MAX_ROUTES`; 8 tokens at top-8)
+`_triton_fp8_moe_impl` runs `_route_parallel_fp8_moe` instead of the grouped
+kernels. A decode token takes the grouped path 76 us per layer at the
+Qwen3.5-122B-A10B TP2 geometry although its 25 MB of expert weights read in 14
+us: the persistent grouped kernels start `min(SMs, routes * columns / tile)`
+programs (32 for stage 1 of one token) and each scans all 256 expert counts,
+and the routing pass and the zero-filled route buffer add launches. The
+route-parallel kernels give each (route, column tile) its own program (32
+columns in stage 1, 64 in stage 2, 4 warps, 3 stages; 128 + 48 programs for one
+token), read the expert id straight from `topk_ids` and need no routing pass.
+Output is bit-identical to the grouped path (same dot, same K order; rows with
+an unrouted id are zero). Per MoE layer, CUDA-graph timed, RTX PRO 6000 (SM120),
+256 experts, top-8, hidden 3072, intermediate 512:
+
+| tokens | routes | grouped | route-parallel |
+| ---: | ---: | ---: | ---: |
+| 1 | 8 | 75.3 us | 14.9 us (5.06x) |
+| 2 | 16 | 78.9 us | 19.3 us (4.10x) |
+| 4 | 32 | 91.4 us | 49.9 us (1.83x) |
+| 8 | 64 | 202.6 us | 187.2 us (1.08x) |
+| 16 | 128 | 334.8 us | 325.9 us (1.03x, grouped kept) |
+| 32 | 256 | 494.3 us | 485.5 us (1.02x, grouped kept) |
+
+From 8 tokens the layer reads about as many distinct experts as it has routes,
+so both launches are bound by the same weight traffic and the grouped one,
+which shares a read between the rows of an expert, takes over.
+
 ## Triton FP8-activation MoE
 `triton_fp8_block_fp8_act_precomputed_moe_apply` (`_triton/fp8.py`,
 `internal_activation_dtype="fp8"`, opt-in through

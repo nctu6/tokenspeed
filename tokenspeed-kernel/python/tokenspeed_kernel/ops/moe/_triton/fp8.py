@@ -33,6 +33,13 @@ from tokenspeed_kernel.ops.moe._triton.common import (
 )
 
 _FP8_BLOCK = 128
+# Up to this many routed rows (tokens x top-k) the route-parallel kernels run;
+# above it the grouped kernels, which share a weight read between the rows of
+# an expert. Measured crossover: 64 routes (8 decode tokens at top-8) is 1.08x,
+# 128 routes ties (ops/moe/README.md, "Triton FP8 MoE for few tokens").
+_ROUTE_PARALLEL_MAX_ROUTES = 64
+_ROUTE_STAGE1_BLOCK_N = 32
+_ROUTE_STAGE2_BLOCK_N = 64
 
 
 def _validate_fp8_moe(
@@ -271,19 +278,231 @@ def _stage2_kernel(
         problem_start += problem_tiles
 
 
+@triton.jit
+def _stage1_route_kernel(
+    x_ptr,
+    w13_ptr,
+    w13_scale_ptr,
+    inter_ptr,
+    topk_ids_ptr,
+    hidden_size: tl.constexpr,
+    intermediate_size: tl.constexpr,
+    num_experts: tl.constexpr,
+    top_k: tl.constexpr,
+    swiglu_alpha: tl.constexpr,
+    swiglu_limit: tl.constexpr,
+    swiglu_beta: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
+    SCALE_BLOCK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Stage 1 of one routed row: program (route, column tile), no expert scan.
+
+    The math is `_stage1_kernel` with one valid row in a BLOCK_M tile, so the
+    result is bit-identical."""
+    tl.static_assert(SCALE_BLOCK % BLOCK_N == 0)
+    tl.static_assert(SCALE_BLOCK % BLOCK_K == 0)
+    route = tl.program_id(0)
+    tile_n = tl.program_id(1)
+    expert_id = tl.load(topk_ids_ptr + route).to(tl.int32)
+    # Ids outside [0, num_experts) are not routed: their rows stay untouched.
+    if (expert_id >= 0) & (expert_id < num_experts):
+        token = route // top_k
+        scale_k = hidden_size // SCALE_BLOCK
+        up_scale_offset = intermediate_size // SCALE_BLOCK * scale_k
+        expert_weight = w13_ptr + expert_id.to(tl.int64) * (
+            2 * intermediate_size * hidden_size
+        )
+        expert_scale = w13_scale_ptr + expert_id * 2 * up_scale_offset
+        row_mask = tl.arange(0, BLOCK_M) < 1
+        n_offset = tile_n * BLOCK_N
+        gate_rows = n_offset + tl.arange(0, BLOCK_N)
+        up_rows = intermediate_size + gate_rows
+        gate_scale = expert_scale + n_offset // SCALE_BLOCK * scale_k
+        up_scale = gate_scale + up_scale_offset
+        gate_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k_offset in range(0, hidden_size, BLOCK_K):
+            k_cols = k_offset + tl.arange(0, BLOCK_K)
+            x = tl.load(
+                tl.broadcast_to(
+                    x_ptr + token.to(tl.int64) * hidden_size + k_cols[None, :],
+                    (BLOCK_M, BLOCK_K),
+                ),
+                mask=row_mask[:, None],
+                other=0.0,
+            )
+            gate = tl.load(
+                expert_weight + gate_rows[:, None] * hidden_size + k_cols[None, :]
+            ).to(tl.bfloat16)
+            up = tl.load(
+                expert_weight + up_rows[:, None] * hidden_size + k_cols[None, :]
+            ).to(tl.bfloat16)
+            scale_col = k_offset // SCALE_BLOCK
+            gate_acc += tl.dot(x, gate.T) * tl.load(gate_scale + scale_col)
+            up_acc += tl.dot(x, up.T) * tl.load(up_scale + scale_col)
+        activated = _swiglu(
+            gate_acc, up_acc, swiglu_alpha, swiglu_limit, swiglu_beta, HAS_LIMIT
+        ).to(tl.bfloat16)
+        inter_offsets = tl.broadcast_to(
+            route.to(tl.int64) * intermediate_size + gate_rows[None, :],
+            (BLOCK_M, BLOCK_N),
+        )
+        tl.store(inter_ptr + inter_offsets, activated, mask=row_mask[:, None])
+
+
+@triton.jit
+def _stage2_route_kernel(
+    inter_ptr,
+    w2_ptr,
+    w2_scale_ptr,
+    route_output_ptr,
+    topk_ids_ptr,
+    hidden_size: tl.constexpr,
+    intermediate_size: tl.constexpr,
+    num_experts: tl.constexpr,
+    SCALE_BLOCK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Stage 2 of one routed row (program per route and column tile); zero rows for unrouted ids."""
+    tl.static_assert(SCALE_BLOCK % BLOCK_N == 0)
+    tl.static_assert(SCALE_BLOCK % BLOCK_K == 0)
+    route = tl.program_id(0)
+    tile_n = tl.program_id(1)
+    expert_id = tl.load(topk_ids_ptr + route).to(tl.int32)
+    row_mask = tl.arange(0, BLOCK_M) < 1
+    n_offset = tile_n * BLOCK_N
+    weight_rows = n_offset + tl.arange(0, BLOCK_N)
+    output_offsets = tl.broadcast_to(
+        route.to(tl.int64) * hidden_size + weight_rows[None, :], (BLOCK_M, BLOCK_N)
+    )
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    if (expert_id >= 0) & (expert_id < num_experts):
+        scale_k = intermediate_size // SCALE_BLOCK
+        expert_weight = w2_ptr + expert_id.to(tl.int64) * (
+            hidden_size * intermediate_size
+        )
+        expert_scale = w2_scale_ptr + expert_id * (hidden_size // SCALE_BLOCK * scale_k)
+        weight_scale = expert_scale + n_offset // SCALE_BLOCK * scale_k
+        for k_offset in range(0, intermediate_size, BLOCK_K):
+            k_cols = k_offset + tl.arange(0, BLOCK_K)
+            intermediate = tl.load(
+                tl.broadcast_to(
+                    inter_ptr
+                    + route.to(tl.int64) * intermediate_size
+                    + k_cols[None, :],
+                    (BLOCK_M, BLOCK_K),
+                ),
+                mask=row_mask[:, None],
+                other=0.0,
+            )
+            weight = tl.load(
+                expert_weight
+                + weight_rows[:, None] * intermediate_size
+                + k_cols[None, :]
+            ).to(tl.bfloat16)
+            acc += tl.dot(intermediate, weight.T) * tl.load(
+                weight_scale + k_offset // SCALE_BLOCK
+            )
+    tl.store(route_output_ptr + output_offsets, acc, mask=row_mask[:, None])
+
+
+def _route_parallel_fp8_moe(
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Block-FP8 MoE for few routed rows: one program per (route, column tile).
+
+    The grouped kernels give each program a stripe of experts and make it scan
+    all `num_experts` counts; with a handful of routed rows that scan and the
+    few active programs (a stage has `routes * columns / BLOCK_N` tiles) leave
+    the GPU idle. Here every route reads its own expert's weight columns, so
+    one decode token spreads over 128 + 48 programs and needs no routing
+    pass. Same math as `_triton_fp8_moe_impl`, bit-identical output."""
+    num_tokens, hidden_size = x.shape
+    num_experts, twice_intermediate_size, _ = w.w13_weight.shape
+    intermediate_size = twice_intermediate_size // 2
+    top_k = topk_ids.shape[1]
+    route_count = num_tokens * top_k
+    swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_params(w)
+    intermediate = torch.empty(
+        (route_count, intermediate_size), device=x.device, dtype=x.dtype
+    )
+    route_output = torch.empty(
+        (route_count, hidden_size), device=x.device, dtype=x.dtype
+    )
+    output = torch.empty_like(x)
+    _stage1_route_kernel[(route_count, intermediate_size // _ROUTE_STAGE1_BLOCK_N)](
+        x,
+        w.w13_weight,
+        w.w13_weight_scale_inv,
+        intermediate,
+        topk_ids,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=1.0 if swiglu_limit is None else swiglu_limit,
+        swiglu_beta=swiglu_beta,
+        HAS_LIMIT=swiglu_limit is not None,
+        SCALE_BLOCK=_FP8_BLOCK,
+        BLOCK_M=16,
+        BLOCK_N=_ROUTE_STAGE1_BLOCK_N,
+        BLOCK_K=_FP8_BLOCK,
+        num_warps=4,
+        num_stages=3,
+    )
+    _stage2_route_kernel[(route_count, hidden_size // _ROUTE_STAGE2_BLOCK_N)](
+        intermediate,
+        w.w2_weight,
+        w.w2_weight_scale_inv,
+        route_output,
+        topk_ids,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        SCALE_BLOCK=_FP8_BLOCK,
+        BLOCK_M=16,
+        BLOCK_N=_ROUTE_STAGE2_BLOCK_N,
+        BLOCK_K=_FP8_BLOCK,
+        num_warps=4,
+        num_stages=3,
+    )
+    _combine(route_output, topk_weights, output, None, 0)
+    return output
+
+
 def _triton_fp8_moe_impl(
     x: torch.Tensor,
     w: torch.nn.Module,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
 ) -> torch.Tensor:
+    if x.shape[0] == 0:
+        return torch.empty_like(x)
+    if x.shape[0] * topk_ids.shape[1] <= _ROUTE_PARALLEL_MAX_ROUTES:
+        return _route_parallel_fp8_moe(x, w, topk_weights, topk_ids)
+    return _grouped_fp8_moe(x, w, topk_weights, topk_ids)
+
+
+def _grouped_fp8_moe(
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Block-FP8 MoE with the routed rows grouped by expert (two persistent kernels)."""
     num_tokens, hidden_size = x.shape
     num_experts, twice_intermediate_size, _ = w.w13_weight.shape
     intermediate_size = twice_intermediate_size // 2
     top_k = topk_ids.shape[1]
-    if num_tokens == 0:
-        return torch.empty_like(x)
-
     swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_params(w)
     expert_route_ids, expert_counts, route_output, output = _prepare_routed_output(
         x, topk_ids, num_experts

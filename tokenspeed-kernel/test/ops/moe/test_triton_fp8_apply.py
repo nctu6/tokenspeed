@@ -219,6 +219,7 @@ def test_triton_fp8_moe_token_count():
             *map(int_specialization_class, counts),
             routes <= 16 * num_experts,
             routes <= 128,
+            routes <= fp8._ROUTE_PARALLEL_MAX_ROUTES,
         )
 
     # Tokens are independent: a shorter batch is a prefix of one that uses
@@ -230,9 +231,51 @@ def test_triton_fp8_moe_token_count():
     with assert_no_triton_compile(
         fp8._stage1_kernel,
         fp8._stage2_kernel,
+        fp8._stage1_route_kernel,
+        fp8._stage2_route_kernel,
         _common._routing_kernel,
         _common._combine_kernel,
     ):
         for tokens in sweep:
             expected = small if tokens <= small_tile_tokens else full
             torch.testing.assert_close(run(tokens), expected[:tokens], rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("num_tokens", [1, 2, 8])
+@pytest.mark.parametrize(
+    ("activation", "swiglu_limit"), [("silu", None), ("swiglu", 1.5)]
+)
+def test_triton_fp8_route_parallel_matches_grouped_bitwise(
+    num_tokens: int, activation: str, swiglu_limit: float | None
+) -> None:
+    """The few-token launch gives the grouped launch's bits, unrouted ids included."""
+    _skip_unless_supported()
+    from tokenspeed_kernel.ops.moe._triton import fp8
+
+    num_experts, top_k, hidden_size, intermediate_size = 16, 8, 512, 256
+    generator = torch.Generator(device="cuda").manual_seed(1)
+    x = torch.randn(
+        num_tokens,
+        hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    weights, _, _ = _experts(
+        num_experts, top_k, hidden_size, intermediate_size, generator
+    )
+    if swiglu_limit is not None:
+        weights.swiglu_arg = SimpleNamespace(alpha=None, limit=swiglu_limit)
+    topk_ids = _topk_ids(num_tokens, num_experts, top_k, generator)
+    topk_ids[0, 1] = -1
+    topk_ids[-1, 0] = num_experts
+    topk_weights = torch.rand(
+        num_tokens, top_k, device="cuda", dtype=torch.float32, generator=generator
+    )
+    plan = _plan(activation, swiglu_limit, hidden_size, intermediate_size)
+    kernel_moe_process_weights(plan, weights)
+    assert num_tokens * top_k <= fp8._ROUTE_PARALLEL_MAX_ROUTES
+    route = fp8._route_parallel_fp8_moe(x, weights, topk_weights, topk_ids)
+    grouped = fp8._grouped_fp8_moe(x, weights, topk_weights, topk_ids)
+    torch.testing.assert_close(route, grouped, rtol=0, atol=0)
