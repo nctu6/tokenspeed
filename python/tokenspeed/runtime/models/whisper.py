@@ -97,6 +97,7 @@ from tokenspeed_kernel.ops.attention.mha import (
     mha_extend_with_kvcache,
 )
 from tokenspeed_kernel.ops.layernorm import add_layernorm
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from torch import nn
@@ -115,6 +116,7 @@ from tokenspeed.runtime.execution.slot_state import (
 )
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import (
     MultimodalEncoderAttention,
+    dense_encoder_attention_backend,
 )
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -1330,7 +1332,9 @@ class WhisperForConditionalGeneration(nn.Module):
             mapping,
             quant_config=None,  # the tower stays in bf16/fp16
             prefix=add_prefix("model.encoder", prefix),
-            mm_attention_backend=mm_attention_backend,
+            mm_attention_backend=dense_encoder_attention_backend(
+                mm_attention_backend, current_platform()
+            ),
         )
         self.decoder = WhisperDecoder(
             config,

@@ -41,7 +41,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import PlatformInfo, current_platform
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from tokenspeed.runtime.distributed import utils as dist_utils
@@ -355,6 +355,37 @@ def _default_multimodal_encoder_attn_backend() -> str:
         f"No default multimodal encoder attention backend for platform {_platform}; "
         "set --mm-attention-backend explicitly."
     )
+
+
+def dense_encoder_attention_backend(
+    requested: str | None, platform: PlatformInfo
+) -> str | None:
+    """Backend for a tower that only feeds equal-length ``[bsz, seq_len, dim]`` windows.
+
+    Whisper's encoder is the user: a fixed 1500-frame window per request. An
+    explicit ``requested`` backend always wins. Otherwise workstation Blackwell
+    (SM12x) takes ``sdpa``, which runs about half the time of the ``triton_attn``
+    platform default there; every other platform keeps the platform default
+    (``None``). Towers with packed variable-length batches must not use this:
+    ``sdpa`` refuses them.
+
+    Args:
+        requested: ``--mm-attention-backend`` or None when unset.
+        platform: The platform the tower runs on.
+
+    Returns:
+        The backend name to pass to ``MultimodalEncoderAttention``, or None for
+        the platform default.
+    """
+    if requested is not None:
+        return requested
+    if platform.is_nvidia and platform.arch_version.major == 12:
+        logger.info(
+            "auto: mm_attention_backend=sdpa for the dense encoder window "
+            f"(sm{platform.arch_version.major}{platform.arch_version.minor})"
+        )
+        return "sdpa"
+    return None
 
 
 @functools.lru_cache(maxsize=None)
