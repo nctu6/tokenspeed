@@ -29,6 +29,9 @@
 #   ENABLE_AUTO_TOOL_CHOICE default: empty. Non-empty = --enable-auto-tool-choice
 #                           (some SMG builds reject this flag; leave off on the sm120 host)
 #   TOOL_CALL_PARSER     default: qwen_coder (omit by setting empty)
+#   ENABLE_FP8_ATTN_PROJ default: 1 on sm120 with online FP8 (QUANTIZATION=fp8),
+#                        else empty. Non-empty and not 0 = --enable-fp8-attn-proj
+#                        (block-FP8 attention and GDN projections); 0 = off.
 #   VENV_DIR             default: ./.venv
 #   TOKENSPEED_CUDA_ARCH override detected arch (e.g. sm120 / sm90 / 12.0 / 9.0)
 #   TOKENSPEED_TRITON_PREFILL_SKIP_OOR   default: 1 (F1; kernel default on)
@@ -74,6 +77,12 @@
 #     2 x 96 GB). --moe-backend triton stays for this online-FP8 case because the
 #     default FlashInfer TRT-LLM FP8 MoE crashes on SM120 (bring-up on the SM120
 #     host: hidden_states_scale shape error); `MOE_BACKEND=auto` re-tests it.
+#   - Online FP8: --enable-fp8-attn-proj (block-FP8 QKV/O and GDN projections) is
+#     on. 2 x 96 GB, out tok/s C=1/16/64/256: 168.1/665.9/1178.8/1971.6 vs
+#     146.3/634.2/1141.1/1902.1 without (+14.9/+5.0/+3.3/+3.7 %). 400 multi-step
+#     word problems, two greedy runs each: accuracy 0.9375/0.9375 without vs
+#     0.935/0.9375 with (two runs of one config differ in 1 of 400 answers).
+#     `ENABLE_FP8_ATTN_PROJ=0` turns it off.
 #   - MAX_MODEL_LEN 8192 / MAX_NUM_SEQS 64 / KV fp8 are memory limits (~86 GiB
 #     used at 8192 context), not sm90 leftovers (32k KV OOMs, see above).
 #
@@ -230,6 +239,11 @@ else
     MAX_NUM_SEQS="${MAX_NUM_SEQS:-128}"
     MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 fi
+if [[ "${_IS_SM120}" -eq 1 && "${QUANTIZATION}" == "fp8" ]]; then
+    ENABLE_FP8_ATTN_PROJ="${ENABLE_FP8_ATTN_PROJ:-1}"
+else
+    ENABLE_FP8_ATTN_PROJ="${ENABLE_FP8_ATTN_PROJ:-}"
+fi
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-}"
 DTYPE="${DTYPE:-bfloat16}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
@@ -312,6 +326,9 @@ if [[ -n "$KV_CACHE_DTYPE" ]]; then
 fi
 if [[ -n "$ATTENTION_BACKEND" ]]; then
     cmd+=(--attention-backend "$ATTENTION_BACKEND")
+fi
+if [[ -n "$ENABLE_FP8_ATTN_PROJ" && "$ENABLE_FP8_ATTN_PROJ" != "0" ]]; then
+    cmd+=(--enable-fp8-attn-proj)
 fi
 if [[ -n "$ENABLE_EXPERT_PARALLEL" ]]; then
     cmd+=(--enable-expert-parallel)
