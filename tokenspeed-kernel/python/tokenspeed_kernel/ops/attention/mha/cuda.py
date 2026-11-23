@@ -21,6 +21,7 @@ import math
 
 import torch
 from tokenspeed_kernel._optional import has_fa4_cute, has_optional_package
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -54,6 +55,114 @@ if platform.is_blackwell_plus and has_fa4_cute():
         flash_attn_func,
         flash_attn_varlen_func,
     )
+
+    def _fa4_mha_prefill(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        window_left: int,
+        return_lse: bool,
+        softmax_scale: float | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Causal varlen self-attention through FA4; the one body of every FA4 prefill leaf."""
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        out, lse = flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=((window_left, 0) if window_left >= 0 else (None, None)),
+            return_lse=return_lse,
+        )
+        if return_lse:
+            return out, lse.transpose(0, 1).contiguous()
+        return out
+
+
+if platform.is_nvidia and platform.arch_version.major == 12 and has_fa4_cute():
+    # SM120 runs FA4's SM80-class ``mma.sync`` kernel in 99 KB of shared memory.
+    # Head dims up to 128 fit; 256 does not compile. On a 32/8-head causal batch
+    # it is 3.2-3.4x the Triton prefill leaf (ops/attention/README.md).
+    def _with_readable_tail(cu_seqlens: torch.Tensor) -> torch.Tensor:
+        """``cu_seqlens`` viewed over a buffer that holds one more element, equal to its last.
+
+        FA4's SM80-class varlen kernel launches a few surplus tiles beyond the last
+        sequence (``batch == num_batch``) and reads ``cu_seqlens[batch + 1]`` for them
+        before it finds they are empty: one int32 past the end of a ``bs + 1`` tensor.
+        Whatever sits there becomes that tile's sequence length, so a neighbouring
+        allocation turns into a bogus tile that reads and writes past ``q``/``k``/``v``,
+        or faults when the tensor ends a mapped segment. With the repeated last value the
+        surplus tile has length 0.
+        """
+        return torch.cat((cu_seqlens, cu_seqlens[-1:]))[:-1]
+
+    @register_kernel(
+        "attention",
+        "mha_prefill",
+        name="fa4_mha_prefill_sm120",
+        solution="fa4",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 0),
+            max_arch_version=ArchVersion(12, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": frozenset({64, 80, 96, 112, 128}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+            "sinks": frozenset({False}),
+            "skip_softmax": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
+        },
+    )
+    def fa4_mha_prefill_sm120(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_cpu: list[int],
+        max_seqlen: int,
+        window_left: int = -1,
+        logit_cap: float = 0.0,
+        sinks: torch.Tensor | None = None,
+        return_lse: bool = False,
+        softmax_scale: float | None = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        cu_seqlens = _with_readable_tail(cu_seqlens)
+        if is_warming_up():
+            # FA4 compiles a second kernel when every sequence's query rows,
+            # packed per KV head, fit one 128-row tile (a short prefill). The
+            # startup warmup runs one long prefill, so compile the short
+            # variant here too rather than on the first short request.
+            _fa4_mha_prefill(
+                q[:1],
+                k[:1],
+                v[:1],
+                _with_readable_tail(cu_seqlens.new_tensor([0, 1])),
+                1,
+                window_left,
+                return_lse,
+                softmax_scale,
+            )
+        return _fa4_mha_prefill(
+            q, k, v, cu_seqlens, max_seqlen, window_left, return_lse, softmax_scale
+        )
+
 
 if platform.is_nvidia and platform.is_blackwell and has_fa4_cute():
     # FA4 on Blackwell supports prefill head_dim in [8, 256] divisible by 8,
@@ -127,24 +236,9 @@ if platform.is_nvidia and platform.is_blackwell and has_fa4_cute():
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if softmax_scale is None:
-            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
-        out, lse = flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            softmax_scale=softmax_scale,
-            causal=True,
-            window_size=((window_left, 0) if window_left >= 0 else (None, None)),
-            return_lse=return_lse,
+        return _fa4_mha_prefill(
+            q, k, v, cu_seqlens, max_seqlen, window_left, return_lse, softmax_scale
         )
-        if return_lse:
-            return out, lse.transpose(0, 1).contiguous()
-        return out
 
     @_register_fa4_mha(
         "mha_extend_with_kvcache",
