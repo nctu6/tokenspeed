@@ -130,6 +130,7 @@ def make_config(
     host_write_policy: str,
     prefill_decode_interval: int,
     prefill_decode_min_interval: int,
+    mixed_prefill_token_budget: int,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -205,6 +206,10 @@ def make_config(
             finished request's pages return to the pool.
         cache_groups: The arena's scheduler group configs.
         enable_mixed_prefill_decode: Mixed prefill/decode batches.
+        mixed_prefill_token_budget: ``--mixed-prefill-token-budget``: the
+            most prompt tokens a round that also carries decodes may schedule;
+            0 keeps the decode-count-aware bound. Fused role with mixed
+            batches only.
         prefix_replay_tokens: Prompt tail recomputed after a prefix hit.
         state_checkpoint_in_forward:
             ``--enable-state-checkpoint-in-forward``: the prefill forward that
@@ -325,6 +330,9 @@ def make_config(
     if prefill_decode_min_interval:
         # Set only when on, for the same reason.
         cfg.prefill_decode_min_interval = prefill_decode_min_interval
+    if mixed_prefill_token_budget:
+        # Set only when on, for the same reason.
+        cfg.mixed_prefill_token_budget = mixed_prefill_token_budget
     if enable_short_prefill_first:
         # Older scheduler wheels retain FIFO and reject an explicit opt-in.
         cfg.enable_short_prefill_first = True

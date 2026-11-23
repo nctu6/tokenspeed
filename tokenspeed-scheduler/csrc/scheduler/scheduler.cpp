@@ -149,10 +149,18 @@ Scheduler::Scheduler(SchedulerConfig config)
         // the reference keeps the budget itself.
         mixed_ref_chunk_ = std::max<std::int32_t>(
             1, std::min(config_.max_scheduled_tokens, env_int("TOKENSPEED_MIXED_REF_CHUNK", 4096)));
+        // An explicit mixed_prefill_token_budget replaces the mixed-mode
+        // heuristics: it is the reference chunk (so the admission floors scale
+        // with it), and neither the decode-count shrink nor the long-chunk cap
+        // below apply, since the budget already bounds what rides beside the
+        // decodes.
+        if (config_.mixed_prefill_token_budget > 0) {
+            mixed_ref_chunk_ = config_.mixed_prefill_token_budget;
+        }
         short_prompt_tokens_ = std::max(0, env_int("TOKENSPEED_SHORT_PROMPT_TOKENS", config_.max_scheduled_tokens));
         long_prefill_floor_ = std::max(0, env_int("TOKENSPEED_LONG_PREFILL_FLOOR", mixed_ref_chunk_ / 4));
         // TOKENSPEED_MIXED_LONG_CHUNK (default: half a reference chunk, mixed mode only).
-        mixed_long_chunk_ = config_.enable_mixed_prefill_decode
+        mixed_long_chunk_ = config_.enable_mixed_prefill_decode && config_.mixed_prefill_token_budget == 0
                                 ? std::max(0, env_int("TOKENSPEED_MIXED_LONG_CHUNK", mixed_ref_chunk_ / 2))
                                 : 0;
         // TOKENSPEED_MIXED_DECODE_REF (default 4, mixed mode only): beside more

@@ -530,6 +530,10 @@ class ServerArgs:
     prefill_decode_interval: int = 0
     # The same, owed even while an overdue prompt suspends the interval.
     prefill_decode_min_interval: int = 0
+    # Mixed batches: the most prompt tokens a round that also carries decodes
+    # may schedule; 0 keeps the decode-count-aware default
+    # (docs/design/scheduler.md §3.3).
+    mixed_prefill_token_budget: int = 0
     enable_short_prefill_first: bool = False
     # The fused engine's prefill-delay gate (docs/design/prefill-delay.md):
     # prefill work is held for a window of decode rounds and then batched, so
@@ -1386,6 +1390,15 @@ class ServerArgs:
         if self.gpu_memory_utilization is None:
             self.gpu_memory_utilization = 0.95
 
+        # An explicit prompt-token budget beside decodes is a mixed-batch knob.
+        if self.mixed_prefill_token_budget:
+            if self.enable_mixed_batch is False:
+                raise ValueError(
+                    "--mixed-prefill-token-budget bounds the prompt tokens that "
+                    "ride beside decodes; it cannot be combined with "
+                    "--disable-mixed-batch"
+                )
+            self.enable_mixed_batch = True
         # Mixed prefill+decode default (auto) and the chunk size it pairs with.
         if self.enable_mixed_batch is None:
             self.enable_mixed_batch = self._mixed_batch_by_default()
@@ -3124,6 +3137,20 @@ class ServerArgs:
                 "prefill engine runs no decodes and a decode engine no local "
                 "prefill rounds"
             )
+        if self.mixed_prefill_token_budget < 0:
+            raise ValueError("--mixed-prefill-token-budget must be non-negative")
+        if self.mixed_prefill_token_budget and self.disaggregation_mode != "null":
+            raise ValueError(
+                "--mixed-prefill-token-budget needs --disaggregation-mode null: "
+                "a prefill engine runs no decodes and a decode engine no local "
+                "prefill rounds"
+            )
+        if self.mixed_prefill_token_budget > self.chunked_prefill_size:
+            raise ValueError(
+                "--mixed-prefill-token-budget must not exceed "
+                f"--chunked-prefill-size ({self.mixed_prefill_token_budget} > "
+                f"{self.chunked_prefill_size})"
+            )
         if self.prefill_decode_min_interval < 0:
             raise ValueError("--prefill-decode-min-interval must be non-negative")
         if self.prefill_decode_min_interval and self.disaggregation_mode != "null":
@@ -3627,6 +3654,19 @@ class ServerArgs:
             "for a prompt it has held back in full. A long prompt's chunks "
             "then alternate with decode rounds instead of stalling the decodes "
             "back to back. Aggregated serving only. 0 (the default) is off.",
+        )
+        parser.add_argument(
+            "--mixed-prefill-token-budget",
+            type=int,
+            default=ServerArgs.mixed_prefill_token_budget,
+            metavar="N",
+            help="Mixed batches: the most prompt tokens (resident chunks and new "
+            "prompts together) one round may schedule beside the running "
+            "decodes. The decodes are always scheduled first. Without it the "
+            "bound shrinks with the decode count, so a long decode batch leaves "
+            "little room for new prompts. Implies --enable-mixed-batch; at most "
+            "--chunked-prefill-size. Aggregated serving only. 0 (the default) "
+            "keeps the decode-count-aware bound.",
         )
         parser.add_argument(
             "--enable-state-checkpoint-in-forward",

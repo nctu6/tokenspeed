@@ -178,6 +178,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         storage_config=None,
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
+        mixed_prefill_token_budget=0,
     )
     # Keyword-only and required, with or without a Host tier.
     with pytest.raises(TypeError, match="host_write_policy"):
@@ -1046,6 +1047,7 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         host_write_policy="write_through",
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
+        mixed_prefill_token_budget=0,
     )
     assert make_config(**fields).prefill_chunk_yield_tokens == 0
     assert (

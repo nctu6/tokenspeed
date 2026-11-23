@@ -283,6 +283,11 @@ struct ClosedLoop {
         cfg.decode_input_tokens = 1;
         cfg.overlap_schedule_depth = overlap_depth;
         cfg.enable_mixed_prefill_decode = mixed;
+        if (mixed && seed % 4 == 1) {
+            // An explicit budget beside the decodes on a quarter of the mixed
+            // seeds, chosen without drawing from the random stream.
+            cfg.mixed_prefill_token_budget = std::min<std::int32_t>(cfg.max_scheduled_tokens, 4 + seed % 24);
+        }
         cfg.state_checkpoint_in_forward = in_forward || knobs.drop_short_prompt_ends;
         cfg.drop_short_prompt_end_checkpoints = knobs.drop_short_prompt_ends;
         cfg.demote_superseded_state_checkpoints = knobs.demote;

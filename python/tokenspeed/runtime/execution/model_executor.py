@@ -3063,7 +3063,11 @@ class ModelExecutor:
                 copy_event.record()
                 if step_timer_launch is not None:
                     self.gpu_step_timer.finish(
-                        "decode" if num_extends == 0 else "extend",
+                        (
+                            "decode"
+                            if num_extends == 0
+                            else "mixed" if num_extends < bs else "extend"
+                        ),
                         step_timer_start,
                         step_timer_launch,
                         step_timer_host_ms,

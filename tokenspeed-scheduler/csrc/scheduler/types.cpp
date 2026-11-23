@@ -213,6 +213,20 @@ void SchedulerConfig::Validate() const {
             "Scheduler: prefill_decode_min_interval (--prefill-decode-min-interval) applies to the fused role only: "
             "a P node runs no decodes and a D node no local prefill");
     }
+    if (mixed_prefill_token_budget < 0) {
+        throw std::invalid_argument(
+            "Scheduler: mixed_prefill_token_budget (--mixed-prefill-token-budget) must be >= 0");
+    }
+    if (mixed_prefill_token_budget != 0 && (role != Role::kFused || !enable_mixed_prefill_decode)) {
+        throw std::invalid_argument(
+            "Scheduler: mixed_prefill_token_budget (--mixed-prefill-token-budget) needs the fused role with mixed "
+            "prefill/decode batches: it bounds the prompt tokens that ride beside decodes");
+    }
+    if (mixed_prefill_token_budget > max_scheduled_tokens) {
+        throw std::invalid_argument(
+            "Scheduler: mixed_prefill_token_budget (--mixed-prefill-token-budget) must not exceed "
+            "max_scheduled_tokens (--chunked-prefill-size)");
+    }
     if (HasHostCache() || HasSnapshotPool()) {
         if (host_group_packing.size() != cache_groups.size()) {
             throw std::invalid_argument("Scheduler: Host pools require explicit packing for every cache group");

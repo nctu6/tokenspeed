@@ -489,6 +489,107 @@ TEST_F(MixedRefChunkSuite, RoundWithDecodesIsHeldToTheReferenceChunk) {
     EXPECT_LE(PrefillTokens(second, "d"), 32) << "a decode rides this round: the reference chunk bounds the prefill";
 }
 
+// An explicit mixed_prefill_token_budget bounds the prompt tokens beside the
+// decodes whatever the decode count; the decode-count shrink (here ref = 1, so
+// a third of the chunk beside three decodes) no longer applies.
+class MixedPrefillBudgetSuite : public MixedDecodeRefSuite {
+protected:
+    static constexpr std::int32_t kBudget = 48;
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = MixedDecodeRefSuite::MakeConfig();
+        cfg.mixed_prefill_token_budget = kBudget;
+        return cfg;
+    }
+    void StartDecodes(const std::vector<std::string>& ids) {
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            Submit(MakeRequestSpec(ids[i], /*num_pages=*/2, /*start=*/1 + static_cast<std::int32_t>(i) * 100));
+        }
+        ASSERT_EQ(ForwardIds(PlanOnce()).size(), ids.size());
+        for (const auto& id : ids) {
+            SendForwardDone(id, {7});
+        }
+    }
+};
+TEST_F(MixedPrefillBudgetSuite, TheBudgetReplacesTheDecodeCountShrink) {
+    StartDecodes({"d0", "d1", "d2"});
+    Submit(MakeRequestSpec("p", /*num_pages=*/100, /*start=*/1000));
+    const std::int32_t p_tokens = TokensOf(PlanOnce(), "p");
+    EXPECT_GT(p_tokens, Config().max_scheduled_tokens / 3) << "three decodes would shrink the share to a third";
+    EXPECT_LE(p_tokens, kBudget);
+}
+TEST_F(MixedPrefillBudgetSuite, ABurstOfPromptsStaysWithinTheBudgetAndEveryDecodeRuns) {
+    StartDecodes({"d0", "d1", "d2"});
+    for (int i = 0; i < 10; ++i) {
+        Submit(MakeRequestSpec("p" + std::to_string(i), /*num_pages=*/4, /*start=*/1000 + i * 100));
+    }
+    const auto plan = PlanOnce();
+    std::int32_t prompt_tokens = 0;
+    for (const auto& op : plan.Operations()) {
+        if (auto* f = std::get_if<ForwardBatch>(&op)) {
+            for (std::size_t i = 0; i < f->request_ids.size(); ++i) {
+                if (f->request_ids[i][0] == 'p') {
+                    prompt_tokens += f->input_lengths[i];
+                }
+            }
+        }
+    }
+    EXPECT_GT(prompt_tokens, 0);
+    EXPECT_LE(prompt_tokens, kBudget);
+    for (const char* id : {"d0", "d1", "d2"}) {
+        EXPECT_EQ(TokensOf(plan, id), 1) << id << " is scheduled before any prompt takes budget";
+    }
+}
+TEST_F(MixedPrefillBudgetSuite, ALongPromptAdvancesEveryRoundBesideTheDecodes) {
+    StartDecodes({"d0", "d1", "d2"});
+    Submit(MakeRequestSpec("long", /*num_pages=*/100, /*start=*/1000));
+    for (int round = 0; round < 4; ++round) {
+        const auto plan = PlanOnce();
+        const std::int32_t long_tokens = TokensOf(plan, "long");
+        EXPECT_GT(long_tokens, 0) << "round " << round << ": the prompt is not starved";
+        EXPECT_LE(long_tokens, kBudget) << "round " << round;
+        for (const char* id : {"d0", "d1", "d2"}) {
+            EXPECT_EQ(TokensOf(plan, id), 1) << "round " << round << ": " << id;
+            SendForwardDone(id, {7});
+        }
+        SendForwardDone("long");
+    }
+}
+TEST(SchedulerConstructionTest, ChecksTheMixedPrefillTokenBudget) {
+    const auto config = [](Role role, bool mixed, std::int32_t budget) {
+        SchedulerConfig cfg{};
+        cfg.role = role;
+        cfg.prefix_granularity = 2;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
+        cfg.device_allocator.total_pages = 32;
+        cfg.disable_l2_cache = true;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full_attention",
+            .block_granularity = cfg.prefix_granularity,
+            .total_pages = 32,
+        });
+        if (role != Role::kFused) {
+            cfg.cache_groups.front().transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(cfg);
+        cfg.enable_mixed_prefill_decode = mixed;
+        cfg.mixed_prefill_token_budget = budget;
+        return WithHostPackingFromDevice(cfg);
+    };
+    EXPECT_NO_THROW(config(Role::kFused, true, 64).Validate());
+    EXPECT_NO_THROW(config(Role::kFused, false, 0).Validate());
+    // Without mixed batches, outside the fused role, negative, or above one chunk.
+    for (const auto& cfg : {config(Role::kFused, false, 16), config(Role::kP, true, 16), config(Role::kD, true, 16),
+                            config(Role::kFused, true, -1), config(Role::kFused, true, 65)}) {
+        try {
+            cfg.Validate();
+            ADD_FAILURE() << "mixed_prefill_token_budget " << cfg.mixed_prefill_token_budget << " was accepted";
+        } catch (const std::invalid_argument& error) {
+            EXPECT_NE(std::string{error.what()}.find("mixed_prefill_token_budget"), std::string::npos) << error.what();
+        }
+    }
+}
 // Under the overlap schedule the next decode is planned before the previous
 // result lands. A request whose declared budget the forwards in flight already
 // cover must not get another step: it would run on the GPU after the request is

@@ -112,6 +112,13 @@ struct SchedulerConfig {
     // Device residency events require at least one continuous Full/history group.
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
+    // Fused role, mixed mode only: the most prompt tokens (resident chunks and
+    // new prompts together) a round that also carries decodes may schedule.
+    // The decodes are scheduled first and keep their own budget; this bounds
+    // what rides beside them, whatever their count and whatever the prompt
+    // sizes (docs/design/scheduler.md section 3.3). 0 leaves the bound to the
+    // decode-count-aware default (TOKENSPEED_MIXED_* knobs).
+    std::int32_t mixed_prefill_token_budget{0};
     // Fused role only: decode rounds owed after a local prefill round
     // (docs/design/scheduler.md §3.3). 0 is off.
     std::int32_t prefill_decode_interval{0};

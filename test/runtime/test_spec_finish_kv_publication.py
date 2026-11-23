@@ -124,6 +124,7 @@ class _Engine:
                 host_write_policy="write_through",
                 prefill_decode_interval=0,
                 prefill_decode_min_interval=0,
+                mixed_prefill_token_budget=0,
                 decode_input_tokens=width,
                 overlap_schedule_depth=int(overlap),
                 cache_groups=[

@@ -2147,14 +2147,26 @@ void Scheduler::scheduleShortPromptsAhead(AdmissionFeedback& feedback, PlanBuild
         request->TrackScheduledForward();
     }
 }
-// Decode-count-aware prefill budget for a mixed round: past mixed_decode_ref_
+// Prefill budget beside the decodes of a mixed round. With an explicit
+// mixed_prefill_token_budget it is that budget. Otherwise it is
+// decode-count-aware: past mixed_decode_ref_
 // decodes, the prefill share shrinks as ref / D of a reference chunk, so the
 // step every decode waits for stays bounded while few-decode rounds
 // (long-context prefill beside a handful of decodes) keep the reference
 // chunk. A round with decodes never takes more than the reference chunk, so a
 // larger budget only widens decode-free rounds.
 void Scheduler::capPrefillBesideDecodes(PlanBuild& build) const {
-    if (mixed_decode_ref_ <= 0 || !build.pushed_decode) {
+    if (!build.pushed_decode) {
+        return;
+    }
+    if (config_.mixed_prefill_token_budget > 0) {
+        // Explicit bound: the prompt tokens beside the decodes, whatever their
+        // count. The reserve keeps a hit chunk able to advance.
+        build.token_budget =
+            std::min(build.token_budget, std::max(config_.mixed_prefill_token_budget, build.pending_prefill_reserve));
+        return;
+    }
+    if (mixed_decode_ref_ <= 0) {
         return;
     }
     std::int32_t decodes = 0;
