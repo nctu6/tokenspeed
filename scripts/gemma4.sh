@@ -16,8 +16,8 @@
 #                        "SM120 defaults" below.
 #   PREFILL_GRAPH_MAX_TOKENS  default: empty (engine default; the engine caps it
 #                        at 1024 on SM120, see "SM120 defaults"). Set to override.
-#   MAX_CUDAGRAPH_CAPTURE_SIZE  default: empty (engine default; on SM120 at TP1 the
-#                        engine caps it at 128, see "SM120 defaults"). Set to override.
+#   MAX_CUDAGRAPH_CAPTURE_SIZE  default: 128 on SM120 at TENSOR_PARALLEL_SIZE=1,
+#                        else empty (ladder up to MAX_NUM_SEQS). See "SM120 defaults".
 #   DTYPE                default: bfloat16
 #   KV_CACHE_DTYPE       default: empty (omit flag)
 #   ATTENTION_BACKEND    default: empty (engine auto). Set e.g. triton to force.
@@ -41,18 +41,21 @@
 # CUDA_DEVICES GPU; explicit env always wins, other archs are unchanged):
 #   No attention/GEMM backend is forced: the engine picks the SM120 attention
 #   leaves and the DeepGEMM SM120 GEMM leaves.
-#   The engine (not this script) resolves two CUDA-graph defaults at startup from
-#   the detected device and logs them ("auto: ..." lines); see
-#   docs/configuration/server.md:
-#   - --prefill-graph-max-tokens 1024: the 8192-token bucket ladder reserves
-#     2.3 GB of the 96 GB card, which the KV pool gets back (19.9 -> 21.7 GB at
-#     TP1; more concurrent 12000-char RAG requests fit).
-#   - --max-cudagraph-capture-size 128 at TP1 when the checkpoint fills at least
-#     half of the card (here 58.8 GB of 96 GB): the KV pool holds about 33
-#     requests of the 12000-char RAG load, so the ladder up to MAX_NUM_SEQS=512
-#     reserved 1.64 GB for graphs that are never used. The KV pool grows
-#     2248 -> 2371 parents (+5.5%). TP2 keeps the full ladder: it has room for
-#     batches above 128 and loses 6-8% with the cap.
+#   The engine (not this script) caps the prefill graphs at 1024 tokens on SM12x
+#   (--prefill-graph-max-tokens, logged as "auto: prefill_graph_max_tokens=1024";
+#   docs/configuration/server.md): the 8192-token bucket ladder reserves 2.3 GB
+#   of the 96 GB card, which the KV pool gets back (19.9 -> 21.7 GB at TP1; more
+#   concurrent 12000-char RAG requests fit).
+#   This script caps the decode CUDA-graph ladder at 128 requests at TP1
+#   (--max-cudagraph-capture-size 128). It is a model and workload fact, not a
+#   device one: one 96 GB GPU holds the weights (58.8 GB) and a KV pool of only
+#   about 33 requests of the 12000-char RAG load, so the ladder up to
+#   MAX_NUM_SEQS=512 reserved 1.64 GB for graphs that are never used (decode
+#   graph memory is linear in the ladder top: 0.43/0.86/1.64 GB for
+#   128/256/512). The KV pool grows 2248 -> 2371 parents (+5.5%). Short requests
+#   that do reach batches of 230-250 also gain 1.4/1.5%: a batch above 128 runs
+#   without a graph. TP2 keeps the full ladder: it has room for batches above
+#   128 and loses 6-8% with the cap (872/1001 vs 931/1090).
 #   RAG, 256 output tokens, MAX_NUM_SEQS=512, out tok/s at C=1/16/64/256 (vLLM
 #   0.32.0 in brackets):
 #     TP1 23.1/264.7/364.8/360.6 (22.3/250.6/379.5/378.1); 339.7/344.7 at C=64/256
@@ -112,9 +115,9 @@ KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"
 # SM120 (compute capability 12.x) of the first selected GPU. TOKENSPEED_CUDA_ARCH
 # (e.g. sm120 / 12.0) overrides the nvidia-smi query. Same variables as the
-# other model scripts: _CUDA_ARCH_RAW, _IS_SM120. Only the long-context chunk
-# default below needs it: it depends on the measured KV budget, which the engine
-# cannot know before the memory profile.
+# other model scripts: _CUDA_ARCH_RAW, _IS_SM120. The two defaults below depend on
+# this model's KV budget on a 96 GB card and the expected load, which the engine
+# does not know when it resolves its arguments.
 _CUDA_ARCH_RAW="${TOKENSPEED_CUDA_ARCH:-$(nvidia-smi --id="${CUDA_DEVICES%%,*}" --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -1 || true)}"
 _IS_SM120=0
 case "$(tr '[:upper:]' '[:lower:]' <<<"${_CUDA_ARCH_RAW}" | tr -d '[:space:]_')" in
@@ -123,6 +126,9 @@ esac
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-}"
 PREFILL_GRAPH_MAX_TOKENS="${PREFILL_GRAPH_MAX_TOKENS:-}"
 MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-}"
+if [[ -z "$MAX_CUDAGRAPH_CAPTURE_SIZE" && "$_IS_SM120" == "1" && "$TENSOR_PARALLEL_SIZE" == "1" ]]; then
+    MAX_CUDAGRAPH_CAPTURE_SIZE=128
+fi
 if [[ -z "$CHUNKED_PREFILL_SIZE" && -z "$KV_CACHE_DTYPE" && "$_IS_SM120" == "1" && "$MAX_MODEL_LEN" -gt 199000 ]]; then
     CHUNKED_PREFILL_SIZE=1024
 fi
@@ -155,7 +161,7 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
-echo "[gemma4] sm120=${_IS_SM120} CUDA_DEVICES=${CUDA_DEVICES} TP=${TENSOR_PARALLEL_SIZE} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_NUM_SEQS=${MAX_NUM_SEQS} KV=${KV_CACHE_DTYPE:-auto} chunked_prefill=${CHUNKED_PREFILL_SIZE:-engine_default} prefill_graph_max_tokens=${PREFILL_GRAPH_MAX_TOKENS:-engine_default} cudagraph_cap=${MAX_CUDAGRAPH_CAPTURE_SIZE:-engine_default}" >&2
+echo "[gemma4] sm120=${_IS_SM120} CUDA_DEVICES=${CUDA_DEVICES} TP=${TENSOR_PARALLEL_SIZE} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_NUM_SEQS=${MAX_NUM_SEQS} KV=${KV_CACHE_DTYPE:-auto} chunked_prefill=${CHUNKED_PREFILL_SIZE:-engine_default} prefill_graph_max_tokens=${PREFILL_GRAPH_MAX_TOKENS:-engine_default} cudagraph_cap=${MAX_CUDAGRAPH_CAPTURE_SIZE:-max_num_seqs}" >&2
 cmd=(
     tokenspeed serve "$MODEL_PATH"
     --served-model-name "$SERVED_MODEL_NAME"
