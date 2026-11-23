@@ -393,3 +393,48 @@ def test_sm120_runs_its_own_leaves(
     if replaced_spec is not None:
         # The capped leaf stays registered for the platforms it was built for.
         assert not replaced_spec.capability.satisfied_by(sm120_platform), replaced
+
+
+_TRTLLM_FP8_BLOCK_MOE = (
+    "flashinfer_trtllm_fp8_moe_apply",
+    "flashinfer_trtllm_fp8_routed_moe_apply",
+)
+
+
+@pytest.mark.parametrize("name", _TRTLLM_FP8_BLOCK_MOE)
+def test_trtllm_block_fp8_moe_is_not_offered_on_sm120(
+    name: str,
+    b200_platform: PlatformInfo,
+    b300_platform: PlatformInfo,
+    sm120_platform: PlatformInfo,
+) -> None:
+    """Its FP8 activation quantizer has no SM12x kernel: ``--moe-backend auto``
+    chose it there and the server died with ``NoKernelFoundError`` for
+    ``quantization.fp8_with_scale``. Datacenter Blackwell keeps it."""
+    import tokenspeed_kernel.ops.moe  # noqa: F401  (registers the leaves)
+
+    spec = KernelRegistry.get().get_by_name(name)
+    if spec is None:
+        pytest.skip("FlashInfer TRT-LLM MoE leaves are not registered here")
+    assert spec.capability.satisfied_by(b200_platform), name
+    assert spec.capability.satisfied_by(b300_platform), name
+    assert not spec.capability.satisfied_by(sm120_platform), name
+
+
+def test_sm120_offers_a_block_fp8_moe_leaf_without_trtllm(
+    sm120_platform: PlatformInfo,
+) -> None:
+    import tokenspeed_kernel.ops.moe  # noqa: F401  (registers the leaves)
+
+    offered = KernelRegistry.get().get_for_operator(
+        "moe", "apply", platform=sm120_platform
+    )
+    block_fp8 = [
+        spec
+        for spec in offered
+        if "fp8" in spec.traits.get("weight_dtype", ())
+        and (128, 128) in spec.traits.get("fp8_scale_block_shape", ())
+    ]
+    assert block_fp8, "no block-FP8 MoE leaf on SM120"
+    assert "triton" in {spec.solution for spec in block_fp8}
+    assert not {spec.name for spec in block_fp8 if spec.solution == "flashinfer_trtllm"}

@@ -905,16 +905,23 @@ if platform.is_nvidia:
                 w.gemm1_clamp_limit = _per_expert(swiglu_arg.limit)
         return None
 
+    # The block-scale FP8 activation quantizer these leaves call has a
+    # ``trtllm`` kernel for SM100-SM107 only, so workstation Blackwell (SM12x)
+    # fails at run time. Excluding it lets ``--moe-backend auto`` pick the
+    # Triton block-FP8 leaves there.
+    _TRTLLM_FP8_BLOCK_CAPABILITY = CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(11, 99),
+    )
+
     @register_kernel(
         "moe",
         "apply",
         name="flashinfer_trtllm_fp8_moe_apply",
         solution="flashinfer_trtllm",
         weight_preprocessor=flashinfer_trtllm_fp8_moe_process_weights,
-        capability=CapabilityRequirement(
-            vendors=frozenset({"nvidia"}),
-            min_arch_version=ArchVersion(10, 0),
-        ),
+        capability=_TRTLLM_FP8_BLOCK_CAPABILITY,
         signatures=format_signatures(
             "x",
             "dense",
@@ -1071,10 +1078,7 @@ if platform.is_nvidia:
         name="flashinfer_trtllm_fp8_routed_moe_apply",
         solution="flashinfer_trtllm",
         weight_preprocessor=flashinfer_trtllm_fp8_moe_process_weights,
-        capability=CapabilityRequirement(
-            vendors=frozenset({"nvidia"}),
-            min_arch_version=ArchVersion(10, 0),
-        ),
+        capability=_TRTLLM_FP8_BLOCK_CAPABILITY,
         signatures=format_signatures(
             "x",
             "dense",
