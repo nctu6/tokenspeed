@@ -20,9 +20,9 @@
 """Startup defaults ServerArgs resolves from the detected device.
 
 Workstation Blackwell (compute capability 12.x) trades KV pool against CUDA-graph
-memory differently from datacenter parts: the prefill graph ladder is capped and
-a checkpoint that fills the card caps the decode ladder. Explicit flags always
-win and other architectures keep the engine defaults.
+memory differently from datacenter parts, so the prefill graph ladder is
+capped there. Explicit flags always win and other architectures keep the engine
+defaults.
 """
 
 import argparse
@@ -62,14 +62,6 @@ def _platform(major: int, minor: int) -> PlatformInfo:
 
 SM120 = _platform(12, 0)
 SM90 = _platform(9, 0)
-
-
-def _checkpoint(root, gib: int) -> str:
-    """A model directory whose ``.safetensors`` files add up to ``gib`` GiB (sparse)."""
-    root.mkdir(exist_ok=True)
-    with open(root / "model-00001.safetensors", "wb") as f:
-        f.truncate(gib * 2**30)
-    return str(root)
 
 
 def _resolve(argv: list[str], platform: PlatformInfo) -> ServerArgs:
@@ -132,54 +124,3 @@ class TestPrefillGraphCap:
             SM120,
         )
         assert sa.prefill_graph_max_tokens is None
-
-
-class TestDecodeGraphCap:
-    def test_checkpoint_filling_the_card_caps_the_ladder(self, tmp_path):
-        model = _checkpoint(tmp_path / "big", 60)
-        sa = _resolve(["--model", model, "--max-num-seqs", "452"], SM120)
-        assert sa.max_cudagraph_capture_size == 128
-
-    def test_small_checkpoint_keeps_the_full_ladder(self, tmp_path):
-        model = _checkpoint(tmp_path / "small", 16)
-        sa = _resolve(["--model", model, "--max-num-seqs", "452"], SM120)
-        assert sa.max_cudagraph_capture_size == 452
-
-    def test_batch_within_the_cap_is_unchanged(self, tmp_path):
-        model = _checkpoint(tmp_path / "big", 60)
-        sa = _resolve(["--model", model, "--max-num-seqs", "64"], SM120)
-        assert sa.max_cudagraph_capture_size == 64
-
-    def test_explicit_value_wins(self, tmp_path):
-        model = _checkpoint(tmp_path / "big", 60)
-        sa = _resolve(
-            [
-                "--model",
-                model,
-                "--max-num-seqs",
-                "452",
-                "--max-cudagraph-capture-size",
-                "256",
-            ],
-            SM120,
-        )
-        assert sa.max_cudagraph_capture_size == 256
-
-    def test_other_architectures_keep_the_full_ladder(self, tmp_path):
-        model = _checkpoint(tmp_path / "big", 60)
-        sa = _resolve(["--model", model, "--max-num-seqs", "452"], SM90)
-        assert sa.max_cudagraph_capture_size == 452
-
-    def test_two_gpus_keep_the_full_ladder(self, tmp_path):
-        model = _checkpoint(tmp_path / "big", 60)
-        sa = _resolve(
-            ["--model", model, "--max-num-seqs", "452", "--tensor-parallel-size", "2"],
-            SM120,
-        )
-        assert sa.max_cudagraph_capture_size == 452
-
-    def test_hub_id_without_a_local_checkpoint_is_not_guessed(self):
-        sa = _resolve(
-            ["--model", "org/not-a-local-dir", "--max-num-seqs", "452"], SM120
-        )
-        assert sa.max_cudagraph_capture_size == 452

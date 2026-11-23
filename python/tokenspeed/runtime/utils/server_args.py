@@ -101,29 +101,6 @@ logger = get_colorful_logger(__name__)
 # DeepSeek V4.1). Capped at 1024 tokens that memory goes back to the KV pool;
 # longer chunks run without a graph.
 SM12X_PREFILL_GRAPH_MAX_TOKENS = 1024
-# A model whose checkpoint fills at least this share of one such GPU leaves a KV
-# pool that holds few requests (Gemma-4 31B: about 33 of a 12000-char RAG load),
-# so decode graphs above SM12X_DECODE_GRAPH_MAX_BATCH are never replayed. Their
-# memory (0.43 / 0.86 / 1.64 GB for a ladder to 128 / 256 / 512) goes to the KV
-# pool instead; a larger batch runs the same refresh path without a graph.
-SM12X_KV_BOUND_WEIGHT_FRACTION = 0.5
-SM12X_DECODE_GRAPH_MAX_BATCH = 128
-
-
-def _checkpoint_weight_bytes(model: str) -> int | None:
-    """Bytes of the ``*.safetensors`` files of a local checkpoint directory.
-    Returns None when ``model`` is not a local directory (a hub id): the size
-    is then unknown and the rules that need it do not apply.
-    """
-    if not os.path.isdir(model):
-        return None
-    return sum(
-        entry.stat().st_size
-        for entry in os.scandir(model)
-        if entry.is_file() and entry.name.endswith(".safetensors")
-    )
-
-
 # Sampling backends whose verify runs a draft-prob chain kernel
 # (--enable-speculative-sampling) for the step drafters (EAGLE3, MTP): the
 # FlashInfer backends over whole rows, sonic over its top-128 candidates.
@@ -1473,23 +1450,6 @@ class ServerArgs:
                 # the cache is sized, so the larger ladder costs KV pages
                 # rather than headroom.
                 self.max_cudagraph_capture_size = self.max_num_seqs
-                weight_bytes = _checkpoint_weight_bytes(self.model)
-                if (
-                    is_sm12x
-                    and gpu_mem is not None
-                    and weight_bytes is not None
-                    and self.mapping.world_size == 1
-                    and weight_bytes >= SM12X_KV_BOUND_WEIGHT_FRACTION * gpu_mem * 2**20
-                    and self.max_num_seqs > SM12X_DECODE_GRAPH_MAX_BATCH
-                ):
-                    self.max_cudagraph_capture_size = SM12X_DECODE_GRAPH_MAX_BATCH
-                    logger.info(
-                        "auto: max_cudagraph_capture_size="
-                        f"{self.max_cudagraph_capture_size} "
-                        f"(sm{platform.arch_version.major}{platform.arch_version.minor}, "
-                        f"1 GPU, checkpoint {weight_bytes / 2**30:.1f} GiB of "
-                        f"{gpu_mem / 1024:.1f} GiB: the KV pool holds few requests)"
-                    )
         if self.disaggregation_decode_extra_slots is None:
             self.disaggregation_decode_extra_slots = (
                 self.max_num_seqs // self.mapping.attn.dp_size
