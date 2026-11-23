@@ -1679,6 +1679,16 @@ that failed for capacity seals new-prompt admission for the round
 the round's prefill work, resident chunks included (`scheduleLocalPrefillWork`,
 so on the P role too; §1.4).
 
+**Mixed prefill token budget** (`mixed_prefill_token_budget` `N`,
+`--mixed-prefill-token-budget`; fused role with mixed mode only, `N` at most
+`max_scheduled_tokens`; `0` is off). A round that carries decodes lets the
+local-prefill phases (resident chunks and new prompts together) schedule at
+most `N` tokens, never less than `pending_prefill_reserve`, whatever the
+decode count or the prompt sizes. `N` also replaces the reference chunk
+(`TOKENSPEED_MIXED_REF_CHUNK`) that scales the admission floors, and the
+decode-count shrink and the long-chunk cap (`TOKENSPEED_MIXED_DECODE_REF`,
+`TOKENSPEED_MIXED_LONG_CHUNK`) no longer apply: one bound, one path. Rounds
+without decodes keep the whole token budget.
 **Phases, non-mixed:** after the restore, the prefill phases run first and
 alone; decodes get the round only when no prefill scheduled. No prefill
 reserve is needed — scheduling order is the capacity priority.
