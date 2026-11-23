@@ -1788,6 +1788,33 @@ def test_qwen_splits_attention_layers_until_state_groups_fill_the_parent() -> No
     assert setup.spec.token_capacity > 0
 
 
+def test_qwen_kv_group_split_holds_more_requests_in_one_budget(monkeypatch) -> None:
+    """Every request holds one parent per state group, so the split's smaller state parents hold more
+    requests than the single 24-segment KV group the same layers had before."""
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
+        QwenGDNRecipe,
+    )
+
+    def state_bytes_per_request(plan) -> int:
+        return sum(
+            plan.lcm_block_bytes
+            for group in plan.groups
+            if group.group_id.startswith(LINEAR_ATTENTION)
+        )
+
+    split = state_bytes_per_request(_qwen_gdn_setup(12).spec.memory_plan)
+    monkeypatch.setattr(QwenGDNRecipe, "_max_kv_groups", property(lambda self: 1))
+    unsplit_plan = _qwen_gdn_setup(12).spec.memory_plan
+    assert sorted(group.group_id for group in unsplit_plan.groups) == [
+        FULL_ATTENTION,
+        f"{LINEAR_ATTENTION}_0",
+        f"{LINEAR_ATTENTION}_1",
+    ]
+    # 3 x (12 segments + conv windows) against 2 x 24 segments; the test model's conv windows
+    # are a seventh of a state, so the saving is 14 % here and 23 % at the real 1/48.
+    assert split < 0.9 * state_bytes_per_request(unsplit_plan)
+
+
 def test_qwen_mtp_draft_layer_fills_state_segments() -> None:
     """An MTP layer of a target attention layer's bytes takes segments the state layers fill too."""
     plan = _qwen_gdn_setup(2, draft_kv_heads=1).spec.memory_plan
