@@ -92,6 +92,37 @@ MIXED_BATCH_LARGE_CHUNK_ARCHITECTURES = frozenset(
 )
 
 logger = get_colorful_logger(__name__)
+# Workstation Blackwell (compute capability 12.x, e.g. RTX PRO 6000, 96 GB)
+# defaults, resolved in ``resolve_memory_and_scheduling`` from the detected
+# device; an explicit flag always wins. See docs/configuration/server.md.
+#
+# The prefill CUDA-graph ladder up to the 8192-token default reserves about
+# 2.3 GB of a 96 GB card (56 buckets for Gemma-4 31B; 27% of the KV pool for
+# DeepSeek V4.1). Capped at 1024 tokens that memory goes back to the KV pool;
+# longer chunks run without a graph.
+SM12X_PREFILL_GRAPH_MAX_TOKENS = 1024
+# A model whose checkpoint fills at least this share of one such GPU leaves a KV
+# pool that holds few requests (Gemma-4 31B: about 33 of a 12000-char RAG load),
+# so decode graphs above SM12X_DECODE_GRAPH_MAX_BATCH are never replayed. Their
+# memory (0.43 / 0.86 / 1.64 GB for a ladder to 128 / 256 / 512) goes to the KV
+# pool instead; a larger batch runs the same refresh path without a graph.
+SM12X_KV_BOUND_WEIGHT_FRACTION = 0.5
+SM12X_DECODE_GRAPH_MAX_BATCH = 128
+
+
+def _checkpoint_weight_bytes(model: str) -> int | None:
+    """Bytes of the ``*.safetensors`` files of a local checkpoint directory.
+    Returns None when ``model`` is not a local directory (a hub id): the size
+    is then unknown and the rules that need it do not apply.
+    """
+    if not os.path.isdir(model):
+        return None
+    return sum(
+        entry.stat().st_size
+        for entry in os.scandir(model)
+        if entry.is_file() and entry.name.endswith(".safetensors")
+    )
+
 
 # Sampling backends whose verify runs a draft-prob chain kernel
 # (--enable-speculative-sampling) for the step drafters (EAGLE3, MTP): the
@@ -1389,6 +1420,29 @@ class ServerArgs:
         # Set the chunked prefill token budget.
         if self.chunked_prefill_size is None:
             self.chunked_prefill_size = 8192
+        platform = current_platform()
+        is_sm12x = bool(platform.is_nvidia and platform.arch_version.major == 12)
+        if (
+            is_sm12x
+            and self.prefill_graph_max_tokens is None
+            and self.prefill_graph_capture_sizes is None
+            and not self.enforce_eager
+            and not self.disable_prefill_graph
+            and not self.is_embedding
+            and self.disaggregation_mode != "decode"
+        ):
+            self.prefill_graph_max_tokens = min(
+                SM12X_PREFILL_GRAPH_MAX_TOKENS, self.chunked_prefill_size
+            )
+            if self.max_total_tokens:
+                self.prefill_graph_max_tokens = min(
+                    self.prefill_graph_max_tokens, self.max_total_tokens
+                )
+            logger.info(
+                f"auto: prefill_graph_max_tokens={self.prefill_graph_max_tokens} "
+                f"(sm{platform.arch_version.major}{platform.arch_version.minor}: "
+                "the 8192-token prefill graph ladder costs KV pool)"
+            )
 
         # Set max number of sequences.
         if self.max_num_seqs is None:
@@ -1419,6 +1473,23 @@ class ServerArgs:
                 # the cache is sized, so the larger ladder costs KV pages
                 # rather than headroom.
                 self.max_cudagraph_capture_size = self.max_num_seqs
+                weight_bytes = _checkpoint_weight_bytes(self.model)
+                if (
+                    is_sm12x
+                    and gpu_mem is not None
+                    and weight_bytes is not None
+                    and self.mapping.world_size == 1
+                    and weight_bytes >= SM12X_KV_BOUND_WEIGHT_FRACTION * gpu_mem * 2**20
+                    and self.max_num_seqs > SM12X_DECODE_GRAPH_MAX_BATCH
+                ):
+                    self.max_cudagraph_capture_size = SM12X_DECODE_GRAPH_MAX_BATCH
+                    logger.info(
+                        "auto: max_cudagraph_capture_size="
+                        f"{self.max_cudagraph_capture_size} "
+                        f"(sm{platform.arch_version.major}{platform.arch_version.minor}, "
+                        f"1 GPU, checkpoint {weight_bytes / 2**30:.1f} GiB of "
+                        f"{gpu_mem / 1024:.1f} GiB: the KV pool holds few requests)"
+                    )
         if self.disaggregation_decode_extra_slots is None:
             self.disaggregation_decode_extra_slots = (
                 self.max_num_seqs // self.mapping.attn.dp_size
