@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 __all__ = [
     "H3Config",
@@ -52,6 +53,28 @@ SUPPORTED_FPS = 24
 MIN_DURATION_S = 4.0
 MAX_DURATION_S = 15.0
 DEFAULT_SHORT_EDGE = 768
+
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.platform import PlatformInfo
+
+
+def default_ulysses_degree(platform: PlatformInfo, num_gpus: int) -> int:
+    """Ulysses degree when neither ``--ulysses-degree`` nor ``--ring`` is given.
+    Two workstation-Blackwell GPUs (SM12x, 96 GB) serve H3 with the DiT sequence
+    split over both and every weight resident (``ulysses`` residency, degree 2):
+    0.245 vs 0.182 req/s at one request and 0.312 vs 0.184 at two against
+    ``device_split`` with CPU offload (t2va 672x384, 75 GiB per GPU). Every other
+    platform and GPU count keeps ``device_split`` / ``single`` (degree 1).
+    Args:
+        platform: The platform the pipeline runs on.
+        num_gpus: GPUs given to the pipeline.
+    Returns:
+        The ulysses degree to serve with.
+    """
+    if platform.is_nvidia and platform.arch_version.major == 12 and num_gpus == 2:
+        return 2
+    return 1
 
 
 @dataclass(frozen=True)

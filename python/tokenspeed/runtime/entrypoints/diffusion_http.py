@@ -40,7 +40,7 @@ from typing import Any
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse, Response
 
-from tokenspeed.runtime.diffusion.config import H3Config
+from tokenspeed.runtime.diffusion.config import H3Config, default_ulysses_degree
 from tokenspeed.runtime.diffusion.job import JobStatus, VideoJobQueue
 from tokenspeed.runtime.diffusion.pipeline import H3GenerateRequest, H3Pipeline
 from tokenspeed.runtime.diffusion.references import (
@@ -452,6 +452,18 @@ def serve(argv: list[str], *, host: str | None = None, port: int | None = None) 
     port = port or args.port
     ulysses = int(args.ulysses_degree or 1)
     ring = int(args.ring or 1)
+    # Neither flag given: the engine picks the layout for this device. A
+    # defaulted ulysses degree keeps the weights resident, so CPU offload is off.
+    split_default = args.ulysses_degree is None and args.ring is None
+    if split_default:
+        from tokenspeed_kernel.platform import current_platform
+
+        ulysses = default_ulysses_degree(current_platform(), int(args.num_gpus))
+        if ulysses > 1:
+            logger.info(
+                f"auto: ulysses_degree={ulysses} (sm12x, {args.num_gpus} GPUs, "
+                "weights resident)"
+            )
     world = usp_world_size(ulysses, ring)
     # Diffusers CP needs N processes; re-exec under torchrun when needed.
     maybe_reexec_torchrun(argv, world)
@@ -463,7 +475,8 @@ def serve(argv: list[str], *, host: str | None = None, port: int | None = None) 
         num_gpus=int(args.num_gpus),
         dtype=args.dtype,
         memory_reserve_margin=args.memory_reserve_margin,
-        enable_cpu_offload=not args.no_cpu_offload,
+        enable_cpu_offload=not args.no_cpu_offload
+        and not (split_default and ulysses > 1),
         ulysses_degree=ulysses,
         ring_degree=ring,
         text_encoder_tp_size=int(args.text_encoder_tp_size or 1),
