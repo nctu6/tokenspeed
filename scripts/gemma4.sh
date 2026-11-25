@@ -32,8 +32,9 @@
 #                        engine also honors it directly from the environment.
 #   FORCE_DETERMINISTIC_RSAG / DISABLE_NCCL_NVLS
 #                        legacy per-knob switches (non-empty = on); still work.
-#   GPU_MEMORY_UTILIZATION default: empty (engine default). TP1 on one 141GB sm90
-#                        card needs ~0.85 to fit the 31B weights + KV.
+#   GPU_MEMORY_UTILIZATION default: empty (engine default); 0.95 on SM120 at
+#                        TENSOR_PARALLEL_SIZE=1, see "SM120 defaults". TP1 on one
+#                        141GB sm90 card needs ~0.85 to fit the 31B weights + KV.
 #   MM_ENCODER_TP_MODE   default: empty (engine default: weights). "data" runs
 #                        the vision tower data-parallel across the TP ranks.
 #
@@ -61,6 +62,11 @@
 #     TP1 23.1/264.7/364.8/360.6 (22.3/250.6/379.5/378.1); 339.7/344.7 at C=64/256
 #         before these defaults;
 #     TP2 42.9/479.8/931.4/1090.4 (41.2/444.1/869.1/975.2).
+#   GPU_MEMORY_UTILIZATION defaults to 0.95 at TP1 (TP2 and other archs keep the
+#   engine default). TP1 is KV-cache-bound at C>=64 (about 30 running requests
+#   of the 12000-char RAG load fit): at 0.9 the pool is full and throughput vs
+#   vLLM 0.34 at 0.95 was 0.92/0.93 at C=64/256; at 0.95 on both it is
+#   1.04/1.01/1.01 at C=16/64/256. vLLM 0.34 no longer starts TP1 at 0.9.
 #   Long context: one 8192-token prefill chunk is reserved per sliding-window
 #   group, so a 262144-token request does not fit the KV pool of one 96 GB GPU
 #   (single-request limit 199614 at TP1). With MAX_MODEL_LEN above 199000 the
@@ -82,7 +88,7 @@
 # Usage:
 #   ./scripts/gemma4.sh
 #   # SM120, TP1, 256K context (chunk 1024 is added automatically)
-#   CUDA_DEVICES=6 TENSOR_PARALLEL_SIZE=1 MAX_MODEL_LEN=262144 GPU_MEMORY_UTILIZATION=0.9 ./scripts/gemma4.sh
+#   CUDA_DEVICES=6 TENSOR_PARALLEL_SIZE=1 MAX_MODEL_LEN=262144 ./scripts/gemma4.sh
 #   CUDA_DEVICES=6,7 HOST_PORT=8779 ./scripts/gemma4.sh
 #   ATTENTION_BACKEND=triton ./scripts/gemma4.sh
 #   # multi-model: override served name when needed
@@ -136,6 +142,9 @@ fi
 FORCE_DETERMINISTIC_RSAG="${FORCE_DETERMINISTIC_RSAG:-}"
 DISABLE_NCCL_NVLS="${DISABLE_NCCL_NVLS:-}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-}"
+if [[ -z "$GPU_MEMORY_UTILIZATION" && "$_IS_SM120" == "1" && "$TENSOR_PARALLEL_SIZE" == "1" ]]; then
+    GPU_MEMORY_UTILIZATION=0.95
+fi
 MM_ENCODER_TP_MODE="${MM_ENCODER_TP_MODE:-}"
 case "${VLLM_BATCH_INVARIANT:-}" in
     1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn])
@@ -161,7 +170,7 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
-echo "[gemma4] sm120=${_IS_SM120} CUDA_DEVICES=${CUDA_DEVICES} TP=${TENSOR_PARALLEL_SIZE} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_NUM_SEQS=${MAX_NUM_SEQS} KV=${KV_CACHE_DTYPE:-auto} chunked_prefill=${CHUNKED_PREFILL_SIZE:-engine_default} prefill_graph_max_tokens=${PREFILL_GRAPH_MAX_TOKENS:-engine_default} cudagraph_cap=${MAX_CUDAGRAPH_CAPTURE_SIZE:-max_num_seqs}" >&2
+echo "[gemma4] sm120=${_IS_SM120} CUDA_DEVICES=${CUDA_DEVICES} TP=${TENSOR_PARALLEL_SIZE} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_NUM_SEQS=${MAX_NUM_SEQS} KV=${KV_CACHE_DTYPE:-auto} chunked_prefill=${CHUNKED_PREFILL_SIZE:-engine_default} prefill_graph_max_tokens=${PREFILL_GRAPH_MAX_TOKENS:-engine_default} cudagraph_cap=${MAX_CUDAGRAPH_CAPTURE_SIZE:-max_num_seqs} gpu_mem=${GPU_MEMORY_UTILIZATION:-engine_default}" >&2
 cmd=(
     tokenspeed serve "$MODEL_PATH"
     --served-model-name "$SERVED_MODEL_NAME"
