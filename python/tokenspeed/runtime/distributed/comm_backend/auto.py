@@ -38,6 +38,10 @@ from tokenspeed.runtime.distributed.comm_backend.base import (
     CommWork,
     Group,
 )
+from tokenspeed.runtime.distributed.comm_backend.copy_engine import (
+    CopyEngineAllReduceBackend,
+    copy_engine_all_reduce_applies,
+)
 from tokenspeed.runtime.distributed.comm_backend.iris import (
     IrisBackend,
 )
@@ -123,6 +127,8 @@ class AutoBackend(CommBackend):
         self._trtllm_ar = TrtllmAllReduceBackend(fallback=self._nccl)
         self._iris = IrisBackend(fallback=self._nccl)
         self._rsag = TritonRSAGBackend(fallback=self._nccl)
+        # Past the one-shot window, two PCIe ranks reduce on the copy engines.
+        self._copy_engine = CopyEngineAllReduceBackend(min_bytes=MAX_ONESHOT_BYTES)
         # Projection fallbacks retain Auto's ordinary routing and numerics.
         self._projection = ProjectionBackend(fallback=self)
         # Lamport token/channel-shard exchanges prepared by layers at build
@@ -140,6 +146,18 @@ class AutoBackend(CommBackend):
     @property
     def trtllm_ar(self) -> TrtllmAllReduceBackend:
         return self._trtllm_ar
+
+    def configure_copy_engine_all_reduce(self, group: Group, max_bytes: int) -> bool:
+        """Arm the copy-engine tier for ``group`` when it applies there, with
+        chunks of ``max_bytes``.
+
+        Collective over the group's ranks, before graph capture. Returns
+        whether the group is armed.
+        """
+        if not copy_engine_all_reduce_applies(group) or self._group_spans_nodes(group):
+            return False
+        self._copy_engine.configure_group(group, max_bytes)
+        return True
 
     def configure(self, use_pynccl: bool = False) -> None:
         self._nccl.configure(use_pynccl=use_pynccl)
@@ -408,6 +426,12 @@ class AutoBackend(CommBackend):
             tensors = tensor
             if len(tensors) == 0:
                 raise ValueError("all-reduce requires at least one tensor")
+            if not self._force_deterministic_rsag() and all(
+                self._copy_engine.serves(value, group, op) for value in tensors
+            ):
+                return tuple(
+                    self._copy_engine.all_reduce(value, group) for value in tensors
+                )
             use_nccl = self._force_deterministic_rsag() or not self._iris_reaches(group)
             if (
                 not use_nccl
@@ -448,6 +472,7 @@ class AutoBackend(CommBackend):
         # Tiered dispatch -- first match wins. This is Tier 1 (which backend);
         # the trtllm backend then runs Tier 2 (mnnvl vs IPC, by pattern, payload
         # bytes and the IPC kernel's strategy) inside _ar_fusion_workspace.
+        #   0. copy engine armed, past one-shot .... copy engine (2 PCIe ranks)
         #   1. trtllm_ar armed for this group ...... trtllm_ar   (mnnvl / IPC fusion)
         #   2. group Iris cannot map ............... NCCL
         #   3. producer-owned memory or Iris can run Iris
@@ -457,6 +482,8 @@ class AutoBackend(CommBackend):
         # the "usable here" test. Checking it before the cross-node NCCL
         # fallback is what lets a cross-node group use mnnvl at all -- otherwise
         # the workspace is armed and never called.
+        if self._copy_engine.serves(tensor, group, op):
+            return self._copy_engine.all_reduce(tensor, group)
         if self._trtllm_ar.has_trtllm_ar(group):
             return self._trtllm_ar.all_reduce(tensor, group, op=op)
         if not self._iris_reaches(group):

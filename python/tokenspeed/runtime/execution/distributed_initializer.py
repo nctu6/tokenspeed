@@ -299,6 +299,36 @@ class DistributedInitializer:
                             f"trtllm one-shot all-reduce for group {group!s}: "
                             f"{('enabled' if ok else 'unavailable (NCCL fallback)')!s}",
                         )
+            # Imported here like the registry does: the Auto backend pulls in
+            # the NVIDIA and AMD kernel modules.
+            from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+            from tokenspeed.runtime.distributed.comm_backend.copy_engine import (
+                COPY_ENGINE_MAX_CHUNK_BYTES,
+            )
+
+            # Both flags route every reduction off the tiered dispatch.
+            if (
+                isinstance(backend, AutoBackend)
+                and not config.force_deterministic_rsag
+                and not config.batch_invariant_collectives
+            ):
+                # One chunk holds a prefill chunk's BF16 hidden rows, capped
+                # where the copy bandwidth has long reached its plateau.
+                max_bytes = min(
+                    max(1, config.max_num_tokens) * config.hidden_size * 2,
+                    COPY_ENGINE_MAX_CHUNK_BYTES,
+                )
+                for group in sorted(
+                    {config.mapping.attn.tp_group, config.mapping.moe.tp_ep_group}
+                ):
+                    if len(group) > 1 and backend.configure_copy_engine_all_reduce(
+                        group, max_bytes
+                    ):
+                        logger.info(
+                            f"copy-engine all-reduce for group {group!s}: enabled "
+                            f"(payloads past the one-shot window, chunks of "
+                            f"{max_bytes} B)"
+                        )
 
         logger.info(
             "Init comm buff end. Avail mem="

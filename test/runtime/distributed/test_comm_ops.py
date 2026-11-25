@@ -25,7 +25,13 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 class TestAutoBackendTopology:
     @pytest.fixture
     def backend(self, monkeypatch):
-        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+        from tokenspeed.runtime.distributed.comm_backend.auto import (
+            MAX_ONESHOT_BYTES,
+            AutoBackend,
+        )
+        from tokenspeed.runtime.distributed.comm_backend.copy_engine import (
+            CopyEngineAllReduceBackend,
+        )
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
         monkeypatch.setitem(
@@ -35,6 +41,8 @@ class TestAutoBackendTopology:
         )
         backend = AutoBackend.__new__(AutoBackend)
         backend._nccl = Mock()
+        # Unarmed: no group of these tests takes the copy-engine tier.
+        backend._copy_engine = CopyEngineAllReduceBackend(min_bytes=MAX_ONESHOT_BYTES)
         backend._rsag = Mock()
         backend._iris = Mock()
         backend._trtllm_ar = Mock()
