@@ -200,6 +200,38 @@ task-boundary fence orders writes across domains: that link is not documented,
 and the evidence for it is empirical (byte-exact gathers over long runs with
 concurrent compute and collectives, on GB300).
 
+## Copy-engine all-reduce (two ranks)
+
+`copy_engine.CopyEngineAllReduceState` sums a tensor over a two-rank group in
+place with the data moved by the copy engines. Each rank owns half of the
+tensor (rank 0 the first, both halves 16-byte aligned). A call copies the
+peer's half into the peer's symmetric staging buffer, waits at a barrier,
+adds its own half to the staged one, copies the sum into the peer's result
+buffer, waits at a second barrier, and copies the peer's sum back. The copies
+are device-to-device `cudaMemcpyAsync` calls into peer-mapped memory; only the
+add and the barriers use SMs. A sum of two BF16, FP16 or FP32 values rounds
+once, so the result equals NCCL's all-reduce bit for bit. Tensors larger than
+the state's chunk run in chunks; the barriers order every buffer reuse, so
+calls and graph replays need no other synchronization. Build the state
+collectively before graph capture.
+
+Two RTX PRO 6000s on one PCIe switch, BF16 `[rows, 3072]`, back-to-back calls,
+ms per call:
+
+| MB | NCCL 2.30 | trtllm IPC workspace | SM peer stores | copy engine |
+|---:|----------:|---------------------:|---------------:|------------:|
+| 3.1 | 0.119 | 0.101 | 0.107 | 0.083 |
+| 12.6 | 0.442 | 0.405 | 0.408 | 0.264 |
+| 25.2 | 0.867 | 0.827 | 0.809 | 0.503 |
+| 50.3 | 1.718 | 1.673 | 1.611 | 0.980 |
+| 100.7 | 3.379 | - | 3.233 | 1.974 |
+
+The copy engines move about 49 GB/s each way at once on this link; SM stores
+to peer memory reach about 31 GB/s and NCCL's ring about 29 GB/s algorithm
+bandwidth (no `NCCL_*` setting changes that except
+`NCCL_P2P_USE_CUDA_MEMCPY=1`, which reaches 1.16 ms at 50 MB, but a server
+started with it hung during startup in both tries).
+
 ## Staged multimem all-reduce
 
 `multimem.py` keeps one symmetric BF16 buffer per row width and group.

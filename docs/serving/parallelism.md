@@ -1020,6 +1020,11 @@ Where FlashInfer's BT presets cover the group (8 ranks, width 7168,
 SM103), payloads of at least 1 MiB per rank instead take its owner
 reduction, which sums the ranks in order in fp32 where the Lamport kernels sum
 in BF16 (`tokenspeed_kernel/ops/communication/README.md` has the measurements).
+A two-rank group of one node whose NVIDIA GPUs are joined only by PCIe
+also arms a copy-engine all-reduce at startup: SUM all-reduces past the
+one-shot window (prefill chunks) move their data with `cudaMemcpyAsync`
+into peer-mapped buffers instead of NCCL, at 0.57-0.70x NCCL's time and
+with NCCL's bits (`tokenspeed_kernel/ops/communication/README.md`).
 Cross-node groups arm the full two-shot capacity at startup. Single-node
 groups start at the one-shot window and serve larger shapes once
 model-level preparation widens the shared workspace. Other
