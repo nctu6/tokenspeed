@@ -1688,7 +1688,11 @@ decode count or the prompt sizes. `N` also replaces the reference chunk
 (`TOKENSPEED_MIXED_REF_CHUNK`) that scales the admission floors, and the
 decode-count shrink and the long-chunk cap (`TOKENSPEED_MIXED_DECODE_REF`,
 `TOKENSPEED_MIXED_LONG_CHUNK`) no longer apply: one bound, one path. Rounds
-without decodes keep the whole token budget.
+without decodes keep the whole token budget. `N` counts prompt tokens only:
+the forward of a mixed round carries `N` plus one token per decode (more
+under speculation), and it replays a prefill graph only if that total fits
+the largest prefill-graph bucket (`--prefill-graph-max-tokens`, 1024 by
+default on SM12x); a larger round runs eager.
 **Phases, non-mixed:** after the restore, the prefill phases run first and
 alone; decodes get the round only when no prefill scheduled. No prefill
 reserve is needed — scheduling order is the capacity priority.

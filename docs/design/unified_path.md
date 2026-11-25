@@ -1732,7 +1732,12 @@ not a reason to recompute each layer through a second commit path. Since forward
 mode is derived from the extend count, zero means decode at this entry. Hybrid
 delegates to the recurrent child.
 A mixed batch gives prefill and decode rows their existing metadata and
-forwards; only the decode suffix enters the acceptance commit. The
+forwards; only the decode suffix enters the acceptance commit. This holds
+without speculation too: a recurrent backend scans only the leading extend
+rows and runs the one-token decode rows through its decode kernels, which
+update their state pages in place. Scanning the decode rows with the extend
+rows would gather and scatter every decoding request's state on every
+recurrent layer. The
 Qwen4-Exp root invokes its attention child, then PLE for decode and QSA for
 decode/mixed, excluding leading extends from QSA acceptance. Mixed rounds
 retain PLE's direct state writes. Each consumer commits once; stateless
