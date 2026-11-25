@@ -768,14 +768,25 @@ def test_a_mixed_forward_with_verify_rows_gives_its_extend_rows_their_checkpoint
     assert prefill.scan_checkpoint_rows is None
 
 
-def test_a_mixed_forward_without_drafts_plans_its_checkpoints_over_every_row():
-    # Without drafts the MIXED round scans its one-token decode rows with its
-    # extend rows, so the plan counts every row; the decode rows store none.
+def test_a_mixed_forward_without_drafts_runs_its_decode_rows_apart():
+    # Without drafts the MIXED round still scans only its extend rows, so the
+    # checkpoint plan counts those rows; the one-token decode rows update their
+    # state in place from their own pages and store no checkpoints.
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
     backend = _checkpointing_state_backend(spec_tokens=1)
     _init_mixed_round(backend, ForwardMode.MIXED, 4, checkpoints=True, device="cpu")
-    assert backend._mixed_forward_metadata is None
-    metadata = backend.forward_metadata
-    assert metadata.scan_state_checkpoints.cu_starts.tolist() == [0, 2, 3, 3, 3]
-    assert metadata.scan_checkpoint_rows.tolist() == [1, 2]
+    mixed = backend._mixed_forward_metadata
+    assert mixed is not None
+    full = backend.forward_metadata
+    plan = mixed.prefill.scan_state_checkpoints
+    assert plan.cu_starts.tolist() == [0, 2, 3]
+    assert mixed.prefill.scan_checkpoint_rows.tolist() == [1, 2]
+    assert mixed.prefill.scan_query_start_loc.numel() == 3
+    for pages in ("state_in_blocks_by_group", "state_out_blocks_by_group"):
+        assert (
+            getattr(mixed.decode, pages)["linear_attention"].tolist()
+            == getattr(full, pages)["linear_attention"][2:].tolist()
+        )
+    assert mixed.decode.state_checkpoints is None
+    assert mixed.decode.scan_state_checkpoints is None

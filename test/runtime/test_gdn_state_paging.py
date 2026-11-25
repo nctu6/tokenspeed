@@ -952,6 +952,179 @@ class TestGDNStatePagingGPUTest:
                     assert torch.equal(slab[1], saved)
                     assert (slab[0].abs().max().item()) == (0.0)
 
+    def test_mixed_forward_matches_separate_prefill_and_decode(self):
+        """A mixed batch scans its prefill rows and updates its decode rows in place.
+        Without speculation the decode rows must not go through the prefill
+        scan (which gathers and scatters every decode request's state): the
+        mixed forward equals an extend of the prefill request followed by a
+        decode of the decoding request, in outputs and in state pages.
+        """
+        from tokenspeed_kernel.ops.attention.gdn.triton import (
+            triton_gdn_chunk_prefill,
+        )
+
+        import tokenspeed.runtime.layers.attention.backends.state.mamba as mamba
+
+        torch = self.torch
+        ForwardMode = self.ForwardMode
+        h, d = self.H, self.D
+        channels = 3 * h * d
+        prompt_a, prompt_b = 8, 6
+        raw = torch.randn(
+            prompt_a + prompt_b + 1, channels, device="cuda", dtype=torch.bfloat16
+        )
+        a = torch.randn(raw.shape[0], h, device="cuda", dtype=torch.float32)
+        b = torch.randn_like(a)
+        common = dict(
+            conv_weights=torch.randn(
+                channels, self.WIDTH, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.1,
+            bias=torch.randn(channels, device="cuda", dtype=torch.bfloat16) * 0.1,
+            activation="silu",
+            key_dim=h * d,
+            value_dim=h * d,
+            attention_tp_size=1,
+            head_k_dim=d,
+            head_v_dim=d,
+            A_log=torch.randn(h, device="cuda", dtype=torch.float32) * 0.1,
+            dt_bias=torch.randn(h, device="cuda", dtype=torch.float32) * 0.1,
+            layer_id=0,
+        )
+        # Rows: request A's prompt, request B's prompt, then A's decode token.
+        a_prompt = slice(0, prompt_a)
+        b_prompt = slice(prompt_a, prompt_a + prompt_b)
+        a_decode = slice(prompt_a + prompt_b, prompt_a + prompt_b + 1)
+
+        def fresh_backend():
+            conv = torch.zeros(
+                8, channels, self.WIDTH - 1, device="cuda", dtype=torch.bfloat16
+            )
+            recurrent = torch.zeros(8, h, d, d, device="cuda", dtype=torch.float32)
+            pool = _ContractPool({0: ("linear_attention", conv, recurrent)})
+            backend = self._make_backend(pool, spec_num_tokens=1, replay_ssm=False)
+            return backend, conv, recurrent
+
+        def tables(rows):
+            return {
+                "linear_attention": torch.tensor(rows, dtype=torch.int32, device="cuda")
+            }
+
+        def int32(values):
+            return torch.tensor(values, dtype=torch.int32, device="cuda")
+
+        def extend(backend, rows, block_rows, pool_index):
+            length = rows.stop - rows.start
+            backend.init_forward_metadata(
+                bs=1,
+                num_extends=1,
+                req_pool_indices=int32([pool_index]),
+                seq_lens=int32([length]),
+                forward_mode=ForwardMode.EXTEND,
+                block_tables=tables([block_rows]),
+                **_extend_kwargs(
+                    torch,
+                    torch.tensor([length], dtype=torch.int32),
+                    torch.zeros(1, dtype=torch.int32),
+                    "cuda",
+                ),
+            )
+            return backend.forward_extend(
+                None,
+                None,
+                None,
+                layer=None,
+                out_cache_loc=None,
+                token_to_kv_pool=backend.kv_pool,
+                bs=1,
+                forward_mode=ForwardMode.EXTEND,
+                mixed_qkv=raw[rows],
+                a=a[rows],
+                b=b[rows],
+                seq_len=length,
+                **common,
+            )
+
+        with patch.object(mamba, "gdn_chunk_prefill", triton_gdn_chunk_prefill):
+            reference, ref_conv, ref_ssm = fresh_backend()
+            candidate, cand_conv, cand_ssm = fresh_backend()
+            for backend in (reference, candidate):
+                # Request A (pool row 1) holds its prompt state in block 2.
+                extend(backend, a_prompt, [0, 2], 1)
+            # Reference: B's prompt (pool row 2, block 4), then A's decode
+            # (reads block 2, writes block 3).
+            ref_prefill = extend(reference, b_prompt, [0, 4], 2)
+            reference.refresh_decode_metadata(
+                1,
+                1,
+                int32([1]),
+                int32([prompt_a + 1]),
+                forward_mode=ForwardMode.DECODE,
+                block_tables=tables([[2, 3]]),
+            )
+            ref_decode = reference.forward_decode(
+                None,
+                None,
+                None,
+                layer=None,
+                out_cache_loc=None,
+                token_to_kv_pool=reference.kv_pool,
+                bs=1,
+                # The decode convolution updates its input in place.
+                mixed_qkv=raw[a_decode].clone(),
+                a=a[a_decode],
+                b=b[a_decode],
+                **common,
+            )
+            # Candidate: both in one mixed batch, the extend row first.
+            candidate.init_forward_metadata(
+                bs=2,
+                num_extends=1,
+                req_pool_indices=int32([2, 1]),
+                seq_lens=int32([prompt_b, prompt_a + 1]),
+                forward_mode=ForwardMode.MIXED,
+                block_tables=tables([[0, 4], [2, 3]]),
+                **_extend_kwargs(
+                    torch,
+                    torch.tensor([prompt_b], dtype=torch.int32),
+                    torch.zeros(1, dtype=torch.int32),
+                    "cuda",
+                ),
+            )
+            mixed = candidate.forward_extend(
+                None,
+                None,
+                None,
+                layer=None,
+                out_cache_loc=None,
+                token_to_kv_pool=candidate.kv_pool,
+                bs=2,
+                forward_mode=ForwardMode.MIXED,
+                mixed_qkv=raw[prompt_a:],
+                a=a[prompt_a:],
+                b=b[prompt_a:],
+                seq_len=prompt_b + 1,
+                **common,
+            )
+        expected = torch.cat(
+            (ref_prefill.flatten(0, 1), ref_decode.flatten(0, 1)), dim=0
+        )
+        assert tuple(mixed.shape) == tuple(expected.shape)
+        torch.testing.assert_close(
+            mixed.float(), expected.float(), atol=1e-1, rtol=1e-2
+        )
+        assert (mixed.float() - expected.float()).abs().mean().item() < 1e-3
+        for block in (3, 4):
+            assert (cand_ssm[block].abs().max().item()) > 0.0
+            diff = (cand_ssm[block] - ref_ssm[block]).abs()
+            assert (
+                diff.mean().item() < 1e-3
+            ), f"state block {block}: {diff.mean().item()}"
+            assert torch.equal(cand_conv[block], ref_conv[block])
+        # Request A's prompt-end block is read, never rewritten.
+        assert torch.equal(cand_ssm[2], ref_ssm[2])
+        assert (cand_ssm[0].abs().max().item()) == 0.0
+
     def test_verify_scratch_seeds_conv_but_omits_replayed_ssm_state(self):
         torch = self.torch
         conv_dim = 3 * self.H * self.D

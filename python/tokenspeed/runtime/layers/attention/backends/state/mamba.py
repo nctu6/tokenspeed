@@ -214,7 +214,7 @@ class MambaForwardMetadata:
     # chunked scan's plan for them (its interval, buffer and the buffer row of
     # each checkpoint); None when the forward writes none. A MIXED forward
     # that runs its decode rows apart writes them through its extend rows'
-    # metadata alone (_prepare_mixed_verify_metadata). Capacity metadata may
+    # metadata alone (_prepare_split_mixed_metadata). Capacity metadata may
     # instead keep fixed slots here (``CapacityPrefillMetadata``).
     state_checkpoints: InForwardStateCheckpoints | None = None
     scan_state_checkpoints: GdnStateCheckpoints | None = None
@@ -1044,11 +1044,11 @@ class MambaAttnBackend(AttentionBackend):
             extend_seq_lens_cpu, query_start_loc.numel()
         )
 
-        # A MIXED forward whose decode rows defer their state commit runs them
-        # apart from its leading extend rows (_prepare_mixed_verify_metadata).
-        split_mixed = (
-            forward_mode.is_mixed() and self.deferred_state_commit and num_extends < bs
-        )
+        # A MIXED forward runs its decode rows apart from its leading extend
+        # rows (_prepare_split_mixed_metadata): scanning them with the extend
+        # rows would gather and scatter every decode request's recurrent state
+        # through the prefill scan, a cost that grows with the decode batch.
+        split_mixed = forward_mode.is_mixed() and num_extends < bs
         state_in_blocks_by_group = None
         state_out_blocks_by_group = None
         state_checkpoints = None
@@ -1106,7 +1106,7 @@ class MambaAttnBackend(AttentionBackend):
         )
 
         if split_mixed:
-            self._prepare_mixed_verify_metadata(
+            self._prepare_split_mixed_metadata(
                 bs,
                 num_extends,
                 req_pool_indices,
@@ -1152,7 +1152,7 @@ class MambaAttnBackend(AttentionBackend):
             rows.to(self.device),
         )
 
-    def _prepare_mixed_verify_metadata(
+    def _prepare_split_mixed_metadata(
         self,
         bs: int,
         num_extends: int,
@@ -1163,6 +1163,10 @@ class MambaAttnBackend(AttentionBackend):
         state_checkpoints: InForwardStateCheckpoints | None,
     ) -> None:
         """Reuse ordinary prefill and decode metadata for their respective rows.
+
+        The decode rows take the target-verify metadata when decode defers its
+        state commit, and the plain decode metadata (one token, state updated
+        in place) otherwise.
 
         ``state_checkpoints`` are the forward's in-forward State checkpoints
         (all on extend rows), or None; the prefill rows' scan stores them.
@@ -1208,19 +1212,38 @@ class MambaAttnBackend(AttentionBackend):
             scan_checkpoint_rows=scan_checkpoint_rows,
         )
         decode_bs = bs - num_extends
-        self.refresh_decode_metadata(
-            decode_bs,
-            decode_bs,
-            req_pool_indices[num_extends:bs],
-            seq_lens[num_extends:bs],
-            forward_mode=ForwardMode.DECODE,
-            for_graph_replay=False,
-            block_tables={
-                group: table[num_extends:bs] for group, table in block_tables.items()
-            },
-        )
+        if self.deferred_state_commit:
+            self.refresh_decode_metadata(
+                decode_bs,
+                decode_bs,
+                req_pool_indices[num_extends:bs],
+                seq_lens[num_extends:bs],
+                forward_mode=ForwardMode.DECODE,
+                for_graph_replay=False,
+                block_tables={
+                    group: table[num_extends:bs]
+                    for group, table in block_tables.items()
+                },
+            )
+            decode = self.forward_metadata
+        else:
+            # The decode kernels read only the rows' state pages. They need
+            # 16-byte aligned index tensors, which a view starting at row
+            # ``num_extends`` is not, so the pages are copied.
+            decode = MambaForwardMetadata(
+                query_start_loc=None,
+                scan_query_start_loc=None,
+                state_in_blocks_by_group={
+                    group: pages[num_extends:bs].clone()
+                    for group, pages in full_metadata.state_in_blocks_by_group.items()
+                },
+                state_out_blocks_by_group={
+                    group: pages[num_extends:bs].clone()
+                    for group, pages in full_metadata.state_out_blocks_by_group.items()
+                },
+            )
         self._mixed_forward_metadata = _MixedStateMetadata(
-            num_extends, int(lengths.sum()), prefill, self.forward_metadata
+            num_extends, int(lengths.sum()), prefill, decode
         )
         self.forward_metadata = full_metadata
 
@@ -1232,8 +1255,9 @@ class MambaAttnBackend(AttentionBackend):
         accepted_path: torch.Tensor | None,
     ) -> None:
         if num_extends:
-            # An ordinary mixed scan has already published its final state.
-            if self._mixed_forward_metadata is None:
+            # An ordinary mixed scan, and a split one whose decode rows write
+            # their state in place, have already published their final state.
+            if self._mixed_forward_metadata is None or not self.deferred_state_commit:
                 return
             accepted_lengths = accepted_lengths[num_extends:]
             if accepted_path is not None:
@@ -1917,18 +1941,33 @@ class MambaAttnBackend(AttentionBackend):
                 if inputs.get("output_norm") is not None:
                     inputs["output_norm"] = inputs["output_norm"].rows(begin, end)
                 self.forward_metadata = part_metadata
-                output = self.forward_extend(
-                    q,
-                    k,
-                    v,
-                    layer,
-                    token_to_kv_pool,
-                    rows,
-                    forward_mode=mode,
-                    save_kv_cache=save_kv_cache,
-                    **inputs,
-                )
-                outputs.append(output.squeeze(0) if output.ndim == 4 else output)
+                if mode.is_decode():
+                    # One token per row: the decode kernels (or, with deferred
+                    # state commit, the target-verify scan).
+                    output = self.forward_decode(
+                        q,
+                        k,
+                        v,
+                        layer,
+                        token_to_kv_pool,
+                        rows,
+                        save_kv_cache=save_kv_cache,
+                        **inputs,
+                    )
+                else:
+                    output = self.forward_extend(
+                        q,
+                        k,
+                        v,
+                        layer,
+                        token_to_kv_pool,
+                        rows,
+                        forward_mode=mode,
+                        save_kv_cache=save_kv_cache,
+                        **inputs,
+                    )
+                # [1, T, H, V] scan output or [B, 1, H, V] decode output -> [rows, H, V]
+                outputs.append(output.flatten(0, 1) if output.ndim == 4 else output)
         finally:
             self.forward_metadata = original_metadata
         output = torch.cat(outputs, dim=0)
