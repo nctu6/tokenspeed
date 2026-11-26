@@ -639,7 +639,7 @@ These stay explicit, because they change numerics or depend on the measured KV b
 | `--gpu-id-step` | Spacing between local workers' GPU ordinals. Default 1. |
 | `--nnodes` | Number of nodes. |
 | `--node-rank` | Rank of the current node. |
-| `--dist-init-addr` | Distributed initialization address. |
+| `--dist-init-addr` | Distributed initialization address. Omit it on a single node: the server then uses private `ipc://` sockets and a claimed rendezvous port, so servers started together never collide. When given, the address and the ports derived above it (`+1` to `+7`) are used as is, and a busy port fails startup. |
 | `--emulate-rank-zero` | Run only global rank 0 of the configured layout on one GPU, with local stand-ins for its collectives. For single-GPU performance work; outputs are not meaningful. See [Emulating rank 0 on one GPU](../serving/parallelism.md#emulating-rank-0-on-one-gpu). |
 
 Use `--tensor-parallel-size` for simple launches. When attention, dense,

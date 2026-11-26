@@ -65,7 +65,12 @@ from tokenspeed.runtime.utils import (
     nullable_str,
 )
 from tokenspeed.runtime.utils.launcher import check_dist_init_port, detect_topology
-from tokenspeed.runtime.utils.network import is_port_available, join_host_port
+from tokenspeed.runtime.utils.network import join_host_port
+from tokenspeed.runtime.utils.port_reservation import (
+    claim_port,
+    create_ipc_dir,
+    reserve_port,
+)
 from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_ALGORITHMS,
     BLOCK_SPEC_RULES,
@@ -5739,9 +5744,6 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     return server_args
 
 
-ZMQ_TCP_PORT_DELTA = 233
-
-
 @dataclasses.dataclass
 class PortArgs:
     # Reserved in the port cluster; no process binds it.
@@ -5771,33 +5773,58 @@ class PortArgs:
 
     @staticmethod
     def init_new(server_args: ServerArgs, dp_rank: int | None = None) -> "PortArgs":
-        port = server_args.port + random.randint(100, 1000)
-        while True:
-            if is_port_available(port):
-                break
-            if port < 60000:
-                port += 42
-            else:
-                port -= 43
+        """Allocate the control-plane addresses of one server.
 
-        # DP attention. Use TCP + port to handle both single-node and multi-node.
-        if server_args.mapping.nnodes == 1 and server_args.dist_init_addr is None:
-            # Only use default port fallback when dp_size == 1
-            # For dp_size > 1, we need explicit dist_init_addr to avoid port conflicts
+        Without ``--dist-init-addr`` on a single node (and no attention DP),
+        the ZMQ endpoints are ``ipc://`` sockets in a directory private to this
+        server and the rendezvous port is claimed atomically, so servers
+        started at the same moment cannot collide and no address derives from
+        the HTTP port. An explicit ``--dist-init-addr`` is honored as given,
+        and its derived port cluster must be free: a busy port is an error,
+        never moved.
+
+        Args:
+            server_args: The server's resolved arguments.
+            dp_rank: Attention-DP rank whose scheduler input port to derive;
+                None for the controller-side ports.
+
+        Returns:
+            The addresses every process of this server uses.
+
+        Raises:
+            ValueError: If the address is malformed, missing where required, or
+                a port it implies is in use.
+        """
+        # Reserved for the rendezvous fallback in DistributedConfig; the
+        # claim keeps another server from taking it.
+        port = reserve_port()
+
+        if server_args.dist_init_addr is None:
+            if server_args.mapping.nnodes != 1:
+                raise ValueError(
+                    f"--dist-init-addr is required for nnodes={server_args.mapping.nnodes} "
+                    "and could not be derived from the launcher environment. "
+                    "Example: --dist-init-addr <head-node-ip>:20000"
+                )
+            # For dp_size > 1 the scheduler ranks are TCP endpoints derived
+            # from the address, so it must be explicit.
             if server_args.mapping.has_attn_dp:
                 raise ValueError(
                     f"When dp_size > 1 (dp_size={server_args.mapping.attn.dp_size}), you must provide --dist-init-addr. "
                     f"Example: --dist-init-addr 127.0.0.1:4000"
                 )
-            dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
-        elif server_args.dist_init_addr is None:
-            raise ValueError(
-                f"--dist-init-addr is required for nnodes={server_args.mapping.nnodes} "
-                "and could not be derived from the launcher environment. "
-                "Example: --dist-init-addr <head-node-ip>:20000"
+            ipc_dir = create_ipc_dir()
+            return PortArgs(
+                tokenizer_ipc_name=f"ipc://{ipc_dir}/tokenizer",
+                scheduler_input_ipc_name=f"ipc://{ipc_dir}/scheduler_input",
+                nccl_port=port,
+                dist_init_addr=f"127.0.0.1:{reserve_port()}",
+                rpc_ipc_name=f"ipc://{ipc_dir}/rpc",
+                metrics_ipc_name=f"ipc://{ipc_dir}/metrics",
+                tokenizer_worker_ipc_name=None,
             )
-        else:
-            dist_init_addr = server_args.dist_init_addr.split(":")
+
+        dist_init_addr = server_args.dist_init_addr.split(":")
         if len(dist_init_addr) != 2:
             raise ValueError(
                 "please provide --dist-init-addr as host:port of head node"
@@ -5806,49 +5833,36 @@ class PortArgs:
         dist_init_host, dist_init_port = dist_init_addr
         dist_init_port = int(dist_init_port)
 
-        # Scan forward until we find a port cluster where all derived ports are
-        # free. This handles the case where a previous engine instance left
-        # ports in TIME_WAIT or its child processes haven't fully terminated
-        # yet. Note: the port at offset +1 (formerly detokenizer_port) is
-        # intentionally skipped so the rest of the port layout stays stable for
-        # any external tooling that indexed off the historical port cluster.
-        #
-        # The whole cluster is bound on node 0 alone, so scanning is only
-        # meaningful there: is_port_available binds the local wildcard, and a
-        # follower moving its own base would simply address ports the head
-        # never bound. Multi-node therefore takes the cluster as derived and
-        # reports a conflict instead of relocating it.
-        while True:
-            port_base = dist_init_port + 1
-            rpc_port = port_base + 2
-            metrics_ipc_port = port_base + 3
-            if dp_rank is None:
-                scheduler_input_port = port_base + 4
-            else:
-                scheduler_input_port = port_base + 2 + 1 + dp_rank
-            rpc_ipc_port = scheduler_input_port + 1
-            cluster = [
-                dist_init_port,
-                port_base,
-                rpc_port,
-                metrics_ipc_port,
-                scheduler_input_port,
-                rpc_ipc_port,
-            ]
-            if server_args.mapping.nnodes > 1:
-                if server_args.node_rank == 0:
-                    busy = [p for p in cluster if not is_port_available(p)]
-                    if busy:
-                        raise ValueError(
-                            f"control-plane ports {busy} are already in use on the "
-                            "head node. Every node derives this cluster from "
-                            "--dist-init-addr, so it cannot be moved on one node "
-                            "alone; restart with a different --dist-init-addr port."
-                        )
-                break
-            if all(is_port_available(p) for p in cluster):
-                break
-            dist_init_port += 10
+        # The control-plane ports are derived upward from the explicit port.
+        # (The port at offset +1 is bound by the tokenizer endpoint; the layout
+        # is kept stable for external tooling that indexes off it.) The whole
+        # cluster is bound on node 0 alone, and every node derives it from the
+        # same address, so one node cannot move it: a busy port is reported.
+        port_base = dist_init_port + 1
+        rpc_port = port_base + 2
+        metrics_ipc_port = port_base + 3
+        if dp_rank is None:
+            scheduler_input_port = port_base + 4
+        else:
+            scheduler_input_port = port_base + 2 + 1 + dp_rank
+        rpc_ipc_port = scheduler_input_port + 1
+        cluster = [
+            dist_init_port,
+            port_base,
+            rpc_port,
+            metrics_ipc_port,
+            scheduler_input_port,
+            rpc_ipc_port,
+        ]
+        if server_args.node_rank == 0:
+            busy = [p for p in cluster if not claim_port(p)]
+            if busy:
+                raise ValueError(
+                    f"control-plane ports {busy} are already in use on the "
+                    f"head node (derived from --dist-init-addr "
+                    f"{server_args.dist_init_addr}). Restart with a different "
+                    "--dist-init-addr port."
+                )
 
         return PortArgs(
             tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",

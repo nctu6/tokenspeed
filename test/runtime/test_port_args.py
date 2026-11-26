@@ -1,20 +1,5 @@
 from tokenspeed.runtime.execution.distributed_initializer import DistributedConfig
-from tokenspeed.runtime.utils import server_args as server_args_module
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
-
-
-def test_resolved_dist_init_addr_moves_with_busy_control_port(monkeypatch):
-    args = ServerArgs(model="x", port=8051)
-    monkeypatch.setattr(server_args_module.random, "randint", lambda _low, _high: 500)
-    monkeypatch.setattr(
-        server_args_module,
-        "is_port_available",
-        lambda port: port != 8284,
-    )
-
-    port_args = PortArgs.init_new(args)
-
-    assert port_args.dist_init_addr == "127.0.0.1:8294"
 
 
 def test_distributed_config_uses_resolved_dist_init_addr():
