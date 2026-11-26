@@ -82,8 +82,13 @@ if platform.is_hopper_plus:
 def is_available() -> bool:
     """Whether the flashinfer GDN chunk-prefill kernel can run on this platform."""
     cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+    # SM12x runs FlashInfer's CuTe DSL SM120 delta-rule prefill.
+    supported_arch = (
+        platform.is_hopper
+        or platform.is_blackwell
+        or (platform.is_nvidia and platform.arch_version.major == 12)
+    )
     # Older FlashInfer wheels lack the separate Rubin implementation.
-    supported_arch = platform.is_hopper or platform.is_blackwell
     if platform.arch_version == ArchVersion(10, 7):
         supported_arch = _flashinfer_gdn.is_rubin_prefill_available()
     return supported_arch and cuda_major >= 13
@@ -122,7 +127,7 @@ if is_available():
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
-            max_arch_version=ArchVersion(10, 7),
+            max_arch_version=ArchVersion(12, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),

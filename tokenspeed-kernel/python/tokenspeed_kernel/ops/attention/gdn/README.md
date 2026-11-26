@@ -145,6 +145,13 @@ Missing or modified sources leave the portable kernels available; a direct
 adapter call reports the compatibility error. Updating the accepted sources
 requires reviewing these contracts and repeating GPU validation.
 
+SM12x prefill (`flashinfer_gdn_chunk_prefill`) runs FlashInfer's CuTe DSL
+SM120 delta-rule kernel (FlashInfer 0.7.4, CUDA 13) through the same adapter,
+with `use_cp=False`. On a 8192-token Qwen3.6-35B-A3B prefill chunk it replaces
+the Triton chunk kernels (about 1.05 ms per layer) with about 0.56 ms; the
+`test_gdn_chunk_prefill_*[flashinfer]` tests run on SM120 too. FlashInfer's own
+context-parallel route (`use_cp="auto"`, about 0.4 ms per layer for one long
+sequence) is not used.
 SM107 prefill uses FlashInfer's Rubin chunked implementation when it is
 installed. The existing K-last state, device sequence bounds and in-forward
 checkpoint contracts are unchanged. The PDL adapter wraps the upstream
