@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# deepseek-v4.1-flash-1017.sh -- serve DeepSeek-V4.1-Flash-1017 (TP=2 or TP=4)
+# deepseek-v4.1-flash-1017.sh -- serve DeepSeek-V4.1-Flash-1017 (TP=2 on SM12x, else TP=4)
 # =============================================================================
 #
 # Single-node, aggregated serve of deepseek-ai/DeepSeek-V4.1-Flash-1017 from a
@@ -8,7 +8,10 @@
 # topology use test/ci_system/serve_deepseek_v41_flash_pd_1p1d.sh instead.
 #
 # DeepSeek V4.1 (deepseek_v41) runs on its FlatKV attention backend with a
-# four-group KV cache; the serve knobs below follow the recipe in
+# four-group KV cache. With no env set, an SM12x host (RTX PRO 6000, 96 GiB)
+# serves on two GPUs (TP=2, CUDA_DEVICES=0,1) with the first 128 of the 384 routed
+# experts, DSPARK on and `--moe-backend auto`; other archs default to TP=4 with
+# all experts. The serve knobs below follow the recipe in
 # docs/recipes/models.md ("DeepSeek V4.1-Flash"). Same-checkpoint DSpark
 # speculative decoding is on by default (the CI/eval default for this
 # checkpoint). It needs prefix caching on; V4.1 keeps the draft windows in
@@ -48,8 +51,10 @@
 #   SERVED_MODEL_NAME    default: test. SPACE-separated for multiple names
 #                        (e.g. "DeepSeek-V4.1-Flash-1017 test"); NOT comma-separated.
 #   HOST_PORT            default: 8977 (the script exits if it is in use)
-#   TENSOR_PARALLEL_SIZE default: 4  (set 2 for TP=2; must match CUDA_DEVICES count)
-#   CUDA_DEVICES         default: arch/TP-aware (0..TP-1); override to pin GPUs
+#   TENSOR_PARALLEL_SIZE default: the number of CUDA_DEVICES when that is set,
+#                        else 2 on sm120/sm121 and 4 on other archs. Must be 2 or 4
+#                        and match the CUDA_DEVICES count.
+#   CUDA_DEVICES         default: 0..TP-1 (0,1 on sm12x); override to pin GPUs
 #   MOE_BACKEND          default: arch-aware (mega_moe on sm100/sm103; auto on
 #                        sm120/sm121; marlin on sm90). 'auto' omits the flag so
 #                        the engine resolves it. Overriding to mega_moe forces
@@ -105,14 +110,16 @@
 #   EXTRA_SERVE_ARGS     extra serve args (space-separated), appended verbatim.
 #
 # Recommended invoke:
-#   # TP=4 on GPUs 0-3
+#   # TP=2 on GPUs 0-1 is the SM12x default (96 GiB cards: partial MoE, first
+#   # 128 of 384 experts), so a bare ./scripts/deepseek-v4.1-flash-1017.sh does it
+#   # TP=4 on GPUs 0-3 (all 384 experts)
 #   TENSOR_PARALLEL_SIZE=4 CUDA_DEVICES=0,1,2,3 ./scripts/deepseek-v4.1-flash-1017.sh
-#   # TP=2 on GPUs 0-1 (96 GiB cards: partial MoE, first 128 of 384 experts)
-#   TENSOR_PARALLEL_SIZE=2 CUDA_DEVICES=0,1 ./scripts/deepseek-v4.1-flash-1017.sh
+#   # TP=2 on other GPUs, e.g. 6 and 7 (TP follows the device count)
+#   CUDA_DEVICES=6,7 ./scripts/deepseek-v4.1-flash-1017.sh
 #
 # Usage:
 #   ./scripts/deepseek-v4.1-flash-1017.sh
-#   TENSOR_PARALLEL_SIZE=2 ./scripts/deepseek-v4.1-flash-1017.sh
+#   TENSOR_PARALLEL_SIZE=4 ./scripts/deepseek-v4.1-flash-1017.sh
 #   ENABLE_DSPARK=0 ./scripts/deepseek-v4.1-flash-1017.sh
 #   MOE_BACKEND=marlin ./scripts/deepseek-v4.1-flash-1017.sh
 
@@ -220,7 +227,18 @@ if (exec 3<>"/dev/tcp/127.0.0.1/${HOST_PORT}") 2>/dev/null; then
     exit 1
 fi
 
-TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-4}"
+# TP follows an explicit CUDA_DEVICES; without one it is 2 on SM12x (96 GiB cards
+# cannot hold the all-experts TP=2 weight, so the 128-expert subset below applies)
+# and 4 elsewhere.
+if [[ -z "${TENSOR_PARALLEL_SIZE:-}" ]]; then
+    if [[ -n "${CUDA_DEVICES:-}" ]]; then
+        TENSOR_PARALLEL_SIZE="$(awk -F',' '{print NF}' <<<"$CUDA_DEVICES")"
+    elif [[ "${_CUDA_ARCH}" == sm12* ]]; then
+        TENSOR_PARALLEL_SIZE=2
+    else
+        TENSOR_PARALLEL_SIZE=4
+    fi
+fi
 if [[ "${TENSOR_PARALLEL_SIZE}" != "2" && "${TENSOR_PARALLEL_SIZE}" != "4" ]]; then
     echo "ERROR: TENSOR_PARALLEL_SIZE='${TENSOR_PARALLEL_SIZE}' must be 2 or 4." >&2
     exit 1
