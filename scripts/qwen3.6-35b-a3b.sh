@@ -40,6 +40,14 @@
 #   TOOL_CALL_PARSER     default: qwen_coder (alias of qwen_xml; Qwen3.6 XML
 #                           <tool_call>/<function=...> format. Omit by setting
 #                           empty)
+#   EXTRA_SERVE_ARGS     default: empty; appended verbatim to `tokenspeed serve`.
+#                        Opt-in MTP speculative decoding (the checkpoint ships one
+#                        MTP layer; off by default, as in vLLM):
+#                        EXTRA_SERVE_ARGS="--speculative-algorithm MTP --speculative-num-steps 2 --speculative-draft-model-path $MODEL_PATH"
+#                        RAG out tok/s at C=1/16/64 on one SM120 GPU, greedy:
+#                        off 169/717/1388, steps=2 256/940/1996, steps=3
+#                        264/1008/1695 (C=64 queues behind the wider verify
+#                        step); the accuracy probe is equal within its +-0.01 noise.
 #   VENV_DIR             default: ./.venv
 #   TOKENSPEED_CUDA_ARCH override detected arch (e.g. sm120 / sm90 / 12.0 / 9.0)
 #   TOKENSPEED_TRITON_PREFILL_SKIP_OOR   default: 1 (F1; kernel default on)

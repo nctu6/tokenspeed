@@ -33,6 +33,13 @@
 #   ENABLE_FP8_ATTN_PROJ default: 1 on sm120 with online FP8 (QUANTIZATION=fp8),
 #                        else empty. Non-empty and not 0 = --enable-fp8-attn-proj
 #                        (block-FP8 attention and GDN projections); 0 = off.
+#   EXTRA_SERVE_ARGS     default: empty; appended verbatim to `tokenspeed serve`.
+#                        Opt-in MTP speculative decoding (the checkpoint ships an
+#                        MTP layer; off by default, as in vLLM):
+#                        EXTRA_SERVE_ARGS="--speculative-algorithm MTP --speculative-num-steps 2 --speculative-draft-model-path $MODEL_PATH"
+#                        RAG out tok/s at C=1/16/64 on two SM120 GPUs, greedy:
+#                        FP8 off 167/691/1227, MTP 254/838/1591; NVFP4 off
+#                        134/847/1569, MTP 231/1039/1871.
 #   VENV_DIR             default: ./.venv
 #   TOKENSPEED_CUDA_ARCH override detected arch (e.g. sm120 / sm90 / 12.0 / 9.0)
 #   TOKENSPEED_TRITON_PREFILL_SKIP_OOR   default: 1 (F1; kernel default on)
