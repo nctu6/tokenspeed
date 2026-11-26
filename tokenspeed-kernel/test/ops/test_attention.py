@@ -228,13 +228,14 @@ def test_mha_prefill_lse(
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 
 
+@pytest.mark.parametrize("window_left", [511, -1], ids=["window", "full"])
 @pytest.mark.parametrize(
     "is_causal,use_custom_mask",
     [(True, False), (False, False), (True, True)],
     ids=["causal", "noncausal", "custom-future"],
 )
 def test_mha_prefill_triton_window_bounds(
-    device: str, require, is_causal: bool, use_custom_mask: bool
+    device: str, require, is_causal: bool, use_custom_mask: bool, window_left: int
 ) -> None:
     from tokenspeed_kernel.ops.attention.mha._triton.prefill import (
         prefill_attention_fwd,
@@ -242,7 +243,9 @@ def test_mha_prefill_triton_window_bounds(
 
     require("attention", "mha_extend_with_kvcache", "triton", torch.bfloat16, "q")
     # A cached suffix with unaligned window boundaries and a partial query tile.
-    query_len, prefix_len, window_left, page_size = 257, 577, 511, 64
+    # Without a window the causal kernel still skips the key tiles past each
+    # query tile; the output must not change.
+    query_len, prefix_len, page_size = 257, 577, 64
     kv_len = prefix_len + query_len
     num_pages = (kv_len + page_size - 1) // page_size
     q = _randn((query_len, 4, 64), device=device, dtype=torch.bfloat16)
@@ -252,7 +255,9 @@ def test_mha_prefill_triton_window_bounds(
     page_table = torch.arange(num_pages - 1, -1, -1, device=device, dtype=torch.int32)
     q_pos = prefix_len + torch.arange(query_len, device=device)
     k_pos = torch.arange(kv_len, device=device)
-    mask = q_pos[:, None] - k_pos[None, :] <= window_left
+    mask = torch.ones(query_len, kv_len, device=device, dtype=torch.bool)
+    if window_left >= 0:
+        mask &= q_pos[:, None] - k_pos[None, :] <= window_left
     if use_custom_mask:
         # The custom mask replaces causality and selects a future key tile.
         mask &= k_pos[None, :] == kv_len - 1

@@ -41,3 +41,15 @@ usually mapped and zero.
 reference per head dim, GQA ratio and window, checks that it does not
 recompile across batch shapes and pins which leaf SM120 selects at head dims
 64, 128 and 256.
+
+## Triton causal prefill and extend
+
+`_triton/prefill.py` (`triton_mha_prefill`, `triton_mha_extend_with_kvcache`)
+stops each query tile's key loop at the tile's last query position when the call
+is causal and has no custom mask, with or without a sliding window. The skipped
+key tiles are fully masked, so the output is unchanged; a prefill chunk that
+starts at position 0 does about half the work. Before this the loop ran to the
+end of the sequence unless a window was set. On SM120 a 8192-token chunk of
+Qwen3.6-35B-A3B (head dim 256, FP8 KV) went from 4.2 ms to 2.5 ms per full
+attention layer. `test_mha_prefill_triton_window_bounds` covers windowed and
+unwindowed causal calls with a cached prefix and a partial query tile.

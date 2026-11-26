@@ -139,14 +139,17 @@ def _fwd_kernel(
 
     begin_n = 0
     end_n = cur_seq_len
+    first_query = cur_q_start + cur_block_m * BLOCK_M
+    # Causal: no key at or past the block's last query position + 1 is visible,
+    # so those tiles are all masked and add exactly zero. Skipping them halves
+    # the work of a prefill that starts at position 0. A custom mask replaces
+    # causal masking, so it may admit future keys.
+    if IS_CAUSAL and not USE_CUSTOM_MASK:
+        end_n = tl.minimum(cur_seq_len, first_query + BLOCK_M)
     if SLIDING_WINDOW_SIZE > 0:
         # Exclude only tiles that the existing window path would SKIP_TILE.
         # Preserve the first intersecting tile and the order of all arithmetic.
-        first_query = cur_q_start + cur_block_m * BLOCK_M
         begin_n = tl.maximum(0, first_query - SLIDING_WINDOW_SIZE) // BLOCK_N * BLOCK_N
-        # A custom mask replaces causal masking, so it may admit future keys.
-        if IS_CAUSAL and not USE_CUSTOM_MASK:
-            end_n = tl.minimum(cur_seq_len, first_query + BLOCK_M)
 
     for start_n in range(begin_n, end_n, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
