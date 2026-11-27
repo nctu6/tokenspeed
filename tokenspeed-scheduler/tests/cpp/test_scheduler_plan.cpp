@@ -2029,6 +2029,134 @@ TEST_F(HybridJunctionCutTestSuite, ThirdRequestResumesFromTheJunctionCheckpoint)
     }
 }
 
+// Prompts that share a cached KV prefix with no state checkpoint are cut at the
+// junction. The fused role prepays the rest of such a prompt, so the cut does
+// not hold the head of line: the prompts behind it are admitted in the same
+// round, the completing ones first.
+class HybridJunctionAdmissionSuite : public HybridJunctionCutTestSuite {
+protected:
+    // A declared generation budget gives the admission its decode headroom,
+    // which is what prepays the prompt's rest (as for a served request).
+    RequestSpec Budgeted(RequestSpec spec) {
+        spec.max_new_tokens = 16;
+        return spec;
+    }
+    // Publishes KV and state at the 11-token prompt end only, so a prompt
+    // sharing its first 8 tokens has a KV hit at 8 and no state there.
+    void FinishSeed() {
+        Submit(Budgeted(MakeHybridRequest("seed", 100)));
+        PlanOnce();
+        SendForwardDone("seed", {900});
+        PlanOnce();
+        SendFinish("seed");
+        PlanOnce();
+    }
+    static bool Completes(const ForwardBatch& batch, std::size_t row) {
+        return batch.extend_prefix_lens[row] + batch.input_lengths[row] == batch.prefill_lengths[row];
+    }
+    // Lands every row of a plan: a completing prefill samples a token.
+    void Land(const ForwardBatch& batch) {
+        for (std::size_t row = 0; row < batch.request_ids.size(); ++row) {
+            const bool tokenless = row < batch.NumExtends() && !Completes(batch, row);
+            SendForwardDone(batch.request_ids[row],
+                            tokenless ? std::vector<std::int32_t>{} : std::vector<std::int32_t>{901});
+        }
+    }
+};
+TEST_F(HybridJunctionAdmissionSuite, JunctionCutsShareARoundAndCompletingPromptsGoFirst) {
+    FinishSeed();
+    Submit(Budgeted(MakeHybridRequest("j1", 200)));
+    Submit(Budgeted(MakeRequestSpec("fresh", /*num_pages=*/1, /*start=*/5000)));
+    Submit(Budgeted(MakeHybridRequest("j2", 300)));
+    const ExecutionPlan first = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(first);
+    ASSERT_NE(batch, nullptr);
+    // Both junction cuts end at 8; the whole prompt that arrived between them
+    // runs ahead of them, since completing prefills form a prefix.
+    EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"fresh", "j1", "j2"}));
+    EXPECT_EQ(batch->input_lengths, (std::vector<std::int32_t>{2, 8, 8}));
+    EXPECT_TRUE(CompletingPrefillsFormAPrefix(*batch));
+    Land(*batch);
+    // The second pieces are residents: they run before anything new.
+    Submit(Budgeted(MakeHybridRequest("j3", 400)));
+    const ExecutionPlan second = PlanOnce();
+    batch = FindForwardBatch(second);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_GE(batch->request_ids.size(), 2u);
+    EXPECT_EQ(batch->request_ids[batch->request_ids.size() - 3], "j1");
+    EXPECT_EQ(batch->input_lengths[batch->request_ids.size() - 3], 3);
+}
+// Prefix matching stays exact: the junction checkpoint a shared round
+// publishes is the one the next prompt resumes from.
+TEST_F(HybridJunctionAdmissionSuite, TheCheckpointsOfCutsInOneRoundAreStillMatched) {
+    FinishSeed();
+    Submit(Budgeted(MakeHybridRequest("j1", 200)));
+    Submit(Budgeted(MakeHybridRequest("j2", 300)));
+    for (int round = 0; round < 6; ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        if (batch == nullptr) {
+            continue;
+        }
+        Land(*batch);
+        for (std::size_t row = 0; row < batch->NumExtends(); ++row) {
+            if (Completes(*batch, row)) {
+                SendFinish(batch->request_ids[row]);
+            }
+        }
+    }
+    PlanOnce();
+    Submit(Budgeted(MakeHybridRequest("reuse", 500)));
+    const ExecutionPlan reuse_plan = PlanOnce();
+    const ForwardBatch* reuse = FindForwardBatch(reuse_plan);
+    ASSERT_NE(reuse, nullptr);
+    ASSERT_EQ(reuse->request_ids, std::vector<std::string>{"reuse"});
+    EXPECT_EQ(reuse->extend_prefix_lens, std::vector<std::int32_t>{8});
+}
+// A pool too small for every cut prompt at once: the second pieces cannot all
+// be funded, yet every prompt finishes (a resident that cannot advance is
+// retracted, as before), with completing prefills a prefix in every round.
+class HybridJunctionPressureSuite : public HybridJunctionAdmissionSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = HybridJunctionAdmissionSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 44;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = 44;
+        }
+        return cfg;
+    }
+};
+TEST_F(HybridJunctionPressureSuite, EveryCutPromptFinishesUnderMemoryPressure) {
+    FinishSeed();
+    constexpr int kPrompts = 6;
+    for (int i = 0; i < kPrompts; ++i) {
+        Submit(Budgeted(MakeHybridRequest("p" + std::to_string(i), 200 + 100 * i)));
+    }
+    std::set<std::string> finished;
+    int round = 0;
+    int forwards = 0;
+    for (; round < 300 && finished.size() < kPrompts; ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        AckImageStores(plan);
+        AckRestores(plan);
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        if (batch == nullptr || batch->request_ids.empty()) {
+            continue;
+        }
+        ++forwards;
+        EXPECT_TRUE(CompletingPrefillsFormAPrefix(*batch)) << "round " << round;
+        Land(*batch);
+        for (std::size_t row = 0; row < batch->request_ids.size(); ++row) {
+            if (row >= batch->NumExtends() || Completes(*batch, row)) {
+                SendFinish(batch->request_ids[row]);
+                finished.insert(batch->request_ids[row]);
+            }
+        }
+    }
+    EXPECT_EQ(finished.size(), static_cast<std::size_t>(kPrompts))
+        << "stalled after " << round << " rounds, " << forwards << " forwards";
+}
 // prefill_decode_interval: after a round that schedules a prefill chunk, the
 // next N rounds that can schedule a decode run decodes alone, but no prompt
 // is held back more than N rounds in total.

@@ -2200,6 +2200,37 @@ std::int32_t Scheduler::prefillBudgetFor(const Request& request, const PlanBuild
     return std::min(build.token_budget, std::max(mixed_long_chunk_, build.pending_prefill_reserve));
 }
 
+// Whether a prefill that just ran its junction cut (docs/design/scheduler.md
+// §1.1) can leave the head of line: the chunk ended exactly at the junction
+// and the rest of the prompt is already paid for. The fused role prepays the
+// whole prompt's pages in every full-history group at the first chunk (the
+// table already has room for the unscheduled rest), and a State group's rotation at the
+// next chunk releases the input slot it replaces (net zero blocks), so no
+// newcomer can take what the second piece needs. Anything else a later chunk
+// might still be short of (a sliding window's growth, a prompt the first
+// admission did not prepay) keeps the hold.
+bool Scheduler::junctionChunkPaidInFull(Request& request) const {
+    if (config_.role != Role::kFused || !request.Is<fsm::Prefilling>()) {
+        return false;
+    }
+    const std::int32_t junction = request.CacheProgressRef().junction_tokens;
+    if (junction == 0 || request.PrefillSize() - request.UnscheduledPrefillSize() != junction) {
+        return false;
+    }
+    const std::vector<BlockTable>& tables = request.BlockTablesRef();
+    for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
+        const CacheGroupConfig& group = config_.cache_groups[static_cast<std::size_t>(i)];
+        if (group.attn_kind == AttnKind::kState) {
+            continue;
+        }
+        if (group.attn_kind != AttnKind::kFull ||
+            coordinator_.GroupBlocksNeededFor(i, tables[static_cast<std::size_t>(i)],
+                                              request.UnscheduledPrefillSize()) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
 // Local prefill phases shared by the P and fused grammars: resident chunks
 // (they hold pages), then new prompts. One loop per tier so the order is
 // visible.
@@ -2331,6 +2362,11 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 pushOperation(build, *request, std::move(*admitted));
                 request->TrackScheduledForward();
                 if (holdsHeadOfLine(*request)) {
+                    if (junctionChunkPaidInFull(*request)) {
+                        // The prompt's second piece needs nothing a newcomer
+                        // could take: the line stays open behind it.
+                        continue;
+                    }
                     carryWholePrompts(feedback, build, candidates, carried, decode_reserve);
                     return;
                 }
@@ -2538,6 +2574,14 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
         // resumes it; a prompt's chunks therefore cluster instead of
         // scattering across rounds.
         scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
+        // A junction cut leaves the line open, so several incomplete prefills
+        // may share the round: they go behind the completing ones, which the
+        // runtime needs as a prefix (docs/design/unified_path.md, "Prefill
+        // requests without generated outputs").
+        std::ranges::stable_partition(build.operations, [](const ForwardOperation& operation) {
+            const auto* prefill = std::get_if<PrefillOperation>(&operation);
+            return prefill == nullptr || prefill->extend_prefix_len + prefill->input_length >= prefill->prefill_length;
+        });
     }
 
     if (!config_.enable_mixed_prefill_decode && !interval_owes_decodes && !build.pushed_prefill) {

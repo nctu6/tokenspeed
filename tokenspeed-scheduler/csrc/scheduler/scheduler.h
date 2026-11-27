@@ -728,6 +728,9 @@ private:
     bool prefillDeferralExhausted(std::span<Request* const> candidates) const;
     bool belowPrefillWatermark() const;
     bool prefillAllowed(const Request& request, const PlanBuild& build) const;
+    // A prefill that ran its junction cut with the rest of its prompt already
+    // paid for does not hold the head of line (scheduleLocalPrefillWork).
+    bool junctionChunkPaidInFull(Request& request) const;
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
