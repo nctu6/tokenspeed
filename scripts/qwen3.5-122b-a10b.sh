@@ -48,10 +48,10 @@
 #                        MAX_NUM_SEQS=512 (32768 context, GPU_MEMORY_UTILIZATION
 #                        =0.9), C=1/16/64, FP8 off 167/691/1227, steps=2
 #                        254/838/1591; NVFP4 off 134/847/1569, steps=2
-#                        231/1039/1871. At C=256 MTP gives FP8 2114 (off 2122)
-#                        and NVFP4 2176 (off 2551; vLLM MTP loses 3 % there): for
-#                        an NVFP4 server held at C>~160 set ENABLE_MTP=0. The
-#                        accuracy probe (400 items x 2) is equal within its
+#                        231/1039/1871. With the defaults here (MTP + mixed
+#                        4096) at C=256 FP8 gives 2325-2359 (off 2118) and
+#                        NVFP4 3015-3029 (off 2553), so MTP stays on at every
+#                        concurrency. The accuracy probe (400 items x 2) is equal within its
 #                        +-0.01 noise. The decode CUDA-graph ladder keeps the
 #                        engine default (it reaches MAX_NUM_SEQS): capping it at
 #                        128 as qwen3.6-35b-a3b.sh does gives this model on two
