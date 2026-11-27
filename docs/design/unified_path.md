@@ -1737,7 +1737,17 @@ without speculation too: a recurrent backend scans only the leading extend
 rows and runs the one-token decode rows through its decode kernels, which
 update their state pages in place. Scanning the decode rows with the extend
 rows would gather and scatter every decoding request's state on every
-recurrent layer. The
+recurrent layer. With speculation the decode rows of a MIXED round are each
+request's whole verify window (`spec_num_tokens` rows, the same width as a
+pure verify round): paged MHA attends them through its decode kernels over the
+request's cache, a recurrent backend runs them through its verify metadata and
+defers their state commit to acceptance, and only those rows are sampled and
+verified. A chain drafter's first step reuses the target's MIXED metadata
+(prefill chunks, then the verify windows); its later steps are ordinary decode
+steps over every request. The target's MIXED forward replays the breakable
+prefill graph as without speculation (its attention breaks read the live
+split), the drafter's MIXED steps run eager, and `--mixed-prefill-token-budget`
+bounds the round's prompt tokens. The
 Qwen4-Exp root invokes its attention child, then PLE for decode and QSA for
 decode/mixed, excluding leading extends from QSA acceptance. Mixed rounds
 retain PLE's direct state writes. Each consumer commits once; stateless
