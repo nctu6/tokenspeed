@@ -554,6 +554,49 @@ TEST_F(MixedPrefillBudgetSuite, ALongPromptAdvancesEveryRoundBesideTheDecodes) {
         SendForwardDone("long");
     }
 }
+// Speculative decoding: every decode of a mixed round carries its whole verify
+// window (decode_input_tokens), and the prompt tokens beside those windows
+// stay within mixed_prefill_token_budget.
+class MixedVerifyWindowSuite : public MixedPrefillBudgetSuite {
+protected:
+    static constexpr std::int32_t kVerifyWidth = 3;
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = MixedPrefillBudgetSuite::MakeConfig();
+        cfg.decode_input_tokens = kVerifyWidth;
+        return cfg;
+    }
+};
+TEST_F(MixedVerifyWindowSuite, VerifyWindowsAndPromptChunksShareARound) {
+    StartDecodes({"d0", "d1", "d2"});
+    for (int i = 0; i < 10; ++i) {
+        Submit(MakeRequestSpec("p" + std::to_string(i), /*num_pages=*/4, /*start=*/1000 + i * 100));
+    }
+    for (int round = 0; round < 3; ++round) {
+        const auto plan = PlanOnce();
+        std::int32_t prompt_tokens = 0;
+        for (const auto& op : plan.Operations()) {
+            if (auto* f = std::get_if<ForwardBatch>(&op)) {
+                for (std::size_t i = 0; i < f->request_ids.size(); ++i) {
+                    if (f->request_ids[i][0] == 'p') {
+                        prompt_tokens += f->input_lengths[i];
+                    }
+                }
+            }
+        }
+        EXPECT_GT(prompt_tokens, 0) << "round " << round << ": a prompt chunk rides beside the verifies";
+        EXPECT_LE(prompt_tokens, kBudget) << "round " << round;
+        for (const char* id : {"d0", "d1", "d2"}) {
+            EXPECT_EQ(TokensOf(plan, id), kVerifyWidth) << "round " << round << ": " << id;
+            SendForwardDone(id, {7, 8});
+        }
+        for (int i = 0; i < 10; ++i) {
+            const std::string id = "p" + std::to_string(i);
+            if (TokensOf(plan, id) > 0) {
+                SendForwardDone(id);
+            }
+        }
+    }
+}
 TEST(SchedulerConstructionTest, ChecksTheMixedPrefillTokenBudget) {
     const auto config = [](Role role, bool mixed, std::int32_t budget) {
         SchedulerConfig cfg{};

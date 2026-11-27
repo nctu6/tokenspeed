@@ -1356,8 +1356,9 @@ class ServerArgs:
         Only architectures whose attention runs on the paged MHA backend (which
         splits a MIXED round into extend rows and decode rows) and that were
         validated end to end opt in. Features that reject mixed rounds
-        (PD disaggregation, prefill context parallel, speculative decoding)
-        keep the old default.
+        (PD disaggregation, prefill context parallel) keep the old default,
+        and so does speculative decoding, whose mixed rounds (verify windows
+        beside prompt chunks) are opt-in with --enable-mixed-batch.
         """
         if self.disaggregation_mode != "null" or self.speculative_algorithm:
             return False

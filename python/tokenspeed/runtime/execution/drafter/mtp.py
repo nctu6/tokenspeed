@@ -675,9 +675,15 @@ class Mtp(HiddenStateDrafter):
             device=self.device,
         )
 
+        if 0 < draft_input.num_extends < bs:
+            # The extend depths below take every row for a prompt row, and the
+            # frontier window every request for a decode request.
+            raise NotImplementedError(
+                "the multi-depth MTP drafter does not draft MIXED rounds; "
+                "serve it with --disable-mixed-batch"
+            )
         if draft_input.num_extends > 0:
-            # EXTEND round (MIXED batches are rejected at the backend's metadata
-            # init): every depth runs the prompt chunk's ragged rows.
+            # EXTEND round: every depth runs the prompt chunk's ragged rows.
             next_tokens[:, 0] = draft_input.base_model_output[:bs]
             self._run_extend_depths(bs, next_tokens, draft_input)
         else:

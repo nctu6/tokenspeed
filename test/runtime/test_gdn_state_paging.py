@@ -1125,6 +1125,197 @@ class TestGDNStatePagingGPUTest:
         assert torch.equal(cand_ssm[2], ref_ssm[2])
         assert (cand_ssm[0].abs().max().item()) == 0.0
 
+    @pytest.mark.parametrize("replay_ssm", [False, True])
+    def test_mixed_verify_round_matches_separate_prefill_and_verify(self, replay_ssm):
+        """A MIXED round of a speculative engine: the decode request carries its
+        whole verify window and defers its state commit to acceptance.
+
+        The mixed forward plus its commit equals an extend of the prefill
+        request, then a verify of the decoding request committed at the same
+        accepted length, in outputs and in state pages.
+        """
+        from tokenspeed_kernel.ops.attention.gdn.triton import (
+            triton_gdn_chunk_prefill,
+        )
+
+        import tokenspeed.runtime.layers.attention.backends.state.mamba as mamba
+
+        torch = self.torch
+        if replay_ssm and not self.gdn_replay_commit_supported(torch.bfloat16):
+            pytest.skip("no GDN replay commit on this device")
+        ForwardMode = self.ForwardMode
+        h, d, width, accepted = self.H, self.D, 3, 2
+        channels = 3 * h * d
+        prompt_a, prompt_b = 8, 6
+        raw = torch.randn(
+            prompt_a + prompt_b + width, channels, device="cuda", dtype=torch.bfloat16
+        )
+        # The replay commit stores the gate inputs beside the BF16 projection.
+        gate_dtype = torch.bfloat16 if replay_ssm else torch.float32
+        a = torch.randn(raw.shape[0], h, device="cuda", dtype=gate_dtype)
+        b = torch.randn_like(a)
+        common = dict(
+            conv_weights=torch.randn(
+                channels, self.WIDTH, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.1,
+            bias=torch.randn(channels, device="cuda", dtype=torch.bfloat16) * 0.1,
+            activation="silu",
+            key_dim=h * d,
+            value_dim=h * d,
+            attention_tp_size=1,
+            head_k_dim=d,
+            head_v_dim=d,
+            A_log=torch.randn(h, device="cuda", dtype=torch.float32) * 0.1,
+            dt_bias=torch.randn(h, device="cuda", dtype=torch.float32) * 0.1,
+            layer_id=0,
+        )
+        # Rows: request A's prompt, request B's prompt, then A's verify window.
+        a_prompt = slice(0, prompt_a)
+        b_prompt = slice(prompt_a, prompt_a + prompt_b)
+        a_verify = slice(prompt_a + prompt_b, prompt_a + prompt_b + width)
+
+        def fresh_backend():
+            conv = torch.zeros(
+                8, channels, self.WIDTH - 1, device="cuda", dtype=torch.bfloat16
+            )
+            recurrent = torch.zeros(8, h, d, d, device="cuda", dtype=torch.float32)
+            pool = _ContractPool({0: ("linear_attention", conv, recurrent)})
+            backend = self._make_backend(
+                pool, spec_num_tokens=width, replay_ssm=replay_ssm
+            )
+            return backend, conv, recurrent
+
+        def tables(rows):
+            return {
+                "linear_attention": torch.tensor(rows, dtype=torch.int32, device="cuda")
+            }
+
+        def int32(values):
+            return torch.tensor(values, dtype=torch.int32, device="cuda")
+
+        def extend(backend, rows, block_rows, pool_index):
+            length = rows.stop - rows.start
+            backend.init_forward_metadata(
+                bs=1,
+                num_extends=1,
+                req_pool_indices=int32([pool_index]),
+                seq_lens=int32([length]),
+                forward_mode=ForwardMode.EXTEND,
+                block_tables=tables([block_rows]),
+                **_extend_kwargs(
+                    torch,
+                    torch.tensor([length], dtype=torch.int32),
+                    torch.zeros(1, dtype=torch.int32),
+                    "cuda",
+                ),
+            )
+            return backend.forward_extend(
+                None,
+                None,
+                None,
+                layer=None,
+                out_cache_loc=None,
+                token_to_kv_pool=backend.kv_pool,
+                bs=1,
+                forward_mode=ForwardMode.EXTEND,
+                mixed_qkv=raw[rows],
+                a=a[rows],
+                b=b[rows],
+                seq_len=length,
+                **common,
+            )
+
+        with patch.object(mamba, "gdn_chunk_prefill", triton_gdn_chunk_prefill):
+            reference, ref_conv, ref_ssm = fresh_backend()
+            candidate, cand_conv, cand_ssm = fresh_backend()
+            for backend in (reference, candidate):
+                # Request A (pool row 1) holds its prompt state in block 2.
+                extend(backend, a_prompt, [0, 2], 1)
+            # Reference: B's prompt (pool row 2, block 4), then A's verify
+            # (reads block 2, commits block 3 at the accepted length).
+            ref_prefill = extend(reference, b_prompt, [0, 4], 2)
+            reference.refresh_decode_metadata(
+                1,
+                1,
+                int32([1]),
+                int32([prompt_a + width]),
+                forward_mode=ForwardMode.DECODE,
+                block_tables=tables([[2, 3]]),
+            )
+            ref_verify = reference.forward_decode(
+                None,
+                None,
+                None,
+                layer=None,
+                out_cache_loc=None,
+                token_to_kv_pool=reference.kv_pool,
+                bs=1,
+                # The decode convolution updates its input in place.
+                mixed_qkv=raw[a_verify].clone(),
+                a=a[a_verify],
+                b=b[a_verify],
+                **common,
+            )
+            reference.commit_state_after_acceptance(
+                int32([accepted]), num_extends=0, accepted_path=None
+            )
+            # Candidate: both in one mixed round, the extend row first.
+            candidate.init_forward_metadata(
+                bs=2,
+                num_extends=1,
+                req_pool_indices=int32([2, 1]),
+                seq_lens=int32([prompt_b, prompt_a + width]),
+                forward_mode=ForwardMode.MIXED,
+                block_tables=tables([[0, 4], [2, 3]]),
+                **_extend_kwargs(
+                    torch,
+                    torch.tensor([prompt_b], dtype=torch.int32),
+                    torch.zeros(1, dtype=torch.int32),
+                    "cuda",
+                ),
+            )
+            mixed = candidate.forward_extend(
+                None,
+                None,
+                None,
+                layer=None,
+                out_cache_loc=None,
+                token_to_kv_pool=candidate.kv_pool,
+                bs=2,
+                forward_mode=ForwardMode.MIXED,
+                mixed_qkv=raw[prompt_a:].clone(),
+                a=a[prompt_a:],
+                b=b[prompt_a:],
+                seq_len=prompt_b + width,
+                **common,
+            )
+            # The extend row's entry is ignored; the decode row's is applied.
+            candidate.commit_state_after_acceptance(
+                int32([1, accepted]), num_extends=1, accepted_path=None
+            )
+        expected = torch.cat(
+            (ref_prefill.flatten(0, 1), ref_verify.flatten(0, 1)), dim=0
+        )
+        assert tuple(mixed.shape) == tuple(expected.shape)
+        torch.testing.assert_close(
+            mixed.float(), expected.float(), atol=1e-1, rtol=1e-2
+        )
+        assert (mixed.float() - expected.float()).abs().mean().item() < 1e-3
+        # The verify rows run the same decode kernels in both rounds.
+        verify_rows = ref_verify.flatten(0, 1).shape[0]
+        assert torch.equal(mixed[-verify_rows:], expected[-verify_rows:])
+        for block in (3, 4):
+            assert (cand_ssm[block].abs().max().item()) > 0.0
+            diff = (cand_ssm[block] - ref_ssm[block]).abs()
+            assert (
+                diff.mean().item() < 1e-3
+            ), f"state block {block}: {diff.mean().item()}"
+            assert torch.equal(cand_conv[block], ref_conv[block])
+        # Request A's verified state is the reference's, bit for bit.
+        assert torch.equal(cand_ssm[3], ref_ssm[3])
+        assert torch.equal(cand_ssm[2], ref_ssm[2])
+
     def test_verify_scratch_seeds_conv_but_omits_replayed_ssm_state(self):
         torch = self.torch
         conv_dim = 3 * self.H * self.D

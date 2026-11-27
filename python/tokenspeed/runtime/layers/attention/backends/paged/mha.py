@@ -297,12 +297,11 @@ class MHAAttnBackend(PagedAttentionBackend):
                 f"init_forward_metadata only serves extend/mixed ({forward_mode})"
             )
         is_mixed = forward_mode.is_mixed()
-        if is_mixed and self.is_draft and not self.draft_block_decode:
-            raise RuntimeError("MHA mixed draft metadata requires block decoding")
-        # Block drafters share the target's mixed metadata initialization.
-        # Before their model forward, they refresh decode metadata and publish
-        # a uniform block window starting at each request's accepted prefix.
-        # This does not enable a mixed forward for ordinary token drafters.
+        # A draft's MIXED metadata is the target's: the prefill rows' chunks,
+        # then each decode request's verify window (spec_num_tokens rows over
+        # the cache the target's verify wrote). A chain drafter's first step
+        # runs exactly those rows; a block drafter refreshes decode metadata
+        # and publishes its own window before its forward.
         if is_mixed and not 0 < num_extends < bs:
             raise ValueError(
                 "MHA mixed metadata requires both prefill and decode requests"
@@ -768,9 +767,11 @@ class MHAAttnBackend(PagedAttentionBackend):
         sinks = kwargs.get("sinks")
         decode = self.mixed_decode_metadata
         if decode is not None:
-            # MIXED: extend tokens first, then one token per decode request.
+            # MIXED: extend tokens first, then each decode request's
+            # spec_num_tokens rows (one without speculation, the verify
+            # window with it), attended causally over the request's cache.
             num_extend_tokens = metadata.cu_extend_seq_lens_cpu[-1]
-            num_decode = decode.seq_lens.shape[0]
+            num_decode = decode.seq_lens.shape[0] * self.spec_num_tokens
             extend_out = self._extend_rows(
                 q[:num_extend_tokens],
                 k[:num_extend_tokens],
