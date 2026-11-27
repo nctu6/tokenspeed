@@ -40,14 +40,44 @@
 #   TOOL_CALL_PARSER     default: qwen_coder (alias of qwen_xml; Qwen3.6 XML
 #                           <tool_call>/<function=...> format. Omit by setting
 #                           empty)
+#   MAX_CUDAGRAPH_CAPTURE_SIZE  default: 128 when MAX_NUM_SEQS > 128, else empty (engine
+#                        default: the ladder reaches MAX_NUM_SEQS). Set but empty
+#                        = engine default. The decode graphs are priced out of
+#                        the KV pool; MAX_NUM_SEQS=512 with MTP: 533 pages and
+#                        RAG 2169/2147 out tok/s at C=128/256, with cap 128 792
+#                        pages and 2767/2726 (cap 192: C=256 2578); MTP off
+#                        C=256 2287 -> 2324; 256 concurrent short requests (128
+#                        in, 256 out) MTP 2184 -> 2602, off 3424 -> 3549. No
+#                        change at C<=64 (the same graphs). The two-GPU model
+#                        of qwen3.5-122b-a10b.sh gains nothing from it and
+#                        keeps the engine ladder.
+#   ENABLE_MTP           default: auto = MTP speculative decoding when the checkpoint
+#                        ships an MTP layer (config mtp_num_hidden_layers >= 1
+#                        and mtp.* tensors in the weight index or safetensors
+#                        headers; the model name is not used). 1 = force on
+#                        (error if there is no MTP layer), 0 = off. A
+#                        --speculative-* flag in EXTRA_SERVE_ARGS replaces it.
+#   MTP_NUM_STEPS        default: 3 when MAX_NUM_SEQS <= 32, else 2 (draft tokens
+#                        per step; the draft model is MODEL_PATH itself).
+#                        RAG out tok/s on one SM120 GPU, greedy. This script's
+#                        own defaults (MAX_NUM_SEQS=32), C=1/8/16/32: MTP off
+#                        170/546/731/977, steps=2 256/687/949/1359, steps=3
+#                        265/718/1009/1445. MAX_NUM_SEQS=512 (32768 context,
+#                        GPU_MEMORY_UTILIZATION=0.9), C=1/16/32/48/64/128/256:
+#                        off 169/717/-/-/1388/1999/2285; steps=2
+#                        256/946/1341/1704/1999/2169/2151; steps=3
+#                        264/1008/1450/1777/1695/-/-. Steps=3 beats steps=2 up
+#                        to C=48 and loses 15 % at C=64 (queued prompts wait
+#                        seconds: TTFT p50 2.7 s vs 0.2 s), so the default
+#                        follows the decode batch bound. With the graph cap
+#                        above MTP wins at every concurrency measured (C=256
+#                        2726 vs off 2324, TTFT p50 12 s vs 2.9 s). Without the
+#                        cap it wins up to about C=128 and loses 6-7 % at
+#                        C=256 (cache pool 533 pages instead of 751, about 84
+#                        requests in flight instead of 210; vLLM MTP loses 10
+#                        % there). The accuracy probe (400 items x 2) is
+#                        equal within its +-0.01 noise. Measured on SM120 only.
 #   EXTRA_SERVE_ARGS     default: empty; appended verbatim to `tokenspeed serve`.
-#                        Opt-in MTP speculative decoding (the checkpoint ships one
-#                        MTP layer; off by default, as in vLLM):
-#                        EXTRA_SERVE_ARGS="--speculative-algorithm MTP --speculative-num-steps 2 --speculative-draft-model-path $MODEL_PATH"
-#                        RAG out tok/s at C=1/16/64 on one SM120 GPU, greedy:
-#                        off 169/717/1388, steps=2 256/940/1996, steps=3
-#                        264/1008/1695 (C=64 queues behind the wider verify
-#                        step); the accuracy probe is equal within its +-0.01 noise.
 #   VENV_DIR             default: ./.venv
 #   TOKENSPEED_CUDA_ARCH override detected arch (e.g. sm120 / sm90 / 12.0 / 9.0)
 #   TOKENSPEED_TRITON_PREFILL_SKIP_OOR   default: 1 (F1; kernel default on)
@@ -171,6 +201,39 @@ _detect_gpu_mem_mib() {
         | head -1 | tr -d '[:space:]'
 }
 
+# MTP speculative decoding: on when the checkpoint ships an MTP layer. The
+# check reads the files, not the model name: config.json declares
+# mtp_num_hidden_layers >= 1 (top level or text_config) and the weight index (or
+# the safetensors headers when there is no index) holds mtp.* tensors.
+_checkpoint_has_mtp() {
+    python3 - "$1" <<'PY'
+import glob
+import json
+import os
+import struct
+import sys
+root = sys.argv[1]
+config_path = os.path.join(root, "config.json")
+if not os.path.isfile(config_path):
+    sys.exit(1)
+with open(config_path) as f:
+    config = json.load(f)
+layers = max(int(c.get("mtp_num_hidden_layers") or 0) for c in (config, config.get("text_config") or {}))
+if layers < 1:
+    sys.exit(1)
+index_path = os.path.join(root, "model.safetensors.index.json")
+if os.path.isfile(index_path):
+    with open(index_path) as f:
+        names = list(json.load(f)["weight_map"])
+else:
+    names = []
+    for path in glob.glob(os.path.join(root, "*.safetensors")):
+        with open(path, "rb") as f:
+            (header_len,) = struct.unpack("<Q", f.read(8))
+            names += json.loads(f.read(header_len))
+sys.exit(0 if any(n.startswith("mtp.") for n in names) else 1)
+PY
+}
 # Default GPUs first: the arch below is read from the first selected device.
 CUDA_DEVICES="${CUDA_DEVICES:-6}"
 _CUDA_ARCH_RAW="${TOKENSPEED_CUDA_ARCH:-$(_detect_cuda_arch)}"
@@ -320,6 +383,61 @@ if [[ -n "$DISABLE_NCCL_NVLS" ]]; then
     export NCCL_NVLS_ENABLE=0
 fi
 
+# ENABLE_MTP: auto (default) = on when the checkpoint has MTP weights, 1 = on
+# (error when it has none), 0 = off. MTP_NUM_STEPS is the draft length; its
+# default follows the decode batch bound: 3 when MAX_NUM_SEQS <= 32 (the wider
+# verify step wins at that concurrency), else 2. Any --speculative-* flag in
+# EXTRA_SERVE_ARGS replaces this default (explicit wins).
+ENABLE_MTP="${ENABLE_MTP:-auto}"
+if [[ "$MAX_NUM_SEQS" -le 32 ]]; then
+    MTP_NUM_STEPS="${MTP_NUM_STEPS:-3}"
+else
+    MTP_NUM_STEPS="${MTP_NUM_STEPS:-2}"
+fi
+_mtp=0
+case "$ENABLE_MTP" in
+    auto)
+        if [[ "${EXTRA_SERVE_ARGS:-}" != *--speculative* ]] && _checkpoint_has_mtp "$MODEL_PATH"; then
+            _mtp=1
+        fi
+        ;;
+    1)
+        if ! _checkpoint_has_mtp "$MODEL_PATH"; then
+            echo "ERROR: ENABLE_MTP=1 but $MODEL_PATH has no MTP layer (mtp_num_hidden_layers / mtp.* weights)." >&2
+            exit 1
+        fi
+        if [[ "${EXTRA_SERVE_ARGS:-}" == *--speculative* ]]; then
+            echo "ERROR: ENABLE_MTP=1 conflicts with --speculative-* in EXTRA_SERVE_ARGS; set only one." >&2
+            exit 1
+        fi
+        _mtp=1
+        ;;
+    0) ;;
+    *)
+        echo "ERROR: ENABLE_MTP must be auto, 1 or 0 (got '$ENABLE_MTP')." >&2
+        exit 1
+        ;;
+esac
+if [[ "$_mtp" -eq 1 ]]; then
+    cmd+=(--speculative-algorithm MTP --speculative-num-steps "$MTP_NUM_STEPS" --speculative-draft-model-path "$MODEL_PATH")
+    echo "[qwen3.6-35b] MTP speculative decoding on (steps=${MTP_NUM_STEPS}; ENABLE_MTP=0 turns it off)" >&2
+fi
+# Decode CUDA-graph ladder cap. The engine's default ladder reaches MAX_NUM_SEQS
+# and its graphs are priced out of the KV pool (with MTP the verify and draft
+# graphs cost about 3 GB at 512). A decode step above 128 requests runs 50 ms or
+# more here, which hides the eager launch cost, so graphs above 128 only take
+# cache pages: the default cap is 128 when MAX_NUM_SEQS > 128. An explicit
+# MAX_CUDAGRAPH_CAPTURE_SIZE wins; set but empty = the engine default.
+if [[ -z "${MAX_CUDAGRAPH_CAPTURE_SIZE+x}" ]]; then
+    if [[ "$MAX_NUM_SEQS" -gt 128 ]]; then
+        MAX_CUDAGRAPH_CAPTURE_SIZE=128
+    else
+        MAX_CUDAGRAPH_CAPTURE_SIZE=""
+    fi
+fi
+if [[ -n "$MAX_CUDAGRAPH_CAPTURE_SIZE" ]]; then
+    cmd+=(--max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE")
+fi
 # Extra serve args (space-separated), appended verbatim, e.g. EXTRA_SERVE_ARGS="--chunked-prefill-size 4096".
 if [[ -n "${EXTRA_SERVE_ARGS:-}" ]]; then
     # shellcheck disable=SC2206
