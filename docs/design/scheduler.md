@@ -197,6 +197,9 @@ already, so the owner keeps writing its partial block and needs no copy-in
 (`cache-concepts.md`, copy-in). Every other chunk end publishes only its
 completed full pages.
 
+A junction cut does not hold the head of line (`junctionChunkPaidInFull`,
+§1.1): on the fused role its second piece needs nothing a newcomer could take.
+
 **Reserve.** What an admission holds beyond the chunk it computes is stated
 once per round (`PrefillReserve`: decode width, whether the round completes
 the prompt, prompt headroom, the sliding-window growth recycling cannot
@@ -279,9 +282,29 @@ same rule makes the finishing round of a chunked prefill cheap: its final
 chunk releases the line *within* the round, so the prompts queued behind it
 start in that round, not the next.
 
+**A junction cut leaves the line open.** A prompt whose first chunk was cut at
+its junction (§1) is incomplete, but its remaining pieces need no capacity a
+later candidate could take, so it does not hold the line and the candidates
+behind it are admitted in the same round. The conditions are the ones that
+make it true, tested on the request itself: the role is fused; the chunk ended
+exactly at the junction; every full-history group's table already has room for
+the unscheduled rest of the prompt (the first admission prepays it with the
+decode headroom, §1 "Reserve"); and the only other groups are State groups,
+whose rotation at the next chunk releases the input slot it replaces and so
+needs no net block. Anything else, a sliding window above all, keeps the hold.
+Without it, a repeated-prompt workload whose KV is cached but whose State
+checkpoints are gone (Host L2 full of KV only) cuts nearly every prompt, and
+the hold admits one new prompt per round. A checkpoint input shared with
+another request is not released by the rotation, so that second piece may
+still fail for capacity; it then waits as a resident, and a resident that
+cannot advance is retracted like any stranded prefill (§2). A round therefore
+carries several incomplete prefills; `buildFusedPlan` moves their rows behind
+the completing ones, so completing prefills still form a prefix.
+
 **Decodes are not part of the line.** In mixed mode the decode batch is built
 before the prefill phases and takes its token budget first (§3.3), so a round
-is *all decodes + the completing prefills + at most one truncated prefill*.
+is *all decodes + the completing prefills + at most one truncated prefill*
+(plus the junction-cut prompts above, their rows behind the completing ones).
 Outside mixed mode, prefill and decode never share a round at all — decodes
 get the round only when no prefill scheduled, or ahead of the prefills while
 a prefill/decode interval is owed (§3.3) — so head-of-line only ever

@@ -1109,8 +1109,9 @@ still produces all cache state required by later chunks. DeepSeek V4.1 uses
 this after the candidate-source layer writes global KV. Other backends keep
 the original output contract.
 
-The scheduler packs completing prefills first, at most one incomplete prefill
-last among prefills, then decode requests. An immutable `ForwardOutputLayout`
+The scheduler packs completing prefills first, then the incomplete prefills
+(one, or several when junction cuts share a round, `scheduler.md` §1.1), then
+decode requests. An immutable `ForwardOutputLayout`
 records E original prefills, P output-bearing prefills, D decode requests and
 verify width K. Completing prefills must form a prefix (validated on the CPU).
 Every forward carries a layout; one with P=E is the identity layout, and the
