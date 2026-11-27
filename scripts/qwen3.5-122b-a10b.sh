@@ -58,6 +58,17 @@
 #                        GPUs no throughput (NVFP4 MTP C=256 2167/2192 capped,
 #                        2181/2171 not), its cache pool is not the limit.
 #                        Measured on SM120 only.
+#   MIXED_PREFILL_TOKEN_BUDGET  default: 4096 when MTP is on (else unused).
+#                        > 0 = --enable-mixed-batch --mixed-prefill-token-budget
+#                        N: prompt chunks of up to N tokens run in the same
+#                        round as the MTP verify windows instead of separate
+#                        prefill rounds; 0 = off. An explicit mixed-batch flag
+#                        in EXTRA_SERVE_ARGS replaces it. RAG out tok/s on two
+#                        SM120 GPUs, MAX_NUM_SEQS=512 (32768 context,
+#                        GPU_MEMORY_UTILIZATION=0.9), steps=2, C=1/16/64/256,
+#                        2 runs: FP8 off 254/840/1570/2110, 4096
+#                        254/892/1768/2332; NVFP4 off 236/1032/1874/2164, 4096
+#                        235/1089/2066/2272. Measured on SM120 only.
 #   EXTRA_SERVE_ARGS     default: empty; appended verbatim to `tokenspeed serve`.
 #   VENV_DIR             default: ./.venv
 #   TOKENSPEED_CUDA_ARCH override detected arch (e.g. sm120 / sm90 / 12.0 / 9.0)
@@ -443,6 +454,16 @@ esac
 if [[ "$_mtp" -eq 1 ]]; then
     cmd+=(--speculative-algorithm MTP --speculative-num-steps "$MTP_NUM_STEPS" --speculative-draft-model-path "$MODEL_PATH")
     echo "[qwen3.5-122b] MTP speculative decoding on (steps=${MTP_NUM_STEPS}; ENABLE_MTP=0 turns it off)" >&2
+    # Mixed prefill+decode rounds: prompt chunks of up to
+    # MIXED_PREFILL_TOKEN_BUDGET tokens ride beside the MTP verify windows
+    # instead of taking rounds of their own (the engine keeps mixed rounds
+    # opt-in under speculative decoding). 0 = off; an explicit mixed-batch
+    # flag in EXTRA_SERVE_ARGS replaces this default.
+    MIXED_PREFILL_TOKEN_BUDGET="${MIXED_PREFILL_TOKEN_BUDGET:-4096}"
+    if [[ "$MIXED_PREFILL_TOKEN_BUDGET" -gt 0 && "${EXTRA_SERVE_ARGS:-}" != *-mixed-* ]]; then
+        cmd+=(--enable-mixed-batch --mixed-prefill-token-budget "$MIXED_PREFILL_TOKEN_BUDGET")
+        echo "[qwen3.5-122b] mixed prefill+decode rounds on (prompt budget ${MIXED_PREFILL_TOKEN_BUDGET} tokens; MIXED_PREFILL_TOKEN_BUDGET=0 turns it off)" >&2
+    fi
 fi
 # Extra serve args (space-separated), appended verbatim, e.g. EXTRA_SERVE_ARGS="--chunked-prefill-size 4096".
 if [[ -n "${EXTRA_SERVE_ARGS:-}" ]]; then

@@ -258,3 +258,31 @@ def test_decode_graph_ladder_is_the_engine_default_for_the_two_gpu_model(tmp_pat
     """The cap gave qwen3.5-122b-a10b.sh nothing at C=256: no default cap."""
     args = _serve_args(tmp_path, SCRIPT, CUDA_DEVICES="6,7", MAX_NUM_SEQS="512")
     assert "--max-cudagraph-capture-size" not in args
+
+
+def _mixed_budget(args: list[str]) -> str | None:
+    if "--mixed-prefill-token-budget" not in args:
+        assert "--enable-mixed-batch" not in args
+        return None
+    assert "--enable-mixed-batch" in args
+    return args[args.index("--mixed-prefill-token-budget") + 1]
+
+
+@pytest.mark.parametrize("script, devices", SERVE_SCRIPTS)
+def test_mixed_rounds_default_on_with_mtp(tmp_path, script, devices):
+    model = _checkpoint(tmp_path / "model", config_layers=1, weights="index")
+    run = lambda **env: _serve_args(  # noqa: E731
+        tmp_path, script, **{"MODEL_PATH": str(model), **devices, **env}
+    )
+    assert _mixed_budget(run()) == "4096"
+    assert _mixed_budget(run(MIXED_PREFILL_TOKEN_BUDGET="2048")) == "2048"
+    assert _mixed_budget(run(MIXED_PREFILL_TOKEN_BUDGET="0")) is None
+    # Mixed rounds are tied to the MTP default: off without MTP.
+    assert _mixed_budget(run(ENABLE_MTP="0")) is None
+    bare = _checkpoint(tmp_path / "bare", config_layers=None, weights="index")
+    assert _mixed_budget(run(MODEL_PATH=str(bare))) is None
+    # An explicit mixed-batch flag replaces the default and is kept once.
+    for extra in ("--disable-mixed-batch", "--mixed-prefill-token-budget 1024"):
+        args = run(EXTRA_SERVE_ARGS=extra)
+        assert args.count("--mixed-prefill-token-budget") == extra.count("budget")
+        assert "--enable-mixed-batch" not in args

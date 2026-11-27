@@ -77,6 +77,18 @@
 #                        requests in flight instead of 210; vLLM MTP loses 10
 #                        % there). The accuracy probe (400 items x 2) is
 #                        equal within its +-0.01 noise. Measured on SM120 only.
+#   MIXED_PREFILL_TOKEN_BUDGET  default: 4096 when MTP is on (else unused).
+#                        > 0 = --enable-mixed-batch --mixed-prefill-token-budget
+#                        N: prompt chunks of up to N tokens run in the same
+#                        round as the MTP verify windows instead of separate
+#                        prefill rounds; 0 = off. An explicit mixed-batch flag
+#                        in EXTRA_SERVE_ARGS replaces it. RAG out tok/s on one
+#                        SM120 GPU, MAX_NUM_SEQS=512 (32768 context,
+#                        GPU_MEMORY_UTILIZATION=0.9), steps=2, C=1/16/64/256,
+#                        2 runs: off 256/938/1987/2714, 4096 257/1011/2281/3187;
+#                        2048 257/1010/2248/3099, 8192 256/1014/2278/3225 (1
+#                        run). vLLM 0.34 MTP 233/998/2020/2023. Measured on
+#                        SM120 only.
 #   EXTRA_SERVE_ARGS     default: empty; appended verbatim to `tokenspeed serve`.
 #   VENV_DIR             default: ./.venv
 #   TOKENSPEED_CUDA_ARCH override detected arch (e.g. sm120 / sm90 / 12.0 / 9.0)
@@ -421,6 +433,16 @@ esac
 if [[ "$_mtp" -eq 1 ]]; then
     cmd+=(--speculative-algorithm MTP --speculative-num-steps "$MTP_NUM_STEPS" --speculative-draft-model-path "$MODEL_PATH")
     echo "[qwen3.6-35b] MTP speculative decoding on (steps=${MTP_NUM_STEPS}; ENABLE_MTP=0 turns it off)" >&2
+    # Mixed prefill+decode rounds: prompt chunks of up to
+    # MIXED_PREFILL_TOKEN_BUDGET tokens ride beside the MTP verify windows
+    # instead of taking rounds of their own (the engine keeps mixed rounds
+    # opt-in under speculative decoding). 0 = off; an explicit mixed-batch
+    # flag in EXTRA_SERVE_ARGS replaces this default.
+    MIXED_PREFILL_TOKEN_BUDGET="${MIXED_PREFILL_TOKEN_BUDGET:-4096}"
+    if [[ "$MIXED_PREFILL_TOKEN_BUDGET" -gt 0 && "${EXTRA_SERVE_ARGS:-}" != *-mixed-* ]]; then
+        cmd+=(--enable-mixed-batch --mixed-prefill-token-budget "$MIXED_PREFILL_TOKEN_BUDGET")
+        echo "[qwen3.6-35b] mixed prefill+decode rounds on (prompt budget ${MIXED_PREFILL_TOKEN_BUDGET} tokens; MIXED_PREFILL_TOKEN_BUDGET=0 turns it off)" >&2
+    fi
 fi
 # Decode CUDA-graph ladder cap. The engine's default ladder reaches MAX_NUM_SEQS
 # and its graphs are priced out of the KV pool (with MTP the verify and draft
