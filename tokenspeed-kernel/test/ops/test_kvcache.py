@@ -1291,6 +1291,45 @@ def test_transfer_kv_all_layer_mla(device: str) -> None:
         assert torch.equal(layers_dst[layer_idx], expected[layer_idx])
 
 
+@pytest.mark.parametrize("item_size", [4, 20, 132])
+def test_transfer_kv_all_layer_rejects_unaligned_item_size(
+    device: str, item_size: int
+) -> None:
+    """The kernel claims 16-byte slot offsets; a 4-byte multiple must be refused."""
+    layer = torch.zeros(4, 256, device=device, dtype=torch.float16)
+    pointers = torch.tensor([layer.data_ptr()], device=device, dtype=torch.uint64)
+    indices = torch.tensor([0], device=device, dtype=torch.int32)
+    with pytest.raises(ValueError, match="multiple of 16 bytes"):
+        transfer_kv_all_layer(
+            src_k_layers=pointers,
+            dst_k_layers=pointers,
+            src_v_layers=pointers,
+            dst_v_layers=pointers,
+            src_indices=indices,
+            dst_indices=indices,
+            item_size=item_size,
+            num_layers=1,
+        )
+
+
+@pytest.mark.parametrize("item_size", [4, 20, 132])
+def test_transfer_kv_all_layer_mla_rejects_unaligned_item_size(
+    device: str, item_size: int
+) -> None:
+    layer = torch.zeros(4, 256, device=device, dtype=torch.float16)
+    pointers = torch.tensor([layer.data_ptr()], device=device, dtype=torch.uint64)
+    indices = torch.tensor([0], device=device, dtype=torch.int32)
+    with pytest.raises(ValueError, match="multiple of 16 bytes"):
+        transfer_kv_all_layer_mla(
+            src_layers=pointers,
+            dst_layers=pointers,
+            src_indices=indices,
+            dst_indices=indices,
+            item_size=item_size,
+            num_layers=1,
+        )
+
+
 # index_k_block_split_scatter (GLM-5 DSA index-K cache write)
 
 

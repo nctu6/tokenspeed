@@ -2927,10 +2927,11 @@ def transfer_kv_all_layer_mla(
     if length == 0:
         return
 
-    if item_size % 4 != 0:
+    # Same 16-byte claim on the word offsets as _kv_transfer_all_layer_kernel.
+    if item_size % 16 != 0:
         raise ValueError(
             "Triton MLA all-layer kernel requires item_size to be a multiple of "
-            "4 bytes."
+            f"16 bytes, got {item_size}."
         )
 
     words_per_chunk = 32
@@ -2989,9 +2990,13 @@ def transfer_kv_all_layer(
     if length == 0:
         return
 
-    if item_size % 4 != 0:
+    # The kernel declares each slot's word offsets ``multiple_of(.., 4)``
+    # (16 bytes), so a slot stride that is only a multiple of 4 bytes would
+    # make that claim false.
+    if item_size % 16 != 0:
         raise ValueError(
-            "Triton KV cache all-layer kernel requires item_size to be a multiple of 4 bytes."
+            "Triton KV cache all-layer kernel requires item_size to be a multiple "
+            f"of 16 bytes, got {item_size}."
         )
 
     words_per_chunk = 32
