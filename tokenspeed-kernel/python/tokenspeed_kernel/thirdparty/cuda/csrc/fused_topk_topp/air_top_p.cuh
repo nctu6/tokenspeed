@@ -281,6 +281,7 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, T* outBuf, in
 template <typename T>
 __global__ void AirTopPRadixKernel(Counter<T>* counters, HisT<T>* histograms,
                                    IdxT* countHistograms, int const pass, T* buf1, T* buf2) {
+    nv::pdl_wait();  // counters, histograms and buffers come from the init kernel / the last pass
     using HisT_ = HisT<T>;
     int const batchId = blockIdx.y;
     auto counter = counters + batchId;
@@ -404,6 +405,7 @@ __global__ void AirTopPInitKernel(Counter<T>* counters, int len, T const* in,
                                   float const* top_p_arr, int32_t const* top_k_arr,
                                   int32_t maxTopK, HisT<T>* histograms,
                                   IdxT* countHistograms) {
+    nv::pdl_wait();  // top_k_arr / top_p_arr come from earlier kernels
     int const batchIdx = blockIdx.x;
     Counter<T>* counter = counters + batchIdx;
     int32_t k = top_k_arr[batchIdx];

@@ -39,6 +39,20 @@
 
 namespace nv {
 
+// Programmatic Dependent Launch (PDL) consumer fence. Every kernel launched with
+// cudaLaunchAttributeProgrammaticStreamSerialization may start before the
+// previous kernel of its stream has finished (once that one triggers, or when
+// the stream is captured into a graph, where the attribute turns the edge
+// into a programmatic one), and nothing it reads is guaranteed visible until
+// it executes griddepcontrol.wait. Call this first in any kernel that reads
+// what an earlier kernel of the pipeline wrote. It is a no-op for a launch
+// without the attribute.
+__device__ __forceinline__ void pdl_wait() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+
 constexpr unsigned FULL_WARP_MASK = 0xffffffff;
 constexpr int WARP_SIZE = 32;
 

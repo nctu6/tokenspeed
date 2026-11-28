@@ -490,6 +490,7 @@ __global__ void last_filter_kernel(const T* in,
                                    IdxT k,
                                    Counter<T, IdxT>* counters,
                                    const bool select_min) {
+    pdl_wait();  // counters and candidates come from the radix passes
     const size_t batch_id = blockIdx.y;
 
     Counter<T, IdxT>* counter = counters + batch_id;
@@ -587,6 +588,7 @@ __global__ void radix_kernel(const T* in,
                              const IdxT k,
                              const bool select_min,
                              const int pass) {
+    pdl_wait();  // counters and histograms come from the init kernel / the previous pass
     const size_t batch_id = blockIdx.y;
     auto counter = counters + batch_id;
     if (counter->skip) {

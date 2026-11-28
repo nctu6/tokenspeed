@@ -40,7 +40,10 @@ namespace fused_topk_topp {
 // Serialization — the next kernel can run its prologue (allocate resources,
 // fetch args) in parallel with the previous kernel's epilogue. Saves a
 // fraction of each launch's overhead. Used for every kernel in this pipeline
-// when the runtime PDL toggle is enabled.
+// when the runtime PDL toggle is enabled. Every kernel of the pipeline starts
+// with nv::pdl_wait(): without it a kernel may read the counters, histograms
+// or top-k arrays before the kernel that writes them has finished (a stale
+// counter read as a pointer faulted with "misaligned address").
 template <typename KernelFunc, typename... Args>
 static inline void launchKernel(bool enable_pdl, KernelFunc kernel, dim3 grid, dim3 block,
                                 size_t smem, cudaStream_t stream, Args... args) {
@@ -71,6 +74,7 @@ __global__ void initTopKSkipKernel(nv::air_topk_stable::Counter<T, IdxT>* counte
                                    int batch_size,
                                    int32_t const* __restrict__ top_k_arr,
                                    int max_topk) {
+    nv::pdl_wait();  // top_k_arr comes from an earlier kernel
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= batch_size) return;
     counters[b].skip = (top_k_arr[b] > max_topk) ? 1 : 0;
@@ -95,6 +99,9 @@ __launch_bounds__(256) __global__ void unifiedInitKernel(
     int32_t const* __restrict__ top_k_arr,
     int32_t max_topk,
     bool in_place_skip) {
+    // top_k_arr / top_p_arr / probs come from the sampler's earlier kernels, and the workspace
+    // may still be read by the previous call's kernels.
+    nv::pdl_wait();
     int const b = blockIdx.x;
     if (b >= batch_size) return;
     int32_t const k = top_k_arr[b];
